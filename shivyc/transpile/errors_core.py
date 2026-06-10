@@ -72,6 +72,12 @@ def init_errors_core() -> None:
     error_collector = ErrorCollector()
 
 
+def set_pending_compiler_error(descrip: str, range: Range | None = None) -> None:
+    """Record a compile error for the transpiled exception shim."""
+    global shivycx_pending_error
+    shivycx_pending_error = CompilerError(descrip, range)
+
+
 def clear_pending_error() -> None:
     """Clear the pending compiler error, if any."""
     global shivycx_pending_error

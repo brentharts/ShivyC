@@ -282,6 +282,10 @@ class ShivyCXTranspiler(ast.NodeVisitor):
                     "char_string", "include_file", "number", "unrecognized",
                 ):
                     self.global_types[kind] = "TokenKind*"
+            if alias.name.endswith("errors_core") or base == "errors_core":
+                self.imported_modules.add(base)
+                self.global_types["error_collector"] = "ErrorCollector*"
+                self.global_types["shivycx_pending_error"] = "CompilerError*"
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         if node.module == "__future__":
@@ -769,6 +773,13 @@ class ShivyCXTranspiler(ast.NodeVisitor):
         self.emit("}")
 
     def visit_Expr(self, node: ast.Expr) -> None:
+        if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name):
+            if node.value.func.id == "set_pending_compiler_error":
+                args = [self.to_c_expr(a) for a in node.value.args]
+                descrip = args[0] if args else '""'
+                err_range = args[1] if len(args) > 1 else "NULL"
+                self.emit(f"shivycx_pending_error = CompilerError_new({descrip}, {err_range});")
+                return
         self.emit(f"{self.to_c_expr(node.value)};")
 
     def _expr_c_type(self, node: ast.expr) -> str:
@@ -960,6 +971,9 @@ class ShivyCXTranspiler(ast.NodeVisitor):
 
         if isinstance(node, ast.Attribute):
             if isinstance(node.value, ast.Name) and node.value.id in self.imported_modules:
+                if node.value.id == "errors_core":
+                    if node.attr in ("error_collector", "shivycx_pending_error"):
+                        return node.attr
                 return node.attr
             obj = self.to_c_expr(node.value)
             if obj == "self":
@@ -1110,6 +1124,18 @@ class ShivyCXTranspiler(ast.NodeVisitor):
 
     def translate_call(self, node: ast.Call) -> str:
         if isinstance(node.func, ast.Attribute):
+            if isinstance(node.func.value, ast.Name) and node.func.value.id == "errors_core":
+                if node.func.attr == "clear_pending_error":
+                    return "clear_pending_error()"
+                if node.func.attr == "take_pending_error":
+                    return "take_pending_error()"
+            if node.func.attr == "add" and isinstance(node.func.value, ast.Attribute):
+                if (
+                    isinstance(node.func.value.value, ast.Name)
+                    and node.func.value.value.id == "errors_core"
+                    and node.func.value.attr == "error_collector"
+                ):
+                    return f"ErrorCollector_add(error_collector, {self.to_c_expr(node.args[0])})"
             if node.func.attr == "add" and isinstance(node.func.value, ast.Name):
                 if node.func.value.id == "error_collector":
                     return f"ErrorCollector_add(error_collector, {self.to_c_expr(node.args[0])})"
@@ -1147,7 +1173,7 @@ class ShivyCXTranspiler(ast.NodeVisitor):
             if node.func.attr == "fullmatch":
                 return f"{self.to_c_expr(node.func.value)}_fullmatch({self.to_c_expr(node.args[0])})"
             if node.func.attr == "splitlines":
-                return f"/* splitlines */ NULL"
+                return f"str_splitlines({self.to_c_expr(node.func.value)})"
             obj_name = self.to_c_expr(node.func.value)
             cls = self.class_from_expr(node.func.value) or self.current_class or "Unknown"
             args = [obj_name] + [self.to_c_expr(a) for a in node.args]

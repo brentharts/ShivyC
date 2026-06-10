@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
+import shivyc.transpile.errors_core as errors_core
+import shivyc.transpile.token_kinds as token_kinds
 from shivyc.transpile.errors_core import (
     CompilerError,
     Position,
     Range,
     Tagged,
-    clear_pending_error,
-    error_collector,
-    take_pending_error,
+    set_pending_compiler_error,
 )
-import shivyc.transpile.token_kinds as token_kinds
 from shivyc.transpile.regex_helpers import (
     float_const_fullmatch,
     identifier_fullmatch,
@@ -240,7 +239,8 @@ def read_string(
     while True:
         if i >= len(line):
             descrip: str = "missing terminating quote"
-            raise CompilerError(descrip, line[start - 1].r)
+            set_pending_compiler_error(descrip, line[start - 1].r)
+            return chars, 0
         if line[i].c == delim:
             if null:
                 chars.append(0)
@@ -285,7 +285,8 @@ def read_include_filename(line: list[Tagged], start: int) -> tuple[str, int]:
             err_range = line[start].r
         else:
             err_range = line[len(line) - 1].r
-        raise CompilerError(descrip, err_range)
+        set_pending_compiler_error(descrip, err_range)
+        return "", 0
 
     i: int = start + 1
     found: bool = False
@@ -296,7 +297,8 @@ def read_include_filename(line: list[Tagged], start: int) -> tuple[str, int]:
         i = i + 1
     if not found:
         missing_descrip: str = "missing terminating character for include filename"
-        raise CompilerError(missing_descrip, line[start].r)
+        set_pending_compiler_error(missing_descrip, line[start].r)
+        return "", 0
 
     return chunk_to_str(line[start:i + 1]), i
 
@@ -347,10 +349,13 @@ def tokenize_line(line: list[Tagged], in_comment: bool) -> tuple[list[Token], bo
         elif include_line:
             if seen_filename:
                 descrip = "extra tokens at end of include directive"
-                raise CompilerError(descrip, line[chunk_end].r)
+                set_pending_compiler_error(descrip, line[chunk_end].r)
+                return tokens, in_comment
             filename: str
             end: int
             filename, end = read_include_filename(line, chunk_end)
+            if errors_core.shivycx_pending_error is not None:
+                return tokens, in_comment
             tokens.append(
                 Token(
                     token_kinds.include_file,
@@ -375,11 +380,13 @@ def tokenize_line(line: list[Tagged], in_comment: bool) -> tuple[list[Token], bo
             wide: bool = prefix == "L"
             chars: list[int]
             chars, end = read_string(line, chunk_end + 1, quote_str, add_null)
+            if errors_core.shivycx_pending_error is not None:
+                return tokens, in_comment
             rep: str = chunk_to_str(line[chunk_end:end + 1])
             tok_range: Range = Range(line[chunk_end].p, line[end].p)
             if kind == token_kinds.char_string and len(chars) == 0:
                 err: str = "empty character constant"
-                error_collector.add(CompilerError(err, tok_range))
+                errors_core.error_collector.add(CompilerError(err, tok_range))
             tok: Token = Token(kind, "", rep, tok_range)
             tok.int_content = chars
             tok.use_int_content = True
@@ -408,6 +415,8 @@ def tokenize_line(line: list[Tagged], in_comment: bool) -> tuple[list[Token], bo
 
     if (include_line or match_include_command(tokens)) and not seen_filename:
         read_include_filename(line, chunk_end)
+        if errors_core.shivycx_pending_error is not None:
+            return tokens, in_comment
 
     return tokens, in_comment
 
@@ -421,12 +430,12 @@ def tokenize(code: str, filename: str) -> list[Token]:
     logical_line: int = 0
     while logical_line < len(lines):
         line: list[Tagged] = lines[logical_line]
-        clear_pending_error()
+        errors_core.clear_pending_error()
         line_tokens: list[Token]
         line_tokens, in_comment = tokenize_line(line, in_comment)
-        err: CompilerError | None = take_pending_error()
+        err: CompilerError | None = errors_core.take_pending_error()
         if err is not None:
-            error_collector.add(err)
+            errors_core.error_collector.add(err)
         else:
             t_idx: int = 0
             while t_idx < len(line_tokens):

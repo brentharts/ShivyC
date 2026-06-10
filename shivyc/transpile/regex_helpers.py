@@ -61,24 +61,104 @@ def str_contains_char(s: str, ch: str) -> bool:
     return False
 
 
+def _is_hex_digit_at(token_str: str, idx: int) -> bool:
+    return str_contains_char("0123456789abcdefABCDEF", token_str[idx])
+
+
+def _match_hex_exponent(token_str: str, start: int, end: int) -> bool:
+    idx: int = start
+    if idx >= end or not str_contains_char("pP", token_str[idx]):
+        return False
+    idx = idx + 1
+    if idx < end and str_contains_char("+-", token_str[idx]):
+        idx = idx + 1
+    if idx >= end or not token_str[idx].isdigit():
+        return False
+    while idx < end and token_str[idx].isdigit():
+        idx = idx + 1
+    return idx == end
+
+
+def _match_hex_float_body(token_str: str) -> bool:
+    if len(token_str) < 5:
+        return False
+    if not str_contains_char("0", token_str[0]) or not str_contains_char("xX", token_str[1]):
+        return False
+    idx: int = 2
+    j: int = idx
+    while j < len(token_str) and _is_hex_digit_at(token_str, j):
+        j = j + 1
+    if j < len(token_str) and str_contains_char(".", token_str[j]):
+        j = j + 1
+        if j < len(token_str) and _is_hex_digit_at(token_str, j):
+            while j < len(token_str) and _is_hex_digit_at(token_str, j):
+                j = j + 1
+            return _match_hex_exponent(token_str, j, len(token_str))
+    j = idx
+    if j >= len(token_str) or not _is_hex_digit_at(token_str, j):
+        return False
+    while j < len(token_str) and _is_hex_digit_at(token_str, j):
+        j = j + 1
+    if j < len(token_str) and str_contains_char(".", token_str[j]):
+        j = j + 1
+    return _match_hex_exponent(token_str, j, len(token_str))
+
+
+def _match_decimal_exponent(token_str: str, start: int, end: int) -> bool:
+    idx: int = start
+    if idx >= end:
+        return True
+    if not str_contains_char("eE", token_str[idx]):
+        return False
+    idx = idx + 1
+    if idx < end and str_contains_char("+-", token_str[idx]):
+        idx = idx + 1
+    if idx >= end or not token_str[idx].isdigit():
+        return False
+    while idx < end and token_str[idx].isdigit():
+        idx = idx + 1
+    return idx == end
+
+
+def _match_decimal_float_body(token_str: str) -> bool:
+    idx: int = 0
+    if idx < len(token_str) and token_str[idx].isdigit():
+        while idx < len(token_str) and token_str[idx].isdigit():
+            idx = idx + 1
+        if idx < len(token_str) and str_contains_char("eE", token_str[idx]):
+            return _match_decimal_exponent(token_str, idx, len(token_str))
+
+    idx = 0
+    while idx < len(token_str) and token_str[idx].isdigit():
+        idx = idx + 1
+    if idx < len(token_str) and str_contains_char(".", token_str[idx]):
+        idx = idx + 1
+        if idx < len(token_str) and token_str[idx].isdigit():
+            while idx < len(token_str) and token_str[idx].isdigit():
+                idx = idx + 1
+            return _match_decimal_exponent(token_str, idx, len(token_str))
+
+    idx = 0
+    if idx < len(token_str) and token_str[idx].isdigit():
+        while idx < len(token_str) and token_str[idx].isdigit():
+            idx = idx + 1
+        if idx < len(token_str) and str_contains_char(".", token_str[idx]):
+            idx = idx + 1
+            return _match_decimal_exponent(token_str, idx, len(token_str))
+    return False
+
+
 def float_const_fullmatch(token_str: str) -> bool:
     """Return whether token_str is a C floating constant spelling."""
     if len(token_str) == 0:
         return False
     if str_contains_char("fFlL", token_str[-1]):
         token_str = substr(token_str, 0, len(token_str) - 1)
-    if _has_substr(token_str, "0x") or _has_substr(token_str, "0X"):
-        if _has_char(token_str, "p") or _has_char(token_str, "P"):
-            return True
-    if _has_char(token_str, "e") or _has_char(token_str, "E"):
+    if len(token_str) == 0:
+        return False
+    if _match_hex_float_body(token_str):
         return True
-    if _has_char(token_str, "."):
-        idx: int = 0
-        while idx < len(token_str):
-            if token_str[idx].isdigit():
-                return True
-            idx = idx + 1
-    return False
+    return _match_decimal_float_body(token_str)
 
 
 def int_const_fullmatch(token_str: str) -> bool:

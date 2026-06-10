@@ -22,6 +22,7 @@ copy_headers() {
     cp "$INC_DIR/regex_helpers.h" "$OUT_DIR/"
     cp "$INC_DIR/tokens.h" "$OUT_DIR/"
     cp "$INC_DIR/token_kinds.h" "$OUT_DIR/"
+    cp "$INC_DIR/lexer_core.h" "$OUT_DIR/"
 }
 
 compile_unit() {
