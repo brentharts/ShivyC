@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Transpile annotated ShivyC modules to C and optionally compile them.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TRANSPILER="$ROOT/shivycx_transpiler.py"
+OUT_DIR="$ROOT/generated"
+INC_DIR="$ROOT/shivyc/transpile"
+
+mkdir -p "$OUT_DIR"
+
+transpile() {
+    local src="$1"
+    local base
+    base="$(basename "$src" .py)"
+    python3 "$TRANSPILER" "$src" -o "$OUT_DIR/${base}.c"
+    echo "wrote $OUT_DIR/${base}.c"
+}
+
+copy_headers() {
+    cp "$INC_DIR/errors_core.h" "$OUT_DIR/"
+    cp "$INC_DIR/regex_helpers.h" "$OUT_DIR/"
+    cp "$INC_DIR/tokens.h" "$OUT_DIR/"
+    cp "$INC_DIR/token_kinds.h" "$OUT_DIR/"
+}
+
+compile_unit() {
+    local name="$1"
+    gcc -std=c11 -Wall -Wextra -I"$ROOT" -I"$OUT_DIR" -c "$OUT_DIR/${name}.c" -o "$OUT_DIR/${name}.o"
+    echo "compiled $OUT_DIR/${name}.o"
+}
+
+case "${1:-all}" in
+    demo)
+        python3 "$TRANSPILER" --demo
+        ;;
+    errors_core)
+        transpile "$ROOT/shivyc/transpile/errors_core.py"
+        copy_headers
+        compile_unit errors_core
+        ;;
+    regex_helpers)
+        transpile "$ROOT/shivyc/transpile/regex_helpers.py"
+        copy_headers
+        compile_unit regex_helpers
+        ;;
+    lexer_core)
+        transpile "$ROOT/shivyc/transpile/errors_core.py"
+        transpile "$ROOT/shivyc/transpile/tokens.py"
+        transpile "$ROOT/shivyc/transpile/token_kinds.py"
+        transpile "$ROOT/shivyc/transpile/regex_helpers.py"
+        transpile "$ROOT/shivyc/transpile/lexer_core.py"
+        copy_headers
+        compile_unit errors_core
+        compile_unit tokens
+        compile_unit token_kinds
+        compile_unit regex_helpers
+        compile_unit lexer_core
+        ;;
+    all)
+        transpile "$ROOT/shivyc/transpile/errors_core.py"
+        transpile "$ROOT/shivyc/transpile/tokens.py"
+        transpile "$ROOT/shivyc/transpile/token_kinds.py"
+        transpile "$ROOT/shivyc/transpile/regex_helpers.py"
+        transpile "$ROOT/shivyc/transpile/lexer_core.py"
+        copy_headers
+        compile_unit errors_core
+        compile_unit tokens
+        compile_unit token_kinds
+        compile_unit regex_helpers
+        compile_unit lexer_core
+        ;;
+    *)
+        transpile "$1"
+        ;;
+esac

@@ -16,3 +16,4 @@ dist/*
 build/*
 gcc_output
 shivyc_output
+generated/
