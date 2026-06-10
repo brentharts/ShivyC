@@ -80,6 +80,8 @@ class _GeneralCmp(ILCommand):
             return arg1_spot, arg2_spot
 
     def make_asm(self, spotmap, home_spots, get_reg, asm_code):  # noqa D102
+        if self.arg1.ctype.is_floating() or self.arg2.ctype.is_floating():
+            return self._make_float_asm(spotmap, get_reg, asm_code)
         regs = []
 
         result = get_reg([spotmap[self.output]],
@@ -116,6 +118,51 @@ class _GeneralCmp(ILCommand):
         else:
             return self.signed_cmp_cmd
 
+    # Floating comparison configuration, set per subclass:
+    #   f_swap  - load arg2 (not arg1) into the scratch first, so the NaN-safe
+    #             "above"/"above-or-equal" tests express < and <=.
+    #   f_jump  - Ja or Jae (CF=0[/ZF=0]); both are false when unordered (NaN),
+    #             which is the correct ordered-comparison result.
+    #   f_eq / f_neq - equality forms, which must consult the parity flag (set
+    #             on unordered) in addition to ZF.
+    f_swap = False
+    f_jump = None
+    f_eq = False
+    f_neq = False
+
+    def _make_float_asm(self, spotmap, get_reg, asm_code):
+        """Emit a floating comparison via ucomisd/ucomiss into a 0/1 result."""
+        from shivyc.spots import XMM0
+        size = self.arg1.ctype.size
+        fmov = asm_cmds.Movss if size == 4 else asm_cmds.Movsd
+        ucomi = asm_cmds.Ucomiss if size == 4 else asm_cmds.Ucomisd
+        out_size = self.output.ctype.size
+        result = get_reg([spotmap[self.output]], [])
+        a1, a2 = spotmap[self.arg1], spotmap[self.arg2]
+        one, zero = LiteralSpot(1), LiteralSpot(0)
+        end = asm_code.get_label()
+
+        if self.f_eq or self.f_neq:
+            asm_code.add(fmov(XMM0, a1, size))
+            asm_code.add(ucomi(XMM0, a2, size))
+            keep, other = (zero, one) if self.f_eq else (one, zero)
+            # Unordered (parity) and inequality (ZF=0) both leave `keep`.
+            asm_code.add(asm_cmds.Mov(result, keep, out_size))
+            asm_code.add(asm_cmds.Jp(end))
+            asm_code.add(asm_cmds.Jne(end))
+            asm_code.add(asm_cmds.Mov(result, other, out_size))
+        else:
+            first, second = (a2, a1) if self.f_swap else (a1, a2)
+            asm_code.add(fmov(XMM0, first, size))
+            asm_code.add(ucomi(XMM0, second, size))
+            asm_code.add(asm_cmds.Mov(result, one, out_size))
+            asm_code.add(self.f_jump(end))
+            asm_code.add(asm_cmds.Mov(result, zero, out_size))
+        asm_code.add(asm_cmds.Label(end))
+
+        if result != spotmap[self.output]:
+            asm_code.add(asm_cmds.Mov(spotmap[self.output], result, out_size))
+
 
 class NotEqualCmp(_GeneralCmp):
     """NotEqualCmp - checks whether arg1 and arg2 are not equal.
@@ -126,6 +173,7 @@ class NotEqualCmp(_GeneralCmp):
     """
     signed_cmp_cmd = asm_cmds.Jne
     unsigned_cmp_cmd = asm_cmds.Jne
+    f_neq = True
 
 
 class EqualCmp(_GeneralCmp):
@@ -137,23 +185,30 @@ class EqualCmp(_GeneralCmp):
     """
     signed_cmp_cmd = asm_cmds.Je
     unsigned_cmp_cmd = asm_cmds.Je
+    f_eq = True
 
 
 class LessCmp(_GeneralCmp):
     signed_cmp_cmd = asm_cmds.Jl
     unsigned_cmp_cmd = asm_cmds.Jb
+    f_swap = True
+    f_jump = asm_cmds.Ja
 
 
 class GreaterCmp(_GeneralCmp):
     signed_cmp_cmd = asm_cmds.Jg
     unsigned_cmp_cmd = asm_cmds.Ja
+    f_jump = asm_cmds.Ja
 
 
 class LessOrEqCmp(_GeneralCmp):
     signed_cmp_cmd = asm_cmds.Jle
     unsigned_cmp_cmd = asm_cmds.Jbe
+    f_swap = True
+    f_jump = asm_cmds.Jae
 
 
 class GreaterOrEqCmp(_GeneralCmp):
     signed_cmp_cmd = asm_cmds.Jge
     unsigned_cmp_cmd = asm_cmds.Jae
+    f_jump = asm_cmds.Jae

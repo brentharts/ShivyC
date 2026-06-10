@@ -33,16 +33,22 @@ class _ValueCmd(ILCommand):
         shift = 0
         while shift < size:
             reg_size = self._reg_size(size - shift)
-            start_spot = start_spot.shift(shift)
-            target_spot = target_spot.shift(shift)
+            # Compute each chunk's spot from the ORIGINAL base by the absolute
+            # offset `shift`. (Reassigning start_spot/target_spot here would
+            # compound the offset across iterations and corrupt copies larger
+            # than 16 bytes, where three or more chunks are emitted.)
+            cur_start = start_spot.shift(shift)
+            cur_target = target_spot.shift(shift)
 
-            if isinstance(start_spot, LiteralSpot):
-                reg = start_spot
-            elif reg != start_spot:
-                asm_code.add(asm_cmds.Mov(reg, start_spot, reg_size))
+            if isinstance(cur_start, LiteralSpot):
+                src = cur_start
+            else:
+                src = reg
+                if reg != cur_start:
+                    asm_code.add(asm_cmds.Mov(reg, cur_start, reg_size))
 
-            if reg != target_spot:
-                asm_code.add(asm_cmds.Mov(target_spot, reg, reg_size))
+            if src != cur_target:
+                asm_code.add(asm_cmds.Mov(cur_target, src, reg_size))
 
             shift += reg_size
 
@@ -73,9 +79,29 @@ class LoadArg(ILCommand):
     """
     arg_regs = [spots.RDI, spots.RSI, spots.RDX, spots.RCX, spots.R8, spots.R9]
 
-    def __init__(self, output, arg_num):
+    def __init__(self, output, arg_num, all_stack=False, reg=None,
+                 is_float=False, stack_index=None):
         self.output = output
-        self.arg_reg = self.arg_regs[arg_num]
+        self.arg_num = arg_num
+        self.is_float = is_float
+        if reg is not None:
+            # Explicit register (used by the ABI-aware generation site, which
+            # counts integer and floating arguments in separate sequences).
+            self.arg_reg = reg
+            self.stack_spot = None
+        elif stack_index is not None:
+            self.arg_reg = None
+            self.stack_spot = MemSpot(spots.RBP, 16 + 8 * stack_index)
+        elif all_stack or arg_num >= len(self.arg_regs):
+            # Variadic functions receive every argument on the stack; ordinary
+            # functions only the 7th onward. Stack arguments sit at [rbp+16],
+            # [rbp+24], ... (the return address is at [rbp+8]).
+            self.arg_reg = None
+            stack_index = arg_num if all_stack else arg_num - len(self.arg_regs)
+            self.stack_spot = MemSpot(spots.RBP, 16 + 8 * stack_index)
+        else:
+            self.arg_reg = self.arg_regs[arg_num]
+            self.stack_spot = None
 
     def inputs(self):
         return []
@@ -84,17 +110,85 @@ class LoadArg(ILCommand):
         return [self.output]
 
     def clobber(self):
-        return [self.arg_reg]
+        # A floating argument arrives in an xmm register, which the integer
+        # allocator does not track, so it need not be reported as clobbered.
+        if self.is_float:
+            return []
+        return [self.arg_reg] if self.arg_reg else []
 
     def abs_spot_pref(self):
-        return {self.output: [self.arg_reg]}
+        # Floating outputs live in memory, so an xmm preference is meaningless.
+        if self.is_float:
+            return {}
+        return {self.output: [self.arg_reg]} if self.arg_reg else {}
 
     def make_asm(self, spotmap, home_spots, get_reg, asm_code):
-        if spotmap[self.output] == self.arg_reg:
+        dest = spotmap[self.output]
+        size = self.output.ctype.size
+        src = self.arg_reg if self.arg_reg else self.stack_spot
+        if dest == src:
             return
+        # A floating argument arrives in an xmm register (or, when spilled, on
+        # the stack); move it with the SSE move into its memory home.
+        if self.is_float:
+            fmov = asm_cmds.Movss if size == 4 else asm_cmds.Movsd
+            if self.arg_reg is not None:
+                asm_code.add(fmov(dest, self.arg_reg, size))
+            else:
+                from shivyc.spots import XMM0
+                asm_code.add(fmov(XMM0, src, size))
+                asm_code.add(fmov(dest, XMM0, size))
+            return
+        # A register source can move directly to a register or memory dest.
+        # A memory source (stack argument) cannot move directly to a memory
+        # dest, so route it through a scratch register in that case.
+        if self.arg_reg is None and isinstance(dest, MemSpot):
+            r = get_reg()
+            asm_code.add(asm_cmds.Mov(r, src, size))
+            asm_code.add(asm_cmds.Mov(dest, r, size))
         else:
-            asm_code.add(asm_cmds.Mov(
-                spotmap[self.output], self.arg_reg, self.output.ctype.size))
+            asm_code.add(asm_cmds.Mov(dest, src, size))
+
+
+class LoadStructArg(_ValueCmd):
+    """Loads a struct-valued function argument into its memory home.
+
+    SysV AMD64: a struct in the INTEGER class arrives in one or two
+    consecutive integer registers (`regs`); a struct in the MEMORY class
+    (size > 16, or one that did not fit the remaining registers) arrives on
+    the stack starting at 8-byte slot `stack_index`. Either way the struct is
+    copied into the parameter's memory home.
+    """
+
+    def __init__(self, output, regs=None, stack_index=None):
+        self.output = output
+        self.regs = regs
+        self.stack_index = stack_index
+
+    def inputs(self):
+        return []
+
+    def outputs(self):
+        return [self.output]
+
+    def clobber(self):
+        return list(self.regs) if self.regs else []
+
+    def make_asm(self, spotmap, home_spots, get_reg, asm_code):
+        home = spotmap[self.output]
+        size = self.output.ctype.size
+        if self.regs is not None:
+            # Register-passed: store each incoming eightbyte register into the
+            # matching 8-byte slot of the home.
+            for i, reg in enumerate(self.regs):
+                remaining = size - 8 * i
+                chunk = next(cs for cs in (8, 4, 2, 1) if remaining >= cs)
+                asm_code.add(asm_cmds.Mov(home.shift(8 * i), reg, chunk))
+        else:
+            # Stack-passed: copy `size` bytes from the incoming stack slots.
+            src = MemSpot(spots.RBP, 16 + 8 * self.stack_index)
+            r = get_reg()
+            self.move_data(home, src, size, r, asm_code)
 
 
 class Set(_ValueCmd):
@@ -129,14 +223,45 @@ class Set(_ValueCmd):
             return {}
 
     def make_asm(self, spotmap, home_spots, get_reg, asm_code): # noqa D102
+        # SIMD bit-packing dispatch (opt-in). A write to a packed flag is
+        # written through to memory + xmm15 everywhere; a read of a packed
+        # flag inside a hot/interrupt routine is served from xmm15 (no load).
+        if getattr(asm_code, "simd_pack_enabled", False):
+            layout = asm_code.simd_pack
+            out_slot = layout.slot_for_spot(spotmap[self.output])
+            arg_slot = layout.slot_for_spot(spotmap[self.arg])
+            if out_slot is not None:
+                return self._set_packed_write(
+                    out_slot, spotmap, get_reg, asm_code)
+            if arg_slot is not None and asm_code.simd_pack_hot:
+                return self._set_packed_read(
+                    arg_slot, spotmap, get_reg, asm_code)
+
         if self.output.ctype.weak_compat(ctypes.bool_t):
             return self._set_bool(spotmap, get_reg, asm_code)
+
+        elif (self.output.ctype.is_floating()
+              or self.arg.ctype.is_floating()):
+            return self._set_float(spotmap, get_reg, asm_code)
 
         elif isinstance(spotmap[self.arg], LiteralSpot):
             out_spot = spotmap[self.output]
             arg_spot = spotmap[self.arg]
             size = self.output.ctype.size
-            asm_code.add(asm_cmds.Mov(out_spot, arg_spot, size))
+            # x86-64 can move only a sign-extended 32-bit immediate straight
+            # to memory; a wider immediate (e.g. an immortal refcount) must go
+            # through a register first.
+            try:
+                lit = int(arg_spot.value)
+            except (TypeError, ValueError):
+                lit = 0
+            if (isinstance(out_spot, MemSpot) and size == 8
+                    and not (-2**31 <= lit < 2**31)):
+                r = get_reg()
+                asm_code.add(asm_cmds.Mov(r, arg_spot, size))
+                asm_code.add(asm_cmds.Mov(out_spot, r, size))
+            else:
+                asm_code.add(asm_cmds.Mov(out_spot, arg_spot, size))
 
         elif self.output.ctype.size <= self.arg.ctype.size:
             if spotmap[self.output] == spotmap[self.arg]:
@@ -171,6 +296,73 @@ class Set(_ValueCmd):
             if r != spotmap[self.output]:
                 asm_code.add(asm_cmds.Mov(spotmap[self.output],
                                           r, self.output.ctype.size))
+
+    def _set_packed_write(self, slot, spotmap, get_reg, asm_code):
+        """Emit a write-through store of self.arg into a packed flag slot."""
+        # Materialize the source value into a scratch register at the correct
+        # size (handles literal / register / memory sources uniformly).
+        val_reg = get_reg()
+        self.move_data(val_reg, spotmap[self.arg],
+                       self.output.ctype.size, val_reg, asm_code)
+        # Two more distinct scratch registers for the bit-insert sequence.
+        acc_reg = get_reg(conf=[val_reg])
+        msk_reg = get_reg(conf=[val_reg, acc_reg])
+        asm_code.simd_pack.emit_write(asm_code, slot, val_reg, acc_reg, msk_reg)
+
+    def _set_packed_read(self, slot, spotmap, get_reg, asm_code):
+        """Emit a zero-latency (register-only) read of a packed flag slot."""
+        out_spot = spotmap[self.output]
+        if isinstance(out_spot, RegSpot):
+            dst = out_spot
+        else:
+            dst = get_reg()
+        asm_code.simd_pack.emit_read(asm_code, slot, dst)
+        if dst != out_spot:
+            asm_code.add(asm_cmds.Mov(out_spot, dst, self.output.ctype.size))
+
+    def _set_float(self, spotmap, get_reg, asm_code):
+        """SET where source and/or destination is floating-point."""
+        from shivyc.spots import XMM0
+        out_spot = spotmap[self.output]
+        arg_spot = spotmap[self.arg]
+        out_t, arg_t = self.output.ctype, self.arg.ctype
+
+        def fmov(size):
+            return asm_cmds.Movss if size == 4 else asm_cmds.Movsd
+
+        if out_t.is_floating() and arg_t.is_floating():
+            if arg_t.size == out_t.size:
+                if out_spot == arg_spot:
+                    return
+                asm_code.add(fmov(arg_t.size)(XMM0, arg_spot, arg_t.size))
+                asm_code.add(fmov(out_t.size)(out_spot, XMM0, out_t.size))
+            else:
+                asm_code.add(fmov(arg_t.size)(XMM0, arg_spot, arg_t.size))
+                conv = (asm_cmds.Cvtsd2ss if arg_t.size == 8
+                        else asm_cmds.Cvtss2sd)
+                asm_code.add(conv(XMM0, XMM0, out_t.size))
+                asm_code.add(fmov(out_t.size)(out_spot, XMM0, out_t.size))
+
+        elif out_t.is_floating():
+            src = arg_spot
+            isize = arg_t.size if arg_t.size in (4, 8) else 8
+            if isinstance(arg_spot, LiteralSpot) or arg_t.size not in (4, 8):
+                r = get_reg()
+                self.move_data(r, arg_spot, isize, r, asm_code)
+                src = r
+            conv = asm_cmds.Cvtsi2ss if out_t.size == 4 else asm_cmds.Cvtsi2sd
+            asm_code.add(conv(XMM0, src, isize))
+            asm_code.add(fmov(out_t.size)(out_spot, XMM0, out_t.size))
+
+        else:
+            asm_code.add(fmov(arg_t.size)(XMM0, arg_spot, arg_t.size))
+            osize = out_t.size if out_t.size in (4, 8) else 4
+            dst = out_spot if isinstance(out_spot, RegSpot) else get_reg()
+            conv = (asm_cmds.Cvttss2si if arg_t.size == 4
+                    else asm_cmds.Cvttsd2si)
+            asm_code.add(conv(dst, XMM0, max(osize, 4)))
+            if dst != out_spot:
+                asm_code.add(asm_cmds.Mov(out_spot, dst, out_t.size))
 
     def _set_bool(self, spotmap, get_reg, asm_code):
         """Emit code for SET command if arg is boolean type."""
@@ -354,7 +546,8 @@ class _RelCommand(_ValueCmd):
              or isinstance(spotmap[reg_val], RegSpot)):
             return spotmap[reg_val]
 
-        val_spot = get_reg([], [spotmap[self.count]] + self._used_regs)
+        val_spot = get_reg([], ([spotmap[self.count]] if self.count else [])
+                           + self._used_regs)
         self._used_regs.append(val_spot)
         return val_spot
 
@@ -405,9 +598,18 @@ class SetRel(_RelCommand):
             raise NotImplementedError("expected base in memory spot")
 
         rel_spot = self.get_rel_spot(spotmap, get_reg, asm_code)
-        reg = self.get_reg_spot(self.val, spotmap, get_reg)
-
         val_size = self.val.ctype.size
+
+        # A floating value lives in memory and moves through the xmm scratch
+        # register; the integer get_reg/move_data path does not apply.
+        if self.val.ctype.is_floating():
+            from shivyc.spots import XMM0
+            fmov = asm_cmds.Movss if val_size == 4 else asm_cmds.Movsd
+            asm_code.add(fmov(XMM0, spotmap[self.val], val_size))
+            asm_code.add(fmov(rel_spot, XMM0, val_size))
+            return
+
+        reg = self.get_reg_spot(self.val, spotmap, get_reg)
         self.move_data(rel_spot, spotmap[self.val], val_size, reg, asm_code)
 
 
@@ -467,7 +669,49 @@ class ReadRel(_RelCommand):
             raise NotImplementedError("expected base in memory spot")
 
         rel_spot = self.get_rel_spot(spotmap, get_reg, asm_code)
-        reg = self.get_reg_spot(self.output, spotmap, get_reg)
-
         out_size = self.output.ctype.size
+
+        # Floating destination: move through the xmm scratch into its memory
+        # home rather than through a GPR.
+        if self.output.ctype.is_floating():
+            from shivyc.spots import XMM0
+            fmov = asm_cmds.Movss if out_size == 4 else asm_cmds.Movsd
+            asm_code.add(fmov(XMM0, rel_spot, out_size))
+            asm_code.add(fmov(spotmap[self.output], XMM0, out_size))
+            return
+
+        reg = self.get_reg_spot(self.output, spotmap, get_reg)
         self.move_data(spotmap[self.output], rel_spot, out_size, reg, asm_code)
+
+
+class VaStartAddr(ILCommand):
+    """Compute the address of the first variadic argument.
+
+    Variadic functions receive all arguments on the stack, so the first
+    variadic argument lives at [rbp + 16 + 8*named_count], where named_count
+    is the number of named parameters.
+    """
+
+    def __init__(self, output, named_count):
+        self.output = output
+        self.named_count = named_count
+
+    def inputs(self):
+        return []
+
+    def outputs(self):
+        return [self.output]
+
+    def clobber(self):
+        return []
+
+    def make_asm(self, spotmap, home_spots, get_reg, asm_code):
+        off = 16 + 8 * self.named_count
+        src = MemSpot(spots.RBP, off)
+        dest = spotmap[self.output]
+        if isinstance(dest, RegSpot):
+            asm_code.add(asm_cmds.Lea(dest, src))
+        else:
+            r = get_reg()
+            asm_code.add(asm_cmds.Lea(r, src))
+            asm_code.add(asm_cmds.Mov(dest, r, 8))

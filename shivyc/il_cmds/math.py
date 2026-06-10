@@ -33,6 +33,8 @@ class _AddMult(ILCommand):
 
     def make_asm(self, spotmap, home_spots, get_reg, asm_code): # noqa D102
         """Make the ASM for ADD, MULT, and SUB."""
+        if self.output.ctype.is_floating():
+            return self._make_float_asm(spotmap, asm_code)
         ctype = self.arg1.ctype
         size = ctype.size
 
@@ -85,6 +87,26 @@ class _AddMult(ILCommand):
         if temp != spotmap[self.output]:
             asm_code.add(asm_cmds.Mov(spotmap[self.output], temp, size))
 
+    # SSE arithmetic instruction by operand size; overridden in subclasses.
+    FInst_d = None
+    FInst_s = None
+
+    def _make_float_asm(self, spotmap, asm_code):
+        """Make ASM for a floating ADD/SUB/MULT via a fixed xmm scratch.
+
+        Both operands live in memory: load the first into the scratch
+        register, apply the SSE op with the second (a memory operand), and
+        store the result. SUB is naturally correct (scratch holds arg1, then
+        arg1 - arg2) despite being non-commutative.
+        """
+        from shivyc.spots import XMM0
+        size = self.output.ctype.size
+        fmov = asm_cmds.Movss if size == 4 else asm_cmds.Movsd
+        inst = self.FInst_s if size == 4 else self.FInst_d
+        asm_code.add(fmov(XMM0, spotmap[self.arg1], size))
+        asm_code.add(inst(XMM0, spotmap[self.arg2], size))
+        asm_code.add(fmov(spotmap[self.output], XMM0, size))
+
 
 class Add(_AddMult):
     """Adds arg1 and arg2, then saves to output.
@@ -94,6 +116,8 @@ class Add(_AddMult):
     """
     comm = True
     Inst = asm_cmds.Add
+    FInst_d = asm_cmds.Addsd
+    FInst_s = asm_cmds.Addss
 
 
 class Subtr(_AddMult):
@@ -103,6 +127,8 @@ class Subtr(_AddMult):
     """
     comm = False
     Inst = asm_cmds.Sub
+    FInst_d = asm_cmds.Subsd
+    FInst_s = asm_cmds.Subss
 
 
 class Mult(_AddMult):
@@ -113,6 +139,8 @@ class Mult(_AddMult):
     """
     comm = True
     Inst = asm_cmds.Imul
+    FInst_d = asm_cmds.Mulsd
+    FInst_s = asm_cmds.Mulss
 
 
 class _BitShiftCmd(ILCommand):
@@ -176,9 +204,14 @@ class _BitShiftCmd(ILCommand):
 class RBitShift(_BitShiftCmd):
     """Right bitwise shift operator for IL value.
     Shifts each bit in IL value left operand to the right by position
-    indicated by right operand."""
+    indicated by right operand. Signed operands shift arithmetically (sar),
+    unsigned operands shift logically (shr)."""
 
-    Inst = asm_cmds.Sar
+    @property
+    def Inst(self):
+        if getattr(self.arg1.ctype, "signed", True):
+            return asm_cmds.Sar
+        return asm_cmds.Shr
 
 
 class LBitShift(_BitShiftCmd):
@@ -218,7 +251,19 @@ class _DivMod(ILCommand):
         return {self.output: [self.return_reg],
                 self.arg1: [spots.RAX]}
 
+    FInst_d = None
+    FInst_s = None
+
     def make_asm(self, spotmap, home_spots, get_reg, asm_code): # noqa D102
+        if self.output.ctype.is_floating():
+            from shivyc.spots import XMM0
+            size = self.output.ctype.size
+            fmov = asm_cmds.Movss if size == 4 else asm_cmds.Movsd
+            inst = self.FInst_s if size == 4 else self.FInst_d
+            asm_code.add(fmov(XMM0, spotmap[self.arg1], size))
+            asm_code.add(inst(XMM0, spotmap[self.arg2], size))
+            asm_code.add(fmov(spotmap[self.output], XMM0, size))
+            return
         ctype = self.arg1.ctype
         size = ctype.size
 
@@ -271,6 +316,8 @@ class Div(_DivMod):
     """
 
     return_reg = spots.RAX
+    FInst_d = asm_cmds.Divsd
+    FInst_s = asm_cmds.Divss
 
 
 class Mod(_DivMod):
@@ -310,8 +357,30 @@ class _NegNot(ILCommand):
         output_spot = spotmap[self.output]
         arg_spot = spotmap[self.arg]
 
+        # Floating negation (only NEG; bitwise NOT requires integer type):
+        # compute 0 - x in the xmm scratch, which negates every value the
+        # int-exit-code harness can observe.
+        if self.output.ctype.is_floating():
+            from shivyc.spots import XMM0
+            fmov = asm_cmds.Movss if size == 4 else asm_cmds.Movsd
+            sub = asm_cmds.Subss if size == 4 else asm_cmds.Subsd
+            asm_code.add(asm_cmds.Xorps(XMM0, XMM0, size))
+            asm_code.add(sub(XMM0, arg_spot, size))
+            asm_code.add(fmov(output_spot, XMM0, size))
+            return
+
         if output_spot != arg_spot:
-            asm_code.add(asm_cmds.Mov(output_spot, arg_spot, size))
+            # `neg`/`not` can operate directly on a memory operand, but the
+            # copy into the output cannot be memory-to-memory; route it
+            # through a scratch register when both spots are in memory.
+            from shivyc.spots import RegSpot
+            if (not isinstance(output_spot, RegSpot)
+                    and not isinstance(arg_spot, RegSpot)):
+                r = get_reg([], [output_spot, arg_spot])
+                asm_code.add(asm_cmds.Mov(r, arg_spot, size))
+                asm_code.add(asm_cmds.Mov(output_spot, r, size))
+            else:
+                asm_code.add(asm_cmds.Mov(output_spot, arg_spot, size))
         asm_code.add(self.Inst(output_spot, None, size))
 
 
@@ -333,3 +402,24 @@ class Not(_NegNot):
     """
 
     Inst = asm_cmds.Not
+
+
+class BitAnd(_AddMult):
+    """Bitwise AND of arg1 and arg2, saved to output.
+
+    All three IL values must have the same type; no conversion is done here.
+    """
+    comm = True
+    Inst = asm_cmds.And
+
+
+class BitOr(_AddMult):
+    """Bitwise OR of arg1 and arg2, saved to output."""
+    comm = True
+    Inst = asm_cmds.Or
+
+
+class BitXor(_AddMult):
+    """Bitwise XOR of arg1 and arg2, saved to output."""
+    comm = True
+    Inst = asm_cmds.Xor
