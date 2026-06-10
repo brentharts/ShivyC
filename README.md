@@ -1,58 +1,14 @@
-# ShivyC [![Build Status](https://travis-ci.org/ShivamSarodia/ShivyC.svg?branch=master)](https://travis-ci.org/ShivamSarodia/ShivyC) [![Code Coverage](https://codecov.io/gh/ShivamSarodia/ShivyC/branch/master/graph/badge.svg)](https://codecov.io/gh/ShivamSarodia/ShivyC)
-
-### A hobby C compiler created in Python.
-
-![ShivyC demo GIF.](https://raw.githubusercontent.com/ShivamSarodia/ShivyC/master/demo.gif)
+### ShivyCX A C compiler created in Python.
 
 ---
 
-ShivyC is a hobby C compiler written in Python 3 that supports a subset of the C11 standard and generates reasonably efficient binaries, including some optimizations. ShivyC also generates helpful compile-time error messages.
+ShivyCX is a C compiler written in Python 3 that supports a subset of the C11 standard and generates reasonably efficient binaries, including some optimizations. ShivyC also generates helpful compile-time error messages.
 
-This [implementation of a trie](tests/general_tests/trie/trie.c) is an example of what ShivyC can compile today. For a more comprehensive list of features, see the [feature test directory](tests/feature_tests).
 
 ## Quickstart
 
 ### x86-64 Linux
 ShivyC requires only Python 3.6 or later to compile C code. Assembling and linking are done using the GNU binutils and glibc, which you almost certainly already have installed.
-
-To install ShivyC:
-```
-pip3 install shivyc
-```
-To create, compile, and run an example program:
-```c
-$ vim hello.c
-$ cat hello.c
-
-#include <stdio.h>
-int main() {
-  printf("hello, world!\n");
-}
-
-$ shivyc hello.c
-$ ./out
-hello, world!
-```
-To run the tests:
-```
-git clone https://github.com/ShivamSarodia/ShivyC.git
-cd ShivyC
-python3 -m unittest discover
-```
-
-### Other Architectures
-For the convenience of those not running Linux, the [`docker/`](docker/) directory provides a Dockerfile that sets up an x86-64 Linux Ubuntu environment with everything necessary for ShivyC. To use this, run:
-```
-git clone https://github.com/ShivamSarodia/ShivyC.git
-cd ShivyC
-docker/shell
-```
-This will open up a shell in an environment with ShivyC installed and ready to use with
-```
-shivyc any_c_file.c           # to compile a file
-python3 -m unittest discover  # to run tests
-```
-The Docker ShivyC executable will update live with any changes made in your local ShivyC directory.
 
 ## Implementation Overview
 #### Preprocessor
@@ -70,11 +26,6 @@ ShivyC traverses the parse tree to generate a flat custom IL (intermediate langu
 #### ASM generation
 ShivyC sequentially reads the IL commands, converting each into Intel-format x86-64 assembly code. ShivyC performs register allocation using George and Appel’s iterated register coalescing algorithm (see References below). The general ASM generation functionality is in [`asm_gen.py`](shivyc/asm_gen.py) , but much of the ASM generating code is in the `make_asm` function of each IL command in [`il_cmds/*.py`](shivyc/il_cmds/).
 
-## Contributing
-This project is no longer under active development and I'm unlikely to review non-trivial PRs. However:
-
-- If you have a question about ShivyC, the best way to ask is via Github Issues. I'll answer when I can, but my response may not be so helpful because it's been a while since I've had time to think about this project.
-- If you have an perspective on how ShivyC can be made practically helpful to a group, please make an Issue. I'd love to hear from you, although unfortunately I may not be in a position to implement any changes depending on my other interests and obligations.
 
 ## References
 - [ShivC](https://github.com/ShivamSarodia/ShivC) - ShivyC is a rewrite from scratch of my old C compiler, ShivC, with much more emphasis on feature completeness and code quality. See the ShivC README for more details.
