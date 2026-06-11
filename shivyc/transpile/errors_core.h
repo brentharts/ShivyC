@@ -1,8 +1,6 @@
 #ifndef SHIVYC_ERRORS_CORE_H
 #define SHIVYC_ERRORS_CORE_H
 
-#include <stdbool.h>
-#include <stddef.h>
 #include "shivycx_runtime.h"
 
 typedef struct Position Position;
@@ -26,28 +24,16 @@ struct Tagged {
     Range *r;
 };
 
+typedef struct ErrorCollector ErrorCollector;
+struct ErrorCollector {
+    int issue_count;
+};
+
 typedef struct CompilerError CompilerError;
 struct CompilerError {
     const char *descrip;
     Range *range;
     bool warning;
-};
-
-typedef struct {
-    CompilerError **data;
-    size_t size;
-    size_t capacity;
-} CompilerErrorList;
-
-void CompilerErrorList_init(CompilerErrorList *list);
-void CompilerErrorList_push(CompilerErrorList *list, CompilerError *item);
-size_t CompilerErrorList_len(const CompilerErrorList *list);
-CompilerError *CompilerErrorList_get(const CompilerErrorList *list, size_t index);
-void CompilerErrorList_clear(CompilerErrorList *list);
-
-typedef struct ErrorCollector ErrorCollector;
-struct ErrorCollector {
-    CompilerErrorList *issues;
 };
 
 extern ErrorCollector *error_collector;
@@ -65,9 +51,6 @@ ErrorCollector *ErrorCollector_new(void);
 void ErrorCollector_add(ErrorCollector *self, CompilerError *issue);
 bool ErrorCollector_ok(ErrorCollector *self);
 void ErrorCollector_clear(ErrorCollector *self);
-size_t ErrorCollector_issue_count(const ErrorCollector *self);
-CompilerError *ErrorCollector_issue_at(const ErrorCollector *self, size_t index);
 CompilerError *CompilerError_new(const char *descrip, Range *range);
-Position *position_add_col(Position *pos, int delta);
 
 #endif

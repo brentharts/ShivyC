@@ -18,7 +18,6 @@ extern TokenKind *char_string;
 extern TokenKind *include_file;
 extern TokenKind *number;
 extern TokenKind *unrecognized;
-extern TokenKind *semicolon;
 
 void init_token_kinds(void);
 

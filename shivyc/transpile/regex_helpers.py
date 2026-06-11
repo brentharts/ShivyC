@@ -169,8 +169,6 @@ def int_const_fullmatch(token_str: str) -> bool:
     prefix: str = substr(core, 0, 2)
     idx: int = 0
     if prefix == "0x" or prefix == "0X":
-        if len(core) <= 2:
-            return False
         idx = 2
         while idx < len(core):
             if not str_contains_char("0123456789abcdefABCDEF", core[idx]):
@@ -178,8 +176,6 @@ def int_const_fullmatch(token_str: str) -> bool:
             idx = idx + 1
         return True
     if prefix == "0b" or prefix == "0B":
-        if len(core) <= 2:
-            return False
         idx = 2
         while idx < len(core):
             if not str_contains_char("01", core[idx]):
