@@ -218,6 +218,17 @@ class DeclInfo:
             self.process_typedef(symbol_table)
             return
 
+        # GCC __auto_type: infer the declared type from the initializer. Probe
+        # the initializer's type on a throwaway IL copy (as sizeof does), so no
+        # code is emitted twice.
+        if isinstance(self.ctype, ctypes.AutoCType):
+            if self.init is None or isinstance(self.init, decl_nodes.InitList):
+                err = "__auto_type declaration requires a scalar initializer"
+                raise CompilerError(err, self.range)
+            probe_il = il_code.copy()
+            init_val = self.init.make_il(probe_il, symbol_table, c)
+            self.ctype = init_val.ctype
+
         if self.body and not self.ctype.is_function():
             err = "function definition provided for non-function type"
             raise CompilerError(err, self.range)
@@ -1138,6 +1149,27 @@ class Declaration(Node):
         elif any(s.kind == token_kinds.enum_kw for s in specs):
             node = [s for s in specs if s.kind == token_kinds.enum_kw][0]
             base_type = self.parse_enum_spec(node)
+
+        # is a GCC __typeof__(expr): probe the expression's type and use it.
+        elif any(isinstance(s, decl_nodes.TypeofSpec) for s in specs):
+            ts = [s for s in specs
+                  if isinstance(s, decl_nodes.TypeofSpec)][0]
+            probe_il = self.il_code.copy()
+            val = ts.expr.make_il(probe_il, self.symbol_table, self.c)
+            base_type = val.ctype
+
+        # is a GCC __auto_type: the real type is inferred from the initializer
+        # later (in DeclInfo.process); use the auto sentinel for now.
+        elif any(s.kind == token_kinds.auto_type_kw for s in specs):
+            base_type = ctypes.auto_type
+
+        # is a C11 _Atomic(type-name) specifier: use the inner type (ShivyCX is
+        # single-threaded, so an atomic type degrades to its underlying type).
+        elif any(isinstance(s, decl_nodes.AtomicSpec) for s in specs):
+            atomic = [s for s in specs
+                      if isinstance(s, decl_nodes.AtomicSpec)][0]
+            inner_base, _ = self.make_specs_ctype(atomic.root.specs, True)
+            base_type, _ = self.make_ctype(atomic.root.decls[0], inner_base)
 
         # is a typedef
         elif any(s.kind == token_kinds.identifier for s in specs):
