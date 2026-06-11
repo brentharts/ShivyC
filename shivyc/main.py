@@ -71,6 +71,37 @@ def main():
     ctypes.long_double_as_double = getattr(
         arguments, "long_double_as_double", False)
 
+    # Load a per-function register budget (thread partitioning) if supplied;
+    # ASMGen consults arguments._thread_alloc to restrict allocation.
+    arguments._thread_alloc = None
+    if getattr(arguments, "thread_alloc_json", None):
+        import json
+        try:
+            with open(arguments.thread_alloc_json) as fh:
+                arguments._thread_alloc = json.load(fh)
+        except OSError as e:
+            print(CompilerError(f"cannot read thread budget: {e}"))
+            return 1
+
+    # Whole-program memory-safety analysis: detect use-after-free / double-free
+    # (and optionally auto-free candidates) over all inputs, then exit.
+    if getattr(arguments, "check_memory", False):
+        import shivyc.memory_safety as memory_safety
+        return memory_safety.run(arguments.files, arguments)
+
+    # Micro-slicing analysis: find pure, independent fragments and a slice plan
+    # for productive spin-waiting, then exit.
+    if getattr(arguments, "microslice", False):
+        import shivyc.microslice as microslice
+        return microslice.run(arguments.files, arguments)
+
+    # Thread-partition switcher: analyze threads.left/right across the inputs
+    # and emit a specialized context switcher, then exit. (Analysis + codegen
+    # of the switcher only; the user's TUs are compiled normally otherwise.)
+    if getattr(arguments, "emit_thread_switcher", None):
+        import shivyc.thread_contracts as thread_contracts
+        return thread_contracts.run(arguments.files, arguments)
+
     # Whole-program call-graph report: build the cross-TU call graph over all
     # input files and print it, then exit. (Analysis only; emits no objects.)
     if getattr(arguments, "print_call_graph", False):
@@ -268,6 +299,19 @@ def process_c_file(file, args):
             return None
 
     ext_info = getattr(args, "_extensions", None)
+
+    # Auto-free: insert free() for provably-local, non-escaping, never-freed
+    # allocations so the programmer may omit it. Runs before the optimization
+    # passes so the inserted frees are optimized like any other call.
+    if getattr(args, "auto_free", False):
+        import shivyc.memory_safety as memory_safety
+        try:
+            n = memory_safety.insert_auto_frees(il_code, symbol_table, args)
+            if n and not getattr(args, "quiet", False):
+                print(f"auto-free: inserted {n} free(s) for non-escaping "
+                      f"allocations in {file}")
+        except Exception:
+            pass  # never let the analysis break a normal compile
 
     # Cross-TU inlining runs first, before any optimization pass: splicing a
     # small pure leaf (whose body was captured from the whole-program graph)
@@ -574,9 +618,42 @@ def get_arguments():
                         action="store_true",
                         help="print the cross-translation-unit call graph")
 
+    # Register-partitioned threads (bare-metal).
+    parser.add_argument("--emit-thread-switcher", dest="emit_thread_switcher",
+                        metavar="OUT.s", default=None,
+                        help="analyze threads.left/right declarations across "
+                             "the inputs and write a specialized context "
+                             "switcher to OUT.s, then exit")
+    parser.add_argument("--thread-alloc-json", dest="thread_alloc_json",
+                        metavar="FILE", default=None,
+                        help="constrain each function's register pool to the "
+                             "{func: [reg,...]} budget in FILE (used by the "
+                             "thread partitioner to make footprints disjoint)")
+
     # Disable the on-disk AST parse cache.
     parser.add_argument("--no-cache", dest="no_cache", action="store_true",
                         help="disable the on-disk parsed-AST cache")
+
+    # Whole-program memory-safety analysis.
+    parser.add_argument("--check-memory", dest="check_memory",
+                        action="store_true",
+                        help="run the whole-program use-after-free / double-free "
+                             "analysis over the inputs and exit")
+    parser.add_argument("--auto-free", dest="auto_free", action="store_true",
+                        help="with --check-memory, also report (and where safe, "
+                             "insert) automatic frees for non-escaping allocations")
+
+    # Micro-slicing: productive spin-waiting analysis.
+    parser.add_argument("--microslice", dest="microslice", action="store_true",
+                        help="analyze the inputs for pure, independent fragments "
+                             "and print a slice plan for productive spinning")
+    parser.add_argument("--slice-budget", dest="slice_budget", type=int,
+                        metavar="N", default=None,
+                        help="per-slice cost budget for --microslice (default 64)")
+    parser.add_argument("--emit-microslice", dest="emit_microslice",
+                        metavar="OUT.c", default=None,
+                        help="with --microslice, write a work-injected acquire "
+                             "scaffold for the hottest fragment to OUT.c")
 
     return parser.parse_args()
 
