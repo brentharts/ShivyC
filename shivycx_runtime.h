@@ -193,6 +193,90 @@ static inline char *str_slice(const char *s, size_t start, size_t end) {
     return out;
 }
 
+/* String -> bool map (transpile-ready symbol scopes). */
+typedef struct {
+    char **keys;
+    bool *values;
+    size_t size;
+    size_t capacity;
+} StrBoolMap;
+
+static inline void StrBoolMap_init(StrBoolMap *map) {
+    map->keys = NULL;
+    map->values = NULL;
+    map->size = 0;
+    map->capacity = 0;
+}
+
+static inline StrBoolMap *StrBoolMap_new(void) {
+    StrBoolMap *map = (StrBoolMap *)malloc(sizeof(StrBoolMap));
+    if (map) {
+        StrBoolMap_init(map);
+    }
+    return map;
+}
+
+static inline void StrBoolMap_reserve(StrBoolMap *map, size_t cap) {
+    if (cap <= map->capacity) {
+        return;
+    }
+    size_t new_cap = map->capacity ? map->capacity * 2 : 8;
+    while (new_cap < cap) {
+        new_cap *= 2;
+    }
+    map->keys = (char **)realloc(map->keys, new_cap * sizeof(char *));
+    map->values = (bool *)realloc(map->values, new_cap * sizeof(bool));
+    map->capacity = new_cap;
+}
+
+static inline void StrBoolMap_set(StrBoolMap *map, const char *key, bool value) {
+    for (size_t i = 0; i < map->size; i++) {
+        if (strcmp(map->keys[i], key) == 0) {
+            map->values[i] = value;
+            return;
+        }
+    }
+    StrBoolMap_reserve(map, map->size + 1);
+    map->keys[map->size] = (char *)key;
+    map->values[map->size] = value;
+    map->size++;
+}
+
+static inline bool StrBoolMap_contains(const StrBoolMap *map, const char *key) {
+    for (size_t i = 0; i < map->size; i++) {
+        if (strcmp(map->keys[i], key) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static inline bool StrBoolMap_get(const StrBoolMap *map, const char *key, bool default_value) {
+    for (size_t i = 0; i < map->size; i++) {
+        if (strcmp(map->keys[i], key) == 0) {
+            return map->values[i];
+        }
+    }
+    return default_value;
+}
+
+static inline void StrBoolMap_clear(StrBoolMap *map) {
+    map->size = 0;
+}
+
+static inline StrBoolMap *StrBoolMap_copy(const StrBoolMap *src) {
+    StrBoolMap *dst = StrBoolMap_new();
+    if (!dst || !src) {
+        return dst;
+    }
+    for (size_t i = 0; i < src->size; i++) {
+        StrBoolMap_set(dst, src->keys[i], src->values[i]);
+    }
+    return dst;
+}
+
+DEFINE_LIST(StrBoolMap, StrBoolMapList)
+
 typedef struct {
     const char *data;
     size_t len;

@@ -549,3 +549,28 @@ simple_types = {token_kinds.void_kw: void,
                 token_kinds.long_kw: longint,
                 token_kinds.float_kw: flt,
                 token_kinds.double_kw: dbl}
+
+
+class AutoCType:
+    """Sentinel type for the GCC `__auto_type` specifier.
+
+    The real type is inferred from the declaration's initializer when the
+    declaration is processed, so this placeholder only needs to answer the few
+    predicates the declaration machinery queries before that inference runs.
+    """
+
+    def is_function(self):
+        return False
+
+    def is_array(self):
+        return False
+
+    def is_incomplete(self):
+        return False
+
+    def is_struct_union(self):
+        return False
+
+
+# Singleton sentinel used wherever `__auto_type` appears as a type specifier.
+auto_type = AutoCType()

@@ -194,3 +194,33 @@ class Enum(DeclNode):
         self.kind = token_kinds.enum_kw
         self.r = r
         super().__init__()
+
+
+class AtomicSpec:
+    """A C11 `_Atomic ( type-name )` type specifier.
+
+    Carries the parsed inner type-name as a `decl_nodes.Root`. ShivyCX targets
+    a single-threaded runtime, so an atomic type is represented as its
+    underlying type; this node lets the spec list carry that inner type for
+    `make_specs_ctype` to resolve. It mimics the token interface (`kind`, `r`)
+    the spec list expects.
+    """
+
+    def __init__(self, root, r):
+        self.root = root        # decl_nodes.Root for the parenthesized type-name
+        self.r = r
+        self.kind = None        # not a keyword token; ignored by kind checks
+
+
+class TypeofSpec:
+    """A GCC `__typeof__ ( expression )` type specifier.
+
+    Carries the parsed expression; `make_specs_ctype` probes its type and uses
+    that as the declared base type. Mimics the token interface (`kind`, `r`)
+    the spec list expects.
+    """
+
+    def __init__(self, expr, r):
+        self.expr = expr
+        self.r = r
+        self.kind = None

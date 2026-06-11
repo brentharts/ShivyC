@@ -14,10 +14,36 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 SKIP_METHOD_TAGS = frozenset({"pragma: no cover", "transpiler: skip"})
+TUPLE_RETURN_ALIASES: Dict[str, Dict[str, Tuple[str, List[str]]]] = {
+    "lexer_core": {
+        "tokenize_line": ("TokenizeLineResult", ["tokens", "in_comment"]),
+        "tokenize_text_line": ("TokenizeLineResult", ["tokens", "in_comment"]),
+        "read_string": ("ReadStringResult", ["chars", "end"]),
+        "read_include_filename": ("ReadIncludeResult", ["filename", "end"]),
+    },
+    "parser_core": {
+        "parse_root": ("ParseRootResult", ["node", "index"]),
+    },
+}
 KNOWN_CLASSES = frozenset({
     "Position", "Range", "Tagged", "Token", "TokenKind",
-    "CompilerError", "ErrorCollector",
+    "CompilerError", "ErrorCollector", "ParserError", "Node", "Root",
 })
+STRUCT_FIELD_TYPES: Dict[str, Dict[str, str]] = {
+    "Token": {
+        "kind": "TokenKind*", "content": "const char*", "rep": "const char*",
+        "r": "Range*", "int_content": "IntList*",
+    },
+    "Range": {"start": "Position*", "end": "Position*"},
+    "Tagged": {"c": "const char*", "p": "Position*", "r": "Range*"},
+    "Position": {
+        "file": "const char*", "full_line": "const char*",
+    },
+    "ParserError": {"descrip": "const char*", "range": "Range*"},
+    "CompilerError": {"descrip": "const char*", "range": "Range*"},
+    "Node": {"r": "Range*"},
+    "Root": {"nodes": "NodeList*"},
+}
 IMPORTED_MODULE_GLOBALS = frozenset({"token_kinds"})
 
 
@@ -62,6 +88,7 @@ class ShivyCXTranspiler(ast.NodeVisitor):
         self.tuple_structs: Set[str] = set()
         self.tuple_id = 0
         self.tuple_field_types: Dict[str, List[str]] = {}
+        self.tuple_field_names: Dict[str, List[str]] = {}
         self.tuple_type_cache: Dict[Tuple[str, ...], str] = {}
         self.function_returns: Dict[str, str] = {}
         self.current_return_type: Optional[str] = None
@@ -112,10 +139,29 @@ class ShivyCXTranspiler(ast.NodeVisitor):
                     self.tuple_type_cache[field_types] = name
                     return name
             if isinstance(node_annotation.slice, ast.Subscript):
+                if (
+                    isinstance(node_annotation.slice.value, ast.Name)
+                    and node_annotation.slice.value.id == "dict"
+                ):
+                    elem = self.map_type(node_annotation.slice)
+                    elem_base = elem.replace("*", "")
+                    self.list_types.add(elem_base)
+                    return f"{elem_base}List*"
                 inner_list = self.map_type(node_annotation.slice)
                 inner_base = inner_list.replace("List*", "")
                 self.list_types.add(f"{inner_base}ListList")
                 return f"{inner_base}ListList*"
+            if (
+                isinstance(node_annotation.value, ast.Name)
+                and node_annotation.value.id == "dict"
+                and isinstance(node_annotation.slice, ast.Tuple)
+                and len(node_annotation.slice.elts) == 2
+            ):
+                key_t = self.map_type(node_annotation.slice.elts[0])
+                val_t = self.map_type(node_annotation.slice.elts[1])
+                if key_t == "const char*" and val_t == "bool":
+                    self.list_types.add("StrBoolMap")
+                    return "StrBoolMap*"
             if isinstance(node_annotation.value, ast.Name) and node_annotation.value.id in ("list", "List"):
                 if isinstance(node_annotation.slice, ast.Name) and node_annotation.slice.id == "str":
                     self.list_types.add("Str")
@@ -165,8 +211,7 @@ class ShivyCXTranspiler(ast.NodeVisitor):
         self.emit("#include <string.h>")
         self.emit("#include <ctype.h>")
         self.emit('#include "shivycx_runtime.h"')
-        if self.module_name != "errors_core":
-            self.emit('#include "errors_core.h"')
+        self.emit('#include "errors_core.h"')
         if self.module_name in ("lexer_core", "token_kinds"):
             self.emit('#include "tokens.h"')
         if self.module_name == "token_kinds":
@@ -174,6 +219,16 @@ class ShivyCXTranspiler(ast.NodeVisitor):
         if self.module_name == "lexer_core":
             self.emit('#include "regex_helpers.h"')
             self.emit('#include "token_kinds.h"')
+        if self.module_name == "parser_utils":
+            self.emit('#include "tokens.h"')
+            self.emit('#include "token_kinds.h"')
+        if self.module_name == "parser_core":
+            self.emit('#include "tokens.h"')
+            self.emit('#include "token_kinds.h"')
+            self.emit('#include "parser_utils.h"')
+            self.emit('#include "tree_nodes.h"')
+        if self.module_name == "tree_nodes":
+            self.emit('#include "tree_nodes.h"')
         if self.module_name in ("lexer_core", "token_kinds"):
             self.emit('#include "shivycx_exceptions.h"')
         self.emit("")
@@ -207,10 +262,33 @@ class ShivyCXTranspiler(ast.NodeVisitor):
                 c_type = self.map_type(item.annotation)
                 self.global_types[item.target.id] = c_type
 
+    def register_tuple_alias(
+        self,
+        name: str,
+        field_names: List[str],
+        field_types: List[str],
+    ) -> None:
+        key = tuple(field_types)
+        self.tuple_structs.add(name)
+        self.tuple_field_types[name] = field_types
+        self.tuple_field_names[name] = field_names
+        self.tuple_type_cache[key] = name
+
     def prescan_function(self, node: ast.FunctionDef) -> None:
         if node.returns:
-            ret = self.map_type(node.returns)
-            self.function_returns[node.name] = ret
+            alias = TUPLE_RETURN_ALIASES.get(self.module_name, {}).get(node.name)
+            if (
+                alias
+                and isinstance(node.returns, ast.Subscript)
+                and isinstance(node.returns.slice, ast.Tuple)
+            ):
+                type_name, field_names = alias
+                field_types = [self.map_type(elt) for elt in node.returns.slice.elts]
+                self.register_tuple_alias(type_name, field_names, field_types)
+                self.function_returns[node.name] = type_name
+            else:
+                ret = self.map_type(node.returns)
+                self.function_returns[node.name] = ret
         for arg in node.args.args:
             if arg.annotation:
                 self.map_type(arg.annotation)
@@ -219,6 +297,8 @@ class ShivyCXTranspiler(ast.NodeVisitor):
                 self.map_type(stmt.annotation)
 
     def emit_list_typedefs(self) -> None:
+        if self.module_name == "tree_nodes":
+            return
         if not self.list_types and not self.tuple_structs:
             return
         self.emit("/* List type definitions */")
@@ -229,7 +309,17 @@ class ShivyCXTranspiler(ast.NodeVisitor):
                 continue
             elif name == "TokenKind" and self.module_name == "token_kinds":
                 continue
-            elif name == "TokenKind" and self.module_name in ("lexer_core", "token_kinds"):
+            elif name == "TokenKind" and self.module_name in ("lexer_core", "token_kinds", "parser_utils"):
+                continue
+            elif name == "Token" and self.module_name in ("lexer_core", "parser_utils"):
+                continue
+            elif name == "Token" and self.module_name in ("lexer_core", "parser_utils", "parser_core"):
+                continue
+            elif name == "Node" and self.module_name == "parser_core":
+                continue
+            elif name == "CompilerError" and self.module_name == "errors_core":
+                continue
+            elif name == "StrBoolMap":
                 continue
             elif name == "Str":
                 if self.module_name == "lexer_core":
@@ -242,7 +332,7 @@ class ShivyCXTranspiler(ast.NodeVisitor):
                 self.emit("        list->data = (char **)realloc(list->data, cap * sizeof(char *));")
                 self.emit("        list->capacity = cap;")
                 self.emit("    }")
-                self.emit("    list->data[list->size++] = item;")
+                self.emit("    list->data[list->size++] = (char *)item;")
                 self.emit("}")
                 self.emit("static inline size_t StrList_len(const StrList *list) { return list->size; }")
                 self.emit("static inline const char *StrList_get(const StrList *list, size_t index) { return list->data[index]; }")
@@ -262,9 +352,15 @@ class ShivyCXTranspiler(ast.NodeVisitor):
         self.emit("")
         for name in sorted(self.tuple_structs):
             fields_list = self.tuple_field_types.get(name, [])
-            fields = "; ".join(
-                f"{fields_list[i]} f{i}" for i in range(len(fields_list))
-            )
+            field_names = self.tuple_field_names.get(name)
+            if field_names and len(field_names) == len(fields_list):
+                fields = "; ".join(
+                    f"{fields_list[i]} {field_names[i]}" for i in range(len(fields_list))
+                )
+            else:
+                fields = "; ".join(
+                    f"{fields_list[i]} f{i}" for i in range(len(fields_list))
+                )
             self.emit(f"typedef struct {{ {fields}; }} {name};")
         if self.tuple_structs:
             self.emit("")
@@ -280,12 +376,19 @@ class ShivyCXTranspiler(ast.NodeVisitor):
                 for kind in (
                     "dquote", "squote", "pound", "identifier", "string",
                     "char_string", "include_file", "number", "unrecognized",
+                    "semicolon",
                 ):
                     self.global_types[kind] = "TokenKind*"
             if alias.name.endswith("errors_core") or base == "errors_core":
                 self.imported_modules.add(base)
                 self.global_types["error_collector"] = "ErrorCollector*"
                 self.global_types["shivycx_pending_error"] = "CompilerError*"
+            if alias.name.endswith("parser_utils") or base == "parser_utils":
+                self.imported_modules.add(base)
+                self.global_types["tokens"] = "TokenList*"
+                self.global_types["best_error"] = "ParserError*"
+                self.global_types["symbols"] = "SimpleSymbolTable*"
+                self.global_types["cur_func_name"] = "const char*"
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         if node.module == "__future__":
@@ -301,6 +404,7 @@ class ShivyCXTranspiler(ast.NodeVisitor):
             for kind in (
                 "dquote", "squote", "pound", "identifier", "string",
                 "char_string", "include_file", "number", "unrecognized",
+                "semicolon",
             ):
                 self.global_types[kind] = "TokenKind*"
 
@@ -317,25 +421,25 @@ class ShivyCXTranspiler(ast.NodeVisitor):
                             attributes.append((self.map_type(stmt.annotation), stmt.target.attr))
 
         self.class_fields[class_name] = attributes
-        self.emit(f"typedef struct {class_name} {class_name};")
-        self.emit(f"struct {class_name} {{")
-        self.indent_level += 1
-        for c_type, attr_name in attributes:
-            self.emit(f"{c_type} {attr_name};")
-        self.indent_level -= 1
-        self.emit("};")
-        self.emit("")
+        if self.module_name not in ("errors_core", "tree_nodes"):
+            self.emit(f"typedef struct {class_name} {class_name};")
+            self.emit(f"struct {class_name} {{")
+            self.indent_level += 1
+            for c_type, attr_name in attributes:
+                self.emit(f"{c_type} {attr_name};")
+            self.indent_level -= 1
+            self.emit("};")
+            self.emit("")
 
         init_method = next(
             (m for m in node.body if isinstance(m, ast.FunctionDef) and m.name == "__init__"),
             None,
         )
-        if init_method:
-            self.generate_constructor(class_name, init_method)
-
         for item in node.body:
             if isinstance(item, ast.FunctionDef) and item.name != "__init__":
                 self.visit(item)
+        if init_method:
+            self.generate_constructor(class_name, init_method)
 
         self.current_class = None
 
@@ -362,6 +466,8 @@ class ShivyCXTranspiler(ast.NodeVisitor):
                             base = c_type.replace("*", "")
                             self.emit(f"self->{attr} = ({c_type})malloc(sizeof({base}));")
                             self.emit(f"{base}_init(self->{attr});")
+                        elif isinstance(stmt.value, ast.Dict) and len(stmt.value.keys) == 0:
+                            self.emit(f"self->{attr} = StrBoolMap_new();")
                         else:
                             self.emit(f"self->{attr} = {self.to_c_expr(stmt.value)};")
                     elif stmt.annotation:
@@ -429,6 +535,14 @@ class ShivyCXTranspiler(ast.NodeVisitor):
             elif arg.arg != "self" and arg.annotation:
                 self.scope.declare(arg.arg, self.map_type(arg.annotation))
 
+        used_names: Set[str] = set()
+        for child in ast.walk(node):
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
+                used_names.add(child.id)
+        for arg in node.args.args:
+            if arg.arg != "self" and arg.arg not in used_names:
+                self.emit(f"(void){arg.arg};")
+
         for stmt in node.body:
             if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant):
                 if isinstance(stmt.value.value, str):
@@ -488,6 +602,8 @@ class ShivyCXTranspiler(ast.NodeVisitor):
                             self.emit_empty_list(var_name, c_type)
                         else:
                             self.emit_empty_list(var_name, c_type)
+                    elif isinstance(node.value, ast.Dict) and len(node.value.keys) == 0:
+                        self.emit(f"{c_type} {var_name} = StrBoolMap_new();")
                     elif isinstance(node.value, ast.Constant) and node.value.value is None:
                         self.emit(f"{c_type} {var_name} = NULL;")
                     else:
@@ -538,15 +654,35 @@ class ShivyCXTranspiler(ast.NodeVisitor):
                 else:
                     self.emit(f"{var_name} = {val_str};")
             elif isinstance(target, ast.Attribute):
+                if (
+                    isinstance(target.value, ast.Name)
+                    and target.value.id in self.imported_modules
+                    and target.attr in self.global_types
+                ):
+                    self.emit(f"{target.attr} = {val_str};")
+                    continue
+                if isinstance(node.value, ast.List) and len(node.value.elts) == 0:
+                    obj = self.to_c_expr(target.value)
+                    op = "->" if self.is_pointer_expr(target.value) else "."
+                    list_expr = f"{obj}{op}{target.attr}"
+                    base = self.list_base_from_attr(target)
+                    if base != "Unknown":
+                        self.emit(f"{self.list_op(base, 'clear', list_expr)};")
+                        continue
                 obj = self.to_c_expr(target.value)
                 op = "->" if self.is_pointer_expr(target.value) else "."
                 self.emit(f"{obj}{op}{target.attr} = {val_str};")
             elif isinstance(target, ast.Subscript):
-                base = self.list_base(target.value)
-                if base != "Unknown":
-                    self.emit(f"{self.list_op(base, 'set', self.to_c_expr(target.value), self.to_c_expr(target.slice), val_str)};")
-                else:
+                if self.expr_points_to_map(target.value):
                     self.emit(f"{self.subscript_set(target, val_str)};")
+                else:
+                    base = self.list_base(target.value)
+                    if base != "Unknown":
+                        self.emit(
+                            f"{self.list_op(base, 'set', self.to_c_expr(target.value), self.to_c_expr(target.slice), val_str)};"
+                        )
+                    else:
+                        self.emit(f"{self.subscript_set(target, val_str)};")
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         op_map = {ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/", ast.Mod: "%"}
@@ -606,6 +742,18 @@ class ShivyCXTranspiler(ast.NodeVisitor):
         self.indent_level -= 1
         self.emit("}")
 
+    def is_reversed_list_iter(self, node: ast.expr) -> bool:
+        if not isinstance(node, ast.Subscript):
+            return False
+        sl = node.slice
+        if not isinstance(sl, ast.Slice):
+            return False
+        if sl.lower is not None or sl.upper is not None:
+            return False
+        if not isinstance(sl.step, ast.UnaryOp) or not isinstance(sl.step.op, ast.USub):
+            return False
+        return isinstance(sl.step.operand, ast.Constant) and sl.step.operand.value == 1
+
     def visit_For(self, node: ast.For) -> None:
         if isinstance(node.iter, ast.Call) and isinstance(node.iter.func, ast.Name):
             if node.iter.func.id == "range":
@@ -614,6 +762,20 @@ class ShivyCXTranspiler(ast.NodeVisitor):
             if node.iter.func.id == "enumerate":
                 self.emit_enumerate_for(node)
                 return
+        if self.is_reversed_list_iter(node.iter) and isinstance(node.target, ast.Name):
+            var = node.target.id
+            seq = node.iter.value
+            elem_type = self.list_elem_type(seq)
+            self.scope.declare(var, elem_type)
+            self.emit(f"for (size_t _ri = {self.list_len(seq)}; _ri > 0; ) {{")
+            self.indent_level += 1
+            self.emit("_ri--;")
+            self.emit(f"{elem_type} {var} = {self.list_get(seq, '_ri')};")
+            for stmt in node.body:
+                self.visit(stmt)
+            self.indent_level -= 1
+            self.emit("}")
+            return
         if isinstance(node.target, ast.Name):
             var = node.target.id
             elem_type = self.list_elem_type(node.iter)
@@ -656,7 +818,25 @@ class ShivyCXTranspiler(ast.NodeVisitor):
                 if base == "Int":
                     return "int"
                 return f"{base}*"
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "self" and self.current_class:
+            for c_type, attr_name in self.class_fields.get(self.current_class, []):
+                if attr_name == node.attr and c_type.endswith("List*"):
+                    base = c_type.replace("List*", "")
+                    return f"{base}*"
         return "void*"
+
+    def map_base(self, node: ast.expr) -> str:
+        if isinstance(node, ast.Name):
+            c_type = self.scope.get_type(node.id) or ""
+            if c_type == "StrBoolMap*":
+                return "StrBoolMap"
+        if isinstance(node, ast.Subscript):
+            return self.map_base(node.value)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "self" and self.current_class:
+            for c_type, attr_name in self.class_fields.get(self.current_class, []):
+                if attr_name == node.attr and c_type == "StrBoolMap*":
+                    return "StrBoolMap"
+        return "Unknown"
 
     def emit_tuple_unpack(self, target: ast.Tuple, value: ast.expr) -> None:
         tmp = "_unpack_tmp"
@@ -665,15 +845,17 @@ class ShivyCXTranspiler(ast.NodeVisitor):
         if isinstance(value, ast.Call) and isinstance(value.func, ast.Name):
             tpl_type = self.function_returns.get(value.func.id, tpl_type)
         fields = self.tuple_field_types.get(tpl_type, [])
+        names = self.tuple_field_names.get(tpl_type)
         self.emit(f"{tpl_type} {tmp} = {val};")
         for i, elt in enumerate(target.elts):
             if isinstance(elt, ast.Name):
                 c_type = fields[i] if i < len(fields) else "void*"
+                field = names[i] if names and i < len(names) else f"f{i}"
                 if elt.id not in self.scope.declared:
                     self.scope.declare(elt.id, c_type)
-                    self.emit(f"{c_type} {elt.id} = {tmp}.f{i};")
+                    self.emit(f"{c_type} {elt.id} = {tmp}.{field};")
                 else:
-                    self.emit(f"{elt.id} = {tmp}.f{i};")
+                    self.emit(f"{elt.id} = {tmp}.{field};")
 
     def emit_range_for(self, node: ast.For) -> None:
         if not isinstance(node.target, ast.Name):
@@ -796,9 +978,35 @@ class ShivyCXTranspiler(ast.NodeVisitor):
             return "const char*"
         return ""
 
+    def call_return_type(self, node: ast.Call) -> Optional[str]:
+        if isinstance(node.func, ast.Name):
+            return self.function_returns.get(node.func.id)
+        return None
+
+    def tuple_field_name(self, tpl_type: str, index: int) -> str:
+        names = self.tuple_field_names.get(tpl_type)
+        if names and index < len(names):
+            return names[index]
+        return f"f{index}"
+
+    def tuple_subscript(self, base_expr: str, tpl_type: str, index: int) -> str:
+        return f"{base_expr}.{self.tuple_field_name(tpl_type, index)}"
+
+    def tuple_type_from_expr(self, node: ast.expr) -> Optional[str]:
+        if isinstance(node, ast.Call):
+            return self.call_return_type(node)
+        if isinstance(node, ast.Name):
+            c_type = self.scope.get_type(node.id) or self.global_types.get(node.id) or ""
+            if c_type in self.tuple_structs or c_type.startswith("Tuple_"):
+                return c_type
+        return None
+
     def infer_type_from_value(self, node: ast.expr) -> str:
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            if node.func.id in self.class_fields:
+        if isinstance(node, ast.Call):
+            ret = self.call_return_type(node)
+            if ret:
+                return ret
+            if isinstance(node.func, ast.Name) and node.func.id in self.class_fields:
                 return f"{node.func.id}*"
         if isinstance(node, ast.Constant):
             if isinstance(node.value, bool):
@@ -811,9 +1019,45 @@ class ShivyCXTranspiler(ast.NodeVisitor):
             return self.scope.get_type(node.id) or "int"
         return "int"
 
-    def is_pointer_expr(self, node: ast.expr) -> bool:
+    def struct_name_from_type(self, c_type: str) -> Optional[str]:
+        if c_type.endswith("*"):
+            return c_type[:-1]
+        return None
+
+    def lookup_field_type(self, struct: str, attr: str) -> str:
+        if self.current_class == struct:
+            for c_type, name in self.class_fields.get(struct, []):
+                if name == attr:
+                    return c_type
+        return STRUCT_FIELD_TYPES.get(struct, {}).get(attr, "int")
+
+    def expr_c_type(self, node: ast.expr) -> str:
         if isinstance(node, ast.Name):
-            c_type = self.scope.get_type(node.id) or self.global_types.get(node.id) or ""
+            return self.scope.get_type(node.id) or self.global_types.get(node.id) or ""
+        if isinstance(node, ast.Attribute):
+            base_type = self.expr_c_type(node.value)
+            struct = self.struct_name_from_type(base_type)
+            if struct:
+                return self.lookup_field_type(struct, node.attr)
+        if isinstance(node, ast.Subscript):
+            base = self.list_base(node.value)
+            if base != "Unknown":
+                return f"{base}*"
+            tpl_type = self.tuple_type_from_expr(node.value)
+            if tpl_type and isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, int):
+                fields = self.tuple_field_types.get(tpl_type, [])
+                idx = node.slice.value
+                if idx < len(fields):
+                    return fields[idx]
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            cls = node.func.id
+            if cls in self.class_fields or cls in KNOWN_CLASSES:
+                return f"{cls}*"
+        return ""
+
+    def is_pointer_expr(self, node: ast.expr) -> bool:
+        c_type = self.expr_c_type(node)
+        if c_type:
             return c_type.endswith("*")
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
             return node.value.id == "self"
@@ -833,9 +1077,26 @@ class ShivyCXTranspiler(ast.NodeVisitor):
             c_type = self.scope.get_type(node.id) or ""
             if c_type.endswith("*"):
                 return c_type[:-1]
+        if isinstance(node, ast.Attribute):
+            return self.list_base_from_attr(node)
         if isinstance(node, ast.Subscript):
             return self.list_base(node.value)
         return "Unknown"
+
+    def list_base_from_attr(self, node: ast.Attribute) -> str:
+        if isinstance(node.value, ast.Name) and node.value.id == "self" and self.current_class:
+            for c_type, attr_name in self.class_fields.get(self.current_class, []):
+                if attr_name == node.attr and c_type.endswith("List*"):
+                    return c_type[:-1]
+        return "Unknown"
+
+    def expr_points_to_map(self, node: ast.expr) -> bool:
+        if isinstance(node, ast.Subscript):
+            return self.list_base(node.value) == "StrBoolMapList"
+        if isinstance(node, ast.Name):
+            c_type = self.scope.get_type(node.id) or ""
+            return c_type == "StrBoolMap*"
+        return False
 
     def list_op(self, base: str, op: str, *args: str) -> str:
         if base.endswith("List"):
@@ -850,6 +1111,9 @@ class ShivyCXTranspiler(ast.NodeVisitor):
                 attr = node.attr
                 if attr in ("symbol_kinds", "keyword_kinds"):
                     return f"(int)TokenKindList_len({attr})"
+            base = self.list_base_from_attr(node)
+            if base != "Unknown":
+                return f"(int){self.list_op(base, 'len', self.to_c_expr(node))}"
         if isinstance(node, ast.Name):
             c_type = self.scope.get_type(node.id) or ""
             if c_type == "const char*":
@@ -859,13 +1123,46 @@ class ShivyCXTranspiler(ast.NodeVisitor):
                 return f"(int){self.list_op(base, 'len', node.id)}"
         return "0"
 
+    def subscript_index(self, node: ast.expr, base: str, outer: str) -> str:
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            if isinstance(node.operand, ast.Constant):
+                neg = node.operand.value
+                return f"({self.list_op(base, 'len', outer)} - {neg})"
+        if isinstance(node, ast.Constant):
+            return str(node.value)
+        if isinstance(node, ast.Name):
+            return node.id
+        return self.to_c_expr(node)
+
     def list_get(self, node: ast.expr, index: str) -> str:
+        if isinstance(node, ast.Attribute):
+            base = self.list_base_from_attr(node)
+            if base != "Unknown":
+                return self.list_op(base, "get", self.to_c_expr(node), index)
         if isinstance(node, ast.Name):
             base = self.list_base(node)
             if base != "Unknown":
                 return self.list_op(base, "get", node.id, index)
         return f"{self.to_c_expr(node)}[{index}]"
     def subscript_get(self, node: ast.Subscript) -> str:
+        if isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, int):
+            idx = node.slice.value
+            tpl_type = self.tuple_type_from_expr(node.value)
+            if tpl_type:
+                return self.tuple_subscript(self.to_c_expr(node.value), tpl_type, idx)
+        if self.expr_points_to_map(node.value):
+            container = (
+                self.subscript_get(node.value)
+                if isinstance(node.value, ast.Subscript)
+                else self.to_c_expr(node.value)
+            )
+            return f"StrBoolMap_get({container}, {self.to_c_expr(node.slice)}, false)"
+        if isinstance(node.value, ast.Attribute):
+            base = self.list_base_from_attr(node.value)
+            if base != "Unknown":
+                outer = self.to_c_expr(node.value)
+                idx = self.subscript_index(node.slice, base, outer)
+                return self.list_op(base, "get", outer, idx)
         if isinstance(node.value, ast.Name):
             val_type = self.scope.get_type(node.value.id) or ""
             if val_type == "const char*":
@@ -910,6 +1207,13 @@ class ShivyCXTranspiler(ast.NodeVisitor):
         return f"{self.to_c_expr(node.value)}[{self.to_c_expr(node.slice)}]"
 
     def subscript_set(self, node: ast.Subscript, value: str) -> str:
+        if self.expr_points_to_map(node.value):
+            container = (
+                self.subscript_get(node.value)
+                if isinstance(node.value, ast.Subscript)
+                else self.to_c_expr(node.value)
+            )
+            return f"StrBoolMap_set({container}, {self.to_c_expr(node.slice)}, {value})"
         if isinstance(node.slice, ast.Constant):
             idx = node.slice.value
             base = self.list_base(node.value)
@@ -927,6 +1231,8 @@ class ShivyCXTranspiler(ast.NodeVisitor):
 
     def format_constructor_call(self, cls: str, node: ast.Call) -> str:
         args = [self.c_arg(a) for a in node.args]
+        if cls == "Range" and len(args) == 1:
+            return f"Range_new({args[0]}, {args[0]})"
         return f"{cls}_new({', '.join(args)})"
 
     def format_constructor_call_from_call(self, node: ast.Call) -> str:
@@ -950,6 +1256,11 @@ class ShivyCXTranspiler(ast.NodeVisitor):
         return mapping.get(ch, f"'{ch}'")
 
     def to_c_expr(self, node: ast.AST) -> str:
+        if isinstance(node, ast.Dict):
+            if len(node.keys) == 0:
+                return "StrBoolMap_new()"
+            raise TranspileError("non-empty dict literals are not supported")
+
         if isinstance(node, ast.Constant):
             if isinstance(node.value, str):
                 escaped = (
@@ -974,6 +1285,8 @@ class ShivyCXTranspiler(ast.NodeVisitor):
                 if node.value.id == "errors_core":
                     if node.attr in ("error_collector", "shivycx_pending_error"):
                         return node.attr
+                if node.attr in self.global_types:
+                    return node.attr
                 return node.attr
             obj = self.to_c_expr(node.value)
             if obj == "self":
@@ -1003,6 +1316,15 @@ class ShivyCXTranspiler(ast.NodeVisitor):
         if isinstance(node, ast.UnaryOp):
             operand = self.to_c_expr(node.operand)
             if isinstance(node.op, ast.Not):
+                if (
+                    isinstance(node.operand, ast.Subscript)
+                    and isinstance(node.operand.slice, ast.Slice)
+                    and node.operand.slice.upper is None
+                    and node.operand.slice.step is None
+                    and node.operand.slice.lower is not None
+                ):
+                    start = self.to_c_expr(node.operand.slice.lower)
+                    return f"({self.list_len(node.operand.value)} <= {start})"
                 return f"(!{operand})"
             if isinstance(node.op, ast.USub):
                 return f"(-{operand})"
@@ -1029,6 +1351,10 @@ class ShivyCXTranspiler(ast.NodeVisitor):
                             left_expr = f"{left_expr}[0]"
                         return f"(!str_contains_char({right}, {left_expr}))"
                 if isinstance(op, ast.In):
+                    if isinstance(comparator, ast.Name):
+                        c_type = self.scope.get_type(comparator.id) or ""
+                        if c_type == "StrBoolMap*":
+                            return f"StrBoolMap_contains({comparator.id}, {left})"
                     if isinstance(comparator, ast.Set):
                         checks = []
                         for elt in comparator.elts:
@@ -1139,9 +1465,16 @@ class ShivyCXTranspiler(ast.NodeVisitor):
             if node.func.attr == "add" and isinstance(node.func.value, ast.Name):
                 if node.func.value.id == "error_collector":
                     return f"ErrorCollector_add(error_collector, {self.to_c_expr(node.args[0])})"
-            if node.func.attr == "append" and isinstance(node.func.value, ast.Name):
-                list_name = node.func.value.id
-                base = self.list_base(node.func.value)
+            if node.func.attr == "append":
+                if isinstance(node.func.value, ast.Name):
+                    list_name = node.func.value.id
+                    base = self.list_base(node.func.value)
+                elif isinstance(node.func.value, ast.Attribute):
+                    list_name = self.to_c_expr(node.func.value)
+                    base = self.list_base_from_attr(node.func.value)
+                else:
+                    list_name = ""
+                    base = "Unknown"
                 if base != "Unknown":
                     if base == "IntList":
                         return f"IntList_push({list_name}, {self.to_c_expr(node.args[0])})"
@@ -1151,6 +1484,18 @@ class ShivyCXTranspiler(ast.NodeVisitor):
                 base = self.list_base(node.func.value)
                 if base != "Unknown":
                     return self.list_op(base, "extend", list_name, self.to_c_expr(node.args[0]))
+            if node.func.attr == "pop":
+                if isinstance(node.func.value, ast.Name):
+                    list_name = node.func.value.id
+                    base = self.list_base(node.func.value)
+                elif isinstance(node.func.value, ast.Attribute):
+                    list_name = self.to_c_expr(node.func.value)
+                    base = self.list_base_from_attr(node.func.value)
+                else:
+                    list_name = ""
+                    base = "Unknown"
+                if base != "Unknown":
+                    return f"{self.list_op(base, 'pop_back', list_name)}"
             if node.func.attr == "isspace":
                 obj = self.to_c_expr(node.func.value)
                 return f"isspace((unsigned char)({obj}[0]))"
@@ -1180,6 +1525,8 @@ class ShivyCXTranspiler(ast.NodeVisitor):
             return f"{cls}_{node.func.attr}({', '.join(args)})"
 
         if isinstance(node.func, ast.Name):
+            if node.func.id == "position_add_col":
+                return f"position_add_col({self.to_c_expr(node.args[0])}, {self.to_c_expr(node.args[1])})"
             if node.func.id in self.class_fields or node.func.id in KNOWN_CLASSES:
                 if node.func.id == "TokenKind" and len(node.args) == 0:
                     return "TokenKind_new(\"\")"
@@ -1203,6 +1550,8 @@ class ShivyCXTranspiler(ast.NodeVisitor):
                 return f"str_to_int_base({self.to_c_expr(node.args[0])}, {self.to_c_expr(node.args[1])})"
             if node.func.id == "int":
                 return f"(int)({self.to_c_expr(node.args[0])})"
+            if node.func.id == "dict" and len(node.args) == 1:
+                return f"StrBoolMap_copy({self.to_c_expr(node.args[0])})"
             if node.func.id == "ord":
                 arg = node.args[0]
                 if isinstance(arg, ast.Subscript) and isinstance(arg.value, ast.Name):

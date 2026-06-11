@@ -379,6 +379,12 @@ def _parse_postfix_ops(cur, index):
 def parse_primary(index):
     """Parse primary expression."""
     if token_is(index, token_kinds.open_paren):
+        # GCC statement expression: ({ statements... })
+        if token_is(index + 1, token_kinds.open_brack):
+            from shivyc.parser.statement import parse_compound_statement
+            compound, index = parse_compound_statement(index + 1)
+            index = match_token(index, token_kinds.close_paren, ParserError.GOT)
+            return tree.StmtExpr(compound.items), index
         node, index = parse_expression(index + 1)
         index = match_token(index, token_kinds.close_paren, ParserError.GOT)
         return tree.ParenExpr(node), index

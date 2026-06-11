@@ -385,6 +385,11 @@ class ASMGen:
         near_scratch_funcs = getattr(self.il_code, "near_scratch_funcs", set())
 
         for func in self.il_code.commands:
+            # Thread register partitioning: restrict this function's allocatable
+            # register pool to its group's budget, so left/right threads use
+            # disjoint registers and the generated context switcher is minimal.
+            self._apply_thread_budget(func)
+
             is_meta = func in metamorphic_funcs
             if is_meta:
                 # Metamorphic functions live in a writable+executable section
@@ -431,6 +436,33 @@ class ASMGen:
                 size = self._near_size + (-self._near_size % 16)  # 16-align
                 self.asm_code.add_comm(self._near_label, size, local=True)
             self._near_active = False
+
+    def _apply_thread_budget(self, func):
+        """Restrict `alloc_registers`/`all_registers` for `func` to its thread
+        group's register budget, if one was supplied via
+        `arguments._thread_alloc` ({func_name: [reg64_name, ...]}). Falls back
+        to the full pool for unlisted functions.
+
+        Always keeps at least a small scratch margin so the allocator can still
+        spill via get_reg; correctness is preserved either way (out-of-budget
+        pressure spills to memory rather than to another group's register).
+        """
+        table = getattr(self.arguments, "_thread_alloc", None)
+        if not table:
+            self.alloc_registers = type(self).alloc_registers
+            self.all_registers = type(self).all_registers
+            return
+        budget = table.get(func)
+        if not budget:
+            self.alloc_registers = type(self).alloc_registers
+            self.all_registers = type(self).all_registers
+            return
+        by_name = {r.name: r for r in spots.registers}
+        regs = [by_name[n] for n in budget if n in by_name]
+        if len(regs) < 2:  # keep a minimum so get_reg always has scratch
+            return
+        self.alloc_registers = regs
+        self.all_registers = regs
 
     def _alloc_stack_slot(self, size):
         """Allocate a slot for a local/spill, returning its MemSpot.

@@ -243,7 +243,8 @@ def parse_decl_specifiers(index, _spec_qual=False):
     type_specs = set(ctypes.simple_types.keys())
     type_specs |= {token_kinds.signed_kw, token_kinds.unsigned_kw}
 
-    type_quals = {token_kinds.const_kw}
+    type_quals = {token_kinds.const_kw, token_kinds.volatile_kw,
+                  token_kinds.restrict_kw, token_kinds.atomic_kw}
 
     storage_specs = {token_kinds.auto_kw, token_kinds.register_kw,
                      token_kinds.static_kw,
@@ -265,8 +266,51 @@ def parse_decl_specifiers(index, _spec_qual=False):
     type_spec_class = None
 
     while True:
+        # C11 `_Atomic ( type-name )` type specifier: parse the inner type-name
+        # and carry it as an AtomicSpec. (Plain `_Atomic` without parens is a
+        # type qualifier, handled by the type_quals branch below.)
+        if (not type_spec_class
+              and token_is(index, token_kinds.atomic_kw)
+              and token_is(index + 1, token_kinds.open_paren)):
+            start_r = p.tokens[index].r
+            inner_specs, after = parse_spec_qual_list(index + 2)
+            decl_node, after = parse_abstract_declarator(after)
+            match_token(after, token_kinds.close_paren, ParserError.AT)
+            root = decl_nodes.Root(inner_specs, [decl_node])
+            specs.append(decl_nodes.AtomicSpec(root, start_r))
+            index = after + 1
+            type_spec_class = TYPEDEF      # type is now fully determined
+
+        # C11 `_Alignas ( constant-expression )` / `_Alignas ( type-name )`
+        # alignment specifier. ShivyCX does not honor over-alignment, so it is
+        # parsed and ignored (the balanced parenthesis group is skipped).
+        elif (token_is(index, token_kinds.alignas_kw)
+              and token_is(index + 1, token_kinds.open_paren)):
+            close = _find_pair_forward(index + 1)
+            index = close + 1
+
+        # GCC `__typeof__ ( expression )`: the type is that of the expression.
+        # Resolved later in make_specs_ctype by probing the expression's type.
+        elif (not type_spec_class
+              and token_is(index, token_kinds.typeof_kw)
+              and token_is(index + 1, token_kinds.open_paren)):
+            start_r = p.tokens[index].r
+            close = _find_pair_forward(index + 1)
+            expr_node, _ = parse_expression(index + 2)
+            specs.append(decl_nodes.TypeofSpec(expr_node, start_r))
+            index = close + 1
+            type_spec_class = TYPEDEF      # type is now fully determined
+
+        # GCC `__auto_type`: the type is inferred from the initializer. Record
+        # it as a type specifier; make_specs_ctype maps it to the auto sentinel.
+        elif (not type_spec_class
+              and token_is(index, token_kinds.auto_type_kw)):
+            specs.append(p.tokens[index])
+            index += 1
+            type_spec_class = TYPEDEF      # no other type specifiers combine
+
         # Parse a struct specifier if there is one.
-        if not type_spec_class and token_is(index, token_kinds.struct_kw):
+        elif not type_spec_class and token_is(index, token_kinds.struct_kw):
             node, index = parse_struct_spec(index + 1)
             specs.append(node)
             type_spec_class = STRUCT
@@ -473,7 +517,10 @@ def _find_decl_end(index):
         return index
     if (token_is(index, token_kinds.star)
          or token_is(index, token_kinds.identifier)
-         or token_is(index, token_kinds.const_kw)):
+         or token_is(index, token_kinds.const_kw)
+         or token_is(index, token_kinds.volatile_kw)
+         or token_is(index, token_kinds.restrict_kw)
+         or token_is(index, token_kinds.atomic_kw)):
         return _find_decl_end(index + 1)
     elif token_is(index, token_kinds.open_paren):
         close = _find_pair_forward(index)
@@ -540,7 +587,10 @@ def _parse_declarator_raw(start, end, is_typedef):
             size_start = open_sq + 1
             while size_start < end - 1 and (
                     token_is(size_start, token_kinds.static_kw)
-                    or token_is(size_start, token_kinds.const_kw)):
+                    or token_is(size_start, token_kinds.const_kw)
+                    or token_is(size_start, token_kinds.volatile_kw)
+                    or token_is(size_start, token_kinds.restrict_kw)
+                    or token_is(size_start, token_kinds.atomic_kw)):
                 size_start += 1
             if size_start == end - 1:
                 num_el = None
@@ -584,9 +634,12 @@ def _find_const(index):
     `const` is found, returns the index passed in for the second argument.
     """
     has_const = False
-    while token_is(index, token_kinds.const_kw):
+    quals = {token_kinds.const_kw, token_kinds.volatile_kw,
+             token_kinds.restrict_kw, token_kinds.atomic_kw}
+    while token_in(index, quals):
+        if token_is(index, token_kinds.const_kw):
+            has_const = True
         index += 1
-        has_const = True
     return has_const, index
 
 

@@ -180,3 +180,39 @@ class ParenExpr(general_nodes.Node):
     def make_il_raw(self, il_code, symbol_table, c):
         """Make raw IL code for this expression."""
         return self.expr.make_il_raw(il_code, symbol_table, c)
+
+
+class StmtExpr(_RExprNode):
+    """A GCC statement expression: ({ statements... }).
+
+    Evaluates to the value of the last statement if that statement is an
+    expression statement, and to void otherwise. Declarations and control flow
+    inside the block are permitted and live in their own scope.
+    """
+
+    def __init__(self, items):
+        """items - the block items (statements/declarations) of the braced block."""
+        super().__init__()
+        self.items = items
+
+    def make_il(self, il_code, symbol_table, c):
+        """Generate IL for the block, returning the last expression's value."""
+        symbol_table.new_scope()
+        c = c.set_global(False)
+
+        result = None
+        try:
+            for i, item in enumerate(self.items):
+                last = (i == len(self.items) - 1)
+                if last and isinstance(item, general_nodes.ExprStatement):
+                    # The value of the statement expression is this expression.
+                    result = item.expr.make_il(il_code, symbol_table, c)
+                else:
+                    item.make_il(il_code, symbol_table, c)
+        finally:
+            symbol_table.end_scope()
+
+        if result is None:
+            # No trailing expression: the statement expression has type void.
+            result = ILValue(ctypes.void)
+        return result

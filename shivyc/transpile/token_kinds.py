@@ -16,6 +16,7 @@ char_string: TokenKind | None = None
 include_file: TokenKind | None = None
 number: TokenKind | None = None
 unrecognized: TokenKind | None = None
+semicolon: TokenKind | None = None
 
 
 def _new_kind_list() -> list[TokenKind]:
@@ -46,7 +47,7 @@ def init_token_kinds() -> None:
     """Register all token kinds (call once at startup)."""
     global symbol_kinds, keyword_kinds
     global dquote, squote, pound, identifier, string, char_string
-    global include_file, number, unrecognized
+    global include_file, number, unrecognized, semicolon
 
     symbol_kinds = _new_kind_list()
     keyword_kinds = _new_kind_list()
@@ -130,7 +131,7 @@ def init_token_kinds() -> None:
     _register(symbol_kinds, "[")
     _register(symbol_kinds, "]")
     _register(symbol_kinds, ",")
-    _register(symbol_kinds, ";")
+    semicolon = _register(symbol_kinds, ";")
     _register(symbol_kinds, "?")
     _register(symbol_kinds, ":")
     _register(symbol_kinds, ".")

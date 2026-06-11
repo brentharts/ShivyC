@@ -318,7 +318,6 @@ def tokenize_line(line: list[Tagged], in_comment: bool) -> tuple[list[Token], bo
 
     while chunk_end < len(line):
         symbol_kind: TokenKind | None = match_symbol_kind_at(line, chunk_end)
-        next_symbol_kind: TokenKind | None = match_symbol_kind_at(line, chunk_end + 1)
 
         cur_c: str = line[chunk_end].c
         if chunk_end + 1 < len(line):
