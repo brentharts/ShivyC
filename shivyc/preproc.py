@@ -39,29 +39,128 @@ def process(tokens, this_file, macros=None):
 # "hint" constructs ShivyC does not act on, so stripping them (or mapping them
 # to their plain-C equivalent) lets the headers parse. NOTE: this is
 # deliberately limited to constructs that are safe to ignore. Semantically
-# essential extensions -- inline `__asm__`, `_Thread_local`/`__thread`,
-# `_Atomic`, and the `weak`/`alias` attributes -- are NOT silently stripped
-# here, because doing so would produce incorrect code rather than a parse.
+# essential extensions -- inline `__asm__` and the `weak`/`alias` attributes --
+# are NOT silently stripped here, because doing so would produce incorrect code
+# rather than a parse. The type qualifiers
+# `const`, `volatile`, `restrict`, and `_Atomic` are recognized natively by the
+# parser (and ignored, which is sound for a single-threaded target), so only
+# their GCC double-underscore spellings need mapping here. Thread-local storage
+# (`_Thread_local`/`__thread`) is mapped to ordinary storage: with a single
+# thread of execution there is exactly one instance, so this is sound here.
 _BUILTIN_PRELUDE = r"""
 #define __extension__
 #define __restrict
 #define __restrict__
-#define restrict
 #define __inline
 #define __inline__
 #define inline
 #define _Noreturn
+#define _Thread_local
+#define __thread
 #define __volatile__
 #define __volatile
-#define volatile
 #define __asm__ asm
 #define __asm asm
 #define __signed__ signed
 #define __const const
+#define typeof __typeof__
+#define __typeof __typeof__
 #define __builtin_expect(x, c) (x)
 #define _Static_assert(...)
 #define static_assert(...)
 """
+
+# ISO/IEC TS 18661-3 / C23 interchange & extended floating types, declared
+# throughout glibc's <math.h>/<bits/floatn.h>. ShivyCX has no >64-bit float, so
+# each spelling is mapped to its nearest native type. The 32/64-bit forms are
+# exact; the wider forms (_Float64x/_Float128) are approximated as double, which
+# is sound for bring-up because they appear only in pulled-in libm declarations,
+# never in computation in the target sources.
+_FLOATN_PRELUDE = r"""
+#define _Float16 float
+#define _Float32 float
+#define _Float32x double
+#define _Float64 double
+#define _Float64x double
+#define _Float128 double
+#define _Float128x double
+"""
+_BUILTIN_PRELUDE += _FLOATN_PRELUDE
+
+# GCC `__int128` / `unsigned __int128` 128-bit integers. ShivyCX has no
+# 128-bit integer type, so these are approximated as 64-bit `long long` for
+# bring-up. This is sound only because the target sources use them solely in
+# pulled-in glibc-internal typedefs, never in 128-bit computation; real
+# 128-bit arithmetic is a separate, unsupported feature.
+_BUILTIN_PRELUDE += "#define __int128 long long\n"
+_BUILTIN_PRELUDE += "#define __int128_t long long\n"
+_BUILTIN_PRELUDE += "#define __uint128_t unsigned long long\n"
+
+# A handful of GCC builtins used by glibc's byte-order inlines. Provided as
+# portable shift/mask macros (the operands here are simple values, so the
+# double-evaluation a macro implies is harmless).
+_BUILTIN_PRELUDE += (
+    "#define __builtin_bswap16(x) "
+    "((unsigned short)((((unsigned short)(x) >> 8) & 0xff) "
+    "| (((unsigned short)(x) & 0xff) << 8)))\n"
+    "#define __builtin_bswap32(x) "
+    "((unsigned int)((((unsigned int)(x) & 0xff000000u) >> 24) "
+    "| (((unsigned int)(x) & 0x00ff0000u) >> 8) "
+    "| (((unsigned int)(x) & 0x0000ff00u) << 8) "
+    "| (((unsigned int)(x) & 0x000000ffu) << 24)))\n"
+    "#define __builtin_bswap64(x) "
+    "((unsigned long)("
+    "(((unsigned long)(x) & 0xff00000000000000ul) >> 56) "
+    "| (((unsigned long)(x) & 0x00ff000000000000ul) >> 40) "
+    "| (((unsigned long)(x) & 0x0000ff0000000000ul) >> 24) "
+    "| (((unsigned long)(x) & 0x000000ff00000000ul) >> 8) "
+    "| (((unsigned long)(x) & 0x00000000ff000000ul) << 8) "
+    "| (((unsigned long)(x) & 0x0000000000ff0000ul) << 24) "
+    "| (((unsigned long)(x) & 0x000000000000ff00ul) << 40) "
+    "| (((unsigned long)(x) & 0x00000000000000fful) << 56)))\n"
+)
+
+# GCC __atomic_* builtins. ShivyCX targets a single thread of execution, so each
+# is implemented as the equivalent plain memory operation (the memory-order
+# argument is irrelevant with one thread). The read-modify-write forms use the
+# statement-expression + __auto_type extensions to evaluate the pointer once and
+# return the documented value (old value for __atomic_fetch_*, new value for
+# __atomic_*_fetch). This is sound for the single-threaded target and lets
+# CPython's pyatomic_gcc.h compile unchanged.
+_ATOMIC_PRELUDE = r"""
+#define __atomic_load_n(p, m) (*(p))
+#define __atomic_store_n(p, v, m) ((void)(*(p) = (v)))
+#define __atomic_load(p, r, m) ((void)(*(r) = *(p)))
+#define __atomic_store(p, v, m) ((void)(*(p) = *(v)))
+#define __atomic_exchange_n(p, v, m) __extension__({ __auto_type _axp = (p); __auto_type _axo = *_axp; *_axp = (v); _axo; })
+#define __atomic_exchange(p, v, r, m) ((void)(*(r) = __atomic_exchange_n((p), *(v), (m))))
+#define __atomic_fetch_add(p, v, m) __extension__({ __auto_type _afp = (p); __auto_type _afo = *_afp; *_afp = *_afp + (v); _afo; })
+#define __atomic_fetch_sub(p, v, m) __extension__({ __auto_type _afp = (p); __auto_type _afo = *_afp; *_afp = *_afp - (v); _afo; })
+#define __atomic_fetch_and(p, v, m) __extension__({ __auto_type _afp = (p); __auto_type _afo = *_afp; *_afp = *_afp & (v); _afo; })
+#define __atomic_fetch_or(p, v, m)  __extension__({ __auto_type _afp = (p); __auto_type _afo = *_afp; *_afp = *_afp | (v); _afo; })
+#define __atomic_fetch_xor(p, v, m) __extension__({ __auto_type _afp = (p); __auto_type _afo = *_afp; *_afp = *_afp ^ (v); _afo; })
+#define __atomic_add_fetch(p, v, m) __extension__({ __auto_type _afp = (p); *_afp = *_afp + (v); *_afp; })
+#define __atomic_sub_fetch(p, v, m) __extension__({ __auto_type _afp = (p); *_afp = *_afp - (v); *_afp; })
+#define __atomic_and_fetch(p, v, m) __extension__({ __auto_type _afp = (p); *_afp = *_afp & (v); *_afp; })
+#define __atomic_or_fetch(p, v, m)  __extension__({ __auto_type _afp = (p); *_afp = *_afp | (v); *_afp; })
+#define __atomic_xor_fetch(p, v, m) __extension__({ __auto_type _afp = (p); *_afp = *_afp ^ (v); *_afp; })
+#define __atomic_compare_exchange_n(p, e, d, weak, sm, fm) __extension__({ __auto_type _cp = (p); __auto_type _ce = (e); (*_cp == *_ce) ? ((*_cp = (d)), 1) : ((*_ce = *_cp), 0); })
+#define __atomic_compare_exchange(p, e, d, weak, sm, fm) __atomic_compare_exchange_n((p), (e), *(d), weak, sm, fm)
+#define __atomic_thread_fence(m) ((void)0)
+#define __atomic_signal_fence(m) ((void)0)
+#define __atomic_test_and_set(p, m) __extension__({ __auto_type _tp = (p); __auto_type _to = *_tp; *_tp = 1; _to; })
+#define __atomic_clear(p, m) ((void)(*(p) = 0))
+"""
+_BUILTIN_PRELUDE += _ATOMIC_PRELUDE
+
+# Trivially-ignorable GCC hint builtins: alignment assumptions, prefetch, and
+# unreachable markers carry no observable semantics for ShivyCX's code
+# generation, so they reduce to their argument or a no-op.
+_BUILTIN_PRELUDE += (
+    "#define __builtin_assume_aligned(p, ...) (p)\n"
+    "#define __builtin_prefetch(...) ((void)0)\n"
+    "#define __builtin_unreachable() ((void)0)\n"
+)
 
 
 def _seed_builtins(macros):
