@@ -32,6 +32,44 @@ install:
 		python3 qemu-system-x86 git pypy3
 
 clean:
-	rm -rf bin
+	rm -rf bin build
 
-.PHONY: default test shim install clean
+# ---------------------------------------------------------------------------
+# Bare-metal demos
+#
+# Compile a freestanding ShivyCX app and link it against the inlined mini-OS
+# (no libc, no CRT) via shivycx_baremetal.py. `--image` additionally wraps the
+# kernel in a 64-bit Multiboot boot stub so it can boot under QEMU. Sources live
+# in examples/baremetal/; outputs land in build/.
+BUILD ?= build
+
+# Build every bare-metal demo (no QEMU needed).
+baremetal: baremetal-hello baremetal-kernel baremetal-irq
+	@echo "bare-metal images in $(BUILD)/:"; ls -1 $(BUILD)/*.elf
+
+# Freestanding app linked against the mini-OS console.
+baremetal-hello: shim
+	@mkdir -p $(BUILD)
+	pypy3 shivycx_baremetal.py examples/baremetal/hello.c -o $(BUILD)/hello.elf
+
+# Bootable 64-bit image that prints to VGA/serial.
+baremetal-kernel: shim
+	@mkdir -p $(BUILD)
+	pypy3 shivycx_baremetal.py examples/baremetal/kernel.c -o $(BUILD)/kernel.elf --image
+
+# Bootable image with timer + keyboard via the 64-bit IDT.
+baremetal-irq: shim
+	@mkdir -p $(BUILD)
+	pypy3 shivycx_baremetal.py examples/baremetal/kernel_irq.c -o $(BUILD)/irq.elf --image
+
+# gcc-build the inlined 32-bit MiniKraft baseline from minikraft.py.
+minikraft: shim
+	@mkdir -p $(BUILD)
+	pypy3 minikraft.py --build $(BUILD)/minikraft
+
+# Boot the timer+keyboard image under QEMU (serial to stdout).
+run-irq: baremetal-irq
+	qemu-system-x86_64 -kernel $(BUILD)/irq.elf -serial stdio
+
+.PHONY: default test shim install clean baremetal baremetal-hello \
+        baremetal-kernel baremetal-irq minikraft run-irq
