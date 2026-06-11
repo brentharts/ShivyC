@@ -333,17 +333,24 @@ def _asm_clobbers(index):
 def parse_inline_asm(index):
     """Parse `asm [volatile] ( template [: out [: in [: clobbers]]] ) ;`.
 
-    Only recognized when `asm` is immediately followed by `(` and a string
-    literal, so it does not capture ordinary calls.
+    Recognized when the `asm` keyword (or `__asm__`, rewritten to `asm` in the
+    preprocessor prelude), optionally followed by `volatile`, is followed by
+    `(` and a string literal, so it does not capture ordinary statements.
     """
-    if not (token_is(index, token_kinds.identifier)
-            and p.tokens[index].content == "asm"):
+    if not token_is(index, token_kinds.asm_kw):
         p.raise_error("not an asm statement", index, ParserError.AT)
-    if not (token_is(index + 1, token_kinds.open_paren)
-            and token_is(index + 2, token_kinds.string)):
-        p.raise_error("not an asm statement", index, ParserError.AT)
+    kw_index = index
+    index += 1
+    # Optional GNU `volatile` qualifier. (`__volatile__`/`__volatile` and
+    # `inline` are erased by the preprocessor prelude, so only the bare
+    # `volatile` keyword can appear here.)
+    if token_is(index, token_kinds.volatile_kw):
+        index += 1
+    if not (token_is(index, token_kinds.open_paren)
+            and token_is(index + 1, token_kinds.string)):
+        p.raise_error("not an asm statement", kw_index, ParserError.AT)
 
-    index = match_token(index + 1, token_kinds.open_paren, ParserError.AFTER)
+    index = match_token(index, token_kinds.open_paren, ParserError.AFTER)
     template, index = _asm_string(index)
 
     outputs, inputs, clobbers = [], [], []

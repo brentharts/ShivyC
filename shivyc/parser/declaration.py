@@ -177,11 +177,10 @@ def parse_decls_inits(index, parse_inits=True):
         decls.append(node)
 
         # GCC asm-register binding: `register T v __asm__("reg")` (the prelude
-        # rewrites __asm__ to the `asm` identifier). Record the register name
+        # rewrites __asm__ to the `asm` keyword). Record the register name
         # so the variable can be pinned for inline-asm operands (used by
         # musl's syscall wrappers, e.g. `register long r10 __asm__("r10")`).
-        if (token_is(index, token_kinds.identifier)
-                and p.tokens[index].content == "asm"
+        if (token_is(index, token_kinds.asm_kw)
                 and token_is(index + 1, token_kinds.open_paren)
                 and token_is(index + 2, token_kinds.string)):
             from shivyc.parser.statement import _asm_string
@@ -511,8 +510,7 @@ def _find_decl_end(index):
     # declarator grammar. Stop before it so the caller can consume it; the
     # naive identifier rule below would otherwise swallow `asm` and its
     # parenthesized argument as if they were declarator tokens.
-    if (token_is(index, token_kinds.identifier)
-            and p.tokens[index].content == "asm"
+    if (token_is(index, token_kinds.asm_kw)
             and token_is(index + 1, token_kinds.open_paren)):
         return index
     if (token_is(index, token_kinds.star)
