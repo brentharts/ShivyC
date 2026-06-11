@@ -72,10 +72,21 @@ def main():
             return 1
     else:
         lexer_dispatch.configure(False)
+    # When --musl is given, materialize the packaged musl headers and put their
+    # include directories (and required defines) ahead of the user's, so that
+    # #include resolves against musl instead of the host glibc. This keeps the
+    # build self-contained: no musl tree needs to exist in the source checkout.
+    include_dirs = list(getattr(arguments, "include_dirs", []))
+    defines = list(getattr(arguments, "defines", []))
+    if getattr(arguments, "use_musl", False):
+        from shivyc import musl as _musl
+        _tree = _musl.materialize(getattr(arguments, "musl_dir", None))
+        defines = _tree.defines() + defines
+        include_dirs = _tree.public_include_dirs() + include_dirs
 
     # Apply any -I include directories to the preprocessor.
-    preproc.set_include_dirs(getattr(arguments, "include_dirs", []))
-    preproc.set_defines(getattr(arguments, "defines", []))
+    preproc.set_include_dirs(include_dirs)
+    preproc.set_defines(defines)
 
     # Whether to alias long double to double (-f-long-double-as-double).
     import shivyc.ctypes as ctypes
@@ -623,6 +634,16 @@ def get_arguments():
     parser.add_argument("-D", metavar="name[=value]", dest="defines",
                         action="append", default=[],
                         help="predefine a preprocessor macro")
+
+    # Compile against the packaged musl libc (bypassing glibc). Materializes
+    # musl's headers to a temp dir and prepends their include paths + defines,
+    # so user code resolves #include against musl. The needed musl .c sources
+    # can then be extracted/compiled on demand (see shivyc.musl).
+    parser.add_argument("--musl", dest="use_musl", action="store_true",
+                        help="compile against the packaged musl libc, not glibc")
+    parser.add_argument("--musl-dir", dest="musl_dir", default=None,
+                        help="where to materialize musl headers/sources "
+                             "(default: a temp directory)")
 
     # Build and print the whole-program (cross-TU) call graph, then exit.
     parser.add_argument("--print-call-graph", dest="print_call_graph",
