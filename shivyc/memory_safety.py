@@ -1,0 +1,615 @@
+"""Memory-safety analysis for ShivyCX (use-after-free / double-free / auto-free).
+
+C's manual `malloc`/`free` is the classic source of use-after-free and
+double-free bugs. Because ShivyCX sees the whole call graph, a Python pass can
+track every allocation, pointer copy (alias) and free across the program and:
+
+  * flag a dereference of a pointer whose allocation has been freed
+    (use-after-free), including through aliases,
+  * flag freeing an allocation twice (double-free),
+  * and -- the more ambitious capability -- identify allocations that are
+    provably local with no escaping reference, which the compiler can free
+    automatically so the programmer may omit `free` entirely.
+
+This recovers much of Rust's ownership safety for ordinary, unannotated C,
+driven by whole-program reachability rather than annotations.
+
+The analysis works on ShivyCX's IL (the same `Call.direct_name` / `Set` /
+`ReadAt` / `SetAt` commands the other whole-program passes use), so it sees
+aliasing as it actually flows through the generated code.
+"""
+
+import shivyc.il_cmds.control as control_cmds
+import shivyc.il_cmds.value as value_cmds
+
+# Functions that return a fresh heap allocation owned by the caller.
+ALLOCATORS = {
+    "malloc", "calloc", "realloc", "aligned_alloc", "strdup", "strndup",
+    "kmalloc", "kmalloc_aligned",
+}
+# Functions that free their (first) pointer argument.
+DEALLOCATORS = {"free", "kfree"}
+
+
+# ---------------------------------------------------------------------------
+# Whole-program IL loader (mirrors callgraph.build_program_graph, but keeps the
+# per-function command lists and the ILValue->name map for diagnostics).
+# ---------------------------------------------------------------------------
+class Program:
+    def __init__(self):
+        self.functions = {}     # name -> [il commands]
+        self.names = {}         # ILValue -> source identifier
+        self.edges = {}         # name -> set(callee names)
+        self.defined = set()    # names with a body in this program
+        self.globals = set()    # ILValues with static storage or linkage
+
+
+def load_program(files, args):
+    import shivyc.lexer as lexer
+    import shivyc.preproc as preproc
+    import shivyc.weak_alias as weak_alias
+    import shivyc.cache as cache
+    import shivyc.stackless as stackless
+    import shivyc.main as main_mod
+    import shivyc.extensions as extensions
+    from shivyc.errors import error_collector
+    from shivyc.parser.parser import parse
+    from shivyc.il_gen import ILCode, SymbolTable, Context
+
+    prog = Program()
+    ok = True
+    for file in files:
+        if not file.endswith(".c"):
+            continue
+        try:
+            code = open(file).read()
+        except OSError:
+            ok = False
+            continue
+        try:
+            code, _ = extensions.preprocess_extensions(code)
+        except extensions.ExtensionError:
+            ok = False
+            continue
+
+        error_collector.clear()
+        tokens = preproc.process(lexer.tokenize(code, file), file)
+        tokens, _ = weak_alias.extract_aliases(tokens)
+        tokens = main_mod._concat_adjacent_strings(tokens)
+        key = cache.token_key(tokens)
+        ast = cache.load_ast(key)
+        if ast is None:
+            ast = parse(tokens)
+            if ast is not None and error_collector.ok():
+                cache.store_ast(key, ast)
+        if ast is None:
+            ok = False
+            continue
+        il, st = ILCode(), SymbolTable()
+        try:
+            ast.make_il(il, st, Context())
+        except Exception:
+            ok = False
+            continue
+        if not error_collector.ok():
+            ok = False
+
+        for fn in list(il.commands):
+            il.commands[fn] = stackless._apply_direct_calls(il.commands[fn], st)
+            prog.functions[fn] = il.commands[fn]
+            prog.defined.add(fn)
+            edges = prog.edges.setdefault(fn, set())
+            for cmd in il.commands[fn]:
+                if isinstance(cmd, control_cmds.Call) and cmd.direct_name:
+                    edges.add(cmd.direct_name)
+        for v, n in st.names.items():
+            prog.names[v] = n
+        for v, sto in getattr(st, "storage", {}).items():
+            if sto == st.STATIC:
+                prog.globals.add(v)
+        for v in getattr(st, "linkage_type", {}):
+            prog.globals.add(v)
+    return prog, ok
+
+
+# ---------------------------------------------------------------------------
+# Control-flow graph over a flat IL command list.
+# ---------------------------------------------------------------------------
+class CFG:
+    """Basic-block CFG built from one function's IL command list."""
+
+    def __init__(self, cmds):
+        self.cmds = cmds
+        self.labels = {}        # label -> command index
+        for i, c in enumerate(cmds):
+            if isinstance(c, control_cmds.Label):
+                self.labels[c.label] = i
+        self.leaders = self._find_leaders()
+        self.blocks, self.block_of = self._make_blocks()
+        self.succ = self._make_edges()
+
+    def _is_branch(self, c):
+        return isinstance(c, (control_cmds.Jump, control_cmds._GeneralJump))
+
+    def _find_leaders(self):
+        leaders = {0} if self.cmds else set()
+        for i, c in enumerate(self.cmds):
+            if isinstance(c, control_cmds.Label):
+                leaders.add(i)
+            if self._is_branch(c) or isinstance(c, control_cmds.Return):
+                if i + 1 < len(self.cmds):
+                    leaders.add(i + 1)
+            if isinstance(c, control_cmds._GeneralJump):
+                leaders.add(self.labels.get(c.label, 0))
+            if isinstance(c, control_cmds.Jump):
+                leaders.add(self.labels.get(c.label, 0))
+        return leaders
+
+    def _make_blocks(self):
+        starts = sorted(self.leaders)
+        blocks = []         # list of (start, end_exclusive)
+        block_of = {}
+        for k, s in enumerate(starts):
+            e = starts[k + 1] if k + 1 < len(starts) else len(self.cmds)
+            bid = len(blocks)
+            blocks.append((s, e))
+            for i in range(s, e):
+                block_of[i] = bid
+        return blocks, block_of
+
+    def _make_edges(self):
+        succ = {b: set() for b in range(len(self.blocks))}
+        for b, (s, e) in enumerate(self.blocks):
+            if e == s:
+                continue
+            last = self.cmds[e - 1]
+            if isinstance(last, control_cmds.Return):
+                continue
+            if isinstance(last, control_cmds.Jump):
+                tgt = self.labels.get(last.label)
+                if tgt is not None:
+                    succ[b].add(self.block_of[tgt])
+                continue
+            if isinstance(last, control_cmds._GeneralJump):
+                tgt = self.labels.get(last.label)
+                if tgt is not None:
+                    succ[b].add(self.block_of[tgt])
+                if e < len(self.cmds):           # fallthrough
+                    succ[b].add(self.block_of[e])
+                continue
+            if e < len(self.cmds):               # ordinary fallthrough
+                succ[b].add(self.block_of[e])
+        return succ
+
+
+# ---------------------------------------------------------------------------
+# Abstract state: may-points-to + per-allocation free/escape status.
+# ---------------------------------------------------------------------------
+# freed status lattice: 'a' (allocated) < 'mf' (maybe freed) < 'f' (freed)
+def _merge_freed(x, y):
+    if x == y:
+        return x
+    return "mf"
+
+
+class State:
+    __slots__ = ("pt", "freed", "escaped")
+
+    def __init__(self, pt=None, freed=None, escaped=None):
+        self.pt = dict(pt or {})            # ILValue -> frozenset(alloc_id)
+        self.freed = dict(freed or {})      # alloc_id -> 'a'|'mf'|'f'
+        self.escaped = set(escaped or ())   # alloc_id
+
+    def copy(self):
+        return State(self.pt, self.freed, self.escaped)
+
+    def __eq__(self, o):
+        return (self.pt == o.pt and self.freed == o.freed
+                and self.escaped == o.escaped)
+
+    def merge(self, o):
+        out = self.copy()
+        for v, a in o.pt.items():
+            out.pt[v] = out.pt.get(v, frozenset()) | a
+        for al, s in o.freed.items():
+            out.freed[al] = _merge_freed(out.freed.get(al, s), s)
+        out.escaped |= o.escaped
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Per-function summary (for interprocedural propagation).
+# ---------------------------------------------------------------------------
+class Summary:
+    def __init__(self):
+        self.frees_params = set()     # param indices freed by the callee
+        self.escapes_params = set()   # param indices that escape (stored/returned/passed on)
+        self.derefs_params = set()    # param indices the callee dereferences
+        self.returns_alloc = False    # returns a fresh/owned allocation
+
+
+class Diagnostic:
+    def __init__(self, func, kind, alloc, detail=""):
+        self.func = func
+        self.kind = kind              # 'use-after-free' | 'double-free' | 'leak'
+        self.alloc = alloc
+        self.detail = detail
+
+    def __repr__(self):
+        return f"<{self.kind} in {self.func}: {self.detail}>"
+
+
+def _param_map(cmds):
+    """arg_num -> ILValue for the function's parameters (from LoadArg)."""
+    out = {}
+    for c in cmds:
+        if isinstance(c, value_cmds.LoadArg):
+            out[c.arg_num] = c.output
+    return out
+
+
+def _alloc_name(prog, alloc):
+    """Readable label for an allocation id."""
+    if isinstance(alloc, tuple) and alloc and alloc[0] == "param":
+        return f"parameter {alloc[2]}"
+    return "allocation"
+
+
+class _Ctx:
+    """Per-function analysis context shared across the dataflow."""
+    def __init__(self, fn, record):
+        self.fn = fn
+        self.record = record
+        self.seen_diag = set()
+        self.owned_local = {}     # alloc_id -> live ILValue holding it
+        self.escaped_ever = set()
+        self.freed_ever = set()
+        self.derefed = set()      # alloc_ids dereferenced anywhere
+        self.returned = False     # a heap alloc reached a Return
+        self.param_seed = {}      # ILValue(param) -> frozenset(alloc) for summaries
+
+
+class Analyzer:
+    def __init__(self, prog):
+        self.prog = prog
+        self.summaries = {}           # func -> Summary
+        self.diags = []
+        self.autofree = {}            # func -> list of (cmd_index, ILValue, alloc)
+
+    # -- ordering: callees before callers (reverse topological-ish) --------
+    def _order(self):
+        edges = self.prog.edges
+        order, seen, temp = [], set(), set()
+
+        def visit(n):
+            if n in seen or n not in self.prog.functions:
+                return
+            if n in temp:                 # recursion: break cycle
+                return
+            temp.add(n)
+            for m in edges.get(n, ()):    # visit callees first
+                visit(m)
+            temp.discard(n)
+            seen.add(n)
+            order.append(n)
+        for fn in self.prog.functions:
+            visit(fn)
+        return order
+
+    def run(self):
+        order = self._order()
+        for fn in order:                  # summaries: callees first
+            self.summaries[fn] = self._summarize(fn)
+        for fn in self.prog.functions:    # full check with summaries available
+            self._check(fn)
+        return self.diags, self.autofree
+
+    # -- summary computation (seed params, see what escapes/frees) ---------
+    def _summarize(self, fn):
+        cmds = self.prog.functions[fn]
+        params = _param_map(cmds)
+        seeds = {}
+        ctx = _Ctx(fn, record=False)
+        for idx, val in params.items():
+            ct = getattr(val, "ctype", None)
+            if ct is not None and ct.is_pointer():
+                al = ("param", fn, idx)
+                ctx.param_seed[val] = frozenset({al})
+                seeds[al] = idx
+        exits = self._dataflow(fn, cmds, State(), ctx)
+
+        s = Summary()
+        for st in exits:
+            for al, idx in seeds.items():
+                if st.freed.get(al) == "f":
+                    s.frees_params.add(idx)
+                if al in st.escaped:
+                    s.escapes_params.add(idx)
+        for al, idx in seeds.items():
+            if al in ctx.derefed:
+                s.derefs_params.add(idx)
+        s.returns_alloc = ctx.returned
+        return s
+
+    # -- full check (emit diagnostics + collect auto-free candidates) ------
+    def _check(self, fn):
+        cmds = self.prog.functions[fn]
+        ctx = _Ctx(fn, record=True)
+        self._dataflow(fn, cmds, State(), ctx)
+        for al, val in ctx.owned_local.items():
+            if al in ctx.escaped_ever or al in ctx.freed_ever:
+                continue
+            self.autofree.setdefault(fn, []).append((al, val))
+
+    # -- the dataflow engine ----------------------------------------------
+    def _dataflow(self, fn, cmds, init, ctx):
+        cfg = CFG(cmds)
+        n = len(cfg.blocks)
+        if n == 0:
+            return [init]
+        in_state = [None] * n
+        out_state = [None] * n
+        in_state[0] = init
+        worklist = [0]
+        while worklist:
+            b = worklist.pop()
+            s = in_state[b].copy()
+            start, end = cfg.blocks[b]
+            for i in range(start, end):
+                self._transfer(cmds[i], i, s, ctx)
+            out_state[b] = s
+            for succ in cfg.succ[b]:
+                merged = s if in_state[succ] is None else in_state[succ].merge(s)
+                if in_state[succ] is None or merged != in_state[succ]:
+                    in_state[succ] = merged
+                    if succ not in worklist:
+                        worklist.append(succ)
+
+        exits = []
+        for b in range(n):
+            if out_state[b] is not None and not cfg.succ[b]:
+                exits.append(out_state[b])
+        return exits or [out_state[0] or init]
+
+    def _transfer(self, c, idx, s, ctx):
+        fn = ctx.fn
+        pt, freed, escaped = s.pt, s.freed, s.escaped
+
+        def mark_escape(al):
+            escaped.add(al)
+            ctx.escaped_ever.add(al)
+
+        def mark_free(al):
+            freed[al] = "f"
+            ctx.freed_ever.add(al)
+
+        def use_check(addr, kind):
+            for al in pt.get(addr, ()):
+                ctx.derefed.add(al)
+                if freed.get(al) in ("f", "mf") and ctx.record:
+                    key = (idx, kind, al)
+                    if key not in ctx.seen_diag:
+                        ctx.seen_diag.add(key)
+                        self.diags.append(Diagnostic(
+                            fn, "use-after-free", al, kind))
+
+        if isinstance(c, control_cmds.Call):
+            name = c.direct_name
+            args = list(c.args)
+            if name in ALLOCATORS:
+                if c.ret is not None:
+                    al = (fn, idx)
+                    pt[c.ret] = frozenset({al})
+                    freed[al] = "a"
+                    ctx.owned_local[al] = c.ret
+                return
+            if name in DEALLOCATORS and args:
+                for al in pt.get(args[0], ()):
+                    if freed.get(al) in ("f", "mf") and ctx.record:
+                        key = (idx, "double-free", al)
+                        if key not in ctx.seen_diag:
+                            ctx.seen_diag.add(key)
+                            self.diags.append(Diagnostic(
+                                fn, "double-free", al,
+                                f"free of an {_alloc_name(self.prog, al)} that was "
+                                f"already freed"))
+                    mark_free(al)
+                return
+            summ = self.summaries.get(name)
+            if summ is not None and name in self.prog.defined:
+                for i, a in enumerate(args):
+                    if i in summ.derefs_params:        # callee dereferences arg i
+                        use_check(a, f"passes a freed pointer to {name}(), which dereferences it")
+                    if i in summ.frees_params:
+                        for al in pt.get(a, ()):
+                            if freed.get(al) in ("f", "mf") and ctx.record:
+                                key = (idx, "double-free", al)
+                                if key not in ctx.seen_diag:
+                                    ctx.seen_diag.add(key)
+                                    self.diags.append(Diagnostic(
+                                        fn, "double-free", al,
+                                        "free of an allocation already freed "
+                                        f"(via {name})"))
+                            mark_free(al)
+                    if i in summ.escapes_params:
+                        for al in pt.get(a, ()):
+                            mark_escape(al)
+                if c.ret is not None:
+                    if summ.returns_alloc:
+                        al = (fn, idx, "ret")
+                        pt[c.ret] = frozenset({al})
+                        freed[al] = "a"
+                        ctx.owned_local[al] = c.ret
+                    else:
+                        pt[c.ret] = frozenset()
+                return
+            # unknown / external call: pointer args may be used and they escape
+            for a in args:
+                use_check(a, "passes a freed pointer to a function")
+                for al in pt.get(a, ()):
+                    mark_escape(al)
+            if c.ret is not None:
+                pt[c.ret] = frozenset()
+            return
+
+        if isinstance(c, value_cmds.Set):
+            src = pt.get(c.arg)
+            if src:
+                pt[c.output] = src
+                if c.output in self.prog.globals:
+                    for al in src:        # stored into a global -> escapes
+                        mark_escape(al)
+                else:
+                    # live holder is now `output` (move/alias); all in-function
+                    # holders die together at scope end, so this alone does not
+                    # disqualify auto-free.
+                    for al in src:
+                        if al in ctx.owned_local:
+                            ctx.owned_local[al] = c.output
+            else:
+                pt[c.output] = frozenset()
+            return
+
+        if isinstance(c, value_cmds.ReadAt):
+            use_check(c.addr, "dereferences a pointer after its allocation was freed")
+            pt[c.output] = frozenset()
+            return
+
+        if isinstance(c, value_cmds.SetAt):
+            use_check(c.addr, "dereferences a pointer after its allocation was freed")
+            for al in pt.get(c.val, ()):
+                mark_escape(al)
+            return
+
+        if isinstance(c, control_cmds.Return):
+            if c.arg is not None:
+                for al in pt.get(c.arg, ()):
+                    mark_escape(al)
+                    ctx.returned = True
+            return
+
+        if isinstance(c, value_cmds.LoadArg):
+            seed = ctx.param_seed.get(c.output)
+            if seed:
+                pt[c.output] = seed
+                for al in seed:
+                    freed.setdefault(al, "a")
+            else:
+                pt[c.output] = frozenset()
+            return
+
+        for out in getattr(c, "outputs", lambda: [])():
+            pt[out] = frozenset()
+
+
+# ---------------------------------------------------------------------------
+# Driver + reporting
+# ---------------------------------------------------------------------------
+def analyze_program(files, args):
+    prog, ok = load_program(files, args)
+    diags, autofree = Analyzer(prog).run()
+    return prog, diags, autofree, ok
+
+
+def format_report(diags, autofree):
+    out = []
+    if diags:
+        out.append("memory-safety issues:")
+        for d in diags:
+            out.append(f"  [{d.kind}] in {d.func}: {d.detail}")
+    else:
+        out.append("memory-safety: no use-after-free or double-free found")
+    leaks = sum(len(v) for v in autofree.values())
+    if leaks:
+        out.append("")
+        out.append(f"auto-free candidates ({leaks}): local allocations with no "
+                   "escaping reference, safe to free automatically:")
+        for fn, items in sorted(autofree.items()):
+            out.append(f"  in {fn}: {len(items)} allocation(s) the compiler can "
+                       "free at function exit")
+    return "\n".join(out)
+
+
+def run(files, args):
+    """Entry point for --check-memory: analyze and print a report."""
+    _, diags, autofree, ok = analyze_program(files, args)
+    print(format_report(diags, autofree))
+    # nonzero exit if real bugs were found
+    return 1 if diags else 0
+
+
+# ---------------------------------------------------------------------------
+# Auto-free insertion (the "compiler inserts free for you" capability).
+# ---------------------------------------------------------------------------
+def _program_from_il(il_code, symbol_table):
+    """Build a Program view over an already-generated TU (no file reload)."""
+    import shivyc.stackless as stackless
+    prog = Program()
+    for fn in list(il_code.commands):
+        cmds = stackless._apply_direct_calls(il_code.commands[fn], symbol_table)
+        il_code.commands[fn] = cmds          # keep direct_name on the real list
+        prog.functions[fn] = cmds
+        prog.defined.add(fn)
+        edges = prog.edges.setdefault(fn, set())
+        for c in cmds:
+            if isinstance(c, control_cmds.Call) and c.direct_name:
+                edges.add(c.direct_name)
+    for v, n in symbol_table.names.items():
+        prog.names[v] = n
+    for v, sto in getattr(symbol_table, "storage", {}).items():
+        if sto == symbol_table.STATIC:
+            prog.globals.add(v)
+    for v in getattr(symbol_table, "linkage_type", {}):
+        prog.globals.add(v)
+    return prog
+
+
+def _find_free_template(il_code):
+    """Return a (func ILValue) usable to build a `free` call, by reusing one
+    that already appears in the program, or None if the program never frees."""
+    for cmds in il_code.commands.values():
+        for c in cmds:
+            if (isinstance(c, control_cmds.Call)
+                    and c.direct_name in DEALLOCATORS):
+                return c.func, c.direct_name
+    return None, None
+
+
+def insert_auto_frees(il_code, symbol_table, args=None):
+    """Insert a free() for each provably-local, non-escaping, never-freed
+    allocation, right before every Return of the function that owns it.
+
+    Returns the number of frees inserted. Requires a `free` call to already
+    exist somewhere in the TU (its target is reused); otherwise reports 0 and
+    leaves the program unchanged.
+    """
+    prog = _program_from_il(il_code, symbol_table)
+    _, autofree = Analyzer(prog).run()
+    if not autofree:
+        return 0
+    func_val, free_name = _find_free_template(il_code)
+    if func_val is None:
+        return 0
+
+    inserted = 0
+    for fn, items in autofree.items():
+        cmds = il_code.commands[fn]
+        holders = [val for (_al, val) in items]
+        # insert before each Return (and at the very end if it falls through)
+        new = []
+        for c in cmds:
+            if isinstance(c, control_cmds.Return):
+                for h in holders:
+                    call = control_cmds.Call(func_val, [h], None)
+                    call.direct_name = free_name
+                    new.append(call)
+                    inserted += 1
+            new.append(c)
+        if not new or not isinstance(new[-1], control_cmds.Return):
+            for h in holders:
+                call = control_cmds.Call(func_val, [h], None)
+                call.direct_name = free_name
+                new.append(call)
+                inserted += 1
+        il_code.commands[fn] = new
+    return inserted
