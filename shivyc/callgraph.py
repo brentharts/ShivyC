@@ -158,7 +158,7 @@ def build_program_graph(files, args):
     failed the front end. This performs its own front-end pass and never
     affects normal code generation.
     """
-    import shivyc.lexer_dispatch as lexer_dispatch
+    import shivyc.lexer as lexer
     import shivyc.preproc as preproc
     import shivyc.weak_alias as weak_alias
     import shivyc.cache as cache
@@ -188,7 +188,7 @@ def build_program_graph(files, args):
             continue
 
         error_collector.clear()
-        tokens = preproc.process(lexer_dispatch.tokenize(code, file), file)
+        tokens = preproc.process(lexer.tokenize(code, file), file)
         tokens, _ = weak_alias.extract_aliases(tokens)
         tokens = main_mod._concat_adjacent_strings(tokens)
 

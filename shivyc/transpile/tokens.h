@@ -24,6 +24,4 @@ struct Token {
 TokenKind *TokenKind_new(const char *text_repr);
 Token *Token_new(TokenKind *kind, const char *content, const char *rep, Range *r);
 
-DEFINE_LIST(Token, TokenList)
-
 #endif /* SHIVYC_TOKENS_H */
