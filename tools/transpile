@@ -23,12 +23,50 @@ copy_headers() {
     cp "$INC_DIR/tokens.h" "$OUT_DIR/"
     cp "$INC_DIR/token_kinds.h" "$OUT_DIR/"
     cp "$INC_DIR/lexer_core.h" "$OUT_DIR/"
+    cp "$INC_DIR/parser_utils.h" "$OUT_DIR/"
+    cp "$INC_DIR/tree_nodes.h" "$OUT_DIR/"
+    cp "$INC_DIR/parser_core.h" "$OUT_DIR/"
 }
 
 compile_unit() {
     local name="$1"
-    gcc -std=c11 -Wall -Wextra -I"$ROOT" -I"$OUT_DIR" -c "$OUT_DIR/${name}.c" -o "$OUT_DIR/${name}.o"
+    local pic="${2:-}"
+    local flags=(-std=c11 -Wall -Wextra -I"$ROOT" -I"$OUT_DIR")
+    if [ -n "$pic" ]; then
+        flags+=(-fPIC)
+    fi
+    gcc "${flags[@]}" -c "$OUT_DIR/${name}.c" -o "$OUT_DIR/${name}.o"
     echo "compiled $OUT_DIR/${name}.o"
+}
+
+compile_errors_core() {
+    local pic="${1:-}"
+    compile_unit errors_core "$pic"
+    local flags=(-std=c11 -Wall -Wextra -I"$ROOT" -I"$OUT_DIR")
+    if [ -n "$pic" ]; then
+        flags+=(-fPIC)
+    fi
+    gcc "${flags[@]}" -c "$ROOT/tools/errors_core_link.c" -o "$OUT_DIR/errors_core_link.o"
+    echo "compiled $OUT_DIR/errors_core_link.o"
+}
+
+build_lexer_lib() {
+    compile_errors_core pic
+    compile_unit tokens pic
+    compile_unit token_kinds pic
+    compile_unit regex_helpers pic
+    compile_unit lexer_core pic
+    gcc -fPIC -std=c11 -Wall -Wextra -I"$ROOT" -I"$OUT_DIR" \
+        -c "$ROOT/tools/strlist_link.c" -o "$OUT_DIR/strlist_link.o"
+    gcc -shared -o "$OUT_DIR/libshivycx_lexer.so" \
+        "$OUT_DIR/errors_core.o" \
+        "$OUT_DIR/errors_core_link.o" \
+        "$OUT_DIR/tokens.o" \
+        "$OUT_DIR/token_kinds.o" \
+        "$OUT_DIR/regex_helpers.o" \
+        "$OUT_DIR/strlist_link.o" \
+        "$OUT_DIR/lexer_core.o"
+    echo "built $OUT_DIR/libshivycx_lexer.so"
 }
 
 case "${1:-all}" in
@@ -38,7 +76,16 @@ case "${1:-all}" in
     errors_core)
         transpile "$ROOT/shivyc/transpile/errors_core.py"
         copy_headers
-        compile_unit errors_core
+        compile_errors_core
+        ;;
+    lib)
+        transpile "$ROOT/shivyc/transpile/errors_core.py"
+        transpile "$ROOT/shivyc/transpile/tokens.py"
+        transpile "$ROOT/shivyc/transpile/token_kinds.py"
+        transpile "$ROOT/shivyc/transpile/regex_helpers.py"
+        transpile "$ROOT/shivyc/transpile/lexer_core.py"
+        copy_headers
+        build_lexer_lib
         ;;
     regex_helpers)
         transpile "$ROOT/shivyc/transpile/regex_helpers.py"
@@ -52,7 +99,7 @@ case "${1:-all}" in
         transpile "$ROOT/shivyc/transpile/regex_helpers.py"
         transpile "$ROOT/shivyc/transpile/lexer_core.py"
         copy_headers
-        compile_unit errors_core
+        compile_errors_core
         compile_unit tokens
         compile_unit token_kinds
         compile_unit regex_helpers
@@ -65,11 +112,33 @@ case "${1:-all}" in
         transpile "$ROOT/shivyc/transpile/regex_helpers.py"
         transpile "$ROOT/shivyc/transpile/lexer_core.py"
         copy_headers
-        compile_unit errors_core
+        compile_errors_core
         compile_unit tokens
         compile_unit token_kinds
         compile_unit regex_helpers
         compile_unit lexer_core
+        ;;
+    check)
+        transpile "$ROOT/shivyc/transpile/errors_core.py"
+        transpile "$ROOT/shivyc/transpile/tokens.py"
+        transpile "$ROOT/shivyc/transpile/token_kinds.py"
+        transpile "$ROOT/shivyc/transpile/regex_helpers.py"
+        transpile "$ROOT/shivyc/transpile/lexer_core.py"
+        transpile "$ROOT/shivyc/transpile/parser_utils.py"
+        transpile "$ROOT/shivyc/transpile/tree_nodes.py"
+        transpile "$ROOT/shivyc/transpile/parser_core.py"
+        copy_headers
+        build_lexer_lib
+        gcc -std=c11 -Wall -Wextra -Werror -I"$ROOT" -I"$OUT_DIR" -c "$OUT_DIR"/*.c
+        gcc -std=c11 -Wall -Wextra -Werror -I"$ROOT" -I"$OUT_DIR" -c "$ROOT/tools/errors_core_link.c" \
+            -o "$OUT_DIR/errors_core_link.o"
+        python3 "$ROOT/tools/compare_lexer_original.py"
+        python3 "$ROOT/tools/compare_c_lexer_bridge.py"
+        python3 "$ROOT/tools/compare_compile_backends.py"
+        python3 "$ROOT/tools/compare_tokenize.py"
+        python3 "$ROOT/tools/compare_tokenize_line.py"
+        python3 "$ROOT/tools/compare_parser_utils.py"
+        python3 "$ROOT/tools/compare_parser_core.py"
         ;;
     *)
         transpile "$1"

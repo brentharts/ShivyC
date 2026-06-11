@@ -21,7 +21,7 @@ out of the flat token list.
 
 import pathlib
 
-import shivyc.lexer as lexer
+import shivyc.lexer_dispatch as lexer_dispatch
 import shivyc.token_kinds as token_kinds
 from shivyc.tokens import Token, parse_c_int
 from shivyc.errors import error_collector, CompilerError
@@ -166,9 +166,9 @@ _BUILTIN_PRELUDE += (
 def _seed_builtins(macros):
     """Populate `macros` with the GCC-compatibility prelude definitions."""
     pre = _Preprocessor(macros)
-    pre.run(lexer.tokenize(_BUILTIN_PRELUDE, "<builtin>"), "<builtin>")
+    pre.run(lexer_dispatch.tokenize(_BUILTIN_PRELUDE, "<builtin>"), "<builtin>")
     if _cmdline_define_prelude:
-        pre.run(lexer.tokenize(_cmdline_define_prelude, "<command-line>"),
+        pre.run(lexer_dispatch.tokenize(_cmdline_define_prelude, "<command-line>"),
                 "<command-line>")
 
 
@@ -231,7 +231,7 @@ def is_punct(tok, s):
 def _relex(text, r):
     """Lex `text` into tokens, giving each the range `r` for diagnostics."""
     fname = r.start.file if r and r.start else "<pp>"
-    toks = lexer.tokenize(text, fname)
+    toks = lexer_dispatch.tokenize(text, fname)
     for t in toks:
         t.r = r
     return toks
@@ -478,7 +478,7 @@ class _Preprocessor:
             header = "".join(spell(t) for t in exp).strip()
         try:
             text, filename = read_file(header, this_file)
-            inc = lexer.tokenize(text, filename)
+            inc = lexer_dispatch.tokenize(text, filename)
             out.extend(process(inc, filename, self.macros))
         except IOError:
             error_collector.add(CompilerError(

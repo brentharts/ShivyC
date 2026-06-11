@@ -6,7 +6,7 @@ import platform
 import subprocess
 import sys
 
-import shivyc.lexer as lexer
+import shivyc.lexer_dispatch as lexer_dispatch
 import shivyc.preproc as preproc
 
 from shivyc.errors import error_collector, CompilerError
@@ -62,6 +62,16 @@ def main():
 
     arguments = get_arguments()
 
+    if getattr(arguments, "c_lexer", False):
+        if not lexer_dispatch.ensure_available():
+            err = (
+                "C lexer requested but generated/libshivycx_lexer.so could "
+                "not be built (run ./tools/transpile lib)"
+            )
+            print(CompilerError(err))
+            return 1
+    else:
+        lexer_dispatch.configure(False)
     # When --musl is given, materialize the packaged musl headers and put their
     # include directories (and required defines) ahead of the user's, so that
     # #include resolves against musl instead of the host glibc. This keeps the
@@ -240,7 +250,7 @@ def process_c_file(file, args):
         return None
     args._extensions = ext_info
 
-    token_list = lexer.tokenize(code, file)
+    token_list = lexer_dispatch.tokenize(code, file)
     if not error_collector.ok():
         return None
 
@@ -676,6 +686,13 @@ def get_arguments():
                         metavar="OUT.c", default=None,
                         help="with --microslice, write a work-injected acquire "
                              "scaffold for the hottest fragment to OUT.c")
+
+    parser.add_argument(
+        "--c-lexer",
+        dest="c_lexer",
+        action="store_true",
+        help="use the transpiled C lexer (requires ./tools/transpile lib)",
+    )
 
     return parser.parse_args()
 
