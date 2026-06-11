@@ -16376,6 +16376,13 @@ void register_interrupt_handler(uint8_t interrupt, interrupt_handler_t handler) 
     interrupt_handlers[interrupt] = handler;
 }
 
+/* Point an IDT vector directly at a raw asm entry (e.g. the generated
+ * timer_dispatch), bypassing the generic stub. Used to install the
+ * partition-aware preemptive timer path at vector 32. */
+void idt_set_handler(uint8_t vec, void *entry) {
+    set_gate(vec, (uint64_t)(uintptr_t)entry);
+}
+
 /* C dispatcher for CPU exceptions (vectors 0-31). */
 void isr_handler(struct interrupt_frame64 *frame) {
     if (interrupt_handlers[frame->int_no]) {
