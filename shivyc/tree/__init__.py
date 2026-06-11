@@ -22,7 +22,7 @@ from shivyc.tree.general_nodes import (
 
 # Primary expressions
 from shivyc.tree.primary_exprs import (
-    MultiExpr, Number, String, Identifier, ParenExpr
+    MultiExpr, Number, String, Identifier, ParenExpr, StmtExpr
 )
 
 # Arithmetic operations
@@ -84,7 +84,7 @@ __all__ = [
     'DeclInfo',
 
     # Primary expressions
-    'MultiExpr', 'Number', 'String', 'Identifier', 'ParenExpr',
+    'MultiExpr', 'Number', 'String', 'Identifier', 'ParenExpr', 'StmtExpr',
 
     # Arithmetic operations
     'Plus', 'Minus', 'Mult', 'Div', 'Mod', 'RBitShift', 'LBitShift',
