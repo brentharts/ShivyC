@@ -4,13 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-GENERATED = ROOT / "generated"
+GENERATED = Path(os.environ.get("SHIVYC_TRANSPILE_DIR", "/tmp/shivyc-transpile"))
 HARNESS_SRC = ROOT / "tools" / "tokenize_harness.c"
 HARNESS_BIN = ROOT / "tools" / "tokenize_harness"
 TRANSPILER = ROOT / "tools" / "transpile"

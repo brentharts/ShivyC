@@ -22,4 +22,6 @@ tests/**/*.s
 shivyc.egg-info/*
 dist/*
 build/*
-generated/
+gcc_output
+shivyc_output
+shivyc/transpile/

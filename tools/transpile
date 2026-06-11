@@ -4,7 +4,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TRANSPILER="$ROOT/shivycx_transpiler.py"
-OUT_DIR="$ROOT/generated"
+OUT_DIR="${SHIVYC_TRANSPILE_DIR:-/tmp/shivyc-transpile}"
 INC_DIR="$ROOT/shivyc/transpile"
 
 mkdir -p "$OUT_DIR"
