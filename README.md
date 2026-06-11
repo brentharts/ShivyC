@@ -1,34 +1,171 @@
-### ShivyCX A C compiler created in Python.
+# ShivyCX — an extended C compiler in pure Python
+
+ShivyCX is a self-hosting-oriented C compiler written in Python3. It descends
+from [ShivyC](https://github.com/ShivamSarodia/ShivyC) by Shivam Sarodia,
+supports a subset of C11, targets x86-64 System V (Intel-syntax GNU assembler),
+and adds a set of **whole-program language extensions and analyses** that are
+practical precisely because every pass is a few hundred lines of legible Python.
+
+On top of standard C, ShivyCX adds:
+
+- **`_Nbit` globals** — pack small global flags into an otherwise-idle SIMD
+  register.
+- **Contracts** — compile-time precondition clauses that bound argument lengths
+  and can discharge a vectorizer's remainder loop.
+- **Register-partitioned threads** — a whole-program *left/right* register split
+  with specialized context switchers.
+- **Memory safety** — whole-program use-after-free / double-free detection and
+  automatic `free` insertion for unannotated C.
+- **Bare-metal operation** — freestanding, bootable 64-bit images with an inlined
+  mini-OS.
+- **A Python→C transpiler** — toward compiling the front end with itself.
+
 
 ---
 
-ShivyCX is a C compiler written in Python 3 that supports a subset of the C11 standard and generates reasonably efficient binaries, including some optimizations. ShivyC also generates helpful compile-time error messages.
-
-
 ## Quickstart
 
-### x86-64 Linux
-ShivyC requires only Python 3.6 or later to compile C code. Assembling and linking are done using the GNU binutils and glibc, which you almost certainly already have installed.
+ShivyCX needs only Python 3.6+; assembling and linking use GNU binutils.
 
-## Implementation Overview
+```sh
+# compile and run a C file (note: the entry point must be `int main()`)
+python3 -m shivyc.main hello.c -o hello && ./hello
+
+```
+
+---
+
+## Memory safety for unannotated C
+
+C's manual `malloc`/`free` is the classic source of **use-after-free** and
+**double-free** bugs. Because ShivyCX sees the whole call graph, a Python pass
+([`shivyc/memory_safety.py`](shivyc/memory_safety.py)) tracks every allocation,
+pointer copy (alias), and free, and:
+
+- **flags use-after-free** — dereferencing (or passing to a callee that
+  dereferences) a pointer whose allocation was freed, *through aliases and across
+  functions*;
+- **flags double-free**;
+- **auto-frees** — when escape/region analysis proves an allocation is local with
+  no live reference, the compiler inserts the `free` for you.
+
+```sh
+# report only (no code generated)
+python3 -m shivyc.main tests/dangling_alias.c --check-memory
+#   [use-after-free] in main: dereferences a pointer after its allocation was freed
+
+# insert automatic frees during a normal compile
+python3 -m shivyc.main tests/autofree_leak.c --auto-free -o leak
+```
+
+---
+
+## Register-partitioned threads (left/right)
+
+A function header can declare which side of a two-way register split a thread
+runs on. ShivyCX computes each thread's transitive register footprint from the
+call graph, splits the register file into disjoint `left` / `right` budgets,
+re-runs allocation constrained to each budget, and emits a specialized context
+switcher that saves only the bank in use.
+
+```c
+int main()
+assert foo in threads.left( core=0 )
+assert bar in threads.right( core=0 )
+{ foo(); bar(); }
+```
+
+```sh
+python3 -m shivyc.main threads_demo.c \
+    --emit-thread-switcher switcher.s
+#   left  GP footprint : rax, rcx, rdx, rsi
+#   right GP footprint : r8, r9, r10, r11   -> footprints are disjoint
+# writes switcher.s (cooperative) and switcher.preempt.s (timer-driven)
+```
+
+Details in [`shivyc/README.md`](shivyc/README.md)
+---
+
+## Bare-metal / freestanding operation
+
+A mini-OS (*MiniKraft*) is inlined into [`minikraft.py`](minikraft.py) — every
+source file embedded as a raw triple-quoted string, plus a registry of
+hand-written 64-bit boot files — so the freestanding runtime travels with the
+compiler. The bare-metal driver
+([`shivycx_baremetal.py`](shivycx_baremetal.py)) compiles your app, resolves the
+OS pieces it needs by transitive **symbol closure**, and links freestanding (no
+libc, no CRT).
+
+```sh
+# freestanding app linked against the mini-OS console
+python3 shivycx_baremetal.py tests/hello.c -o hello.elf
+
+# bootable 64-bit Multiboot image (boot stub + long mode + GDT + IDT)
+python3 shivycx_baremetal.py tests/kernel_irq.c -o irq.elf --image
+```
+
+The `--image` path emits a Multiboot stub that identity-maps the first GiB,
+enables PAE/long mode, installs a flat GDT, and jumps to a 64-bit kernel with a
+long-mode IDT (timer + keyboard). The preemptive thread switcher above installs
+itself into the timer vector. Boot is validated statically here (header/checksum,
+ELF64 entry, symbol resolution) since this environment has no emulator. See
+
+---
+
+## Toward self-hosting: a Python→C transpiler
+
+[`shivycx_transpiler.py`](shivycx_transpiler.py) translates annotated ShivyC
+modules to C, beginning with the lexer stack in
+
+[`shivyc/transpile/`](shivyc/transpile/) (token kinds, tokens, the error
+collector, regex helpers, and `tokenize()`). A differential harness feeds the
+same lines to the Python tokenizer and the transpiled C tokenizer and compares
+them token by token.
+
+```sh
+tools/transpile        # transpile + compile the lexer modules
+```
+
+---
+
+## Implementation overview
+
 #### Preprocessor
-ShivyC today has a very limited preprocessor that parses out comments and expands `#include` directives. These features are implemented between [`lexer.py`](shivyc/lexer.py) and [`preproc.py`](shivyc/lexer.py).
+A token-stream macro engine with conditional compilation, function-like macros,
+`#`/`##`, and hide sets ([`preproc.py`](shivyc/preproc.py)), preceded by an
+extension pre-pass ([`extensions.py`](shivyc/extensions.py)) that recognizes the
+non-standard constructs and blanks them while preserving line/column numbers.
 
 #### Lexer
-The ShivyC lexer is implemented primarily in [`lexer.py`](shivyc/lexer.py). Additionally, [`tokens.py`](shivyc/tokens.py) contains definitions of the token classes used in the lexer and [`token_kinds.py`](shivyc/token_kinds.py) contains instances of recognized keyword and symbol tokens.
+Implemented in [`lexer.py`](shivyc/lexer.py), with token classes in
+[`tokens.py`](shivyc/tokens.py) and recognized keywords/symbols in
+[`token_kinds.py`](shivyc/token_kinds.py).
 
 #### Parser
-The ShivyC parser uses recursive descent techniques for all parsing. It is implemented in [`parser/*.py`](shivyc/parser/) and creates a parse tree of nodes defined in [`tree/*.py`](shivyc/tree/).
+Recursive descent in [`parser/*.py`](shivyc/parser/), producing a parse tree of
+nodes from [`tree/*.py`](shivyc/tree/).
 
 #### IL generation
-ShivyC traverses the parse tree to generate a flat custom IL (intermediate language). The commands for this IL are in [`il_cmds/*.py`](shivyc/il_cmds/) . Objects used for IL generation are in [`il_gen.py`](shivyc/il_gen.py) , but most of the IL generating code is in the `make_code` function of each tree node in [`tree/*.py`](shivyc/tree/).
+The parse tree is traversed to a flat three-address IL; commands live in
+[`il_cmds/*.py`](shivyc/il_cmds/) and the generators in each tree node.
 
 #### ASM generation
-ShivyC sequentially reads the IL commands, converting each into Intel-format x86-64 assembly code. ShivyC performs register allocation using George and Appel’s iterated register coalescing algorithm (see References below). The general ASM generation functionality is in [`asm_gen.py`](shivyc/asm_gen.py) , but much of the ASM generating code is in the `make_asm` function of each IL command in [`il_cmds/*.py`](shivyc/il_cmds/).
+IL is lowered to Intel-syntax x86-64; register allocation uses George and
+Appel's iterated register coalescing. General code in
+[`asm_gen.py`](shivyc/asm_gen.py).
 
+#### Whole-program call graph
+The driver can build and print the program-wide call graph
+([`callgraph.py`](shivyc/callgraph.py), `--print-call-graph`); it is the
+substrate for the thread partitioner, the memory-safety analysis, and member
+elimination.
+
+---
 
 ## References
-- [ShivC](https://github.com/ShivamSarodia/ShivC) - ShivyC is a rewrite from scratch of my old C compiler, ShivC, with much more emphasis on feature completeness and code quality. See the ShivC README for more details.
-- C11 Specification - http://www.open-std.org/jtc1/sc22/wg14/www/docs/n1570.pdf
-- x86_64 ABI - https://github.com/hjl-tools/x86-psABI/wiki/x86-64-psABI-1.0.pdf
-- Iterated Register Coalescing (George and Appel) - https://www.cs.purdue.edu/homes/hosking/502/george.pdf
+
+- [ShivC](https://github.com/ShivamSarodia/ShivC) — the original compiler ShivyCX was rewritten from.
+- C11 Specification — http://www.open-std.org/jtc1/sc22/wg14/www/docs/n1570.pdf
+- x86-64 ABI — https://github.com/hjl-tools/x86-psABI/wiki/x86-64-psABI-1.0.pdf
+- Iterated Register Coalescing (George and Appel) — https://www.cs.purdue.edu/homes/hosking/502/george.pdf
+- *Foundational Problems with Compilers and Operating Systems* (B. Hartshorn, viXra 2025).
