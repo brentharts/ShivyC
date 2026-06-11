@@ -2,23 +2,15 @@
 __pycache__/
 *.py[cod]
 *$py.class
-
-# Compiler / linker output
-*.o
-*.so
 out
+out.o
 out.s
 gcc_out
 a.out
-gcc_output
-shivyc_output
-
-# C comparison harness binaries (built by tools/compare_*.py)
-tools/*_harness
-
 test.c
 \#*#
 tests/**/*.s
+tests/**/*.o
 shivyc.egg-info/*
 dist/*
 build/*

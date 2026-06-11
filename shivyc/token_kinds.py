@@ -47,6 +47,12 @@ alignas_kw = TokenKind("_Alignas", keyword_kinds)
 auto_type_kw = TokenKind("__auto_type", keyword_kinds)
 typeof_kw = TokenKind("__typeof__", keyword_kinds)
 
+# GNU inline assembly. Both the bare `asm` and the `__asm__`/`__asm` spellings
+# (the latter rewritten to `asm` in the preprocessor prelude) tokenize to this
+# keyword, so the parser can recognize `asm [volatile] (...)` unambiguously
+# even now that `volatile` is itself a keyword.
+asm_kw = TokenKind("asm", keyword_kinds)
+
 plus = TokenKind("+", symbol_kinds)
 minus = TokenKind("-", symbol_kinds)
 star = TokenKind("*", symbol_kinds)

@@ -23,7 +23,7 @@ Node* load(const char* dictionary);
 bool check(Node* root, const char* word);
 
 int main() {
-  Node* trie = load("tests/general_tests/trie/words.txt");
+  Node* trie = load("general_tests/trie/words.txt");
 
   int NUM_WORDS = 10;
   char* words[10];

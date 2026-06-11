@@ -48,21 +48,18 @@ class ErrorCollector:
     """Accumulates compile-time issues."""
 
     def __init__(self) -> None:
-        self.issues: list[CompilerError] = []
+        self.issue_count: int = 0
 
     def add(self, issue: CompilerError) -> None:
-        self.issues.append(issue)
+        self.issue_count = self.issue_count + 1
 
     def ok(self) -> bool:
-        idx: int = 0
-        while idx < len(self.issues):
-            if not self.issues[idx].warning:
-                return False
-            idx = idx + 1
-        return True
+        if self.issue_count == 0:
+            return True
+        return False
 
     def clear(self) -> None:
-        self.issues = []
+        self.issue_count = 0
 
 
 error_collector: ErrorCollector | None = None
@@ -93,8 +90,3 @@ def take_pending_error() -> CompilerError | None:
     err: CompilerError | None = shivycx_pending_error
     shivycx_pending_error = None
     return err
-
-
-def position_add_col(pos: Position, delta: int) -> Position:
-    """Return a copy of pos with its column shifted by delta."""
-    return Position(pos.file, pos.line, pos.col + delta, pos.full_line)
