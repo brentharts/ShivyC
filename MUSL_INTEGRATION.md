@@ -34,8 +34,6 @@ size_t strlen(const char *s){ ... }''',
 
 ## How to use it
 
-From the compiler driver (already wired by `main.py.patch`):
-
 ```
 shivyc --musl  -c app.c -o app.o          # app.c #includes resolve to musl
 shivyc --musl --musl-dir /tmp/m  -c app.c -o app.o
@@ -79,25 +77,3 @@ for the rare file containing the delimiter or ending in a backslash; it keys
 headers by their path relative to the musl root and sources by name within each
 category.
 
-## Two patches required by this integration
-
-* `main.py.patch` -- adds `--musl` / `--musl-dir` and applies the musl include
-  paths/defines ahead of the user's.
-* `token_kinds.py.patch` -- **NOTE:** the pulled HEAD was missing several
-  keyword tokens that the rest of the tree already references
-  (`volatile_kw`, `restrict_kw`, `atomic_kw`, `alignas_kw`, `typeof_kw`,
-  `auto_type_kw`). This patch adds them. See the caveat below.
-
-## Caveat: the pulled HEAD does not currently build
-
-Independently of musl, the freshly pulled `brentharts/ShivyC` HEAD appears to be
-an **incomplete commit**: several modules reference symbols that are not in the
-pushed files. Adding the missing keyword tokens (above) clears the first wall,
-but `shivyc/tree/general_nodes.py` then references
-`shivyc.tree.decl_nodes.TypeofSpec`, which is not defined in the pushed
-`decl_nodes.py` (the `typeof` / `__auto_type` / atomics / statement-expression
-work looks only partially committed). The repo's own test suite fails ~478/527
-as a result. These look like uncommitted local files rather than real design
-gaps. Because reconstructing them by guessing would diverge from your local
-work, this integration does **not** attempt to. The musl feature itself was
-validated end-to-end with the last known-good compiler build.
