@@ -179,6 +179,9 @@ class ExtensionInfo:
         self.attrs = {}
         # name -> {arg_name -> {'len>=': int, 'len<=': int, 'div-by': int}}
         self.contracts = {}
+        # thread function name -> {'side': 'left'|'right', 'core': int}
+        # Declared via `assert FN in threads.left(core=N)` in a function header.
+        self.threads = {}
 
     def attrs_of(self, name):
         return self.attrs.get(name, set())
@@ -190,7 +193,7 @@ class ExtensionInfo:
         return self.contracts.get(name, {})
 
     def __bool__(self):
-        return bool(self.attrs) or bool(self.contracts)
+        return bool(self.attrs) or bool(self.contracts) or bool(self.threads)
 
 
 def preprocess_extensions(code):
@@ -229,11 +232,13 @@ def preprocess_extensions(code):
             continue
 
         name = m.group("name")
-        attrs, contracts = _parse_region(region, name)
+        attrs, contracts, threads = _parse_region(region, name)
         if attrs:
             info.attrs.setdefault(name, set()).update(attrs)
         if contracts:
             info.contracts.setdefault(name, {}).update(contracts)
+        for tname, rec in threads.items():
+            info.threads[tname] = rec
 
         # Blank the region in place (preserving newlines and byte offsets).
         for idx in range(close_idx + 1, brace_idx):
@@ -245,9 +250,11 @@ def preprocess_extensions(code):
 
 
 def _parse_region(region, func_name):
-    """Extract specifiers and contracts from a header region."""
+    """Extract specifiers, contracts, and thread declarations from a header
+    region. Returns (attrs, contracts, threads)."""
     attrs = set()
     contracts = {}
+    threads = {}
 
     # Pull out specifier tokens first; whatever remains should be asserts.
     def take_specifier(match):
@@ -264,10 +271,57 @@ def _parse_region(region, func_name):
             raise ExtensionError(
                 f"unexpected text in extension region of '{func_name}': "
                 f"{line!r}")
+        thread = _parse_thread_assert(line, func_name)
+        if thread is not None:
+            tname, rec = thread
+            threads[tname] = rec
+            continue
         arg, contract = _parse_assert(line, func_name)
         contracts.setdefault(arg, {}).update(contract)
 
-    return attrs, contracts
+    return attrs, contracts, threads
+
+
+def _parse_thread_assert(line, func_name):
+    """Recognize `assert FN in threads.left(core=N)` / `.right(core=N)`.
+
+    Returns (FN, {'side': 'left'|'right', 'core': int}) or None if the line is
+    not a thread declaration (so the caller can try the contract grammar).
+    """
+    try:
+        node = ast.parse(line, mode="exec").body[0]
+    except SyntaxError:
+        return None
+    if not isinstance(node, ast.Assert):
+        return None
+    test = node.test
+    # FN in threads.SIDE(core=N)
+    if not (isinstance(test, ast.Compare) and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.In)
+            and isinstance(test.left, ast.Name)
+            and len(test.comparators) == 1
+            and isinstance(test.comparators[0], ast.Call)):
+        return None
+    call = test.comparators[0]
+    func = call.func
+    if not (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
+            and func.value.id == "threads"):
+        return None
+    side = func.attr
+    if side not in ("left", "right"):
+        raise ExtensionError(
+            f"thread group must be 'left' or 'right' in '{func_name}': "
+            f"{line!r}")
+    core = 0
+    for kw in call.keywords:
+        if kw.arg == "core" and isinstance(kw.value, ast.Constant) \
+                and isinstance(kw.value.value, int):
+            core = kw.value.value
+        else:
+            raise ExtensionError(
+                f"thread declaration takes only core=<int> in '{func_name}': "
+                f"{line!r}")
+    return test.left.id, {"side": side, "core": core}
 
 
 def _parse_assert(line, func_name):
