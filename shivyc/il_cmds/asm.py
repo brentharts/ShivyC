@@ -27,6 +27,38 @@ def _att_reg(reg64, size):
     return "%" + spots.RegSpot.reg_map[reg64][idx]
 
 
+
+
+def _resolve_asm_dialect(template):
+    """Resolve GCC inline-asm dialect alternatives to the AT&T variant.
+
+    GCC templates may use ``{att-variant|intel-variant|...}`` to pick text by
+    assembler dialect. ShivyCX emits inline asm under ``.att_syntax``, so the
+    first alternative is always selected. A lone ``{`` with no matching
+    ``|``/``}`` (as in CPython's ``"{movq %%rsp, %0"``) is treated as a stray
+    dialect marker and dropped.
+    """
+    out = []
+    i, n = 0, len(template)
+    while i < n:
+        ch = template[i]
+        if ch == "{":
+            j = i + 1
+            while j < n and template[j] not in "|}":
+                out.append(template[j])
+                j += 1
+            # Skip any remaining alternatives up to and including the close.
+            while j < n and template[j] != "}":
+                j += 1
+            i = j + 1 if (j < n and template[j] == "}") else j
+        elif ch == "}":
+            i += 1  # stray close brace
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
 class InlineAsm(ILCommand):
     """A single inline-asm statement.
 
@@ -256,7 +288,7 @@ class InlineAsm(ILCommand):
 
         self._emit_parallel(pre_moves, asm_code)
 
-        text = self.template.replace("%%", "%")
+        text = _resolve_asm_dialect(self.template).replace("%%", "%")
         # Substitute %N high-to-low so %1 does not partially match %10.
         for i in reversed(range(len(operand_strs))):
             text = text.replace("%" + str(i), operand_strs[i])
