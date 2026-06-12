@@ -441,6 +441,13 @@ def process_c_file(file, args):
                 il_code.commands[fn], symbol_table)
         _pack_args.optimize(il_code, symbol_table)
 
+    # Loop register-promotion for packed globals (-fsimd-pack-globals): hoist
+    # the xmm15 decompress/recompress of packed globals out of loops, caching
+    # the live value in a GP register across the loop body.
+    if getattr(args, "simd_pack_globals", False):
+        import shivyc.simd_pack_promote as _promote
+        _promote.optimize(il_code, symbol_table)
+
     # -O4 near-function scratch: a non-reentrant function can hold its locals
     # and register spills in a static per-function buffer instead of the stack,
     # cutting stack pressure (and, for leaf functions, the frame entirely). It
