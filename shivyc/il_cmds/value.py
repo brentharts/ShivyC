@@ -41,7 +41,18 @@ class _ValueCmd(ILCommand):
             cur_target = target_spot.shift(shift)
 
             if isinstance(cur_start, LiteralSpot):
-                src = cur_start
+                # x86-64 `mov mem, imm` accepts only a 32-bit (sign-extended)
+                # immediate. A wider literal written to memory must first be
+                # loaded into the scratch register (`mov reg, imm64` assembles
+                # as movabs), then stored. e.g. storing PY_SSIZE_T_MAX or
+                # LLONG_MIN through a pointer.
+                if (reg_size == 8
+                        and not isinstance(cur_target, RegSpot)
+                        and not (-(2 ** 31) <= cur_start.value < 2 ** 31)):
+                    asm_code.add(asm_cmds.Mov(reg, cur_start, reg_size))
+                    src = reg
+                else:
+                    src = cur_start
             else:
                 src = reg
                 if reg != cur_start:
@@ -542,9 +553,16 @@ class _RelCommand(_ValueCmd):
     def get_reg_spot(self, reg_val, spotmap, get_reg):
         """Get a register or literal spot for self.reg_val."""
 
-        if (isinstance(spotmap[reg_val], LiteralSpot)
-             or isinstance(spotmap[reg_val], RegSpot)):
-            return spotmap[reg_val]
+        spot = spotmap[reg_val]
+        # A literal that fits in a sign-extended 32-bit immediate can be used
+        # directly (it stores fine to memory). A wider literal needs a real
+        # scratch register, because `mov mem, imm64` is not encodable and the
+        # move must go through `mov reg, imm64` (movabs).
+        if isinstance(spot, LiteralSpot):
+            if -(2 ** 31) <= spot.value < 2 ** 31:
+                return spot
+        elif isinstance(spot, RegSpot):
+            return spot
 
         val_spot = get_reg([], ([spotmap[self.count]] if self.count else [])
                            + self._used_regs)
