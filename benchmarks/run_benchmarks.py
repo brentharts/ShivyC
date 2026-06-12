@@ -62,6 +62,30 @@ def _read_asm(src):
         return f.read()
 
 
+def _write_baseline(src_on, src_off, transform):
+    """Derive a feature-OFF baseline source from the primary source.
+
+    The harness is self-contained: the baseline .c is generated here rather than
+    committed, so a fresh checkout never lacks it. `transform` maps the source
+    text to its plain-C equivalent (e.g. stripping `assert` contract clauses or
+    the `__metamorphic__` specifier).
+    """
+    with open(src_on) as f:
+        text = f.read()
+    with open(src_off, "w") as f:
+        f.write(transform(text))
+
+
+def _strip_contract_clauses(text):
+    """Drop lines whose first non-space token is `assert` (contract clauses)."""
+    return "".join(ln for ln in text.splitlines(keepends=True)
+                   if not ln.lstrip().startswith("assert "))
+
+
+def _strip_metamorphic(text):
+    return text.replace(" __metamorphic__", "")
+
+
 def _extract_function(asm, name):
     """Lines of function `name`, label to first ret/jmp terminator."""
     out, capturing = [], False
@@ -126,6 +150,7 @@ def bench_contracts():
     d = os.path.join(HERE, "contracts")
     src_on = os.path.join(d, "bench_contracts.c")
     src_off = os.path.join(d, "bench_contracts_baseline.c")
+    _write_baseline(src_on, src_off, _strip_contract_clauses)
     cfgs = []
 
     _shivyc(src_on, os.path.join(d, "bin_shivyc_contract"))
@@ -182,6 +207,7 @@ def bench_metamorphic():
     d = os.path.join(HERE, "metamorphic")
     src_on = os.path.join(d, "bench_metamorphic.c")
     src_off = os.path.join(d, "bench_metamorphic_baseline.c")
+    _write_baseline(src_on, src_off, _strip_metamorphic)
     cfgs = []
 
     _shivyc(src_off, os.path.join(d, "bin_shivyc_off"))
