@@ -427,6 +427,20 @@ def process_c_file(file, args):
             print(report)
         il_code.simd_proven = proven
 
+    # Argument packing (-f-pack-args): a non-standard calling convention that
+    # bit-packs small integer parameters into shared argument registers,
+    # reducing register pressure and stack spills (most visibly across deeply
+    # nested calls). Direct calls are resolved first so each statically-known
+    # callee can be named; the pass then rewrites packable callee prologues and
+    # annotates their direct call sites.
+    if getattr(args, "pack_args", False):
+        import shivyc.stackless as _stk
+        import shivyc.pack_args as _pack_args
+        for fn in il_code.commands:
+            il_code.commands[fn] = _stk._apply_direct_calls(
+                il_code.commands[fn], symbol_table)
+        _pack_args.optimize(il_code, symbol_table)
+
     # -O4 near-function scratch: a non-reentrant function can hold its locals
     # and register spills in a static per-function buffer instead of the stack,
     # cutting stack pressure (and, for leaf functions, the frame entirely). It
@@ -571,6 +585,13 @@ def get_arguments():
     parser.add_argument("-fstackless-calls",
                         help="direct calls, tail-call jmps, frameless funcs",
                         dest="stackless_calls", action="store_true")
+
+    # Argument packing: a non-standard calling convention that bit-packs several
+    # small integer parameters into as few argument registers as possible.
+    # Applied to statically-known (direct) calls of qualifying functions only.
+    parser.add_argument("-f-pack-args",
+                        help="pack small integer args into shared registers",
+                        dest="pack_args", action="store_true")
 
     # Advanced/experimental: metamorphic returns. Requires a writable text
     # segment (the linker is told to make it writable). The return address is

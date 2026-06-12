@@ -359,6 +359,11 @@ class ASMGen:
             arguments, "stackless_calls", False)
         asm_code.frameless = False
 
+        # Argument packing (opt-in via -f-pack-args). Both caller and callee
+        # consult this flag and recompute the identical packing layout from the
+        # function signature.
+        asm_code.pack_args_enabled = getattr(arguments, "pack_args", False)
+
         # Metamorphic returns (opt-in via -fmetamorphic + __metamorphic__).
         asm_code.metamorphic_funcs = set()
         asm_code.metamorphic_current = None
