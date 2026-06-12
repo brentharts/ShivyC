@@ -342,7 +342,8 @@ class DeclInfo:
         # pointer, or the address of an external object) is emitted as a
         # relocation in the data section rather than runtime code.
         if storage == symbol_table.STATIC:
-            addr = self._static_addr_const(self.init, symbol_table, il_code)
+            addr = self._static_addr_const(
+                self.init, symbol_table, il_code, c)
             if addr is not None:
                 il_code.static_initialize_block(
                     var, [(0, var.ctype.size, addr)], var.ctype.size)
@@ -409,7 +410,8 @@ class DeclInfo:
             consts = []
             all_zero = True
             for off, ctype, expr in entries:
-                addr = self._static_addr_const(expr, symbol_table, il_code)
+                addr = self._static_addr_const(
+                    expr, symbol_table, il_code, c)
                 if addr is not None:
                     consts.append((off, ctype.size, addr))
                     all_zero = False
@@ -529,7 +531,7 @@ class DeclInfo:
         else:
             out.append((base, ctype, init))
 
-    def _static_addr_const(self, node, symbol_table, il_code):
+    def _static_addr_const(self, node, symbol_table, il_code, c=None):
         """If `node` is an address constant with a stable linker symbol,
         return ("sym", name, addend); otherwise None.
 
@@ -555,6 +557,16 @@ class DeclInfo:
             name = il_code.intern_static_string(node.chars)
             return ("sym", name, 0)
 
+        # A bare compound literal of array type decays to the address of its
+        # storage, which at file scope is static. e.g.
+        # `static int *const p = (int[]){ 1, 2, 3 };`.
+        import shivyc.tree.type_exprs as _type_exprs
+        if isinstance(node, _type_exprs.CompoundLiteral) and c is not None:
+            lval = node._lvalue(il_code, symbol_table, c.set_global(True))
+            if lval.il_value.ctype.is_array():
+                return ("sym", symbol_table.asm_name(lval.il_value), 0)
+            return None
+
         if isinstance(node, memory_exprs.AddrOf):
             ref = self._symbol_ref(node.expr, symbol_table, decay=False)
             if ref is not None:
@@ -566,6 +578,17 @@ class DeclInfo:
             name, off, _ = self._static_member_ref(node.expr, symbol_table)
             if name is not None:
                 return ("sym", name, off)
+            # &(compound literal): a compound literal at file scope has static
+            # storage duration, so its address is an address constant (C11
+            # 6.5.2.5p5). Materialize it as an anonymous static object and use
+            # that object's label. CPython's module-definition tables use this,
+            # e.g. `{Py_mod_..., (void*)&(PyABIInfo){...}}`.
+            import shivyc.tree.type_exprs as type_exprs
+            if (isinstance(node.expr, type_exprs.CompoundLiteral)
+                    and c is not None):
+                lval = node.expr._lvalue(il_code, symbol_table,
+                                         c.set_global(True))
+                return ("sym", symbol_table.asm_name(lval.il_value), 0)
             return None
         if isinstance(node, primary_exprs.Identifier):
             return self._symbol_ref(node, symbol_table, decay=True)
@@ -596,7 +619,7 @@ class DeclInfo:
                 return None
             if ctype.is_pointer():
                 return self._static_addr_const(
-                    node.expr, symbol_table, il_code)
+                    node.expr, symbol_table, il_code, c)
             return None
 
         # Pointer arithmetic on an address constant: `ARRAY + n`, `n + ARRAY`,
@@ -611,7 +634,7 @@ class DeclInfo:
                 candidates.append((node.right, node.left))  # n + ARRAY
             for addr_node, int_node in candidates:
                 base = self._static_addr_const(
-                    addr_node, symbol_table, il_code)
+                    addr_node, symbol_table, il_code, c)
                 if base is None:
                     continue
                 n = self._const_int_value(int_node)
