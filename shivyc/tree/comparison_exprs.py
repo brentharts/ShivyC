@@ -45,13 +45,18 @@ class _Equality(_ArithBinOp):
                 err = "comparison between incomparable types"
                 raise CompilerError(err, self.op.r)
 
-        # If one side is pointer to void, cast the other to same.
-        elif left.ctype.arg.is_void():
-            check_cast(right, left.ctype, self.op.r)
-            right = set_type(right, left.ctype, il_code)
-        elif right.ctype.arg.is_void():
-            check_cast(left, right.ctype, self.op.r)
-            left = set_type(left, right.ctype, il_code)
+        # If one side is pointer to void, both convert to a void pointer. C11
+        # 6.5.9p2 allows comparing a void pointer with any object pointer, so
+        # the only thing to preserve is the combined qualification of the
+        # pointed-to types -- casting the qualified side down to a bare `void *`
+        # (and thus discarding `const`) would wrongly be rejected as an
+        # incompatible-pointer conversion.
+        elif left.ctype.arg.is_void() or right.ctype.arg.is_void():
+            const = left.ctype.arg.const or right.ctype.arg.const
+            void_arg = ctypes.void.make_const() if const else ctypes.void
+            void_ptr = ctypes.PointerCType(void_arg)
+            left = set_type(left, void_ptr, il_code)
+            right = set_type(right, void_ptr, il_code)
 
         # If both types are still incompatible, warn! Qualifier differences on
         # the pointed-to type (e.g. `char *` vs `const char *`) are allowed.
