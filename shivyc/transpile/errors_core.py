@@ -1,0 +1,100 @@
+"""Transpile-ready subset of shivyc.errors foundational types.
+
+These classes are the first targets for the ShivyCX-to-C transpiler (Phase 1).
+They mirror the Python originals but carry strict type annotations and avoid
+constructs the transpiler does not yet handle (f-strings, magic methods, etc.).
+"""
+
+from __future__ import annotations
+
+
+class Position:
+    """A position in source code."""
+
+    def __init__(self, file: str, line: int, col: int, full_line: str) -> None:
+        self.file: str = file
+        self.line: int = line
+        self.col: int = col
+        self.full_line: str = full_line
+
+
+class Range:
+    """A continuous range between two positions."""
+
+    def __init__(self, start: Position, end: Position | None = None) -> None:
+        self.start: Position = start
+        self.end: Position = end if end else start
+
+
+class Tagged:
+    """Tagged character for lexing."""
+
+    def __init__(self, c: str, p: Position) -> None:
+        self.c: str = c
+        self.p: Position = p
+        self.r: Range = Range(p, p)
+
+
+class CompilerError:
+    """Compile-time error with source location."""
+
+    def __init__(self, descrip: str, range: Range | None = None) -> None:
+        self.descrip: str = descrip
+        self.range: Range | None = range
+        self.warning: bool = False
+
+
+class ErrorCollector:
+    """Accumulates compile-time issues."""
+
+    def __init__(self) -> None:
+        self.issues: list[CompilerError] = []
+
+    def add(self, issue: CompilerError) -> None:
+        self.issues.append(issue)
+
+    def ok(self) -> bool:
+        idx: int = 0
+        while idx < len(self.issues):
+            if not self.issues[idx].warning:
+                return False
+            idx = idx + 1
+        return True
+
+    def clear(self) -> None:
+        self.issues = []
+
+
+error_collector: ErrorCollector | None = None
+shivycx_pending_error: CompilerError | None = None
+
+
+def init_errors_core() -> None:
+    """Initialize module globals (call once at startup)."""
+    global error_collector
+    error_collector = ErrorCollector()
+
+
+def set_pending_compiler_error(descrip: str, range: Range | None = None) -> None:
+    """Record a compile error for the transpiled exception shim."""
+    global shivycx_pending_error
+    shivycx_pending_error = CompilerError(descrip, range)
+
+
+def clear_pending_error() -> None:
+    """Clear the pending compiler error, if any."""
+    global shivycx_pending_error
+    shivycx_pending_error = None
+
+
+def take_pending_error() -> CompilerError | None:
+    """Return and clear the pending compiler error."""
+    global shivycx_pending_error
+    err: CompilerError | None = shivycx_pending_error
+    shivycx_pending_error = None
+    return err
+
+
+def position_add_col(pos: Position, delta: int) -> Position:
+    """Return a copy of pos with its column shifted by delta."""
+    return Position(pos.file, pos.line, pos.col + delta, pos.full_line)

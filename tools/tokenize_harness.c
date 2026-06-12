@@ -43,7 +43,7 @@ static void print_result(const char *code) {
         printf("token:%s:%s:L%d\n", kind_label(tok->kind), token_text(tok), tok->logical_line);
     }
     if (!ErrorCollector_ok(error_collector)) {
-        printf("issues:%d\n", error_collector->issue_count);
+        printf("issues:%zu\n", ErrorCollector_issue_count(error_collector));
     }
 }
 

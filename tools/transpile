@@ -6,6 +6,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TRANSPILER="$ROOT/shivycx_transpiler.py"
 OUT_DIR="${SHIVYC_TRANSPILE_DIR:-/tmp/shivyc-transpile}"
 INC_DIR="$ROOT/shivyc/transpile"
+ERRORS_CORE_LINK="$ROOT/tools/errors_core_link.c"
+STRLIST_LINK="$ROOT/tools/strlist_link.c"
+TOKENIZE_HARNESS="$ROOT/tools/tokenize_harness.c"
 
 mkdir -p "$OUT_DIR"
 
@@ -17,12 +20,26 @@ transpile() {
     echo "wrote $OUT_DIR/${base}.c"
 }
 
-copy_headers() {
+copy_lexer_headers() {
     cp "$INC_DIR/errors_core.h" "$OUT_DIR/"
     cp "$INC_DIR/regex_helpers.h" "$OUT_DIR/"
     cp "$INC_DIR/tokens.h" "$OUT_DIR/"
     cp "$INC_DIR/token_kinds.h" "$OUT_DIR/"
     cp "$INC_DIR/lexer_core.h" "$OUT_DIR/"
+}
+
+copy_parser_headers() {
+    cp "$INC_DIR/errors_core.h" "$OUT_DIR/"
+    cp "$INC_DIR/tokens.h" "$OUT_DIR/"
+    cp "$INC_DIR/token_kinds.h" "$OUT_DIR/"
+    cp "$INC_DIR/parser_utils.h" "$OUT_DIR/"
+    cp "$INC_DIR/decl_nodes.h" "$OUT_DIR/"
+    cp "$INC_DIR/tree_nodes.h" "$OUT_DIR/"
+    cp "$INC_DIR/expr_nodes.h" "$OUT_DIR/"
+    cp "$INC_DIR/parser_declaration.h" "$OUT_DIR/"
+    cp "$INC_DIR/parser_expression.h" "$OUT_DIR/"
+    cp "$INC_DIR/parser_statement.h" "$OUT_DIR/"
+    cp "$INC_DIR/parser_core.h" "$OUT_DIR/"
 }
 
 compile_unit() {
@@ -31,45 +48,154 @@ compile_unit() {
     echo "compiled $OUT_DIR/${name}.o"
 }
 
+compile_errors_core_link() {
+    gcc -std=c11 -Wall -Wextra -I"$ROOT" -I"$OUT_DIR" -c "$ERRORS_CORE_LINK" -o "$OUT_DIR/errors_core_link.o"
+    echo "compiled $OUT_DIR/errors_core_link.o"
+}
+
+compile_support_objs() {
+    gcc -std=c11 -Wall -Wextra -I"$ROOT" -I"$OUT_DIR" -c "$STRLIST_LINK" -o "$OUT_DIR/strlist_link.o"
+    echo "compiled $OUT_DIR/strlist_link.o"
+    compile_errors_core_link
+}
+
+build_lexer_objs() {
+    transpile "$ROOT/shivyc/transpile/errors_core.py"
+    transpile "$ROOT/shivyc/transpile/tokens.py"
+    transpile "$ROOT/shivyc/transpile/token_kinds.py"
+    transpile "$ROOT/shivyc/transpile/regex_helpers.py"
+    transpile "$ROOT/shivyc/transpile/lexer_core.py"
+    copy_lexer_headers
+    compile_unit errors_core
+    compile_unit tokens
+    compile_unit token_kinds
+    compile_unit regex_helpers
+    compile_unit lexer_core
+    compile_support_objs
+}
+
+build_parser_objs() {
+    transpile "$ROOT/shivyc/transpile/errors_core.py"
+    transpile "$ROOT/shivyc/transpile/tokens.py"
+    transpile "$ROOT/shivyc/transpile/token_kinds.py"
+    transpile "$ROOT/shivyc/transpile/parser_utils.py"
+    transpile "$ROOT/shivyc/transpile/decl_nodes.py"
+    transpile "$ROOT/shivyc/transpile/tree_nodes.py"
+    transpile "$ROOT/shivyc/transpile/expr_nodes.py"
+    transpile "$ROOT/shivyc/transpile/parser_declaration.py"
+    transpile "$ROOT/shivyc/transpile/parser_expression.py"
+    transpile "$ROOT/shivyc/transpile/parser_statement.py"
+    transpile "$ROOT/shivyc/transpile/parser_core.py"
+    copy_parser_headers
+    compile_unit errors_core
+    compile_unit tokens
+    compile_unit token_kinds
+    compile_unit parser_utils
+    compile_unit decl_nodes
+    compile_unit tree_nodes
+    compile_unit expr_nodes
+    compile_unit parser_declaration
+    compile_unit parser_expression
+    compile_unit parser_statement
+    compile_unit parser_core
+    compile_errors_core_link
+    gcc -std=c11 -Wall -Wextra -I"$ROOT" -I"$OUT_DIR" -c "$ROOT/tools/decl_nodes_link.c" -o "$OUT_DIR/decl_nodes_link.o"
+}
+
+link_lexer_exe() {
+    local harness_src="$1"
+    local binary_name="$2"
+    gcc -std=c11 -Wall -Wextra -I"$ROOT" -I"$OUT_DIR" -c "$harness_src" -o "$OUT_DIR/${binary_name}.o"
+    gcc -std=c11 -Wall -Wextra -I"$ROOT" -I"$OUT_DIR" \
+        "$OUT_DIR/${binary_name}.o" \
+        "$OUT_DIR/strlist_link.o" \
+        "$OUT_DIR/errors_core_link.o" \
+        "$OUT_DIR/errors_core.o" \
+        "$OUT_DIR/tokens.o" \
+        "$OUT_DIR/token_kinds.o" \
+        "$OUT_DIR/regex_helpers.o" \
+        "$OUT_DIR/lexer_core.o" \
+        -o "$OUT_DIR/${binary_name}"
+    echo "built $OUT_DIR/${binary_name}"
+}
+
+link_parser_exe() {
+    local harness_src="$1"
+    local binary_name="$2"
+    gcc -std=c11 -Wall -Wextra -I"$ROOT" -I"$OUT_DIR" -c "$harness_src" -o "$OUT_DIR/${binary_name}.o"
+    gcc -std=c11 -Wall -Wextra -I"$ROOT" -I"$OUT_DIR" \
+        "$OUT_DIR/${binary_name}.o" \
+        "$OUT_DIR/errors_core_link.o" \
+        "$OUT_DIR/decl_nodes_link.o" \
+        "$OUT_DIR/errors_core.o" \
+        "$OUT_DIR/tokens.o" \
+        "$OUT_DIR/token_kinds.o" \
+        "$OUT_DIR/parser_utils.o" \
+        "$OUT_DIR/decl_nodes.o" \
+        "$OUT_DIR/tree_nodes.o" \
+        "$OUT_DIR/expr_nodes.o" \
+        "$OUT_DIR/parser_declaration.o" \
+        "$OUT_DIR/parser_expression.o" \
+        "$OUT_DIR/parser_statement.o" \
+        "$OUT_DIR/parser_core.o" \
+        -o "$OUT_DIR/${binary_name}"
+    echo "built $OUT_DIR/${binary_name}"
+}
+
 case "${1:-all}" in
     demo)
         python3 "$TRANSPILER" --demo
         ;;
     errors_core)
         transpile "$ROOT/shivyc/transpile/errors_core.py"
-        copy_headers
+        copy_lexer_headers
         compile_unit errors_core
+        compile_errors_core_link
         ;;
     regex_helpers)
         transpile "$ROOT/shivyc/transpile/regex_helpers.py"
-        copy_headers
+        copy_lexer_headers
         compile_unit regex_helpers
+        ;;
+    parser)
+        build_parser_objs
+        ;;
+    parser_exe)
+        build_parser_objs
+        link_parser_exe "$ROOT/tools/parser_core_harness.c" "shivycx_parse"
         ;;
     lexer_core)
-        transpile "$ROOT/shivyc/transpile/errors_core.py"
-        transpile "$ROOT/shivyc/transpile/tokens.py"
-        transpile "$ROOT/shivyc/transpile/token_kinds.py"
-        transpile "$ROOT/shivyc/transpile/regex_helpers.py"
-        transpile "$ROOT/shivyc/transpile/lexer_core.py"
-        copy_headers
-        compile_unit errors_core
-        compile_unit tokens
-        compile_unit token_kinds
-        compile_unit regex_helpers
-        compile_unit lexer_core
+        build_lexer_objs
+        ;;
+    exe)
+        build_lexer_objs
+        link_lexer_exe "$TOKENIZE_HARNESS" "shivycx_tokenize"
+        ;;
+    check)
+        build_lexer_objs
+        link_lexer_exe "$TOKENIZE_HARNESS" "shivycx_tokenize"
+        build_parser_objs
+        gcc -std=c11 -Wall -Wextra -I"$ROOT" -I"$OUT_DIR" -c "$ROOT/tools/parser_utils_harness.c" -o "$OUT_DIR/parser_utils_harness.o"
+        gcc -std=c11 -Wall -Wextra -I"$ROOT" -I"$OUT_DIR" \
+            "$OUT_DIR/parser_utils_harness.o" \
+            "$OUT_DIR/errors_core_link.o" \
+            "$OUT_DIR/errors_core.o" \
+            "$OUT_DIR/tokens.o" \
+            "$OUT_DIR/token_kinds.o" \
+            "$OUT_DIR/parser_utils.o" \
+            -o "$OUT_DIR/parser_utils_harness"
+        echo "built $OUT_DIR/parser_utils_harness"
+        link_parser_exe "$ROOT/tools/parser_core_harness.c" "parser_core_harness"
+        python3 "$ROOT/tools/compare_tokenize.py" --no-build
+        python3 "$ROOT/tools/compare_tokenize_line.py" --no-build
+        python3 "$ROOT/tools/compare_parser_utils.py" --no-build
+        python3 "$ROOT/tools/compare_parser_core.py" --no-build
         ;;
     all)
-        transpile "$ROOT/shivyc/transpile/errors_core.py"
-        transpile "$ROOT/shivyc/transpile/tokens.py"
-        transpile "$ROOT/shivyc/transpile/token_kinds.py"
-        transpile "$ROOT/shivyc/transpile/regex_helpers.py"
-        transpile "$ROOT/shivyc/transpile/lexer_core.py"
-        copy_headers
-        compile_unit errors_core
-        compile_unit tokens
-        compile_unit token_kinds
-        compile_unit regex_helpers
-        compile_unit lexer_core
+        build_lexer_objs
+        link_lexer_exe "$TOKENIZE_HARNESS" "shivycx_tokenize"
+        build_parser_objs
+        link_parser_exe "$ROOT/tools/parser_core_harness.c" "shivycx_parse"
         ;;
     *)
         transpile "$1"

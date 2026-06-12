@@ -4,17 +4,17 @@
 from __future__ import annotations
 
 import argparse
-import os
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-GENERATED = Path(os.environ.get("SHIVYC_TRANSPILE_DIR", "/tmp/shivyc-transpile"))
+
+from tools.transpile_build import build_harness, transpile_dir
+
 HARNESS_SRC = ROOT / "tools" / "tokenize_line_harness.c"
-HARNESS_BIN = ROOT / "tools" / "tokenize_line_harness"
-TRANSPILER = ROOT / "tools" / "transpile"
+HARNESS_NAME = "tokenize_line_harness"
 
 DEFAULT_SAMPLES = [
     "int x = 42;",
@@ -78,35 +78,13 @@ def python_output(line: str, in_comment: bool = False) -> str:
         lines.append(f"token:{_kind_label(tok.kind)}:{_token_text(tok)}")
     lines.append(f"in_comment:{'true' if out_in_comment else 'false'}")
     if not error_collector.ok():
-        lines.append(f"warnings:{error_collector.issue_count}")
+        lines.append(f"warnings:{len(error_collector.issues)}")
     return "\n".join(lines) + "\n"
-
-
-def build_harness() -> None:
-    subprocess.run([str(TRANSPILER), "lexer_core"], check=True, cwd=ROOT)
-    objs = [
-        GENERATED / f"{name}.o"
-        for name in ("errors_core", "tokens", "token_kinds", "regex_helpers", "lexer_core")
-    ]
-    cmd = [
-        "gcc",
-        "-std=c11",
-        "-Wall",
-        "-Wextra",
-        f"-I{ROOT}",
-        f"-I{GENERATED}",
-        str(HARNESS_SRC),
-        str(ROOT / "tools" / "strlist_link.c"),
-        *[str(o) for o in objs],
-        "-o",
-        str(HARNESS_BIN),
-    ]
-    subprocess.run(cmd, check=True, cwd=ROOT)
 
 
 def c_output(line: str) -> str:
     proc = subprocess.run(
-        [str(HARNESS_BIN), line],
+        [str(transpile_dir() / HARNESS_NAME), line],
         check=True,
         capture_output=True,
         text=True,
@@ -149,7 +127,7 @@ def main() -> int:
 
     _init_python_lexer()
     if not args.no_build:
-        build_harness()
+        build_harness(HARNESS_SRC, HARNESS_NAME)
 
     samples = args.lines or DEFAULT_SAMPLES
     failed = sum(not compare_line(line) for line in samples)

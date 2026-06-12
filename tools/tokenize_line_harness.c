@@ -49,7 +49,7 @@ static void print_result(const char *line, bool in_comment_start) {
     }
     printf("in_comment:%s\n", result.in_comment ? "true" : "false");
     if (!ErrorCollector_ok(error_collector)) {
-        printf("warnings:%d\n", error_collector->issue_count);
+        printf("warnings:%zu\n", ErrorCollector_issue_count(error_collector));
     }
 }
 
