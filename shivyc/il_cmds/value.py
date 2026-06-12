@@ -202,6 +202,116 @@ class LoadStructArg(_ValueCmd):
             self.move_data(home, src, size, r, asm_code)
 
 
+class UnpackArgs(ILCommand):
+    """Unpack bit-packed integer parameters into their parameter homes.
+
+    Used by the -f-pack-args calling convention. The caller has packed several
+    small integer arguments by bit-offset into one or more argument registers
+    (`regs`, the concrete RDI/RSI/... in use). Each PackField in `plan` names a
+    parameter (by its index into `outs`), the register it lives in, its low bit
+    offset, and its byte size. We deposit each field's low `size` bytes into the
+    matching parameter home.
+    """
+
+    def __init__(self, outs, regs, plan):
+        # outs - list of parameter ILValues, in positional order
+        # regs - list of source argument registers (RegSpot), low register first
+        # plan - list of pack_args.PackField
+        self.outs = outs
+        self.regs = regs
+        self.plan = plan
+
+    def inputs(self):
+        return []
+
+    def outputs(self):
+        return list(self.outs)
+
+    def clobber(self):
+        # The packed source registers are consumed here.
+        return list(self.regs)
+
+    # General-purpose registers, used to find a scratch that is not a parameter
+    # home when a memory-homed parameter needs one.
+    _GPRS = [spots.RAX, spots.RDI, spots.RSI, spots.RDX, spots.RCX,
+             spots.R8, spots.R9, spots.R10, spots.R11]
+
+    def make_asm(self, spotmap, home_spots, get_reg, asm_code):
+        n = len(self.regs)
+        out_reg_homes = {spotmap[o] for o in self.outs
+                         if isinstance(spotmap[o], RegSpot)}
+        mem_dest = any(not isinstance(spotmap[o], RegSpot) for o in self.outs)
+
+        # Fast path (no stack traffic): copy each packed source register into a
+        # scratch register that is not a parameter home, then extract each field
+        # from the copy straight into its home. Because the scratch copies are
+        # never parameter homes, writing a home (even one that aliased a source
+        # register) cannot corrupt a field we still need. A memory-homed
+        # parameter additionally needs one work register. This is feasible
+        # whenever enough registers are free of parameter homes -- the common
+        # case; only when parameters fill nearly the whole register file do we
+        # fall back to stack staging below.
+        free = [r for r in self._GPRS if r not in out_reg_homes]
+        need = n + (1 if mem_dest else 0)
+        if len(free) >= need:
+            staged = {self.regs[i]: free[i] for i in range(n)}
+            for src_reg, copy in staged.items():
+                if copy != src_reg:
+                    asm_code.add(asm_cmds.Mov(copy, src_reg, 8))
+            work = free[n] if mem_dest else None
+            for field in self.plan:
+                src = staged[self.regs[field.reg_index]]
+                dest = spotmap[self.outs[field.arg_index]]
+                size = field.size
+                if isinstance(dest, RegSpot):
+                    asm_code.add(asm_cmds.Mov(dest, src, 8))
+                    if field.bit_offset:
+                        asm_code.add(asm_cmds.Raw(
+                            "shr %s, %d" % (dest.asm_str(8), field.bit_offset)))
+                else:
+                    asm_code.add(asm_cmds.Mov(work, src, 8))
+                    if field.bit_offset:
+                        asm_code.add(asm_cmds.Raw(
+                            "shr %s, %d" % (work.asm_str(8), field.bit_offset)))
+                    asm_code.add(asm_cmds.Mov(dest, work, size))
+            return
+
+        # Fallback: at -O0 every general register can simultaneously be a packed
+        # source and a parameter's home, so register staging cannot avoid
+        # collisions. Save the packed source registers to the stack, which frees
+        # every register, then extract each field straight into its home. A
+        # register-homed parameter is written in place; a memory-homed one
+        # borrows a scratch register -- and one is always free precisely then,
+        # because a memory-homed parameter means not all GPRs are parameter
+        # homes.
+        for reg in self.regs:
+            asm_code.add(asm_cmds.Push(reg, None, 8))
+        # After pushing regs[0..n-1] in order, regs[i] sits at [rsp+8*(n-1-i)].
+        scratch = next((r for r in self._GPRS if r not in out_reg_homes), None)
+
+        for field in self.plan:
+            off = 8 * (n - 1 - field.reg_index)
+            src = MemSpot(spots.RSP, off)
+            dest = spotmap[self.outs[field.arg_index]]
+            size = field.size
+            if isinstance(dest, RegSpot):
+                # Load the whole eightbyte then shift the field down; the high
+                # bits hold other packed fields but are ignored wherever this
+                # parameter is later read at its own width.
+                asm_code.add(asm_cmds.Mov(dest, src, 8))
+                if field.bit_offset:
+                    asm_code.add(asm_cmds.Raw(
+                        "shr %s, %d" % (dest.asm_str(8), field.bit_offset)))
+            else:
+                asm_code.add(asm_cmds.Mov(scratch, src, 8))
+                if field.bit_offset:
+                    asm_code.add(asm_cmds.Raw(
+                        "shr %s, %d" % (scratch.asm_str(8), field.bit_offset)))
+                asm_code.add(asm_cmds.Mov(dest, scratch, size))
+
+        asm_code.add(asm_cmds.Add(spots.RSP, LiteralSpot(str(8 * n)), 8))
+
+
 class Set(_ValueCmd):
     """SET - sets output IL value to arg IL value.
 

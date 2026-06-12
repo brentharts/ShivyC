@@ -3,7 +3,7 @@
 import shivyc.asm_cmds as asm_cmds
 import shivyc.spots as spots
 from shivyc.il_cmds.base import ILCommand
-from shivyc.spots import LiteralSpot, MemSpot
+from shivyc.spots import LiteralSpot, MemSpot, RegSpot
 
 
 def _emit_parallel_int_moves(moves, asm_code):
@@ -235,6 +235,9 @@ class Call(ILCommand):
         self.tail = False
         # Set by FuncCall: a variadic callee receives all args on the stack.
         self.variadic = False
+        # Set by the pack-args pass (shivyc/pack_args.py): (regs, fields) when
+        # this direct call uses the bit-packed calling convention.
+        self.pack = None
 
         # Arguments beyond the sixth are passed on the stack (SysV AMD64).
 
@@ -257,6 +260,11 @@ class Call(ILCommand):
         prefs = {}
         if not self.void_return and self.ret.ctype.size <= 8:
             prefs = {self.ret: [spots.RAX]}
+        # For a packed call the arguments are bit-packed into the argument
+        # registers from wherever they happen to live, so they get no single
+        # argument-register preference (that would only create false pressure).
+        if self.pack:
+            return prefs
         # Only scalar integer args have a single-GPR preference; floating args
         # travel through xmm registers and structs larger than a register live
         # in memory (loaded into their ABI registers by explicit moves).
@@ -282,6 +290,93 @@ class Call(ILCommand):
     def indir_read(self): # noqa D102
         return self.args
 
+    def _emit_pack(self, packed_regs, packed_fields, spotmap, get_reg, asm_code):
+        """Build the bit-packed argument registers for a packed call.
+
+        To stay frugal with registers (a packed signature may itself have its
+        arguments spread across every GPR), each packed register is assembled in
+        a stack slot using a single scratch register: each field is
+        zero-extended (which masks it to its own width), shifted to its bit
+        offset, and OR-ed into the slot. The argument registers are loaded from
+        the slots last, after every argument source has been read, so a source
+        that happens to live in an argument register is safe.
+        """
+        def value_into(tmp, src, size):
+            """Place the low `size` bytes of `src` into `tmp`, zero-extended."""
+            if isinstance(src, LiteralSpot):
+                masked = int(src.value) & ((1 << (size * 8)) - 1)
+                asm_code.add(asm_cmds.Mov(tmp, LiteralSpot(str(masked)), 8))
+            elif size in (4, 8):
+                # A 4-byte move zero-extends into the full 64-bit register.
+                asm_code.add(asm_cmds.Mov(tmp, src, size))
+            else:
+                asm_code.add(asm_cmds.Raw("movzx %s, %s"
+                                          % (tmp.asm_str(8), src.asm_str(size))))
+
+        n = len(packed_regs)
+
+        # Fast path (no stack traffic): build each packed register in a scratch
+        # register and move it into its argument register last. A call clobbers
+        # every caller-saved GPR, so any register not holding an argument source
+        # holds nothing live across the call and is free to use as scratch. We
+        # also keep scratch registers off the packed target registers so the
+        # final moves never alias. When enough such registers exist (the common
+        # case -- few packed registers, arguments not filling the whole file)
+        # this avoids the rsp adjustment and memory OR traffic of the fallback.
+        gprs = [spots.RAX, spots.RDI, spots.RSI, spots.RDX, spots.RCX,
+                spots.R8, spots.R9, spots.R10, spots.R11]
+        src_regs = {spotmap[self.args[f.arg_index]] for f in packed_fields
+                    if isinstance(spotmap[self.args[f.arg_index]], RegSpot)}
+        free = [g for g in gprs
+                if g not in src_regs and g not in packed_regs]
+        if len(free) >= n + 1:
+            work = free[0]
+            accs = free[1:1 + n]
+            for ri in range(n):
+                asm_code.add(asm_cmds.Mov(accs[ri], LiteralSpot("0"), 8))
+                for f in (f for f in packed_fields if f.reg_index == ri):
+                    value_into(work, spotmap[self.args[f.arg_index]], f.size)
+                    if f.bit_offset:
+                        asm_code.add(asm_cmds.Raw(
+                            "shl %s, %d" % (work.asm_str(8), f.bit_offset)))
+                    asm_code.add(asm_cmds.Raw(
+                        "or %s, %s" % (accs[ri].asm_str(8), work.asm_str(8))))
+            # All argument sources have been read, so writing the packed
+            # registers (which may have held a source) is now safe.
+            for ri, reg in enumerate(packed_regs):
+                asm_code.add(asm_cmds.Mov(reg, accs[ri], 8))
+            return
+
+        # Fallback (register-starved case, e.g. arguments occupy nearly the
+        # whole register file): build the packed registers in stack slots using
+        # RAX as a fixed scratch. RAX is caller-saved (clobbered by the call
+        # regardless) and never a packed target; if it holds a source, preserve
+        # that value to a stack slot and read it back from there.
+        scratch = spots.RAX
+        need_save = any(spotmap[self.args[f.arg_index]] == scratch
+                        for f in packed_fields)
+        total = n + (1 if need_save else 0)
+        save_off = 8 * n  # only used when need_save
+
+        asm_code.add(asm_cmds.Sub(spots.RSP, LiteralSpot(str(8 * total)), 8))
+        if need_save:
+            asm_code.add(asm_cmds.Mov(MemSpot(spots.RSP, save_off), scratch, 8))
+        for ri in range(n):
+            asm_code.add(asm_cmds.Raw("mov QWORD PTR [rsp+%d], 0" % (8 * ri)))
+        for f in packed_fields:
+            src = spotmap[self.args[f.arg_index]]
+            if src == scratch:
+                src = MemSpot(spots.RSP, save_off)
+            value_into(scratch, src, f.size)
+            if f.bit_offset:
+                asm_code.add(asm_cmds.Raw("shl %s, %d"
+                                          % (scratch.asm_str(8), f.bit_offset)))
+            asm_code.add(asm_cmds.Raw("or QWORD PTR [rsp+%d], %s"
+                                      % (8 * f.reg_index, scratch.asm_str(8))))
+        for ri, reg in enumerate(packed_regs):
+            asm_code.add(asm_cmds.Mov(reg, MemSpot(spots.RSP, 8 * ri), 8))
+        asm_code.add(asm_cmds.Add(spots.RSP, LiteralSpot(str(8 * total)), 8))
+
     def make_asm(self, spotmap, home_spots, get_reg, asm_code): # noqa D102
         ret_size = self.func.ctype.arg.ret.size
         ret_float = self.func.ctype.arg.ret.is_floating()
@@ -293,7 +388,13 @@ class Call(ILCommand):
         xmm_regs = spots.xmm_arg_regs
         int_moves, flt_moves, stack_args = [], [], []
         struct_reg_moves = []  # (list-of-regs, struct arg) for 9..16-byte args
-        if self.variadic:
+        if self.pack:
+            # Packed calling convention: arguments are bit-packed into the
+            # registers named by the plan; nothing is passed on the stack and no
+            # per-arg register move is classified here (emit_reg_moves is
+            # overridden below to build the packed registers).
+            pass
+        elif self.variadic:
             stack_args = list(self.args)
         else:
             ii = fi = 0
@@ -354,6 +455,19 @@ class Call(ILCommand):
                     size = arg.ctype.size
                     fmov = asm_cmds.Movss if size == 4 else asm_cmds.Movsd
                     asm_code.add(fmov(xreg, spotmap[arg], size))
+
+        # Packed calling convention (-f-pack-args): build the packed argument
+        # registers from the args wherever they live, replacing the per-arg
+        # register moves. Packable signatures never have stack/struct/float
+        # args, so the rest of the call machinery (tail/ordinary/metamorphic)
+        # is reused unchanged. A packed call is always a direct call.
+        if self.pack:
+            packed_regs, packed_fields = self.pack
+            int_regs_used = list(packed_regs)
+
+            def emit_reg_moves():
+                self._emit_pack(packed_regs, packed_fields,
+                                spotmap, get_reg, asm_code)
 
         def emit_ret():
             """Move the return value out of its ABI register if needed."""
