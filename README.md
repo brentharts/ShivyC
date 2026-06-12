@@ -155,22 +155,6 @@ ELF64 entry, symbol resolution) since this environment has no emulator. See
 
 ---
 
-## Toward self-hosting: a Python→C transpiler
-
-[`shivycx_transpiler.py`](shivycx_transpiler.py) translates annotated ShivyC
-modules to C, beginning with the lexer stack in
-
-[`shivyc/transpile/`](shivyc/transpile/) (token kinds, tokens, the error
-collector, regex helpers, and `tokenize()`). A differential harness feeds the
-same lines to the Python tokenizer and the transpiled C tokenizer and compares
-them token by token.
-
-```sh
-tools/transpile        # transpile + compile the lexer modules
-```
-
----
-
 ## Implementation overview
 
 #### Preprocessor
