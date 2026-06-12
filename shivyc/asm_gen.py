@@ -668,14 +668,22 @@ class ASMGen:
             return LiteralSpot(self.il_code.literals[v])
 
         elif v in self.il_code.float_literals:
-            import struct
+            import struct, math
             name = f"__fltlit{num}"
             val = self.il_code.float_literals[v]
+            fmt = "<f" if v.ctype.size == 4 else "<d"
+            try:
+                raw = struct.pack(fmt, val)
+            except OverflowError:
+                # A finite literal whose magnitude exceeds the target type's
+                # range converts to IEEE infinity (with the same sign) rather
+                # than being an error.
+                raw = struct.pack(fmt, math.copysign(float("inf"), val))
             if v.ctype.size == 4:
-                bits = struct.unpack("<I", struct.pack("<f", val))[0]
+                bits = struct.unpack("<I", raw)[0]
                 self.asm_code.add_data(name, 4, bits)
             else:
-                bits = struct.unpack("<Q", struct.pack("<d", val))[0]
+                bits = struct.unpack("<Q", raw)[0]
                 self.asm_code.add_data(name, 8, bits)
             return MemSpot(name)
 
