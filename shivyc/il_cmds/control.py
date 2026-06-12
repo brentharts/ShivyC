@@ -391,7 +391,24 @@ class Call(ILCommand):
         if pad:
             asm_code.add(asm_cmds.Sub(spots.RSP, LiteralSpot(str(pad)), 8))
         for slot in reversed(stack_slots):
-            asm_code.add(asm_cmds.Push(slot, None, 8))
+            # x86-64 `push imm` encodes only a 32-bit (sign-extended)
+            # immediate, so a wider literal argument cannot be pushed directly.
+            # No scratch register is guaranteed free here (the argument-register
+            # moves have not happened yet), so push the low half as an 8-byte
+            # slot and overwrite its high 4 bytes with a 32-bit store. e.g.
+            # passing LLONG_MAX/LLONG_MIN as a stack argument.
+            if (isinstance(slot, LiteralSpot)
+                    and not (-(2 ** 31) <= int(slot.value) < 2 ** 31)):
+                v = int(slot.value) & 0xFFFFFFFFFFFFFFFF
+                low = v & 0xFFFFFFFF
+                high = (v >> 32) & 0xFFFFFFFF
+                low_s = low - (1 << 32) if low >= (1 << 31) else low
+                high_s = high - (1 << 32) if high >= (1 << 31) else high
+                asm_code.add(asm_cmds.Push(LiteralSpot(str(low_s)), None, 8))
+                asm_code.add(asm_cmds.Raw(
+                    "mov DWORD PTR [rsp+4], %d" % high_s))
+            else:
+                asm_code.add(asm_cmds.Push(slot, None, 8))
 
         # Move arguments into the argument registers (same for all call forms).
         if self.direct_name:
