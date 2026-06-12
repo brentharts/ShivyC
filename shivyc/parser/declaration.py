@@ -445,6 +445,14 @@ def parse_struct_union_members(index):
         if token_is(index, token_kinds.close_brack):
             return members, index + 1
 
+        # Tolerate stray semicolons (empty member declarations). These arise
+        # from macros such as CPython's Py_ARRAY_LENGTH, which expands a
+        # _Static_assert to nothing inside a struct, leaving a bare `;`. GCC and
+        # Clang accept empty members here, so ShivyCX skips them.
+        if token_is(index, token_kinds.semicolon):
+            index += 1
+            continue
+
         node, index = parse_decls_inits(index, False)
         members.append(node)
 
