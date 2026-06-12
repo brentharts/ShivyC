@@ -14,6 +14,13 @@ On top of standard C, ShivyCX adds:
   and can discharge a vectorizer's remainder loop.
 - **Register-partitioned threads** — a whole-program *left/right* register split
   with specialized context switchers.
+- **Argument packing** — an opt-in (`-f-pack-args`) non-standard calling
+  convention that bit-packs small integer parameters into as few registers as
+  possible (eight `char`s in one register instead of six registers plus two
+  stack slots).
+- **Callee-saved register allocation** — the allocator uses `rbx`/`r12`–`r15`
+  for values live across a call, so they need not spill to memory (always on;
+  ~1.5× on deeply nested call chains).
 - **Memory safety** — whole-program use-after-free / double-free detection and
   automatic `free` insertion for unannotated C.
 - **Bare-metal operation** — freestanding, bootable 64-bit images with an inlined
@@ -86,6 +93,37 @@ python3 -m shivyc.main threads_demo.c \
 Details in [`shivyc/README.md`](shivyc/README.md)
 ---
 
+## Calling convention: argument packing and callee-saved registers
+
+Two optimizations attack the cost of moving values across a call.
+
+**Argument packing (`-f-pack-args`, opt-in).** Under the System V ABI a function
+of nine `char`s burns six registers and spills three to the stack. With
+`-f-pack-args` ([`shivyc/pack_args.py`](shivyc/pack_args.py)), small integer
+parameters are bit-packed by offset into as few registers as possible — the
+caller builds each packed register with shifts/`or`s and the callee unpacks it —
+so eight `char`s arrive in **one** register and nine in two, with no stack
+traffic. Caller and callee recompute the identical layout from the signature, so
+the convention is self-describing. It is applied only to statically known
+(direct) calls, and any function whose address is taken (including via a global
+function-pointer initializer) is **never** packed, so the standard ABI is always
+honored at indirect call sites.
+
+```sh
+# pack small integer args into shared registers (composes with -fstackless-calls)
+python3 -m shivyc.main -f-pack-args prog.c -o prog
+```
+
+**Callee-saved register allocation (always on).** The register allocator uses
+`rbx` and `r12`–`r15` for values that are *live across a call*, which the call
+clobbers in every caller-saved register and would otherwise force to memory.
+Each callee-saved register a function uses is saved in its prologue and restored
+on every exit path; frameless and `-O4` near-scratch leaves stay on caller-saved
+registers so they remain frameless. On deeply nested call chains this is roughly
+a **1.5×** speedup and beats `gcc -O0`.
+
+---
+
 ## Bare-metal / freestanding operation
 
 A mini-OS (*MiniKraft*) is inlined into [`minikraft.py`](minikraft.py) — every
@@ -151,8 +189,11 @@ The parse tree is traversed to a flat three-address IL; commands live in
 
 #### ASM generation
 IL is lowered to Intel-syntax x86-64; register allocation uses George and
-Appel's iterated register coalescing. General code in
-[`asm_gen.py`](shivyc/asm_gen.py).
+Appel's iterated register coalescing over a pool that includes the callee-saved
+registers (`rbx`, `r12`–`r15`), which are saved/restored per function so that
+values live across a call can stay in registers. General code in
+[`asm_gen.py`](shivyc/asm_gen.py); the argument-packing convention is a
+whole-program pass in [`pack_args.py`](shivyc/pack_args.py).
 
 #### Whole-program call graph
 The driver can build and print the program-wide call graph
@@ -169,3 +210,4 @@ elimination.
 - x86-64 ABI — https://github.com/hjl-tools/x86-psABI/wiki/x86-64-psABI-1.0.pdf
 - Iterated Register Coalescing (George and Appel) — https://www.cs.purdue.edu/homes/hosking/502/george.pdf
 - *Foundational Problems with Compilers and Operating Systems* (B. Hartshorn, viXra 2025).
+- https://ai.vixra.org/abs/2507.0081
