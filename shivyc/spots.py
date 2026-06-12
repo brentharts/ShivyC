@@ -110,6 +110,10 @@ class RegSpot(Spot):
                "r9": ["r9", "r9d", "r9w", "r9b"],
                "r10": ["r10", "r10d", "r10w", "r10b"],
                "r11": ["r11", "r11d", "r11w", "r11b"],
+               "r12": ["r12", "r12d", "r12w", "r12b"],
+               "r13": ["r13", "r13d", "r13w", "r13b"],
+               "r14": ["r14", "r14d", "r14w", "r14b"],
+               "r15": ["r15", "r15d", "r15w", "r15b"],
                "rbp": ["rbp", "", "", ""],
                "rsp": ["rsp", "", "", ""]}
 
@@ -265,7 +269,23 @@ R9 = RegSpot("r9")
 R10 = RegSpot("r10")
 R11 = RegSpot("r11")
 
-registers = [RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11]
+# Callee-saved (preserved across calls). A function that allocates any of these
+# must save/restore it in its prologue/epilogue. Because Call does not list them
+# as clobbered, the allocator may keep a value that is live across a call in one
+# of these, avoiding a spill to memory -- the payoff is largest in deeply nested
+# call chains (and composes with -f-pack-args, which frees argument registers).
+RBX = RegSpot("rbx")
+R12 = RegSpot("r12")
+R13 = RegSpot("r13")
+R14 = RegSpot("r14")
+R15 = RegSpot("r15")
+
+# Caller-saved registers are listed first so the graph colorer prefers them for
+# short-lived temporaries (no save/restore cost); callee-saved registers come
+# last and are used mainly for values that survive a call.
+caller_saved_registers = [RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11]
+callee_saved_registers = [RBX, R12, R13, R14, R15]
+registers = caller_saved_registers + callee_saved_registers
 
 RBP = RegSpot("rbp")
 RSP = RegSpot("rsp")

@@ -417,6 +417,16 @@ class ASMGen:
             self._near_off = 0
             self._near_size = 0
 
+            # A near-scratch leaf is meant to stay frameless (spilling into its
+            # static buffer); using a callee-saved register would force a
+            # save/restore frame, so keep these functions on caller-saved only.
+            if self._near_active:
+                cs = set(spots.callee_saved_registers)
+                self.alloc_registers = [r for r in self.alloc_registers
+                                        if r not in cs]
+                self.all_registers = [r for r in self.all_registers
+                                      if r not in cs]
+
             self.asm_code.add(asm_cmds.Label(func))
 
             # Contract-proven SIMD reductions get a hand-synthesized,
@@ -1035,6 +1045,28 @@ class ASMGen:
     def _generate_asm(self, commands, live_vars, spotmap):
         """Generate assembly code."""
 
+        # Map every size variant (rbx/ebx/bx/bl, r12/r12d/...) of each
+        # callee-saved register back to its 64-bit RegSpot, so we can detect
+        # which callee-saved registers the generated body actually touches.
+        callee_saved = spots.callee_saved_registers
+        name_to_reg = {}
+        for reg in callee_saved:
+            for variant in spots.RegSpot.reg_map[reg.name]:
+                if variant:
+                    name_to_reg[variant] = reg
+
+        def used_callee_saved(cmds):
+            used = []
+            seen = set()
+            for c in cmds:
+                for field in (getattr(c, "dest", None), getattr(c, "source", None)):
+                    reg = name_to_reg.get(field)
+                    if reg is not None and reg not in seen:
+                        seen.add(reg)
+                        used.append(reg)
+            return used
+
+
         # This is kinda hacky...
         max_offset = max(spot.rbp_offset() for spot in spotmap.values())
 
@@ -1051,15 +1083,24 @@ class ASMGen:
         frameless = False
         info = getattr(self.il_code, "stackless_info", {})
         fn_info = info.get(self._cur_func_name)
+        # A function that allocates a callee-saved register must save/restore it
+        # in a real prologue/epilogue, so it cannot be frameless.
+        callee_saved_set = set(callee_saved)
+        spotmap_callee_saved = any(s in callee_saved_set
+                                   for s in spotmap.values())
         if fn_info is not None:
             frameless = (base_offset == 0
-                         and fn_info.get("no_regular_call", False))
+                         and fn_info.get("no_regular_call", False)
+                         and not spotmap_callee_saved)
         # A function that receives arguments on the stack reads them relative
         # to rbp ([rbp+16], ...), so it must keep a real frame.
         if any(getattr(cmd, "stack_spot", None) is not None
                for cmd in commands):
             frameless = False
         self.asm_code.frameless = frameless
+        # A frameless function has no place to save callee-saved registers, so
+        # keep its scratch allocation on caller-saved registers only.
+        self._scratch_caller_saved_only = frameless
 
         # Per-command register-scratch spill pool. When every allocatable
         # register holds a value live across a command, handing out a scratch
@@ -1102,6 +1143,10 @@ class ASMGen:
                             _spilled=spilled_this_cmd, _inputs=input_spots):
                     if not pref: pref = []
                     if not conf: conf = []
+                    pool = self.all_registers
+                    if getattr(self, "_scratch_caller_saved_only", False):
+                        pool = [r for r in pool
+                                if r not in set(spots.callee_saved_registers)]
 
                     # Bad if holding a variable live both entering and exiting
                     # this command.
@@ -1115,7 +1160,7 @@ class ASMGen:
                     # Bad if listed as a conflicting spot.
                     bad_spots |= set(conf)
 
-                    for s in (pref + self.all_registers):
+                    for s in (pref + pool):
                         if isinstance(s, RegSpot) and s not in bad_spots:
                             return s
 
@@ -1124,7 +1169,7 @@ class ASMGen:
                     # using (conf or a prior spill) in a scratch slot, hand it
                     # out, and restore it after the command finishes.
                     already = set(r for r, _ in _spilled)
-                    for s in self.all_registers:
+                    for s in pool:
                         if (isinstance(s, RegSpot) and s not in conf
                                 and s not in _inputs and s not in already):
                             j = len(_spilled)
@@ -1153,6 +1198,33 @@ class ASMGen:
         if max_offset % 16 != 0:
             max_offset += 16 - max_offset % 16
 
+        # Callee-saved registers the body actually used must be preserved for
+        # the caller: store each one's incoming value to a frame slot at entry
+        # and restore it before every epilogue. (Frameless functions are kept
+        # off callee-saved registers above, so saved_regs is empty there.)
+        saved_slots = []
+        for reg in used_callee_saved(body):
+            slot = self._alloc_stack_slot(8)
+            saved_slots.append((reg, slot))
+            max_offset = max(max_offset, slot.rbp_offset())
+        if max_offset % 16 != 0:
+            max_offset += 16 - max_offset % 16
+
+        if saved_slots:
+            # Insert the restores just before each epilogue. The epilogue starts
+            # with `mov rsp, rbp` (also used by tail-call teardown), so every
+            # exit path -- ordinary return, tail jump, metamorphic jump -- gets
+            # its registers restored.
+            patched = []
+            for cmd in body:
+                if (getattr(cmd, "name", None) == "mov"
+                        and getattr(cmd, "dest", None) == "rsp"
+                        and getattr(cmd, "source", None) == "rbp"):
+                    for reg, slot in reversed(saved_slots):
+                        patched.append(asm_cmds.Mov(reg, slot, 8))
+                patched.append(cmd)
+            body[:] = patched
+
         if not frameless:
             # Back up rbp and move rsp
             self.asm_code.add(asm_cmds.Push(spots.RBP, None, 8))
@@ -1160,6 +1232,10 @@ class ASMGen:
 
             offset_spot = LiteralSpot(str(max_offset))
             self.asm_code.add(asm_cmds.Sub(spots.RSP, offset_spot, 8))
+
+        # Save callee-saved registers used by the body (after the frame exists).
+        for reg, slot in saved_slots:
+            self.asm_code.add(asm_cmds.Mov(slot, reg, 8))
 
         # SIMD bit-packing prologue hooks.
         if self.simd_pack.active:
