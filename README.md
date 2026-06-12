@@ -8,8 +8,13 @@ practical precisely because every pass is a few hundred lines of legible Python.
 
 On top of standard C, ShivyCX adds:
 
-- **`_Nbit` globals** — pack small global flags into an otherwise-idle SIMD
-  register.
+- **`_Nbit` globals** — pack small global flags (`name_Nbit`, 1≤N≤8) into an
+  otherwise-idle SIMD register (`xmm15`) via `-fsimd-pack-globals`, collapsing
+  *N* flag memory loads in a hot routine to one. A loop pass register-promotes
+  packed globals across a loop — decompress into GP registers once before,
+  operate on registers inside, recompress once after — turning a read-modify-write
+  loop from a regression into a win (~1.4× over memory globals, ~1.8× over
+  `gcc -O0`).
 - **Contracts** — compile-time precondition clauses that bound argument lengths
   and can discharge a vectorizer's remainder loop.
 - **Register-partitioned threads** — a whole-program *left/right* register split
@@ -193,7 +198,9 @@ Appel's iterated register coalescing over a pool that includes the callee-saved
 registers (`rbx`, `r12`–`r15`), which are saved/restored per function so that
 values live across a call can stay in registers. General code in
 [`asm_gen.py`](shivyc/asm_gen.py); the argument-packing convention is a
-whole-program pass in [`pack_args.py`](shivyc/pack_args.py).
+whole-program pass in [`pack_args.py`](shivyc/pack_args.py), and loop
+register-promotion of `_Nbit` packed globals is an IL pass in
+[`simd_pack_promote.py`](shivyc/simd_pack_promote.py).
 
 #### Whole-program call graph
 The driver can build and print the program-wide call graph
