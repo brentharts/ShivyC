@@ -162,6 +162,28 @@ _BUILTIN_PRELUDE += (
     "#define __builtin_unreachable() ((void)0)\n"
 )
 
+# A few more GCC builtins used by CPython/mimalloc. The infinities rely on the
+# fact that a literal beyond the target type's range converts to IEEE infinity;
+# the bit-count and overflow forms are exact, written with the statement-
+# expression extension so each argument is evaluated once.
+_BUILTIN_PRELUDE += (
+    "#define __builtin_inff() (1e40f)\n"
+    "#define __builtin_inf() (1e400)\n"
+    "#define __builtin_huge_valf() (1e40f)\n"
+    "#define __builtin_huge_val() (1e400)\n"
+    "#define __builtin_nanf(s) (0.0f/0.0f)\n"
+    "#define __builtin_clzl(x) __extension__({ unsigned long _clzv=(x); int _clzn=0; if(_clzv==0){_clzn=64;}else{while(!(_clzv & 0x8000000000000000UL)){_clzv<<=1;_clzn++;}} _clzn; })\n"
+    "#define __builtin_clzll(x) __builtin_clzl(x)\n"
+    "#define __builtin_clz(x)  __extension__({ unsigned int _clzv=(x); int _clzn=0; if(_clzv==0){_clzn=32;}else{while(!(_clzv & 0x80000000U)){_clzv<<=1;_clzn++;}} _clzn; })\n"
+    "#define __builtin_ctzl(x) __extension__({ unsigned long _ctzv=(x); int _ctzn=0; if(_ctzv==0){_ctzn=64;}else{while(!(_ctzv & 1UL)){_ctzv>>=1;_ctzn++;}} _ctzn; })\n"
+    "#define __builtin_ctzll(x) __builtin_ctzl(x)\n"
+    "#define __builtin_ctz(x)  __extension__({ unsigned int _ctzv=(x); int _ctzn=0; if(_ctzv==0){_ctzn=32;}else{while(!(_ctzv & 1U)){_ctzv>>=1;_ctzn++;}} _ctzn; })\n"
+    "#define __builtin_umull_overflow(a, b, res) __extension__({ unsigned long _moa=(a),_mob=(b); *(res)=_moa*_mob; (_moa!=0 && (*(res)/_moa)!=_mob); })\n"
+    "#define __builtin_umulll_overflow(a, b, res) __builtin_umull_overflow(a, b, res)\n"
+    "#define __builtin_mul_overflow(a, b, res) __extension__({ __auto_type _moa=(a),_mob=(b); *(res)=_moa*_mob; (_moa!=0 && (*(res)/_moa)!=_mob); })\n"
+    "#define __builtin_add_overflow(a, b, res) __extension__({ __auto_type _aoa=(a),_aob=(b); *(res)=_aoa+_aob; (*(res) < _aoa); })\n"
+)
+
 
 def _seed_builtins(macros):
     """Populate `macros` with the GCC-compatibility prelude definitions."""
