@@ -82,7 +82,7 @@ typedef char* str;
 
 /* ---- Tier 2: generic dynamic value (used only where the type is open) ---- */
 typedef struct Obj Obj;
-enum { T_NONE, T_INT, T_BOOL, T_STR, T_OBJ, T_LIST, T_DICT };
+enum { T_NONE, T_INT, T_BOOL, T_STR, T_OBJ, T_LIST, T_DICT, T_FUNC };
 typedef struct { unsigned char tag; union { long i; str s; Obj* o; } u; } obj;
 
 #define OBJ_NONE    ((obj){T_NONE,{0}})
@@ -120,6 +120,15 @@ static inline bool isinstance_of(Obj* o, const void* t) {
 /* fetch a transpiled value's TypeInfo (cast to the module's TypeInfo type) */
 #define TYPEINFO(T, o) ((const T*)((Obj*)(o))->type)
 
+/* ---- first-class functions: a callable obj (T_FUNC) is a closure: a uniform
+   function pointer plus a captured-environment obj. All transpiled functions
+   used as values get a trampoline of this shape that unpacks the arg list. -- */
+typedef obj (*ClosureFn)(obj env, obj args);   /* args is a T_LIST of arguments */
+typedef struct Closure { Obj _hdr; ClosureFn fn; obj env; } Closure;
+obj  make_closure(ClosureFn fn, obj env);
+obj  call_closure(obj f, obj args);
+obj  call_obj(obj f, int n, ...);              /* convenience: builds arg list  */
+
 /* ---- arena: bump-allocate; free the whole compile at once (no refcount) -- */
 void* aalloc(size_t n);
 void  arena_reset(void);
@@ -136,6 +145,7 @@ typedef struct { obj* data; int len; int cap; } List;
 obj  list_new(void);
 obj  list_of(int n, ...);          /* [a, b, c] literal                       */
 void list_append(obj lst, obj v);
+void list_extend(obj lst, obj it);      /* append all elements of it           */
 obj  list_get(obj lst, long i);    /* supports negative indices               */
 void list_set(obj lst, long i, obj v);
 long pylen(obj v);                 /* len(list) or len(str)                   */
@@ -231,6 +241,27 @@ void* aalloc(size_t n) {
     return p;
 }
 void arena_reset(void) { g_ap = 0; }
+
+/* ---- first-class function support ---- */
+static const TypeInfoHdr CLOSURE_TYPE = { "function", NULL };
+obj make_closure(ClosureFn fn, obj env) {
+    Closure* c = (Closure*)aalloc(sizeof(Closure));
+    c->_hdr.type = &CLOSURE_TYPE;
+    c->fn = fn; c->env = env;
+    return (obj){T_FUNC, {.o = (Obj*)c}};
+}
+obj call_closure(obj f, obj args) {
+    Closure* c = (Closure*)f.u.o;
+    return c->fn(c->env, args);
+}
+obj call_obj(obj f, int n, ...) {
+    obj args = list_new();
+    va_list ap; va_start(ap, n);
+    for (int i = 0; i < n; i++) list_append(args, va_arg(ap, obj));
+    va_end(ap);
+    return call_closure(f, args);
+}
+
 
 static str pyrepr(obj v);   /* repr() — quotes strings inside containers */
 
@@ -345,6 +376,10 @@ void list_append(obj lst, obj v) {
         l->data = nd; l->cap = nc;
     }
     l->data[l->len++] = v;
+}
+void list_extend(obj lst, obj it) {
+    long n = pylen(it);
+    for (long i = 0; i < n; i++) list_append(lst, index_obj(it, i));
 }
 obj list_of(int n, ...) {
     obj r = list_new();
@@ -1224,6 +1259,8 @@ class Transpiler:
         self.singleton_names = {}   # var -> ClassName (module-level instances)
         self.str_sets = {}          # module-level set/list of string literals
         self.func_returns = {}      # top-level function name -> return ctype
+        self.func_values_needed = set()  # functions used as first-class values
+        self.class_values_needed = set()  # classes used as constructor values
         self.func_params = {}       # top-level function name -> [param ctypes]
         self.scope = {}             # local/param name -> ctype (per function)
         self.narrowed = {}          # name -> ctype, active in an isinstance block
@@ -1328,10 +1365,15 @@ class Transpiler:
             if isinstance(node, ast.ClassDef):
                 continue
             self.toplevel(node)
+        self.emit_trampolines()
         self.emit_module_init()
         # insert cross-module extern declarations at the reserved point
         externs = self.build_externs()
-        self.lines[self.extern_idx:self.extern_idx] = externs
+        tramps = ["static obj %s__tramp(obj, obj);" % cname(fn)
+                  for fn in sorted(self.func_values_needed)]
+        tramps += ["static obj %s__ctortramp(obj, obj);" % cls
+                   for cls in sorted(self.class_values_needed)]
+        self.lines[self.extern_idx:self.extern_idx] = externs + tramps
         return "\n".join(self.lines) + "\n"
 
     def struct_body_lines(self, ci):
@@ -1424,6 +1466,25 @@ class Transpiler:
         """Prototypes for top-level functions, plus file-scope declarations for
         module-level globals (initialized later in <module>_init)."""
         protos = []
+        for ci in self.class_order:         # method + constructor prototypes
+            for mname, fn in ci.methods.items():
+                if mname.startswith("__") and mname.endswith("__") \
+                        and mname != "__init__":
+                    continue
+                ret = ann_to_ctype(fn.returns) or OBJ
+                params = self.param_list(fn, skip_self=True)
+                if mname == "__init__":
+                    plist = ", ".join(["%s* self" % ci.name] + params)
+                    protos.append("void %s___init__(%s);" % (ci.name, plist))
+                    cargs = ", ".join(params) if params else "void"
+                    protos.append("%s* %s_new(%s);" % (ci.name, ci.name, cargs))
+                elif mname in VTABLE_METHODS:
+                    protos.append("%s %s_%s(Obj* self_%s);" % (
+                        ret, ci.name, mname,
+                        (", " + ", ".join(params)) if params else ""))
+                else:
+                    plist = ", ".join(["%s* self" % ci.name] + params)
+                    protos.append("%s %s_%s(%s);" % (ret, ci.name, mname, plist))
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
                 protos.append(self.func_signature(node) + ";")
@@ -2028,6 +2089,73 @@ class Transpiler:
         for ln in self.assign(node, toplevel=True):
             self.emit(ln)
 
+    def emit_trampolines(self):
+        """Uniform-signature wrappers for functions used as first-class values:
+        unpack the arg list, coerce to the real parameter types, call, and box
+        the result back to a Tier-2 obj."""
+        for fn in sorted(self.func_values_needed):
+            node = self.func_nodes[fn]
+            pct = self.func_params.get(fn, [])
+            ret = self.func_returns.get(fn, OBJ)
+            args = []
+            for i, ct in enumerate(pct):
+                a = "index_obj(args, %d)" % i
+                if ct == "int":
+                    a = "AS_INT(%s)" % a
+                elif ct == "bool":
+                    a = "truthy(%s)" % a
+                elif ct == "char*":
+                    a = "AS_STR(%s)" % a
+                elif ct.endswith("*") and ct != OBJ:
+                    a = "(%s)AS_OBJ(%s)" % (ct, a)
+                args.append(a)
+            call = "%s(%s)" % (cname(fn), ", ".join(args))
+            self.emit("static obj %s__tramp(obj env, obj args) {" % cname(fn))
+            self.indent += 1
+            self.emit("(void)env; (void)args;")
+            if ret == "void":
+                self.emit("%s; return OBJ_NONE;" % call)
+            elif ret == OBJ:
+                self.emit("return %s;" % call)
+            elif ret == "int":
+                self.emit("return OBJ_INT(%s);" % call)
+            elif ret == "bool":
+                self.emit("return OBJ_BOOL(%s);" % call)
+            elif ret == "char*":
+                self.emit("return OBJ_STR(%s);" % call)
+            elif ret.endswith("*"):
+                self.emit("return OBJ_OBJ(%s);" % call)
+            else:
+                self.emit("return %s;" % call)
+            self.indent -= 1
+            self.emit("}")
+            self.emit()
+        for cls in sorted(self.class_values_needed):
+            ci = self.classes.get(cls) or (self.xclasses[cls][0]
+                                           if cls in self.xclasses else None)
+            init = ci.methods.get("__init__") if ci else None
+            pct = [arg_ctype(init, a) for a in init.args.args[1:]] \
+                if init else []
+            args = []
+            for i, ct in enumerate(pct):
+                a = "index_obj(args, %d)" % i
+                if ct == "int":
+                    a = "AS_INT(%s)" % a
+                elif ct == "bool":
+                    a = "truthy(%s)" % a
+                elif ct == "char*":
+                    a = "AS_STR(%s)" % a
+                elif ct.endswith("*") and ct != OBJ:
+                    a = "(%s)AS_OBJ(%s)" % (ct, a)
+                args.append(a)
+            self.emit("static obj %s__ctortramp(obj env, obj args) {" % cls)
+            self.indent += 1
+            self.emit("(void)env; (void)args;")
+            self.emit("return OBJ_OBJ(%s_new(%s));" % (cls, ", ".join(args)))
+            self.indent -= 1
+            self.emit("}")
+            self.emit()
+
     def emit_module_init(self):
         self.emit("/* Initialize module-level globals (Python import-time). */")
         self.emit("void %s_init(void) {" % self.cmod)
@@ -2235,6 +2363,11 @@ class Transpiler:
                     return f.id + "*"
                 if f.id in self.func_returns:
                     return self.func_returns[f.id]
+                # calling an obj-typed local/param (first-class function) -> obj
+                if f.id in self.scope and self.scope[f.id] == OBJ \
+                        and f.id not in self.func_params \
+                        and f.id not in self.classes:
+                    return OBJ
                 if f.id in self.from_imports:
                     kind, info = self.resolve_import(f.id,
                                                      self.from_imports[f.id])
@@ -2612,6 +2745,14 @@ class Transpiler:
             return "/* expr-error %s */ OBJ_NONE" % e
 
     def ex_Name(self, node):
+        # a top-level function used as a *value* (not called) becomes a closure
+        if node.id in self.func_nodes and node.id not in self.scope:
+            self.func_values_needed.add(node.id)
+            return "make_closure(&%s__tramp, OBJ_NONE)" % cname(node.id)
+        # a class used as a *value* becomes a constructor closure
+        if node.id in self.classes and node.id not in self.scope:
+            self.class_values_needed.add(node.id)
+            return "make_closure(&%s__ctortramp, OBJ_NONE)" % node.id
         return cname(node.id)
 
     def const_literal(self, v):
@@ -2682,7 +2823,8 @@ class Transpiler:
                 if kind in ("singleton", "func"):
                     return cname(node.attr)      # bare exported symbol
                 if kind == "class":
-                    return cname(node.attr)      # class-as-value (rare)
+                    self.class_values_needed.add(node.attr)
+                    return "make_closure(&%s__ctortramp, OBJ_NONE)" % node.attr
                 if base in self.modules:
                     return "%s_%s" % (base, node.attr)
             if base in self.modules:
@@ -2856,6 +2998,14 @@ class Transpiler:
                     defs = self.defaults_for(info, False)
                     cargs = self.coerce_args(pct, node.args, defs)
                     return "%s(%s)" % (fn, ", ".join(cargs))
+            # calling an obj-typed local/param: a first-class function value
+            if fn in self.scope and self.scope[fn] == OBJ \
+                    and fn not in self.func_params and fn not in self.classes:
+                args = [self.wrap_obj(a) for a in node.args]
+                if args:
+                    return "call_obj(%s, %d, %s)" % (cname(fn), len(args),
+                                                     ", ".join(args))
+                return "call_closure(%s, list_new())" % cname(fn)
 
         if isinstance(func, ast.Attribute) and is_super_call(func.value):
             base = self.cur_class.base if self.cur_class else None
@@ -2898,6 +3048,10 @@ class Transpiler:
             # list methods on an obj/list receiver
             if func.attr == "append" and len(node.args) == 1:
                 return "list_append(%s, %s)" % (self.expr(func.value),
+                                                self.wrap_obj(node.args[0]))
+            if func.attr == "extend" and len(node.args) == 1 and \
+                    func.attr not in self.method_owners:
+                return "list_extend(%s, %s)" % (self.wrap_obj(func.value),
                                                 self.wrap_obj(node.args[0]))
             if func.attr == "add" and len(node.args) == 1 and \
                     func.attr not in self.method_owners:
@@ -3170,7 +3324,7 @@ class Transpiler:
             tag = self.BUILTIN_TYPE_TAGS[cls_node.id]
             return "((%s).tag == %s)" % (self.wrap_obj(val_node), tag)
         type_sym = self._type_symbol(cls_node)
-        if self.is_obj_word(val_node):
+        if self.is_obj_word(val_node) or self.value_ctype(val_node) == OBJ:
             return "OBJ_ISINST(%s, %s)" % (self.expr(val_node), type_sym)
         return "isinstance_of((Obj*)(%s), %s)" % (self.expr(val_node),
                                                   type_sym)
@@ -3346,6 +3500,10 @@ class Transpiler:
                 return self.cur_class.name + "*"
             if node.id in self.scope:
                 return self.scope[node.id]
+            if node.id in self.func_nodes:   # function used as a value -> closure
+                return OBJ
+            if node.id in self.classes:      # class used as a value -> ctor closure
+                return OBJ
             if node.id in self.singleton_names:
                 return self.singleton_names[node.id] + "*"
             if node.id in self.mod_const_types:
@@ -3366,6 +3524,11 @@ class Transpiler:
                                                if bn in self.xclasses else None)
                 if sci is not None and self.static_owner(sci, node.attr):
                     return OBJ
+                # alias.ClassName used as a value -> a constructor closure (obj)
+                if bn in self.import_alias:
+                    kind, _ = self.xref(node.attr, self.import_alias[bn])
+                    if kind == "class":
+                        return OBJ
             if isinstance(node.value, ast.Name) and \
                     node.value.id == "self" and self.cur_class:
                 return self.cur_class.field_ctype(node.attr)
