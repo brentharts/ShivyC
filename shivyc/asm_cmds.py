@@ -89,7 +89,7 @@ class Raw:
         return "\t" + self.text
 
 
-class Label:
+class AsmLabel:
     """Class for label."""
 
     def __init__(self, label):  # noqa: D102
@@ -156,19 +156,19 @@ class Movzx(_ASMCommandMultiSize): name = "movzx"  # noqa: D101
 class Mov(_ASMCommand): name = "mov"  # noqa: D101
 
 
-class Add(_ASMCommand): name = "add"  # noqa: D101
+class AsmAdd(_ASMCommand): name = "add"  # noqa: D101
 
 
 class Sub(_ASMCommand): name = "sub"  # noqa: D101
 
 
-class Neg(_ASMCommand): name = "neg"  # noqa: D101
+class AsmNeg(_ASMCommand): name = "neg"  # noqa: D101
 
 
-class Not(_ASMCommand): name = "not"  # noqa: D101
+class AsmNot(_ASMCommand): name = "not"  # noqa: D101
 
 
-class Div(_ASMCommand): name = "div"  # noqa: D101
+class AsmDiv(_ASMCommand): name = "div"  # noqa: D101
 
 
 class Imul(_ASMCommand): name = "imul"  # noqa: D101
@@ -201,7 +201,7 @@ class Pop(_ASMCommand): name = "pop"  # noqa: D101
 class Push(_ASMCommand): name = "push"  # noqa: D101
 
 
-class Call(_ASMCommand): name = "call"  # noqa: D101
+class AsmCall(_ASMCommand): name = "call"  # noqa: D101
 
 
 class Ret(_ASMCommand): name = "ret"  # noqa: D101
