@@ -1260,16 +1260,21 @@ def discover_fields(classnode):
             else:
                 continue
             for tgt in targets:
-                if isinstance(tgt, ast.Attribute) and \
-                        isinstance(tgt.value, ast.Name) and \
-                        tgt.value.id == "self":
-                    # self.x = <optional param>  ->  obj
-                    if ann is None and isinstance(sub, ast.Assign) and \
-                            isinstance(sub.value, ast.Name) and \
-                            sub.value.id in opt:
-                        add(tgt.attr, OBJ)
-                    else:
-                        add(tgt.attr, infer_type(tgt.attr, ann))
+                # `self.a, self.b = ...` -> the target is a Tuple/List of
+                # Attributes; flatten so each self.<attr> is discovered.
+                subtgts = (tgt.elts if isinstance(tgt, (ast.Tuple, ast.List))
+                           else [tgt])
+                for st in subtgts:
+                    if isinstance(st, ast.Attribute) and \
+                            isinstance(st.value, ast.Name) and \
+                            st.value.id == "self":
+                        # self.x = <optional param>  ->  obj
+                        if ann is None and isinstance(sub, ast.Assign) and \
+                                isinstance(sub.value, ast.Name) and \
+                                sub.value.id in opt:
+                            add(st.attr, OBJ)
+                        else:
+                            add(st.attr, infer_type(st.attr, ann))
     return fields
 
 
@@ -2903,7 +2908,7 @@ class Transpiler:
         if isinstance(it, ast.Call) and isinstance(it.func, ast.Name) \
                 and it.func.id == "range" and isinstance(tgt, ast.Name):
             v = cname(tgt.id)
-            a = [self.expr(x) for x in it.args]
+            a = [self.coerce_to("int", x, self.expr(x)) for x in it.args]
             if len(a) == 1:
                 lo, hi, stp = "0", a[0], "1"
             elif len(a) == 2:
@@ -4051,7 +4056,9 @@ class Transpiler:
 
     def str_operand(self, node):
         s = self.expr(node)
-        return "AS_STR(%s)" % s if self.is_obj_word(node) else s
+        return ("AS_STR(%s)" % s
+                if self.is_obj_word(node) or self.value_ctype(node) == OBJ
+                else s)
 
     def as_str(self, node):
         """Render `node` as a char* expression."""
