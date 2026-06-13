@@ -1393,11 +1393,20 @@ class Transpiler:
                 continue
             subs = [c for c, (c2, _m) in self.xclasses.items()
                     if c2 is not ci and c2.root() is ci]
-            if not subs:
-                continue
-            for m in ci.methods:
-                if not (m.startswith("__") and m.endswith("__")):
-                    self.hierarchy_method.setdefault(m, mod)
+            if subs:
+                for m in ci.methods:
+                    if not (m.startswith("__") and m.endswith("__")):
+                        self.hierarchy_method.setdefault(m, mod)
+            else:
+                # An imported polymorphic root whose subclasses live in modules
+                # this one never imports -- e.g. asm_gen calls the ILCommand
+                # interface (inputs/outputs/targets/...) on IL commands it
+                # receives but never constructs. The root's own module emits the
+                # canonical vtable, so dispatch its virtual methods through that.
+                reg = self.load_xmod(mod)
+                if reg:
+                    for m in reg["vt"]:
+                        self.hierarchy_method.setdefault(m, mod)
         self.collect_module_globals(tree)
 
         self.prelude()
@@ -1871,6 +1880,8 @@ class Transpiler:
         miscompile."""
         if attr in self.method_owners:     # a local method of the same name wins
             return None
+        if attr in self.hierarchy_method:  # virtual via a canonical cross-module
+            return None                    # vtable; never bind to one (base) impl
         owners = self.xmethod_owners.get(attr, [])
         return owners[0] if len(owners) == 1 else None
 
