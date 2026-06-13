@@ -1180,6 +1180,7 @@ class Transpiler:
         self.func_returns = {}      # top-level function name -> return ctype
         self.func_params = {}       # top-level function name -> [param ctypes]
         self.scope = {}             # local/param name -> ctype (per function)
+        self.narrowed = {}          # name -> ctype, active in an isinstance block
         self.hoisted = set()        # locals declared at function top
         self.cur_ret = OBJ          # current function's return ctype
         self.loop_n = 0             # unique-id counter for generated loops
@@ -1477,6 +1478,16 @@ class Transpiler:
     def vt_struct_name(modname):
         return "VT_" + modname.replace(".", "_")
 
+    def _class_is_leaf(self, clsname):
+        """True if no known class (local or imported) derives from clsname."""
+        for ci in self.classes.values():
+            if ci.base_name == clsname:
+                return False
+        for cn, (ci, _m) in self.xclasses.items():
+            if ci.base_name == clsname:
+                return False
+        return True
+
     def resolve_xvirtual(self, attr):
         """A polymorphic imported method `attr` is dispatchable via a
         cross-module vtable iff all its definers live in ONE module and it is
@@ -1769,6 +1780,7 @@ class Transpiler:
     def enter_scope(self, fn, skip_self):
         self.scope = {}
         self.hoisted = set()
+        self.narrowed = {}          # name -> ctype, active in an isinstance block
         args = fn.args.args[1:] if skip_self else fn.args.args
         for arg in args:
             self.scope[arg.arg] = arg_ctype(fn, arg)
@@ -2067,6 +2079,21 @@ class Transpiler:
                     if kind == "func":
                         return ann_to_ctype(info.returns) or OBJ
             if isinstance(f, ast.Attribute):
+                # isinstance-narrowed receiver: report the concrete method's
+                # return type, matching ex_Call's narrowing dispatch.
+                if isinstance(f.value, ast.Name) and \
+                        f.value.id in self.narrowed:
+                    cls = self.narrowed[f.value.id][:-1]
+                    ci = self.classes.get(cls) or (self.xclasses[cls][0]
+                                                   if cls in self.xclasses
+                                                   else None)
+                    if ci is not None and self._class_is_leaf(cls):
+                        owner = ci.find_method_owner(f.attr)
+                        if owner is None and f.attr in ci.methods:
+                            owner = ci
+                        if owner is not None and f.attr in owner.methods:
+                            m = owner.methods[f.attr]
+                            return ann_to_ctype(m.returns) or OBJ
                 if isinstance(f.value, ast.Name) and \
                         f.value.id in self.import_alias:
                     kind, info = self.resolve_import(
@@ -2195,9 +2222,46 @@ class Transpiler:
         return ['fprintf(stderr, "raise %s\\n"); abort();' %
                 what.replace('"', '\\"')]
 
+    def _isinstance_class(self, ref):
+        """Resolve an isinstance() 2nd-arg class reference to a known class
+        name (local or imported), or None for tuples / unknown types."""
+        if isinstance(ref, ast.Name):
+            n = ref.id
+        elif isinstance(ref, ast.Attribute):
+            n = ref.attr                # e.g. value_cmds.AddrOf -> AddrOf
+        else:
+            return None                 # tuple-of-types: ambiguous, don't narrow
+        if n in self.classes or n in self.xclasses:
+            return n
+        return None
+
+    def _narrowings(self, test):
+        """[(name, 'Cls*')] implied true by `test`: a bare isinstance(name,Cls)
+        or an `and`-chain of them. Negation / `or` yield nothing."""
+        out = []
+        conds = test.values if isinstance(test, ast.BoolOp) and \
+            isinstance(test.op, ast.And) else [test]
+        for c in conds:
+            if isinstance(c, ast.Call) and isinstance(c.func, ast.Name) \
+                    and c.func.id == "isinstance" and len(c.args) == 2 \
+                    and isinstance(c.args[0], ast.Name):
+                cls = self._isinstance_class(c.args[1])
+                if cls:
+                    out.append((c.args[0].id, cls + "*"))
+        return out
+
     def st_If(self, node):
         lines = ["if (%s) {" % self.bool_expr(node.test)]
+        narrows = self._narrowings(node.test)
+        saved = {n: self.narrowed.get(n) for n, _ in narrows}
+        for n, ct in narrows:
+            self.narrowed[n] = ct
         lines += self.indent_lines(self.suite(node.body))
+        for n in saved:                 # restore: narrowing is block-scoped
+            if saved[n] is None:
+                self.narrowed.pop(n, None)
+            else:
+                self.narrowed[n] = saved[n]
         if node.orelse:
             if len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
                 inner = self.st_If(node.orelse[0])
@@ -2387,6 +2451,26 @@ class Transpiler:
             return repr(v)
         return str(v)
 
+    def _class_has_field(self, cls, field):
+        """True if class `cls` (local or imported), including bases, declares
+        `field` as a real struct member."""
+        ci = self.classes.get(cls) or (self.xclasses[cls][0]
+                                       if cls in self.xclasses else None)
+        if ci is None:
+            return False
+        try:
+            return any(fn == field for fn, _ in ci.full_fields())
+        except Exception:
+            return any(fn == field for fn, _ in ci.own_fields)
+
+    def _class_ptr_expr(self, node, cls):
+        """Render `node` as a `cls*`. A Tier-2 obj (e.g. an isinstance-narrowed
+        variable) must be unwrapped with AS_OBJ; a real pointer casts directly."""
+        e = self.expr(node)
+        if self.is_obj_word(node):
+            return "(%s*)AS_OBJ(%s)" % (cls, e)
+        return "(%s*)(%s)" % (cls, e)
+
     def ex_Attribute(self, node):
         if node.attr == "__name__" and isinstance(node.value, ast.Attribute) \
                 and node.value.attr == "__class__":
@@ -2411,6 +2495,15 @@ class Transpiler:
                 return "%s_%s" % (base, node.attr)
             if base == "self":
                 return "self->%s" % cname(node.attr)
+            # isinstance-narrowed variable: access the field through its proven
+            # concrete class (only when that class really declares the field).
+            if base in self.narrowed:
+                cls = self.narrowed[base][:-1]
+                if self._class_has_field(cls, node.attr):
+                    if cls in self.xclasses and cls not in self.classes:
+                        self.xstructs_needed.add(cls)
+                    return "(%s)->%s" % (self._class_ptr_expr(node.value, cls),
+                                         cname(node.attr))
         # access through a concrete class pointer:  p.attr -> (p)->attr
         bt = self.value_ctype(node.value)
         if bt and bt.endswith("*") and bt != OBJ:
@@ -2668,6 +2761,30 @@ class Transpiler:
                                       ", ".join(argstrs))
             if func.attr in VTABLE_METHODS:
                 return self.vcall(func.value, func.attr, node.args)
+            # isinstance-narrowed receiver: dispatch the method on its proven
+            # concrete class. Safe to devirtualize only for a leaf class, so no
+            # subclass can override the method at runtime.
+            if isinstance(func.value, ast.Name) and \
+                    func.value.id in self.narrowed:
+                cls = self.narrowed[func.value.id][:-1]
+                ci = self.classes.get(cls) or (self.xclasses[cls][0]
+                                               if cls in self.xclasses else None)
+                if ci is not None and self._class_is_leaf(cls):
+                    owner = ci.find_method_owner(func.attr)
+                    if owner is None and func.attr in ci.methods:
+                        owner = ci
+                    if owner is not None and func.attr in owner.methods:
+                        m = owner.methods[func.attr]
+                        ret = ann_to_ctype(m.returns) or OBJ
+                        if owner.name in self.xclasses and \
+                                owner.name not in self.classes:
+                            self.used_xmethods[(owner.name, func.attr)] = ret
+                        pct = [arg_ctype(m, a) for a in m.args.args[1:]]
+                        cargs = self.coerce_args(pct, node.args)
+                        return "%s_%s(%s%s)" % (
+                            owner.name, func.attr,
+                            self._class_ptr_expr(func.value, owner.name),
+                            (", " + ", ".join(cargs)) if cargs else "")
             # non-virtual method on a concrete class pointer
             bt = self.value_ctype(func.value)
             if bt and bt.endswith("*") and bt != OBJ and bt[:-1] in self.classes:
@@ -2678,9 +2795,26 @@ class Transpiler:
                     pct = [arg_ctype(m, a) for a in m.args.args[1:]] \
                         if m else []
                     cargs = self.coerce_args(pct, node.args)
-                    return "%s_%s((%s*)(%s)%s)" % (
-                        owner.name, func.attr, owner.name,
-                        self.expr(func.value),
+                    return "%s_%s(%s%s)" % (
+                        owner.name, func.attr,
+                        self._class_ptr_expr(func.value, owner.name),
+                        (", " + ", ".join(cargs)) if cargs else "")
+            # method on a concrete *imported* class pointer (e.g. narrowed by
+            # isinstance). Safe to devirtualize only when the static class is a
+            # leaf, so no subclass can override the method at runtime.
+            if bt and bt.endswith("*") and bt != OBJ and bt[:-1] in self.xclasses \
+                    and self._class_is_leaf(bt[:-1]):
+                cls = bt[:-1]
+                ci = self.xclasses[cls][0]
+                m = ci.methods.get(func.attr)
+                if m is not None:
+                    ret = ann_to_ctype(m.returns) or OBJ
+                    self.used_xmethods[(cls, func.attr)] = ret
+                    pct = [arg_ctype(m, a) for a in m.args.args[1:]]
+                    cargs = self.coerce_args(pct, node.args)
+                    return "%s_%s(%s%s)" % (
+                        cls, func.attr,
+                        self._class_ptr_expr(func.value, cls),
                         (", " + ", ".join(cargs)) if cargs else "")
             if isinstance(func.value, ast.Name) and \
                     func.value.id in self.classes:
@@ -2997,6 +3131,14 @@ class Transpiler:
             if isinstance(node.value, ast.Name) and \
                     node.value.id in self.modules:
                 return None
+            # isinstance-narrowed base: report the proven concrete field type,
+            # so wrap_obj/coercion stays consistent with what ex_Attribute emits.
+            if isinstance(node.value, ast.Name) and \
+                    node.value.id in self.narrowed:
+                cls = self.narrowed[node.value.id][:-1]
+                if self._class_has_field(cls, node.attr):
+                    ci = self.classes.get(cls) or self.xclasses[cls][0]
+                    return ci.field_ctype(node.attr)
             if self.is_obj_word(node.value):
                 owner = self.resolve_attr_owner(node.attr)
                 if owner:
