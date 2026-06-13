@@ -202,6 +202,8 @@ obj  py_slice(obj seq, long lo, long hi);  /* str or list slice, Python rules  *
 str  char_at(str s, long i);            /* s[i] on a string -> 1-char string   */
 void set_add(obj s, obj v);             /* add to a list-set if absent         */
 void list_remove(obj lst, obj v);       /* remove first matching element       */
+obj  list_pop(obj lst);                 /* remove & return last element        */
+obj  obj_augop(obj a, char op, obj b);  /* x op= y for obj (arith / set ops)   */
 obj  pylist(obj it);                    /* shallow copy iterable into a list   */
 long pyord(obj c);
 str  pychr(long i);
@@ -669,6 +671,38 @@ void list_remove(obj lst, obj v) {
         }
     }
 }
+obj list_pop(obj lst) {
+    if (lst.tag != T_LIST) return OBJ_NONE;
+    List* l = (List*)lst.u.o;
+    if (l->len == 0) return OBJ_NONE;
+    return l->data[--l->len];
+}
+obj obj_augop(obj a, char op, obj b) {
+    int set_like = (a.tag == T_LIST || b.tag == T_LIST);
+    if (op == '+') return obj_add(a, b);
+    if (set_like && op == '|') {                 /* set union */
+        obj r = pyset(a); long n = pylen(b);
+        for (long i = 0; i < n; i++) set_add(r, index_obj(b, i));
+        return r;
+    }
+    if (set_like && op == '&') {                 /* intersection */
+        obj r = list_new(); long n = pylen(a);
+        for (long i = 0; i < n; i++) {
+            obj v = index_obj(a, i);
+            if (pycontains(b, v) && !pycontains(r, v)) list_append(r, v);
+        }
+        return r;
+    }
+    if (set_like && op == '-') {                 /* difference */
+        obj r = list_new(); long n = pylen(a);
+        for (long i = 0; i < n; i++) {
+            obj v = index_obj(a, i);
+            if (!pycontains(b, v) && !pycontains(r, v)) list_append(r, v);
+        }
+        return r;
+    }
+    return obj_bin(op, a, b);
+}
 
 str char_at(str s, long i) {
     long n = (long)strlen(s);
@@ -1010,6 +1044,12 @@ class Transpiler:
                 for cn, ci in reg["classes"].items():
                     self.xclasses.setdefault(cn, (ci, modname))
         self.used_xmethods = {}     # (clsname, method) -> return ctype
+        self.xstructs_needed = set()  # imported classes whose fields are read
+        for cn, (ci, _m) in self.xclasses.items():
+            if cn in self.classes:
+                continue
+            for fn, _ in ci.own_fields:
+                self.field_owners.setdefault(fn, []).append(ci)
         self.collect_module_globals(tree)
 
         self.prelude()
@@ -1039,6 +1079,18 @@ class Transpiler:
         self.lines[self.extern_idx:self.extern_idx] = externs
         return "\n".join(self.lines) + "\n"
 
+    def struct_body_lines(self, ci):
+        """Tag definition `struct C { ... };` for an imported class whose
+        fields are accessed (the typedef is forward-declared separately)."""
+        out = ["struct %s {" % ci.name, "    Obj _hdr;"]
+        ff = ci.full_fields()
+        if not ff:
+            out.append("    char _empty;")
+        for fn, ft in ff:
+            out.append("    %s %s;" % (ft, cname(fn)))
+        out.append("};")
+        return out
+
     def build_externs(self):
         classes, funcs, singles = set(), {}, {}
         for (mod, name) in sorted(self.used_imports):
@@ -1054,11 +1106,22 @@ class Transpiler:
         for (cls, meth) in self.used_xmethods:
             if cls not in self.classes:
                 classes.add(cls)
+        needed = {c for c in self.xstructs_needed
+                  if c in self.xclasses and c not in self.classes}
+        classes |= needed
+        for c in needed:                    # field types may name other classes
+            for _, ft in self.xclasses[c][0].full_fields():
+                base = ft.rstrip("*")
+                if base in self.xclasses and base not in self.classes:
+                    classes.add(base)
         if not (classes or funcs or singles or self.used_xmethods):
             return []
         out = ["/* ---- cross-module imports (extern declarations) ---- */"]
-        for c in sorted(classes):
+        for c in sorted(classes):           # forward typedefs first
             out.append("typedef struct %s %s;" % (c, c))
+        for c in sorted(needed):            # full layout for accessed classes
+            out += self.struct_body_lines(self.xclasses[c][0])
+        for c in sorted(classes):
             out.append("extern const TypeInfoHdr %s_type;" % c)
             out.append("extern %s* %s_new();" % (c, c))
         for n in sorted(funcs):
@@ -1728,6 +1791,12 @@ class Transpiler:
                     return "bool"
                 if f.id in ("str", "chr", "repr"):
                     return "char*"
+                if f.id == "getattr" and len(node.args) >= 2 and \
+                        isinstance(node.args[1], ast.Constant) and \
+                        isinstance(node.args[1].value, str):
+                    owner = self.resolve_attr_owner(node.args[1].value)
+                    return owner.field_ctype(node.args[1].value) if owner \
+                        else OBJ
                 if f.id in ("len", "ord", "int", "abs"):
                     return "int"
                 if f.id in ("range", "sorted", "list", "dict", "set",
@@ -1754,6 +1823,8 @@ class Transpiler:
                         return cname(f.attr) + "*"
                     if kind == "func":
                         return ann_to_ctype(info.returns) or OBJ
+                    if not self.import_alias[f.value.id].startswith("shivyc"):
+                        return OBJ
                 if f.attr == "get" and isinstance(f.value, ast.Attribute) \
                         and isinstance(f.value.value, ast.Name) \
                         and f.value.value.id == "self" and self.cur_class \
@@ -1773,6 +1844,17 @@ class Transpiler:
                         return OBJ
                     if f.attr in ("find", "rfind"):
                         return "int"
+                # method call on a concrete class instance (local or imported)
+                bt = self.value_ctype(f.value)
+                if bt and bt.endswith("*") and bt != OBJ:
+                    cls = bt[:-1]
+                    ci = self.classes.get(cls) or \
+                        (self.xclasses[cls][0] if cls in self.xclasses else None)
+                    if ci:
+                        owner = ci.find_method_owner(f.attr)
+                        if owner:
+                            m = owner.methods.get(f.attr)
+                            return (ann_to_ctype(m.returns) or OBJ) if m else OBJ
         return self.guess_from_value(node)
 
     def st_AnnAssign(self, node):
@@ -1786,9 +1868,22 @@ class Transpiler:
             else (ctype + " ")
         return ["%s%s = %s;" % (decl, tgt, self.expr(node.value))]
 
+    AUG_OP_CHAR = {ast.Add: '+', ast.Sub: '-', ast.Mult: '*', ast.Div: '/',
+                   ast.FloorDiv: '/', ast.Mod: '%', ast.BitOr: '|',
+                   ast.BitAnd: '&', ast.BitXor: '^', ast.LShift: '<',
+                   ast.RShift: '>'}
+
     def st_AugAssign(self, node):
-        return ["%s %s= %s;" % (self.expr(node.target),
-                                self.binop_sym(node.op),
+        tgt = self.expr(node.target)
+        tt = self.target_ctype(node.target) or self.value_ctype(node.target)
+        if tt == OBJ or self.is_obj_word(node.target):
+            ch = self.AUG_OP_CHAR.get(type(node.op), '+')
+            return ["%s = obj_augop(%s, '%c', %s);" % (
+                tgt, tgt, ch, self.wrap_obj(node.value))]
+        if isinstance(node.op, ast.Add) and tt == "char*":
+            return ["%s = pyconcat(%s, %s);" % (tgt, tgt,
+                                                self.as_str(node.value))]
+        return ["%s %s= %s;" % (tgt, self.binop_sym(node.op),
                                 self.expr(node.value))]
 
     def st_Return(self, node):
@@ -1954,6 +2049,20 @@ class Transpiler:
     def st_With(self, node):
         items = ", ".join(self.src1(i.context_expr) for i in node.items)
         lines = ["/* with %s */ {" % items]
+        binds = []
+        for it in node.items:
+            tv = it.optional_vars
+            if isinstance(tv, ast.Name):
+                if tv.id in self.scope or tv.id in self.hoisted:
+                    binds.append("%s = %s;" % (cname(tv.id),
+                                               self.wrap_obj(it.context_expr)))
+                else:
+                    self.scope[tv.id] = OBJ
+                    binds.append("obj %s = %s;" % (
+                        cname(tv.id), self.wrap_obj(it.context_expr)))
+            else:
+                binds.append("%s;" % self.expr(it.context_expr))
+        lines += self.indent_lines(binds)
         lines += self.indent_lines(self.suite(node.body))
         lines.append("}")
         return lines
@@ -2030,12 +2139,17 @@ class Transpiler:
         # access through a concrete class pointer:  p.attr -> (p)->attr
         bt = self.value_ctype(node.value)
         if bt and bt.endswith("*") and bt != OBJ:
+            if bt[:-1] in self.xclasses:
+                self.xstructs_needed.add(bt[:-1])
             return "(%s)->%s" % (self.expr(node.value), cname(node.attr))
         # reading an attribute off a Tier-2 obj: resolve the element's class by
         # which class declares this attribute, then offset into its struct.
-        if self.is_obj_word(node.value):
+        if self.is_obj_word(node.value) or self.value_ctype(node.value) == OBJ:
             owner = self.resolve_attr_owner(node.attr)
             if owner:
+                if owner.name in self.xclasses and \
+                        owner.name not in self.classes:
+                    self.xstructs_needed.add(owner.name)
                 return "((%s*)AS_OBJ(%s))->%s" % (
                     owner.name, self.expr(node.value), cname(node.attr))
             return "OBJ_NONE /* %s.%s */" % (self.src1(node.value), node.attr)
@@ -2118,6 +2232,20 @@ class Transpiler:
                 return "pyrepr(%s)" % self.wrap_obj(node.args[0])
             if fn == "vars":
                 return "dict_new() /* vars() unsupported */"
+            if fn == "getattr" and len(node.args) >= 2 and \
+                    isinstance(node.args[1], ast.Constant) and \
+                    isinstance(node.args[1].value, str):
+                attr = node.args[1].value
+                dflt = self.wrap_obj(node.args[2]) if len(node.args) > 2 \
+                    else "OBJ_NONE"
+                owner = self.resolve_attr_owner(attr)
+                if owner:
+                    if owner.name in self.xclasses and \
+                            owner.name not in self.classes:
+                        self.xstructs_needed.add(owner.name)
+                    return "((%s*)AS_OBJ(%s))->%s" % (
+                        owner.name, self.wrap_obj(node.args[0]), cname(attr))
+                return dflt
             if fn in self.classes:
                 init = self.classes[fn].methods.get("__init__")
                 defs = self.defaults_for(init, True) if init else None
@@ -2194,6 +2322,9 @@ class Transpiler:
                     func.attr not in self.method_owners:
                 return "list_remove(%s, %s)" % (self.wrap_obj(func.value),
                                                 self.wrap_obj(node.args[0]))
+            if func.attr == "pop" and not node.args and \
+                    func.attr not in self.method_owners:
+                return "list_pop(%s)" % self.wrap_obj(func.value)
             if func.attr == "sort":
                 return "list_sort(%s)" % self.expr(func.value)
             if func.attr == "reverse":
@@ -2246,6 +2377,13 @@ class Transpiler:
                     defs = self.defaults_for(info, False)
                     cargs = self.coerce_args(pct, node.args, defs)
                     return "%s(%s)" % (cname(func.attr), ", ".join(cargs))
+                if not modname.startswith("shivyc"):
+                    # unsupported stdlib (re/os/pickle/subprocess/...): no C
+                    # runtime equivalent -> degrade to None so the file builds.
+                    for a in node.args:
+                        self.expr(a)
+                    return "OBJ_NONE /* %s.%s(...) unsupported */" % (
+                        func.value.id, func.attr)
                 if func.value.id in self.modules:
                     return "%s_%s(%s)" % (func.value.id, func.attr,
                                           ", ".join(argstrs))
@@ -2473,10 +2611,16 @@ class Transpiler:
             bt = self.value_ctype(tgt.value)
             if bt and bt.endswith("*") and bt != OBJ:
                 cls = bt[:-1]
+                if cls in self.xclasses:
+                    self.xstructs_needed.add(cls)
                 ci = self.classes.get(cls) or \
                     (self.xclasses[cls][0] if cls in self.xclasses else None)
                 if ci:
                     return ci.field_ctype(tgt.attr)
+            if self.is_obj_word(tgt.value) or bt == OBJ:
+                owner = self.resolve_attr_owner(tgt.attr)
+                if owner:
+                    return owner.field_ctype(tgt.attr)
         return None
 
     def coerce_to(self, target, value_node, rendered):
@@ -2749,11 +2893,22 @@ class Transpiler:
                 inner = "pycontains(%s, %s)" % (self.wrap_obj(right), self.wrap_obj(left))
             return ("(!%s)" % inner) if isinstance(op, ast.NotIn) else inner
         if isinstance(op, (ast.Is, ast.IsNot)):
-            if isinstance(right, ast.Constant) and right.value is None \
-                    and self.is_obj_word(left):
-                s = "IS_NONE(%s)" % ls
-                return ("(!%s)" % s) if isinstance(op, ast.IsNot) else s
-            sym = "==" if isinstance(op, ast.Is) else "!="
+            neg = isinstance(op, ast.IsNot)
+            if isinstance(right, ast.Constant) and right.value is None:
+                lt = self.value_ctype(left)
+                if self.is_obj_word(left) or lt == OBJ:
+                    s = "IS_NONE(%s)" % ls
+                elif lt and lt.endswith("*"):       # char* / class pointer
+                    s = "(%s == NULL)" % ls
+                else:                                # a non-nullable scalar
+                    s = "0"
+                return ("(!%s)" % s) if neg else s
+            # identity on objects -> obj_eq; otherwise raw pointer/scalar compare
+            if self.is_obj_val(left) or self.is_obj_val(right):
+                eq = "obj_eq(%s, %s)" % (self.wrap_obj(left),
+                                         self.wrap_obj(right))
+                return ("(!%s)" % eq) if neg else eq
+            sym = "!=" if neg else "=="
             return "(%s %s %s)" % (ls, sym, rs)
         sym = {ast.Eq: "==", ast.NotEq: "!=", ast.Lt: "<", ast.LtE: "<=",
                ast.Gt: ">", ast.GtE: ">="}[type(op)]
