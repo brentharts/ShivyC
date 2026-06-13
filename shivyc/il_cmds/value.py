@@ -309,7 +309,7 @@ class UnpackArgs(ILCommand):
                         "shr %s, %d" % (scratch.asm_str(8), field.bit_offset)))
                 asm_code.add(asm_cmds.Mov(dest, scratch, size))
 
-        asm_code.add(asm_cmds.Add(spots.RSP, LiteralSpot(str(8 * n)), 8))
+        asm_code.add(asm_cmds.AsmAdd(spots.RSP, LiteralSpot(str(8 * n)), 8))
 
 
 class Set(_ValueCmd):
@@ -510,7 +510,7 @@ class Set(_ValueCmd):
         asm_code.add(asm_cmds.Cmp(arg_spot, zero, self.arg.ctype.size))
         asm_code.add(asm_cmds.Je(label))
         asm_code.add(asm_cmds.Mov(output_spot, one, self.output.ctype.size))
-        asm_code.add(asm_cmds.Label(label))
+        asm_code.add(asm_cmds.AsmLabel(label))
 
 
 class AddrOf(ILCommand):

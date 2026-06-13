@@ -73,7 +73,7 @@ class Label(ILCommand):
         return self.label
 
     def make_asm(self, spotmap, home_spots, get_reg, asm_code): # noqa D102
-        asm_code.add(asm_cmds.Label(self.label))
+        asm_code.add(asm_cmds.AsmLabel(self.label))
 
 
 class Jump(ILCommand):
@@ -375,7 +375,7 @@ class Call(ILCommand):
                                       % (8 * f.reg_index, scratch.asm_str(8))))
         for ri, reg in enumerate(packed_regs):
             asm_code.add(asm_cmds.Mov(reg, MemSpot(spots.RSP, 8 * ri), 8))
-        asm_code.add(asm_cmds.Add(spots.RSP, LiteralSpot(str(8 * total)), 8))
+        asm_code.add(asm_cmds.AsmAdd(spots.RSP, LiteralSpot(str(8 * total)), 8))
 
     def make_asm(self, spotmap, home_spots, get_reg, asm_code): # noqa D102
         ret_size = self.func.ctype.arg.ret.size
@@ -574,11 +574,11 @@ class Call(ILCommand):
         if self.direct_name:
             asm_code.add(asm_cmds.Raw("call " + self.direct_name))
         else:
-            asm_code.add(asm_cmds.Call(target, None, self.func.ctype.size))
+            asm_code.add(asm_cmds.AsmCall(target, None, self.func.ctype.size))
 
         # Caller cleans up any stack-passed arguments.
         if cleanup:
-            asm_code.add(asm_cmds.Add(spots.RSP, LiteralSpot(str(cleanup)), 8))
+            asm_code.add(asm_cmds.AsmAdd(spots.RSP, LiteralSpot(str(cleanup)), 8))
 
         # xmm8-15 are caller-saved, so a call may have clobbered the packed
         # flag register. Inside a hot/interrupt routine, refresh it from the

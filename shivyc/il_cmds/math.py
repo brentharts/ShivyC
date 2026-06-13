@@ -62,7 +62,7 @@ class _AddMult(ILCommand):
                 asm_code.add(self.Inst(temp, temp2, size))
 
             if not self.comm:
-                asm_code.add(asm_cmds.Neg(temp, None, size))
+                asm_code.add(asm_cmds.AsmNeg(temp, None, size))
 
         else:
             if (not self._is_imm64(arg1_spot)
@@ -78,7 +78,7 @@ class _AddMult(ILCommand):
                 asm_code.add(asm_cmds.Mov(temp, arg2_spot, size))
                 asm_code.add(self.Inst(temp, arg1_spot, size))
                 if not self.comm:
-                    asm_code.add(asm_cmds.Neg(temp, None, size))
+                    asm_code.add(asm_cmds.AsmNeg(temp, None, size))
 
             else:  # both are imm64
                 raise NotImplementedError(
@@ -115,7 +115,7 @@ class Add(_AddMult):
     conversion or promotion is done here.
     """
     comm = True
-    Inst = asm_cmds.Add
+    Inst = asm_cmds.AsmAdd
     FInst_d = asm_cmds.Addsd
     FInst_s = asm_cmds.Addss
 
@@ -301,7 +301,7 @@ class _DivMod(ILCommand):
         else:
             # zero out RDX register
             asm_code.add(asm_cmds.Xor(spots.RDX, spots.RDX, size))
-            asm_code.add(asm_cmds.Div(arg2_final_spot, None, size))
+            asm_code.add(asm_cmds.AsmDiv(arg2_final_spot, None, size))
 
         if spotmap[self.output] != self.return_reg:
             asm_code.add(asm_cmds.Mov(output_spot, self.return_reg, size))
@@ -391,7 +391,7 @@ class Neg(_NegNot):
 
     """
 
-    Inst = asm_cmds.Neg
+    Inst = asm_cmds.AsmNeg
 
 
 class Not(_NegNot):
@@ -401,7 +401,7 @@ class Not(_NegNot):
 
     """
 
-    Inst = asm_cmds.Not
+    Inst = asm_cmds.AsmNot
 
 
 class BitAnd(_AddMult):

@@ -106,7 +106,7 @@ class _GeneralCmp(ILCommand):
         asm_code.add(asm_cmds.Cmp(arg1_spot, arg2_spot, arg_size))
         asm_code.add(self.cmp_command()(label))
         asm_code.add(asm_cmds.Mov(result, neq_val_spot, out_size))
-        asm_code.add(asm_cmds.Label(label))
+        asm_code.add(asm_cmds.AsmLabel(label))
 
         if result != spotmap[self.output]:
             asm_code.add(asm_cmds.Mov(spotmap[self.output], result, out_size))
@@ -158,7 +158,7 @@ class _GeneralCmp(ILCommand):
             asm_code.add(asm_cmds.Mov(result, one, out_size))
             asm_code.add(self.f_jump(end))
             asm_code.add(asm_cmds.Mov(result, zero, out_size))
-        asm_code.add(asm_cmds.Label(end))
+        asm_code.add(asm_cmds.AsmLabel(end))
 
         if result != spotmap[self.output]:
             asm_code.add(asm_cmds.Mov(spotmap[self.output], result, out_size))
