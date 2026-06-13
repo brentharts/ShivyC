@@ -7,6 +7,8 @@ import shivyc.spots as spots
 from shivyc.spots import mangle_symbol
 import shivyc.simd_pack as simd_pack
 from shivyc.spots import Spot, RegSpot, MemSpot, LiteralSpot
+from shivyc.il_cmds.base import ILCommand  # noqa: F401  (polymorphic interface
+# dispatched on the IL commands asm_gen consumes; see command.inputs()/etc.)
 
 
 
@@ -38,6 +40,13 @@ class ASMCode:
         self.globals = []
         self.data = []
         self.string_literals = []
+        # Attributes that ASMGen sets during emission. Declared here (rather
+        # than monkey-patched onto the instance) so the transpiler lays them
+        # out in the struct; ASMGen still re-initializes them per run.
+        self.simd_pack_hot = False
+        self.frameless = False
+        self.metamorphic_funcs = set()
+        self.metamorphic_current = None
 
     def add(self, cmd):
         """Add a command to the code.
@@ -316,6 +325,8 @@ class ASMGen:
     offset (int) - Current offset from RBP for allocating on stack
 
     """
+
+    asm_code: ASMCode
 
     # List of registers used for allocation, sorted preferred-first
     alloc_registers = spots.registers
