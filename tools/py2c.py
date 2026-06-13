@@ -695,6 +695,7 @@ OBJ = "obj"
 
 KNOWN_CLASSES = {}      # name -> ClassInfo
 VTABLE_METHODS = set()  # method names that are virtual somewhere in the module
+_XMOD_CACHE = {}        # dotted module name -> imported-symbol registry
 
 
 def ann_text_to_ctype(text):
@@ -906,11 +907,15 @@ def cname(name):
 
 
 class Transpiler:
-    def __init__(self, modname):
+    def __init__(self, modname, base_dir=None):
         self.modname = modname
+        self.base_dir = base_dir    # repo dir containing the shivyc/ package
         self.lines = []
         self.cur_class = None
         self.modules = set()
+        self.import_alias = {}      # alias -> full dotted module name
+        self.from_imports = {}      # imported name -> full dotted module name
+        self.used_imports = set()   # (modname, name) actually referenced
         self.singletons = []
         self.singleton_names = {}   # var -> ClassName (module-level instances)
         self.str_sets = {}          # module-level set/list of string literals
@@ -934,6 +939,15 @@ class Transpiler:
         VTABLE_METHODS = vt
         self.build_owner_maps()
         self.collect_imports(tree)
+        # cross-module class registry: clsname -> (ClassInfo, modname)
+        self.xclasses = {}
+        for modname in set(self.import_alias.values()) | \
+                set(self.from_imports.values()):
+            reg = self.load_xmod(modname)
+            if reg:
+                for cn, ci in reg["classes"].items():
+                    self.xclasses.setdefault(cn, (ci, modname))
+        self.used_xmethods = {}     # (clsname, method) -> return ctype
         self.collect_module_globals(tree)
 
         self.prelude()
@@ -944,11 +958,12 @@ class Transpiler:
             self.emit()
         self.emit_typeinfo_struct()
         for ci in self.class_order:
-            self.emit("static const TypeInfo %s_type;" % ci.name)
+            self.emit("extern const TypeInfo %s_type;" % ci.name)
         if self.class_order:
             self.emit()
         for ci in self.class_order:
             self.emit_struct(ci)
+        self.extern_idx = len(self.lines)   # cross-module externs go here
         self.emit_forward_decls(tree)
         for ci in self.class_order:
             self.emit_class_impl(ci)
@@ -957,21 +972,60 @@ class Transpiler:
                 continue
             self.toplevel(node)
         self.emit_module_init()
+        # insert cross-module extern declarations at the reserved point
+        externs = self.build_externs()
+        self.lines[self.extern_idx:self.extern_idx] = externs
         return "\n".join(self.lines) + "\n"
 
+    def build_externs(self):
+        classes, funcs, singles = set(), {}, {}
+        for (mod, name) in sorted(self.used_imports):
+            kind, info = self.resolve_import(name, mod)
+            if kind == "class" and name not in self.classes:
+                classes.add(name)
+            elif kind == "func" and name not in self.func_params:
+                funcs[name] = ann_to_ctype(info.returns) or OBJ
+            elif kind == "singleton":
+                singles[name] = info
+                if info not in self.classes:
+                    classes.add(info)
+        for (cls, meth) in self.used_xmethods:
+            if cls not in self.classes:
+                classes.add(cls)
+        if not (classes or funcs or singles or self.used_xmethods):
+            return []
+        out = ["/* ---- cross-module imports (extern declarations) ---- */"]
+        for c in sorted(classes):
+            out.append("typedef struct %s %s;" % (c, c))
+            out.append("extern const TypeInfoHdr %s_type;" % c)
+            out.append("extern %s* %s_new();" % (c, c))
+        for n in sorted(funcs):
+            out.append("extern %s %s();" % (funcs[n], n))
+        for n in sorted(singles):
+            out.append("extern %s* %s;" % (singles[n], n))
+        for (cls, meth) in sorted(self.used_xmethods):
+            out.append("extern %s %s_%s();" % (self.used_xmethods[(cls, meth)],
+                                               cls, meth))
+        out.append("")
+        return out
+
     def emit_forward_decls(self, tree):
-        """Prototypes for top-level functions and module singletons, so methods
-        emitted before them still resolve."""
+        """Prototypes for top-level functions, plus file-scope declarations for
+        module-level globals (initialized later in <module>_init)."""
         protos = []
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
                 protos.append(self.func_signature(node) + ";")
-        for var, cls in self.singleton_names.items():
-            protos.append("%s* %s;" % (cls, var))
         if protos:
             self.emit("/* forward declarations */")
             for p in protos:
                 self.emit(p)
+            self.emit()
+        if self.mod_globals:
+            self.emit("/* module-level globals (init in %s_init) */"
+                      % self.modname)
+            for name, ctype, kind, _ in self.mod_globals:
+                self.emit("%s %s;" % (ctype, name))
             self.emit()
 
     def func_signature(self, node):
@@ -984,7 +1038,67 @@ class Transpiler:
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for a in node.names:
-                    self.modules.add((a.asname or a.name).split(".")[0])
+                    alias = (a.asname or a.name).split(".")[0]
+                    self.modules.add(alias)
+                    self.import_alias[alias] = a.name
+            elif isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                if node.level == 0 and mod.startswith("shivyc"):
+                    for a in node.names:
+                        self.from_imports[a.asname or a.name] = mod
+
+    def load_xmod(self, modname):
+        """Parse an imported shivyc module and register its public symbols."""
+        cache = _XMOD_CACHE
+        if modname in cache:
+            return cache[modname]
+        cache[modname] = None       # guard against import cycles
+        reg = {"classes": {}, "funcs": {}, "singletons": {}}
+        if self.base_dir and modname.startswith("shivyc"):
+            path = os.path.join(self.base_dir, *modname.split(".")) + ".py"
+            try:
+                t = ast.parse(open(path, encoding="utf-8").read())
+                classes, order, _ = collect_classes(t)
+                reg["classes"] = classes
+                for n in t.body:
+                    if isinstance(n, ast.FunctionDef):
+                        reg["funcs"][n.name] = n
+                    elif isinstance(n, ast.Assign) and len(n.targets) == 1 \
+                            and isinstance(n.targets[0], ast.Name) \
+                            and isinstance(n.value, ast.Call):
+                        f = n.value.func
+                        cls = None
+                        if isinstance(f, ast.Name):
+                            if f.id in classes or (f.id[:1].isupper()):
+                                cls = f.id
+                        elif isinstance(f, ast.Attribute) and f.attr[:1].isupper():
+                            cls = f.attr
+                        if cls:
+                            reg["singletons"][n.targets[0].id] = cls
+            except (OSError, SyntaxError):
+                pass
+        cache[modname] = reg
+        return reg
+
+    def resolve_import(self, name, modname):
+        """('class'|'func'|'singleton'|None, info) for `name` in `modname`."""
+        reg = self.load_xmod(modname)
+        if not reg:
+            return (None, None)
+        if name in reg["classes"]:
+            return ("class", reg["classes"][name])
+        if name in reg["funcs"]:
+            return ("func", reg["funcs"][name])
+        if name in reg["singletons"]:
+            return ("singleton", reg["singletons"][name])
+        return (None, None)
+
+    def xref(self, name, modname):
+        """Resolve an imported name; record it for extern emission."""
+        kind, info = self.resolve_import(name, modname)
+        if kind:
+            self.used_imports.add((modname, name))
+        return kind, info
 
     def build_owner_maps(self):
         """Which class declares each attribute/method. Because attributes are a
@@ -1025,7 +1139,31 @@ class Transpiler:
     def resolve_method_owner(self, attr):
         return self._resolve_owner(self.method_owners.get(attr, []))
 
+    def ctor_class(self, call):
+        """If `call` constructs a known class (local/imported/alias), return its
+        name (marking the import used); else None."""
+        if not isinstance(call, ast.Call):
+            return None
+        f = call.func
+        if isinstance(f, ast.Name):
+            if f.id in self.classes:
+                return f.id
+            if f.id in self.from_imports:
+                kind, _ = self.xref(f.id, self.from_imports[f.id])
+                if kind == "class":
+                    return f.id
+        if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) \
+                and f.value.id in self.import_alias:
+            kind, _ = self.xref(f.attr, self.import_alias[f.value.id])
+            if kind == "class":
+                return f.attr
+        return None
+
     def collect_module_globals(self, tree):
+        # mod_globals: ordered [(name, ctype, kind, value_node)] needing a
+        # file-scope declaration + deferred init in <module>_init().
+        self.mod_globals = []
+        self.mod_global_names = set()
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
                 self.func_returns[node.name] = ann_to_ctype(node.returns) or OBJ
@@ -1037,15 +1175,22 @@ class Transpiler:
             if not isinstance(tgt, ast.Name):
                 continue
             val = node.value
-            # module-level singleton instance:  NAME = ClassName(...)
-            if isinstance(val, ast.Call) and isinstance(val.func, ast.Name) \
-                    and val.func.id in self.classes:
-                self.singleton_names[tgt.id] = val.func.id
-            # module-level set/list of string literals
+            # string-literal set/list -> fast `in` lowering via in_str
             if isinstance(val, (ast.Set, ast.List)) and val.elts and \
                     all(isinstance(e, ast.Constant) and isinstance(e.value, str)
                         for e in val.elts):
                 self.str_sets[tgt.id] = [e.value for e in val.elts]
+            cls = self.ctor_class(val)
+            if cls:
+                self.singleton_names[tgt.id] = cls
+                self.mod_globals.append((tgt.id, cls + "*", "singleton", val))
+                self.mod_global_names.add(tgt.id)
+            elif isinstance(val, (ast.List, ast.Dict, ast.Set, ast.Tuple,
+                                  ast.BinOp, ast.ListComp, ast.DictComp,
+                                  ast.SetComp, ast.Call)):
+                ct = self.value_ctype(val) or OBJ
+                self.mod_globals.append((tgt.id, ct, "expr", val))
+                self.mod_global_names.add(tgt.id)
 
     def prelude(self):
         bar = "/* " + "=" * 66 + " */"
@@ -1223,7 +1368,7 @@ class Transpiler:
                                        if owner else "NULL"))
         init = ", ".join([".name = %s" % c_string(ci.name),
                           ".base = (const struct TypeInfo*)%s" % base] + slots)
-        self.emit("static const TypeInfo %s_type = { %s };" % (ci.name, init))
+        self.emit("const TypeInfo %s_type = { %s };" % (ci.name, init))
         self.emit()
 
     def param_list(self, fn, skip_self):
@@ -1319,32 +1464,31 @@ class Transpiler:
 
     def toplevel_assign(self, node):
         if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) \
-                and isinstance(node.value, ast.Call) \
-                and isinstance(node.value.func, ast.Name) \
-                and node.value.func.id in self.classes:
-            var = node.targets[0].id
-            cls = node.value.func.id
-            args = self.coerce_args(
-                self.init_param_ctypes(self.classes[cls]), node.value.args)
-            self.emit("/* singleton %s = %s(...) constructed in %s_init() */"
-                      % (var, cls, self.modname))
-            self.singletons.append((var, cls, args))
-            return
-        if isinstance(node.value, (ast.List, ast.Dict, ast.Set, ast.Tuple,
-                                   ast.BinOp)):
-            self.emit("/* module data: " + self.src1(node) + " */")
+                and node.targets[0].id in self.mod_global_names:
+            self.emit("/* module global %s -- initialized in %s_init() */"
+                      % (node.targets[0].id, self.modname))
             return
         for ln in self.assign(node, toplevel=True):
             self.emit(ln)
 
     def emit_module_init(self):
-        self.emit("/* Construct module-level singletons (Python import-time). */")
+        self.emit("/* Initialize module-level globals (Python import-time). */")
         self.emit("void %s_init(void) {" % self.modname)
         self.indent += 1
-        if not self.singletons:
+        if not self.mod_globals:
             self.emit("/* none */")
-        for var, cls, args in self.singletons:
-            self.emit("%s = %s_new(%s);" % (var, cls, ", ".join(args)))
+        for name, ctype, kind, val in self.mod_globals:
+            if kind == "singleton":
+                cls = ctype[:-1]
+                if cls in self.classes:
+                    args = self.coerce_args(
+                        self.init_param_ctypes(self.classes[cls]), val.args)
+                else:                       # imported class -> unchecked args
+                    args = [self.wrap_obj(a) if False else self.expr(a)
+                            for a in val.args]
+                self.emit("%s = %s_new(%s);" % (name, cls, ", ".join(args)))
+            else:
+                self.emit("%s = %s;" % (name, self.expr(val)))
         self.indent -= 1
         self.emit("}")
 
@@ -1423,7 +1567,9 @@ class Transpiler:
             if isinstance(tgt, ast.Name):
                 # already declared in this scope?  ->  plain reassignment
                 if tgt.id in self.scope and not toplevel:
-                    lines.append("%s = %s;" % (cname(tgt.id), rhs))
+                    lines.append("%s = %s;" % (
+                        cname(tgt.id),
+                        self.coerce_to(self.scope[tgt.id], node.value, rhs)))
                     continue
                 # the value's actual C type wins over the name guess
                 ctype = self.value_ctype(node.value) or \
@@ -1432,7 +1578,9 @@ class Transpiler:
                     self.scope[tgt.id] = ctype
                 lines.append("%s %s = %s;" % (ctype, cname(tgt.id), rhs))
             else:
-                lines.append("%s = %s;" % (self.expr(tgt), rhs))
+                lines.append("%s = %s;" % (
+                    self.expr(tgt),
+                    self.coerce_to(self.target_ctype(tgt), node.value, rhs)))
         return lines
 
     def wrap_for_assign(self, value_node, rendered):
@@ -1501,7 +1649,22 @@ class Transpiler:
                     return f.id + "*"
                 if f.id in self.func_returns:
                     return self.func_returns[f.id]
+                if f.id in self.from_imports:
+                    kind, info = self.resolve_import(f.id,
+                                                     self.from_imports[f.id])
+                    if kind == "class":
+                        return cname(f.id) + "*"
+                    if kind == "func":
+                        return ann_to_ctype(info.returns) or OBJ
             if isinstance(f, ast.Attribute):
+                if isinstance(f.value, ast.Name) and \
+                        f.value.id in self.import_alias:
+                    kind, info = self.resolve_import(
+                        f.attr, self.import_alias[f.value.id])
+                    if kind == "class":
+                        return cname(f.attr) + "*"
+                    if kind == "func":
+                        return ann_to_ctype(info.returns) or OBJ
                 if f.attr == "get" and isinstance(f.value, ast.Attribute) \
                         and isinstance(f.value.value, ast.Name) \
                         and f.value.value.id == "self" and self.cur_class \
@@ -1543,17 +1706,8 @@ class Transpiler:
         if node.value is None:
             return ["return;"]
         ret = getattr(self, "cur_ret", OBJ)
-        # cast a subclass pointer to the declared base-pointer return type
-        if ret.endswith("*") and ret != OBJ:
-            val = self.expr(node.value)
-            if self.value_ctype(node.value) != ret:
-                val = "(%s)(%s)" % (ret, val)
-            return ["return %s;" % val]
-        # an obj-returning function must box scalar values
-        if ret == OBJ and self.value_ctype(node.value) in ("int", "bool",
-                                                           "char*"):
-            return ["return %s;" % self.wrap_obj(node.value)]
-        return ["return %s;" % self.expr(node.value)]
+        return ["return %s;" % self.coerce_to(ret, node.value,
+                                              self.expr(node.value))]
 
     def st_Pass(self, node):
         return ["/* pass */"]
@@ -1771,6 +1925,15 @@ class Transpiler:
             return "TYPE(%s)->name" % self.expr(node.value.args[0])
         if isinstance(node.value, ast.Name):
             base = node.value.id
+            if base in self.import_alias:
+                modname = self.import_alias[base]
+                kind, info = self.xref(node.attr, modname)
+                if kind in ("singleton", "func"):
+                    return cname(node.attr)      # bare exported symbol
+                if kind == "class":
+                    return cname(node.attr)      # class-as-value (rare)
+                if base in self.modules:
+                    return "%s_%s" % (base, node.attr)
             if base in self.modules:
                 return "%s_%s" % (base, node.attr)
             if base == "self":
@@ -1871,6 +2034,18 @@ class Transpiler:
             if fn in self.func_params:
                 cargs = self.coerce_args(self.func_params[fn], node.args)
                 return "%s(%s)" % (fn, ", ".join(cargs))
+            if fn in self.from_imports:
+                kind, info = self.xref(fn, self.from_imports[fn])
+                if kind == "class":
+                    pct = [arg_ctype(info.methods["__init__"], a)
+                           for a in info.methods["__init__"].args.args[1:]] \
+                        if "__init__" in info.methods else []
+                    cargs = self.coerce_args(pct, node.args)
+                    return "%s_new(%s)" % (fn, ", ".join(cargs))
+                if kind == "func":
+                    pct = [arg_ctype(info, a) for a in info.args.args]
+                    cargs = self.coerce_args(pct, node.args)
+                    return "%s(%s)" % (fn, ", ".join(cargs))
 
         if isinstance(func, ast.Attribute) and is_super_call(func.value):
             base = self.cur_class.base if self.cur_class else None
@@ -1902,6 +2077,12 @@ class Transpiler:
                 k = argstrs[0]
                 dflt = argstrs[1] if len(argstrs) > 1 else '""'
                 return "%s_%s_get(%s, %s)" % (self.cur_class.name, d, k, dflt)
+            # method call on a concrete class instance (local or imported) is
+            # resolved before the generic list/dict/str heuristics so that an
+            # instance method named append/add/get/pop/etc. wins.
+            rcv = self.method_on_instance(func, node)
+            if rcv is not None:
+                return rcv
             # list methods on an obj/list receiver
             if func.attr == "append" and len(node.args) == 1:
                 return "list_append(%s, %s)" % (self.expr(func.value),
@@ -1946,6 +2127,23 @@ class Transpiler:
                 d = self.wrap_obj(node.args[1]) if len(node.args) > 1 \
                     else "OBJ_NONE"
                 return "dict_get(%s, %s, %s)" % (self.expr(func.value), k, d)
+            if isinstance(func.value, ast.Name) and \
+                    func.value.id in self.import_alias:
+                modname = self.import_alias[func.value.id]
+                kind, info = self.xref(func.attr, modname)
+                if kind == "class":
+                    pct = [arg_ctype(info.methods["__init__"], a)
+                           for a in info.methods["__init__"].args.args[1:]] \
+                        if "__init__" in info.methods else []
+                    cargs = self.coerce_args(pct, node.args)
+                    return "%s_new(%s)" % (cname(func.attr), ", ".join(cargs))
+                if kind == "func":
+                    pct = [arg_ctype(info, a) for a in info.args.args]
+                    cargs = self.coerce_args(pct, node.args)
+                    return "%s(%s)" % (cname(func.attr), ", ".join(cargs))
+                if func.value.id in self.modules:
+                    return "%s_%s(%s)" % (func.value.id, func.attr,
+                                          ", ".join(argstrs))
             if isinstance(func.value, ast.Name) and \
                     func.value.id in self.modules:
                 return "%s_%s(%s)" % (func.value.id, func.attr,
@@ -2019,13 +2217,76 @@ class Transpiler:
                 out.append(self.expr(a))
         return out
 
+    def method_on_instance(self, func, node):
+        """If `func.value` is a concrete class instance (local or imported) and
+        the class declares `func.attr` as a method, emit the direct call."""
+        bt = self.value_ctype(func.value)
+        if not (bt and bt.endswith("*") and bt != OBJ):
+            return None
+        cls = bt[:-1]
+        if cls in self.classes:
+            ci = self.classes[cls]
+            owner = ci.find_method_owner(func.attr)
+            if owner is None:
+                return None
+            if func.attr in VTABLE_METHODS:
+                return self.vcall(func.value, func.attr,
+                                  [self.expr(a) for a in node.args])
+            m = owner.methods.get(func.attr)
+            pct = [arg_ctype(m, a) for a in m.args.args[1:]] if m else []
+            cargs = self.coerce_args(pct, node.args)
+            return "%s_%s((%s*)(%s)%s)" % (
+                owner.name, func.attr, owner.name, self.expr(func.value),
+                (", " + ", ".join(cargs)) if cargs else "")
+        if cls in self.xclasses:
+            ci, modname = self.xclasses[cls]
+            owner = ci.find_method_owner(func.attr)
+            if owner is None:
+                return None
+            m = owner.methods.get(func.attr)
+            ret = (ann_to_ctype(m.returns) or OBJ) if m else OBJ
+            self.used_xmethods[(owner.name, func.attr)] = ret
+            args = [self.expr(a) for a in node.args]  # devirtualized direct call
+            return "%s_%s((%s*)(%s)%s)" % (
+                owner.name, func.attr, owner.name, self.expr(func.value),
+                (", " + ", ".join(args)) if args else "")
+        return None
+
+    BUILTIN_TYPE_TAGS = {"str": "T_STR", "bytes": "T_STR", "int": "T_INT",
+                         "bool": "T_BOOL", "list": "T_LIST", "tuple": "T_LIST",
+                         "dict": "T_DICT"}
+
     def lower_isinstance(self, val_node, cls_node):
-        cls = self.src1(cls_node)
-        type_sym = "&%s_type" % cls if cls in self.classes else "NULL"
+        if isinstance(cls_node, (ast.Tuple, ast.List)):
+            parts = [self.lower_isinstance(val_node, e) for e in cls_node.elts]
+            return "(" + " || ".join(parts) + ")"
+        # builtin types -> Tier-2 tag test
+        if isinstance(cls_node, ast.Name) and \
+                cls_node.id in self.BUILTIN_TYPE_TAGS and \
+                cls_node.id not in self.classes:
+            tag = self.BUILTIN_TYPE_TAGS[cls_node.id]
+            return "((%s).tag == %s)" % (self.wrap_obj(val_node), tag)
+        type_sym = self._type_symbol(cls_node)
         if self.is_obj_word(val_node):
             return "OBJ_ISINST(%s, %s)" % (self.expr(val_node), type_sym)
         return "isinstance_of((Obj*)(%s), %s)" % (self.expr(val_node),
                                                   type_sym)
+
+    def _type_symbol(self, cls_node):
+        """`&Cls_type` for a class reference (local, alias.Cls, or imported)."""
+        clsname = None
+        if isinstance(cls_node, ast.Name):
+            clsname = cls_node.id
+            if clsname not in self.classes and clsname in self.from_imports:
+                self.xref(clsname, self.from_imports[clsname])
+        elif isinstance(cls_node, ast.Attribute) and \
+                isinstance(cls_node.value, ast.Name) and \
+                cls_node.value.id in self.import_alias:
+            clsname = cls_node.attr
+            self.xref(clsname, self.import_alias[cls_node.value.id])
+        if clsname:
+            return "&%s_type" % cname(clsname)
+        return "NULL"
 
     def lower_any_all(self, fn, arg):
         """any(...)/all(...) as a GCC statement-expression loop."""
@@ -2064,6 +2325,51 @@ class Transpiler:
                 "for (long %s = 0; %s < _n%d; %s++) { %s } _r; })") % (
             init, it, src, self.loop_n, it, idx, idx, self.loop_n, idx, body)
 
+    def target_ctype(self, tgt):
+        """Declared C type of an assignment target, or None if unknown."""
+        if isinstance(tgt, ast.Name):
+            if tgt.id in self.scope:
+                return self.scope[tgt.id]
+            if tgt.id in self.singleton_names:
+                return self.singleton_names[tgt.id] + "*"
+        if isinstance(tgt, ast.Attribute):
+            if isinstance(tgt.value, ast.Name) and tgt.value.id == "self" \
+                    and self.cur_class:
+                return self.cur_class.field_ctype(tgt.attr)
+            bt = self.value_ctype(tgt.value)
+            if bt and bt.endswith("*") and bt != OBJ:
+                cls = bt[:-1]
+                ci = self.classes.get(cls) or \
+                    (self.xclasses[cls][0] if cls in self.xclasses else None)
+                if ci:
+                    return ci.field_ctype(tgt.attr)
+        return None
+
+    def coerce_to(self, target, value_node, rendered):
+        """Coerce `rendered` (an expr for value_node) to the `target` C type."""
+        if not target:
+            return rendered
+        vt = self.value_ctype(value_node)
+        if target == vt:
+            return rendered
+        if target == OBJ:
+            return self.wrap_obj(value_node)
+        is_objval = vt == OBJ or self.is_obj_word(value_node)
+        if target.endswith("*"):           # target is a (class) pointer
+            if is_objval:
+                return "(%s)AS_OBJ(%s)" % (target, rendered)
+            if vt and vt.endswith("*") and vt != OBJ:
+                return "(%s)(%s)" % (target, rendered)   # base/derived cast
+            return rendered
+        if is_objval:
+            if target == "int":
+                return "AS_INT(%s)" % rendered
+            if target == "bool":
+                return "truthy(%s)" % rendered
+            if target == "char*":
+                return "AS_STR(%s)" % rendered
+        return rendered
+
     def wrap_obj(self, node):
         if self.is_obj_word(node) or self.value_ctype(node) == OBJ:
             return self.expr(node)
@@ -2100,10 +2406,16 @@ class Transpiler:
 
     def static_type(self, node):
         if isinstance(node, ast.Name):
+            if node.id == "self" and self.cur_class:
+                return self.cur_class.name + "*"
             if node.id in self.scope:
                 return self.scope[node.id]
             if node.id in self.singleton_names:
                 return self.singleton_names[node.id] + "*"
+            if node.id in self.from_imports:
+                kind, info = self.xref(node.id, self.from_imports[node.id])
+                if kind == "singleton":
+                    return info + "*"
             return infer_from_name(node.id)
         if isinstance(node, ast.Attribute):
             if isinstance(node.value, ast.Name) and \
@@ -2487,12 +2799,15 @@ def write_runtime(out_dir):
 def transpile_file(path, out_dir):
     src = open(path, encoding="utf-8").read()
     modname = os.path.splitext(os.path.basename(path))[0]
+    # base_dir is the directory that contains the `shivyc` package
+    d = os.path.dirname(os.path.abspath(path))
+    base_dir = os.path.dirname(d) if os.path.basename(d) == "shivyc" else d
     try:
         tree = ast.parse(src, filename=path)
     except SyntaxError as e:
         print("  SYNTAX ERROR in %s: %s" % (path, e))
         return None
-    out = Transpiler(modname).run(tree)
+    out = Transpiler(modname, base_dir).run(tree)
     out_path = os.path.join(out_dir, modname + ".c")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(out)
