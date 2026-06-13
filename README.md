@@ -194,6 +194,45 @@ elimination.
 
 ---
 
+## Compiling the front end with itself (Python→C transpiler)
+
+[`tools/py2c.py`](tools/py2c.py) is a **specialized** Python→C translator that
+emits C from ShivyCX's own Python source — a step toward a self-hosting front
+end that is smaller and faster than the interpreted path. It is not a general
+Python→C compiler; it understands only the subset of Python the front end is
+written in, and uses that narrowness to produce small, idiomatic C.
+
+It represents values in three tiers — concrete C scalars, concrete class
+`struct`s with a shared `Obj` header for dispatch/`isinstance`, and a tagged
+`obj` union as the dynamic fallback — and keeps each value in the most concrete
+tier it can prove. Type inference, `isinstance` narrowing (including
+`isinstance(x, T) and x.field` chains), cross-module method dispatch through
+replicated vtables, first-class functions, and nested-function lifting are all
+supported. A few small, ordinary type annotations in the front end (for example
+typing the IL-command operand fields as `ILValue` via a `TYPE_CHECKING` import)
+let the translator lower attribute chains like `self.output.ctype.size` to plain
+struct accesses.
+
+Correctness is enforced by **byte-identical behavior harnesses**: for each
+feature, the transpiled C and the original Python run on the same inputs and
+their outputs must match exactly. The transpiler never emits a silently-wrong
+stub to inflate its compile count.
+
+All targeted IL-command modules (`base`, `asm`, `math`, `compare`, `value`,
+`control`) currently translate to cleanly-compiling C. See
+[`TRANSPILER.md`](TRANSPILER.md) for the full design — object model, type
+inference, the annotation convention, downcasting, cross-module machinery, and
+the verification methodology.
+
+```sh
+# transpile the whole front end into a directory (runtime is emitted alongside)
+python3 tools/py2c.py --out /tmp/out
+# or a single module
+python3 tools/py2c.py --out /tmp/out shivyc/il_cmds/value.py
+```
+
+---
+
 ## References
 
 - [ShivC](https://github.com/ShivamSarodia/ShivC) — the original compiler ShivyCX was rewritten from.
