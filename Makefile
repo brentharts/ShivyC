@@ -71,5 +71,8 @@ minikraft: shim
 run-irq: baremetal-irq
 	qemu-system-x86_64 -kernel $(BUILD)/irq.elf -serial stdio
 
+self:
+	cd tools && pypy3 py2c.py
+
 .PHONY: default test shim install clean baremetal baremetal-hello \
         baremetal-kernel baremetal-irq minikraft run-irq
