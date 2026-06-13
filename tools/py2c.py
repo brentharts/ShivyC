@@ -76,6 +76,7 @@ RUNTIME_H = r'''#ifndef SHIVYC_RT_H
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <ctype.h>
 
 typedef char* str;
 
@@ -170,6 +171,38 @@ obj  obj_mod(obj a, obj b);
 obj  obj_bin(char op, obj a, obj b);  /* &|^ and << >>                        */
 long obj_cmp(obj a, obj b);        /* <0,0,>0 for < <= > >=                   */
 obj  pyrange(long lo, long hi, long step);
+
+/* ---- string methods (operate on char*) ---- */
+bool str_startswith(str s, str p);
+bool str_endswith(str s, str p);
+str  str_strip(str s, int mode);   /* 0 both, 1 left, 2 right                 */
+obj  str_split(str s, str sep);    /* sep NULL -> split on whitespace runs    */
+obj  str_splitlines(str s);
+str  str_replace(str s, str a, str b);
+long str_find(str s, str sub, bool last);
+bool str_isdigit(str s);
+bool str_isalpha(str s);
+bool str_isspace(str s);
+bool str_isalnum(str s);
+str  str_lower(str s);
+str  str_upper(str s);
+str  pyjoin(str sep, obj it);
+
+/* ---- common builtins ---- */
+obj  pyenumerate(obj it, long start);   /* list of [i, x]                     */
+obj  pysorted(obj it);                  /* natural-order sort (obj_cmp)        */
+void list_sort(obj lst);                /* in-place natural sort               */
+obj  pymax(obj it, obj dflt, bool has_dflt);
+obj  pymin(obj it, obj dflt, bool has_dflt);
+obj  pysum(obj it, obj start);
+obj  pyreversed(obj it);
+obj  pyset(obj it);                     /* dedup iterable into a list-set      */
+void set_add(obj s, obj v);             /* add to a list-set if absent         */
+obj  pylist(obj it);                    /* shallow copy iterable into a list   */
+long pyord(obj c);
+str  pychr(long i);
+long pyint(obj v);
+long pyabs(long x);
 
 #endif /* SHIVYC_RT_H */
 '''
@@ -493,6 +526,141 @@ obj pyrange(long lo, long hi, long step) {
     else if (step < 0) for (long i = lo; i > hi; i += step) list_append(r, OBJ_INT(i));
     return r;
 }
+
+/* ---- string methods ---- */
+bool str_startswith(str s, str p) {
+    size_t ls = strlen(s), lp = strlen(p);
+    return lp <= ls && memcmp(s, p, lp) == 0;
+}
+bool str_endswith(str s, str p) {
+    size_t ls = strlen(s), lp = strlen(p);
+    return lp <= ls && memcmp(s + ls - lp, p, lp) == 0;
+}
+str str_strip(str s, int mode) {
+    size_t n = strlen(s); size_t a = 0, b = n;
+    if (mode != 2) while (a < b && isspace((unsigned char)s[a])) a++;
+    if (mode != 1) while (b > a && isspace((unsigned char)s[b - 1])) b--;
+    char* o = aalloc(b - a + 1); memcpy(o, s + a, b - a); o[b - a] = 0; return o;
+}
+obj str_split(str s, str sep) {
+    obj r = list_new();
+    if (!sep || !sep[0]) {                 /* whitespace */
+        size_t i = 0, n = strlen(s);
+        while (i < n) {
+            while (i < n && isspace((unsigned char)s[i])) i++;
+            size_t j = i;
+            while (j < n && !isspace((unsigned char)s[j])) j++;
+            if (j > i) { char* o = aalloc(j - i + 1); memcpy(o, s + i, j - i); o[j - i] = 0; list_append(r, OBJ_STR(o)); }
+            i = j;
+        }
+        return r;
+    }
+    size_t sl = strlen(sep); const char* p = s; const char* q;
+    while ((q = strstr(p, sep)) != NULL) {
+        size_t len = q - p; char* o = aalloc(len + 1); memcpy(o, p, len); o[len] = 0;
+        list_append(r, OBJ_STR(o)); p = q + sl;
+    }
+    list_append(r, OBJ_STR((str)p));
+    return r;
+}
+obj str_splitlines(str s) {
+    obj r = list_new(); const char* p = s; const char* start = s;
+    for (; *p; p++) if (*p == '\n') {
+        size_t len = p - start; char* o = aalloc(len + 1); memcpy(o, start, len); o[len] = 0;
+        list_append(r, OBJ_STR(o)); start = p + 1;
+    }
+    if (*start) { list_append(r, OBJ_STR((str)start)); }
+    return r;
+}
+str str_replace(str s, str a, str b) {
+    size_t la = strlen(a); if (!la) return s;
+    size_t lb = strlen(b), ls = strlen(s); int cnt = 0;
+    for (const char* p = s; (p = strstr(p, a)); p += la) cnt++;
+    char* o = aalloc(ls + (lb > la ? (lb - la) : 0) * cnt + 1); char* w = o; const char* p = s; const char* q;
+    while ((q = strstr(p, a))) { memcpy(w, p, q - p); w += q - p; memcpy(w, b, lb); w += lb; p = q + la; }
+    strcpy(w, p); return o;
+}
+long str_find(str s, str sub, bool last) {
+    const char* hit = NULL;
+    if (!last) { const char* q = strstr(s, sub); return q ? (long)(q - s) : -1; }
+    for (const char* p = s; (p = strstr(p, sub)); p++) hit = p;
+    return hit ? (long)(hit - s) : -1;
+}
+bool str_isdigit(str s) { if (!*s) return false; for (; *s; s++) if (!isdigit((unsigned char)*s)) return false; return true; }
+bool str_isalpha(str s) { if (!*s) return false; for (; *s; s++) if (!isalpha((unsigned char)*s)) return false; return true; }
+bool str_isspace(str s) { if (!*s) return false; for (; *s; s++) if (!isspace((unsigned char)*s)) return false; return true; }
+bool str_isalnum(str s) { if (!*s) return false; for (; *s; s++) if (!isalnum((unsigned char)*s)) return false; return true; }
+str str_lower(str s) { size_t n = strlen(s); char* o = aalloc(n + 1); for (size_t i = 0; i < n; i++) o[i] = tolower((unsigned char)s[i]); o[n] = 0; return o; }
+str str_upper(str s) { size_t n = strlen(s); char* o = aalloc(n + 1); for (size_t i = 0; i < n; i++) o[i] = toupper((unsigned char)s[i]); o[n] = 0; return o; }
+str pyjoin(str sep, obj it) {
+    long n = pylen(it); if (n <= 0) return "";
+    size_t sl = strlen(sep), tot = 0;
+    str* parts = aalloc(sizeof(str) * n);
+    for (long i = 0; i < n; i++) { parts[i] = pystr(index_obj(it, i)); tot += strlen(parts[i]); }
+    char* o = aalloc(tot + sl * (n - 1) + 1); char* w = o;
+    for (long i = 0; i < n; i++) { if (i) { memcpy(w, sep, sl); w += sl; } size_t l = strlen(parts[i]); memcpy(w, parts[i], l); w += l; }
+    *w = 0; return o;
+}
+
+/* ---- builtins ---- */
+obj pyenumerate(obj it, long start) {
+    obj r = list_new(); long n = pylen(it);
+    for (long i = 0; i < n; i++) list_append(r, list_of(2, OBJ_INT(start + i), index_obj(it, i)));
+    return r;
+}
+static int cmp_obj_qsort(const void* a, const void* b) {
+    long c = obj_cmp(*(const obj*)a, *(const obj*)b);
+    return c < 0 ? -1 : (c > 0 ? 1 : 0);
+}
+void list_sort(obj lst) {
+    if (lst.tag != T_LIST) return;
+    List* l = (List*)lst.u.o;
+    qsort(l->data, l->len, sizeof(obj), cmp_obj_qsort);
+}
+obj pysorted(obj it) {
+    obj r = pylist(it); list_sort(r); return r;
+}
+obj pymax(obj it, obj dflt, bool has_dflt) {
+    long n = pylen(it); if (n == 0) return has_dflt ? dflt : OBJ_NONE;
+    obj best = index_obj(it, 0);
+    for (long i = 1; i < n; i++) { obj v = index_obj(it, i); if (obj_cmp(v, best) > 0) best = v; }
+    return best;
+}
+obj pymin(obj it, obj dflt, bool has_dflt) {
+    long n = pylen(it); if (n == 0) return has_dflt ? dflt : OBJ_NONE;
+    obj best = index_obj(it, 0);
+    for (long i = 1; i < n; i++) { obj v = index_obj(it, i); if (obj_cmp(v, best) < 0) best = v; }
+    return best;
+}
+obj pysum(obj it, obj start) {
+    obj acc = start; long n = pylen(it);
+    for (long i = 0; i < n; i++) acc = obj_add(acc, index_obj(it, i));
+    return acc;
+}
+obj pyreversed(obj it) {
+    obj r = list_new(); long n = pylen(it);
+    for (long i = n - 1; i >= 0; i--) list_append(r, index_obj(it, i));
+    return r;
+}
+obj pylist(obj it) {
+    obj r = list_new(); long n = pylen(it);
+    for (long i = 0; i < n; i++) list_append(r, index_obj(it, i));
+    return r;
+}
+obj pyset(obj it) {
+    obj r = list_new(); long n = pylen(it);
+    for (long i = 0; i < n; i++) { obj v = index_obj(it, i); if (!pycontains(r, v)) list_append(r, v); }
+    return r;
+}
+void set_add(obj s, obj v) { if (!pycontains(s, v)) list_append(s, v); }
+long pyord(obj c) { return (c.tag == T_STR && c.u.s) ? (unsigned char)c.u.s[0] : (long)as_num(c); }
+str pychr(long i) { char* o = aalloc(2); o[0] = (char)i; o[1] = 0; return o; }
+long pyint(obj v) {
+    if (v.tag == T_INT || v.tag == T_BOOL) return v.u.i;
+    if (v.tag == T_STR) return strtol(v.u.s, NULL, 0);
+    return 0;
+}
+long pyabs(long x) { return x < 0 ? -x : x; }
 '''
 
 
@@ -1321,12 +1489,13 @@ class Transpiler:
                     return "bool"
                 if f.id in ("any", "all"):
                     return "bool"
-                if f.id == "str":
+                if f.id in ("str", "chr", "repr"):
                     return "char*"
                 if f.id in ("len", "ord", "int", "abs"):
                     return "int"
                 if f.id in ("range", "sorted", "list", "dict", "set",
-                            "reversed"):
+                            "reversed", "enumerate", "max", "min", "sum",
+                            "zip", "map", "filter"):
                     return OBJ
                 if f.id in self.classes:
                     return f.id + "*"
@@ -1340,6 +1509,18 @@ class Transpiler:
                     return "char*"
                 if f.attr in VTABLE_METHODS:
                     return self.method_proto(f.attr)[0]
+                if f.attr not in self.method_owners:
+                    if f.attr in ("startswith", "endswith", "isdigit",
+                                  "isalpha", "isspace", "isalnum"):
+                        return "bool"
+                    if f.attr in ("strip", "lstrip", "rstrip", "replace",
+                                  "lower", "upper", "encode", "join"):
+                        return "char*"
+                    if f.attr in ("split", "splitlines", "keys", "values",
+                                  "items"):
+                        return OBJ
+                    if f.attr in ("find", "rfind"):
+                        return "int"
         return self.guess_from_value(node)
 
     def st_AnnAssign(self, node):
@@ -1583,12 +1764,21 @@ class Transpiler:
         if node.attr == "__name__" and isinstance(node.value, ast.Attribute) \
                 and node.value.attr == "__class__":
             return "TYPE(%s)->name" % self.expr(node.value.value)
+        # type(x).__name__  ->  TYPE(x)->name
+        if node.attr == "__name__" and isinstance(node.value, ast.Call) \
+                and isinstance(node.value.func, ast.Name) \
+                and node.value.func.id == "type" and node.value.args:
+            return "TYPE(%s)->name" % self.expr(node.value.args[0])
         if isinstance(node.value, ast.Name):
             base = node.value.id
             if base in self.modules:
                 return "%s_%s" % (base, node.attr)
             if base == "self":
                 return "self->%s" % cname(node.attr)
+        # access through a concrete class pointer:  p.attr -> (p)->attr
+        bt = self.value_ctype(node.value)
+        if bt and bt.endswith("*") and bt != OBJ:
+            return "(%s)->%s" % (self.expr(node.value), cname(node.attr))
         # reading an attribute off a Tier-2 obj: resolve the element's class by
         # which class declares this attribute, then offset into its struct.
         if self.is_obj_word(node.value):
@@ -1627,6 +1817,53 @@ class Transpiler:
                     return "pyrange(%s, %s, 1)" % (a[0], a[1])
                 if len(a) == 3:
                     return "pyrange(%s, %s, %s)" % (a[0], a[1], a[2])
+            if fn == "enumerate" and node.args:
+                start = self.expr(node.args[1]) if len(node.args) > 1 else "0"
+                return "pyenumerate(%s, %s)" % (self.wrap_obj(node.args[0]),
+                                                start)
+            if fn == "sorted" and node.args:
+                return "pysorted(%s)" % self.wrap_obj(node.args[0])
+            if fn == "reversed" and node.args:
+                return "pyreversed(%s)" % self.wrap_obj(node.args[0])
+            if fn in ("max", "min"):
+                kw = {k.arg: k.value for k in node.keywords}
+                if "default" in kw:
+                    dflt, has = self.wrap_obj(kw["default"]), "true"
+                else:
+                    dflt, has = "OBJ_NONE", "false"
+                if len(node.args) == 1:
+                    it = self.wrap_obj(node.args[0])
+                else:
+                    it = "list_of(%d, %s)" % (len(node.args),
+                        ", ".join(self.wrap_obj(x) for x in node.args))
+                return "py%s(%s, %s, %s)" % (fn, it, dflt, has)
+            if fn == "sum" and node.args:
+                start = self.wrap_obj(node.args[1]) if len(node.args) > 1 \
+                    else "OBJ_INT(0)"
+                return "pysum(%s, %s)" % (self.wrap_obj(node.args[0]), start)
+            if fn == "set":
+                return "pyset(%s)" % self.wrap_obj(node.args[0]) if node.args \
+                    else "list_new() /* set() */"
+            if fn == "list":
+                return "pylist(%s)" % self.wrap_obj(node.args[0]) if node.args \
+                    else "list_new()"
+            if fn == "dict":
+                return "dict_new()" if not node.args else \
+                    "dict_new() /* dict(arg) unsupported */"
+            if fn == "ord" and node.args:
+                return "pyord(%s)" % self.wrap_obj(node.args[0])
+            if fn == "chr" and node.args:
+                return "pychr(%s)" % self.as_long(node.args[0])
+            if fn == "int":
+                if len(node.args) == 2:
+                    return "strtol(%s, NULL, %s)" % (self.as_str(node.args[0]),
+                                                     self.expr(node.args[1]))
+                return "pyint(%s)" % self.wrap_obj(node.args[0]) if node.args \
+                    else "0"
+            if fn == "abs" and node.args:
+                return "pyabs(%s)" % self.as_long(node.args[0])
+            if fn == "repr" and node.args:
+                return "pyrepr(%s)" % self.wrap_obj(node.args[0])
             if fn in self.classes:
                 cargs = self.coerce_args(
                     self.init_param_ctypes(self.classes[fn]), node.args)
@@ -1669,8 +1906,20 @@ class Transpiler:
             if func.attr == "append" and len(node.args) == 1:
                 return "list_append(%s, %s)" % (self.expr(func.value),
                                                 self.wrap_obj(node.args[0]))
-            if func.attr in ("sort", "reverse"):
-                return "/* .%s() omitted */ (void)0" % func.attr
+            if func.attr == "add" and len(node.args) == 1 and \
+                    func.attr not in self.method_owners:
+                return "set_add(%s, %s)" % (self.expr(func.value),
+                                            self.wrap_obj(node.args[0]))
+            if func.attr == "sort":
+                return "list_sort(%s)" % self.expr(func.value)
+            if func.attr == "reverse":
+                return "/* .reverse() omitted */ (void)0"
+            # string methods (guard against user methods of the same name)
+            if func.attr in self.STR_METHODS and \
+                    func.attr not in self.method_owners:
+                r = self.lower_str_method(func, node)
+                if r is not None:
+                    return r
             # dict methods on an obj receiver
             if func.attr == "items" and not node.args:
                 return "dict_items(%s)" % self.expr(func.value)
@@ -1703,6 +1952,20 @@ class Transpiler:
                                       ", ".join(argstrs))
             if func.attr in VTABLE_METHODS:
                 return self.vcall(func.value, func.attr, argstrs)
+            # non-virtual method on a concrete class pointer
+            bt = self.value_ctype(func.value)
+            if bt and bt.endswith("*") and bt != OBJ and bt[:-1] in self.classes:
+                ci = self.classes[bt[:-1]]
+                owner = ci.find_method_owner(func.attr)
+                if owner:
+                    m = owner.methods.get(func.attr)
+                    pct = [arg_ctype(m, a) for a in m.args.args[1:]] \
+                        if m else []
+                    cargs = self.coerce_args(pct, node.args)
+                    return "%s_%s((%s*)(%s)%s)" % (
+                        owner.name, func.attr, owner.name,
+                        self.expr(func.value),
+                        (", " + ", ".join(cargs)) if cargs else "")
             if isinstance(func.value, ast.Name) and \
                     func.value.id in self.classes:
                 return "%s_%s(%s)" % (func.value.id, func.attr,
@@ -1913,6 +2176,67 @@ class Transpiler:
     def str_operand(self, node):
         s = self.expr(node)
         return "AS_STR(%s)" % s if self.is_obj_word(node) else s
+
+    def as_str(self, node):
+        """Render `node` as a char* expression."""
+        t = self.value_ctype(node)
+        if t == "char*":
+            return self.expr(node)
+        if t == OBJ or self.is_obj_word(node):
+            return "AS_STR(%s)" % self.expr(node)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return self.expr(node)
+        return "pystr(%s)" % self.wrap_obj(node)
+
+    def as_long(self, node):
+        """Render `node` as a long/int expression."""
+        t = self.value_ctype(node)
+        if t in ("int", "bool"):
+            return self.expr(node)
+        if t == OBJ or self.is_obj_word(node):
+            return "AS_INT(%s)" % self.expr(node)
+        return "pyint(%s)" % self.wrap_obj(node)
+
+    def lower_str_method(self, func, node):
+        """Lower a string method call; returns C or None if not a str method."""
+        m = func.attr
+        recv = lambda: self.as_str(func.value)
+        a = node.args
+        if m == "startswith":
+            return "str_startswith(%s, %s)" % (recv(), self.as_str(a[0]))
+        if m == "endswith":
+            return "str_endswith(%s, %s)" % (recv(), self.as_str(a[0]))
+        if m in ("strip", "lstrip", "rstrip"):
+            mode = {"strip": 0, "lstrip": 1, "rstrip": 2}[m]
+            return "str_strip(%s, %d)" % (recv(), mode)
+        if m == "split":
+            sep = self.as_str(a[0]) if a else "NULL"
+            return "str_split(%s, %s)" % (recv(), sep)
+        if m == "splitlines":
+            return "str_splitlines(%s)" % recv()
+        if m == "replace":
+            return "str_replace(%s, %s, %s)" % (recv(), self.as_str(a[0]),
+                                                self.as_str(a[1]))
+        if m == "find":
+            return "str_find(%s, %s, false)" % (recv(), self.as_str(a[0]))
+        if m == "rfind":
+            return "str_find(%s, %s, true)" % (recv(), self.as_str(a[0]))
+        if m in ("isdigit", "isalpha", "isspace", "isalnum"):
+            return "str_%s(%s)" % (m, recv())
+        if m == "lower":
+            return "str_lower(%s)" % recv()
+        if m == "upper":
+            return "str_upper(%s)" % recv()
+        if m == "join":
+            return "pyjoin(%s, %s)" % (recv(), self.wrap_obj(a[0]))
+        if m == "encode":
+            return recv()
+        return None
+
+    STR_METHODS = {"startswith", "endswith", "strip", "lstrip", "rstrip",
+                   "split", "splitlines", "replace", "find", "rfind",
+                   "isdigit", "isalpha", "isspace", "isalnum", "lower",
+                   "upper", "join", "encode"}
 
     def ex_BoolOp(self, node):
         op = "&&" if isinstance(node.op, ast.And) else "||"
