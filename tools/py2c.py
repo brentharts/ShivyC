@@ -1384,6 +1384,46 @@ class Transpiler:
         # forward typedefs so the TypeInfo vtable can mention class pointers
         for ci in self.class_order:
             self.emit("typedef struct %s %s;" % (ci.name, ci.name))
+        # imported classes used as local field types need a typedef too (and
+        # their struct body, via xstructs_needed, for member access). This is
+        # transitive: an imported field type (ILValue) may itself have imported
+        # field types (CType) -- and those may live in a module this one never
+        # imported, so we resolve and load them on demand.
+        imported_field_types = set()
+        # work items: (ClassInfo, its_module_name)
+        work = [(ci, self.modname) for ci in self.class_order]
+        seen_cls = set()
+        while work:
+            ci, ci_mod = work.pop()
+            if ci.name in seen_cls:
+                continue
+            seen_cls.add(ci.name)
+            for _fn, ft in ci.full_fields():
+                if not ft.endswith("*"):
+                    continue
+                base = ft[:-1]
+                if base in self.classes or base == ci.name:
+                    continue
+                if base not in self.xclasses:
+                    # resolve `base`'s defining module via ci's imports, then
+                    # register the WHOLE module's classes (so sibling subclasses
+                    # are available for downcasts / polymorphic dispatch).
+                    reg = self.load_xmod(ci_mod) if ci_mod else None
+                    src = reg["imports"].get(base) if reg else None
+                    breg = self.load_xmod(src) if src else None
+                    if breg and base in breg["classes"]:
+                        for bn, bci in breg["classes"].items():
+                            self.xclasses.setdefault(bn, (bci, src))
+                            self.xclass_module.setdefault(bn, src)
+                    else:
+                        continue
+                if base not in imported_field_types:
+                    imported_field_types.add(base)
+                    bci, bmod = self.xclasses[base]
+                    work.append((bci, bmod))
+        for c in sorted(imported_field_types):
+            self.emit("typedef struct %s %s;" % (c, c))
+            self.xstructs_needed.add(c)
         if self.class_order:
             self.emit()
         self.emit_typeinfo_struct()
@@ -1424,6 +1464,51 @@ class Transpiler:
         out.append("};")
         return out
 
+    def _load_xclass_anywhere(self, cls):
+        """Best-effort: register imported class `cls` by searching the modules
+        reachable from this one's imports (transitively). Used when a concrete
+        pointer type (e.g. CType* inferred from a `.ctype` access) names a class
+        whose defining module was never directly imported here."""
+        if cls in self.xclasses or cls in self.classes:
+            return cls in self.xclasses
+        roots = set(self.import_alias.values()) | set(self.from_imports.values())
+        seen, work = set(), list(roots)
+        while work:
+            mod = work.pop()
+            if mod in seen:
+                continue
+            seen.add(mod)
+            reg = self.load_xmod(mod)
+            if not reg:
+                continue
+            if cls in reg["classes"]:
+                src = mod
+                breg = reg
+                for bn, bci in breg["classes"].items():
+                    self.xclasses.setdefault(bn, (bci, src))
+                    self.xclass_module.setdefault(bn, src)
+                return True
+            work += list(reg["imports"].values())
+        return False
+
+    def _load_missing_xclass(self, base, from_mod):
+        """Ensure imported class `base` is registered in xclasses, loading its
+        whole defining module (resolved via `from_mod`'s imports) on demand.
+        Returns True if `base` is available afterwards."""
+        if base in self.classes:
+            return False
+        if base in self.xclasses:
+            return True
+        reg = self.load_xmod(from_mod) if from_mod else None
+        src = reg["imports"].get(base) if reg else None
+        breg = self.load_xmod(src) if src else None
+        if breg and base in breg["classes"]:
+            for bn, bci in breg["classes"].items():
+                self.xclasses.setdefault(bn, (bci, src))
+                self.xclass_module.setdefault(bn, src)
+            return True
+        return False
+
     def build_externs(self):
         classes, funcs, singles, globs = set(), {}, {}, {}
         for (mod, name) in sorted(self.used_imports):
@@ -1444,11 +1529,28 @@ class Transpiler:
         needed = {c for c in self.xstructs_needed
                   if c in self.xclasses and c not in self.classes}
         classes |= needed
-        for c in needed:                    # field types may name other classes
-            for _, ft in self.xclasses[c][0].full_fields():
-                base = ft.rstrip("*")
-                if base in self.xclasses and base not in self.classes:
-                    classes.add(base)
+        # transitive field-type dependencies of accessed struct bodies. A body
+        # like ILValue's names CType*, which may live in a module this one never
+        # imported -- load it on demand so its forward typedef can be emitted.
+        dep_work = list(needed)
+        dep_seen = set()
+        while dep_work:
+            c = dep_work.pop()
+            if c in dep_seen or c not in self.xclasses:
+                continue
+            dep_seen.add(c)
+            ci, cmod = self.xclasses[c]
+            for _, ft in ci.full_fields():
+                if not ft.endswith("*"):
+                    continue
+                base = ft[:-1]
+                if base in self.classes:
+                    continue
+                if base not in self.xclasses and \
+                        not self._load_missing_xclass(base, cmod):
+                    continue
+                classes.add(base)
+                dep_work.append(base)
         vt_fwd = set()              # classes named only in VT slot signatures
         for mod in self.xvt_needed:
             reg = self.load_xmod(mod)
@@ -1596,7 +1698,12 @@ class Transpiler:
                         val = _const_value(n.value)
                         if val is not None:
                             reg["consts"][n.targets[0].id] = val
-                for n in t.body:        # name -> defining module (for base res.)
+                imp_src = list(t.body)
+                for n in t.body:        # descend into `if TYPE_CHECKING:`
+                    if isinstance(n, ast.If) and isinstance(n.test, ast.Name) \
+                            and n.test.id == "TYPE_CHECKING":
+                        imp_src += list(n.body)
+                for n in imp_src:        # name -> defining module (for base res.)
                     if isinstance(n, ast.ImportFrom) and n.module:
                         for a in n.names:
                             reg["imports"][a.asname or a.name] = n.module
@@ -2712,6 +2819,9 @@ class Transpiler:
         return out
 
     def st_If(self, node):
+        # `if TYPE_CHECKING:` guards type-only imports; emit nothing for it
+        if isinstance(node.test, ast.Name) and node.test.id == "TYPE_CHECKING":
+            return []
         lines = ["if (%s) {" % self.bool_expr(node.test)]
         narrows = self._narrowings(node.test)
         saved = {n: self.narrowed.get(n) for n, _ in narrows}
@@ -2970,6 +3080,28 @@ class Transpiler:
         except Exception:
             return any(fn == field for fn, _ in ci.own_fields)
 
+    def _field_owner_subclass(self, base_cls, attr):
+        """If `attr` is not declared on `base_cls` but is an own field of
+        exactly one of its (transitive) subclasses, return that subclass name.
+        Used to faithfully downcast a base pointer to the concrete type the
+        Python code assumes (e.g. CType* whose `.signed` lives on IntegerCType).
+        """
+        pool = list(self.classes.values()) + \
+            [ci for ci, _m in self.xclasses.values()]
+        cands = set()
+        for ci in pool:
+            if ci.name == base_cls:
+                continue
+            c, is_sub = ci, False
+            while c is not None:
+                if c.name == base_cls:
+                    is_sub = True
+                    break
+                c = c.base
+            if is_sub and any(fn == attr for fn, _ in ci.own_fields):
+                cands.add(ci.name)
+        return next(iter(cands)) if len(cands) == 1 else None
+
     def _class_ptr_expr(self, node, cls):
         """Render `node` as a `cls*`. A Tier-2 obj (e.g. an isinstance-narrowed
         variable) must be unwrapped with AS_OBJ; a real pointer casts directly."""
@@ -3038,8 +3170,17 @@ class Transpiler:
                 owner = self.static_owner(sci, node.attr)
                 if owner:                       # class static via a typed ptr
                     return "%s_%s" % (owner.name, cname(node.attr))
+            if cls not in self.xclasses and cls not in self.classes:
+                self._load_xclass_anywhere(cls)
             if cls in self.xclasses:
                 self.xstructs_needed.add(cls)
+            if sci is not None and not self._class_has_field(cls, node.attr):
+                sub = self._field_owner_subclass(cls, node.attr)
+                if sub:
+                    if sub in self.xclasses and sub not in self.classes:
+                        self.xstructs_needed.add(sub)
+                    return "((%s*)(%s))->%s" % (
+                        sub, self.expr(node.value), cname(node.attr))
             return "(%s)->%s" % (self.expr(node.value), cname(node.attr))
         # reading an attribute off a Tier-2 obj: resolve the element's class by
         # which class declares this attribute, then offset into its struct.
@@ -3732,6 +3873,21 @@ class Transpiler:
                 owner = self.resolve_attr_owner(node.attr)
                 if owner:
                     return owner.field_ctype(node.attr)
+            # concrete class-pointer base (e.g. self.output.ctype where
+            # self.output is ILValue*): report the field's declared type so a
+            # further `.size` lowers to `->size`.
+            bt = self.value_ctype(node.value)
+            if bt and bt.endswith("*") and bt != OBJ:
+                cls = bt[:-1]
+                ci = self.classes.get(cls) or (self.xclasses[cls][0]
+                                               if cls in self.xclasses else None)
+                if ci is not None and self._class_has_field(cls, node.attr):
+                    return ci.field_ctype(node.attr)
+                if ci is not None:
+                    sub = self._field_owner_subclass(cls, node.attr)
+                    if sub:
+                        sci = self.classes.get(sub) or self.xclasses[sub][0]
+                        return sci.field_ctype(node.attr)
             return OBJ  # other attribute reads degrade to a Tier-2 obj
         if isinstance(node, ast.Constant):
             v = node.value
@@ -3872,15 +4028,35 @@ class Transpiler:
 
     def ex_BoolOp(self, node):
         vals = node.values
-        types = [self.value_ctype(v) for v in vals]
+        is_and = isinstance(node.op, ast.And)
+
+        def render(fn):
+            """Apply each operand's fn left-to-right; for `and`, later operands
+            see the isinstance-narrowings implied by the operands before them
+            (e.g. `isinstance(x, T) and x.field`). Narrowings are restored."""
+            saved, res = {}, []
+            for v in vals:
+                res.append(fn(v))
+                if is_and:
+                    for nm, ct in self._narrowings(v):
+                        saved.setdefault(nm, self.narrowed.get(nm))
+                        self.narrowed[nm] = ct
+            for nm, old in saved.items():
+                if old is None:
+                    self.narrowed.pop(nm, None)
+                else:
+                    self.narrowed[nm] = old
+            return res
+
+        types = render(self.value_ctype)
         same = len(set(types)) == 1 and types[0] in ("int", "bool", "char*")
         if same:
-            rend = [self.expr(v) for v in vals]
-            tests = [self.truth_test(vals[i], rend[i]) for i in range(len(vals))]
+            rend = render(self.expr)
+            tests = render(lambda v: self.truth_test(
+                v, self.expr(v)))
         else:                                # unify to Tier-2 obj
-            rend = [self.wrap_obj(v) for v in vals]
+            rend = render(self.wrap_obj)
             tests = ["truthy(%s)" % r for r in rend]
-        is_and = isinstance(node.op, ast.And)
         expr = rend[-1]
         for i in range(len(vals) - 2, -1, -1):
             if is_and:                       # a and b -> (test(a) ? b : a)
