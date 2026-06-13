@@ -190,6 +190,7 @@ str  pyjoin(str sep, obj it);
 
 /* ---- common builtins ---- */
 obj  pyenumerate(obj it, long start);   /* list of [i, x]                     */
+obj  pyzip(obj a, obj b);               /* list of [x, y] (shortest)          */
 obj  pysorted(obj it);                  /* natural-order sort (obj_cmp)        */
 void list_sort(obj lst);                /* in-place natural sort               */
 obj  pymax(obj it, obj dflt, bool has_dflt);
@@ -616,6 +617,13 @@ obj pyenumerate(obj it, long start) {
     for (long i = 0; i < n; i++) list_append(r, list_of(2, OBJ_INT(start + i), index_obj(it, i)));
     return r;
 }
+obj pyzip(obj a, obj b) {
+    obj r = list_new();
+    long n = pylen(a), m = pylen(b); if (m < n) n = m;
+    for (long i = 0; i < n; i++)
+        list_append(r, list_of(2, index_obj(a, i), index_obj(b, i)));
+    return r;
+}
 static int cmp_obj_qsort(const void* a, const void* b) {
     long c = obj_cmp(*(const obj*)a, *(const obj*)b);
     return c < 0 ? -1 : (c > 0 ? 1 : 0);
@@ -918,6 +926,8 @@ class ClassInfo:
         self.methods = {}
         self.own_fields = []
         self.const_dicts = {}
+        self.class_statics = {}     # class-level obj constants (lists / dicts
+                                    # the const_dict fast-path can't specialize)
         bases = [b for b in node.bases if isinstance(b, ast.Name)]
         if bases:
             self.base_name = bases[0].id
@@ -952,6 +962,19 @@ class ClassInfo:
                 return c
             c = c.base
         return None
+
+
+def _const_value(node):
+    """Python constant value of `node` (int/str/bool, incl. negatives), else
+    None."""
+    if isinstance(node, ast.Constant) and isinstance(node.value,
+                                                     (int, str, bool)):
+        return node.value
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub) \
+            and isinstance(node.operand, ast.Constant) \
+            and isinstance(node.operand.value, (int, float)):
+        return -node.operand.value
+    return None
 
 
 def _assigned_names(fn):
@@ -1023,7 +1046,7 @@ def lift_nested_functions(tree):
     """
     lifted = []
 
-    def process(fn, prefix):
+    def process(fn, prefix, cls=None):
         encl = {a.arg for a in fn.args.args} | _assigned_names(fn)
         nested = [s for s in fn.body if isinstance(s, ast.FunctionDef)]
         if not nested:
@@ -1050,13 +1073,16 @@ def lift_nested_functions(tree):
             sub.name = mangled
             # captured locals default to Tier-2 obj (their real type coerces in
             # at the call site); a name-based guess like defined->bool is wrong.
-            cap_args = [ast.arg(arg=c, annotation=ast.Name(id="object",
-                                                           ctx=ast.Load()))
-                        for c in captures]
+            # `self` keeps its class so member/static access still resolves.
+            cap_args = []
+            for c in captures:
+                ann = ast.Name(id=(cls if (c == "self" and cls) else "object"),
+                               ctx=ast.Load())
+                cap_args.append(ast.arg(arg=c, annotation=ann))
             sub.args.args = cap_args + sub.args.args
             sub.decorator_list = []
             lifted.append(sub)
-            process(sub, mangled)       # handle deeper nesting
+            process(sub, mangled, cls)  # handle deeper nesting
 
     for top in list(tree.body):
         if isinstance(top, ast.FunctionDef):
@@ -1064,10 +1090,26 @@ def lift_nested_functions(tree):
         elif isinstance(top, ast.ClassDef):
             for item in top.body:
                 if isinstance(item, ast.FunctionDef):
-                    process(item, "%s_%s" % (top.name, item.name))
+                    process(item, "%s_%s" % (top.name, item.name), top.name)
     tree.body = lifted + tree.body
     ast.fix_missing_locations(tree)
     return tree
+
+
+def _const_dict_specializable(dnode):
+    """Whether emit_const_dict has a fast-path for this dict literal
+    (str -> list[str], or int -> str). Others become obj class-statics."""
+    keys, vals = dnode.keys, dnode.values
+    if not keys:
+        return False
+    str_keys = all(isinstance(k, ast.Constant) and isinstance(k.value, str)
+                   for k in keys)
+    int_keys = all(isinstance(k, ast.Constant) and isinstance(k.value, int)
+                   for k in keys)
+    list_vals = all(isinstance(v, ast.List) for v in vals)
+    str_vals = all(isinstance(v, ast.Constant) and isinstance(v.value, str)
+                   for v in vals)
+    return (str_keys and list_vals) or (int_keys and str_vals)
 
 
 def collect_classes(tree):
@@ -1086,9 +1128,12 @@ def collect_classes(tree):
             if isinstance(item, ast.FunctionDef):
                 ci.methods[item.name] = item
             elif isinstance(item, ast.Assign) and len(item.targets) == 1 \
-                    and isinstance(item.targets[0], ast.Name) \
-                    and isinstance(item.value, ast.Dict):
-                ci.const_dicts[item.targets[0].id] = item.value
+                    and isinstance(item.targets[0], ast.Name):
+                nm, val = item.targets[0].id, item.value
+                if isinstance(val, ast.Dict) and _const_dict_specializable(val):
+                    ci.const_dicts[nm] = val
+                elif isinstance(val, (ast.Dict, ast.List, ast.Set, ast.Tuple)):
+                    ci.class_statics[nm] = val
         ci.own_fields = discover_fields(ci.node)
     vt = set()
     for ci in order:
@@ -1165,6 +1210,7 @@ def cname(name):
 class Transpiler:
     def __init__(self, modname, base_dir=None):
         self.modname = modname
+        self.cmod = modname.replace(".", "_")   # C-safe form (e.g. for _init)
         self.base_dir = base_dir    # repo dir containing the shivyc/ package
         self.lines = []
         self.cur_class = None
@@ -1229,6 +1275,7 @@ class Transpiler:
         self.xvt_needed = set()     # imported modules needing a VT struct emitted
         self.xtype_externs = set()  # imported TypeInfo singletons (Cls_type)
         self.xvtable_impls = set()  # (clsname, method) imported vtable slot impls
+        self.xconstdict_externs = set()  # (clsname, dict) imported const-dict fns
         self.xclass_module = {}     # imported class name -> its module
         for cn, (ci, mod) in self.xclasses.items():
             self.xclass_module[cn] = mod
@@ -1332,7 +1379,8 @@ class Transpiler:
                     if base in self.xclasses and base not in self.classes:
                         vt_fwd.add(base)
         if not (classes or funcs or singles or self.used_xmethods or
-                self.xvt_needed or self.xtype_externs or self.xvtable_impls):
+                self.xvt_needed or self.xtype_externs or self.xvtable_impls or
+                self.xconstdict_externs):
             return []
         out = ["/* ---- cross-module imports (extern declarations) ---- */"]
         for c in sorted(classes | (vt_fwd - classes)):  # forward typedefs first
@@ -1356,6 +1404,8 @@ class Transpiler:
                     if self.xclass_module.get(cls) else OBJ, cls, meth))
         for cls in sorted(self.xtype_externs):          # imported TypeInfo
             out.append("extern const TypeInfo %s_type;" % cls)
+        for (cls, d) in sorted(self.xconstdict_externs):  # imported const-dicts
+            out.append("extern str %s_%s();" % (cls, d))
         for mod in sorted(self.xvt_needed):     # replicated TypeInfo layouts
             reg = self.load_xmod(mod)
             vt = self.vt_struct_name(mod)
@@ -1388,6 +1438,14 @@ class Transpiler:
             for name, ctype, kind, _ in self.mod_globals:
                 self.emit("%s %s;" % (ctype, name))
             self.emit()
+        statics = [(ci, nm) for ci in self.class_order
+                   for nm in ci.class_statics]
+        if statics:
+            self.emit("/* class-level statics (obj; init in %s_init) */"
+                      % self.modname)
+            for ci, nm in statics:
+                self.emit("obj %s_%s;" % (ci.name, cname(nm)))
+            self.emit()
 
     def func_signature(self, node):
         ret = ann_to_ctype(node.returns) or OBJ
@@ -1415,7 +1473,7 @@ class Transpiler:
             return cache[modname]
         cache[modname] = None       # guard against import cycles
         reg = {"classes": {}, "funcs": {}, "singletons": {}, "vt": set(),
-               "order": [], "imports": {}}
+               "order": [], "imports": {}, "consts": {}}
         if self.base_dir and modname.startswith("shivyc"):
             path = os.path.join(self.base_dir, *modname.split(".")) + ".py"
             try:
@@ -1424,6 +1482,12 @@ class Transpiler:
                 reg["classes"] = classes
                 reg["order"] = order
                 reg["vt"] = vt
+                for n in t.body:        # module-level constant globals
+                    if isinstance(n, ast.Assign) and len(n.targets) == 1 \
+                            and isinstance(n.targets[0], ast.Name):
+                        val = _const_value(n.value)
+                        if val is not None:
+                            reg["consts"][n.targets[0].id] = val
                 for n in t.body:        # name -> defining module (for base res.)
                     if isinstance(n, ast.ImportFrom) and n.module:
                         for a in n.names:
@@ -1767,7 +1831,7 @@ class Transpiler:
         if all_str_keys and list_vals:
             self.emit("/* const dict %s.%s : str -> list[str] */" %
                       (ci.name, dname))
-            self.emit("static str %s_%s(str key, int i) {" % (ci.name, dname))
+            self.emit("str %s_%s(str key, int i) {" % (ci.name, dname))
             self.indent += 1
             for k, v in zip(keys, vals):
                 items = ", ".join(c_string(e.value) for e in v.elts
@@ -1781,7 +1845,7 @@ class Transpiler:
             return
         if all_int_keys and const_str_vals:
             self.emit("/* const dict %s.%s : int -> str */" % (ci.name, dname))
-            self.emit("static str %s_%s_get(long key, str dflt) {" %
+            self.emit("str %s_%s_get(long key, str dflt) {" %
                       (ci.name, dname))
             self.indent += 1
             for k, v in zip(keys, vals):
@@ -1966,7 +2030,7 @@ class Transpiler:
 
     def emit_module_init(self):
         self.emit("/* Initialize module-level globals (Python import-time). */")
-        self.emit("void %s_init(void) {" % self.modname)
+        self.emit("void %s_init(void) {" % self.cmod)
         self.indent += 1
         if not self.mod_globals:
             self.emit("/* none */")
@@ -1982,6 +2046,13 @@ class Transpiler:
                 self.emit("%s = %s_new(%s);" % (name, cls, ", ".join(args)))
             else:
                 self.emit("%s = %s;" % (name, self.expr(val)))
+        for ci in self.class_order:         # class-level statics
+            prev = self.cur_class
+            self.cur_class = ci
+            for nm, val in ci.class_statics.items():
+                self.emit("%s_%s = %s;" % (ci.name, cname(nm),
+                                           self.expr(val)))
+            self.cur_class = prev
         self.indent -= 1
         self.emit("}")
 
@@ -2118,9 +2189,7 @@ class Transpiler:
             if isinstance(node.value, ast.Subscript):
                 inner = node.value
                 if isinstance(inner.value, ast.Attribute) and \
-                        isinstance(inner.value.value, ast.Name) and \
-                        inner.value.value.id == "self" and self.cur_class and \
-                        inner.value.attr in self.cur_class.const_dicts:
+                        self.const_dict_owner(inner.value) is not None:
                     return "char*"
             if self.is_obj_word(node.value) or \
                     self.value_ctype(node.value) == OBJ:
@@ -2422,9 +2491,21 @@ class Transpiler:
                 return ["(void)(%s);" % src]
             if target.id not in self.scope:
                 self.scope[target.id] = OBJ
-            decl = "obj " if (force_decl or target.id not in self.hoisted) \
-                else ""
-            out.append("%s%s = %s;" % (decl, cname(target.id), src))
+            fresh = force_decl or target.id not in self.hoisted
+            decl = "obj " if fresh else ""
+            rhs = src
+            declared = self.scope.get(target.id)
+            if not fresh and declared and declared != OBJ:
+                # `src` is an obj element; coerce to the target's hoisted C type
+                if declared == "char*":
+                    rhs = "AS_STR(%s)" % src
+                elif declared == "int":
+                    rhs = "AS_INT(%s)" % src
+                elif declared == "bool":
+                    rhs = "truthy(%s)" % src
+                elif declared.endswith("*"):
+                    rhs = "(%s)AS_OBJ(%s)" % (declared, src)
+            out.append("%s%s = %s;" % (decl, cname(target.id), rhs))
         elif isinstance(target, (ast.Tuple, ast.List)):
             self.loop_n += 1
             tmp = "_e%d" % self.loop_n
@@ -2533,6 +2614,18 @@ class Transpiler:
     def ex_Name(self, node):
         return cname(node.id)
 
+    def const_literal(self, v):
+        """Render a Python constant (int/str/bool) as a C literal."""
+        if v is True:
+            return "1"
+        if v is False:
+            return "0"
+        if isinstance(v, int):
+            return str(v)
+        if isinstance(v, str):
+            return c_string(v)
+        return "OBJ_NONE"
+
     def ex_Constant(self, node):
         v = node.value
         if v is None:
@@ -2582,6 +2675,9 @@ class Transpiler:
             base = node.value.id
             if base in self.import_alias:
                 modname = self.import_alias[base]
+                consts = self.load_xmod(modname).get("consts", {})
+                if node.attr in consts:
+                    return self.const_literal(consts[node.attr])
                 kind, info = self.xref(node.attr, modname)
                 if kind in ("singleton", "func"):
                     return cname(node.attr)      # bare exported symbol
@@ -2592,7 +2688,20 @@ class Transpiler:
             if base in self.modules:
                 return "%s_%s" % (base, node.attr)
             if base == "self":
-                return "self->%s" % cname(node.attr)
+                if self.cur_class:
+                    owner = self.static_owner(self.cur_class, node.attr)
+                    if owner:
+                        return "%s_%s" % (owner.name, cname(node.attr))
+                    return "self->%s" % cname(node.attr)
+                # cur_class is None (e.g. a lifted nested function): `self` is a
+                # typed param, so fall through to the concrete-pointer path.
+            # Class.STATIC (local or imported)
+            ci = self.classes.get(base) or (self.xclasses[base][0]
+                                            if base in self.xclasses else None)
+            if ci is not None:
+                owner = self.static_owner(ci, node.attr)
+                if owner:
+                    return "%s_%s" % (owner.name, cname(node.attr))
             # isinstance-narrowed variable: access the field through its proven
             # concrete class (only when that class really declares the field).
             if base in self.narrowed:
@@ -2605,8 +2714,15 @@ class Transpiler:
         # access through a concrete class pointer:  p.attr -> (p)->attr
         bt = self.value_ctype(node.value)
         if bt and bt.endswith("*") and bt != OBJ:
-            if bt[:-1] in self.xclasses:
-                self.xstructs_needed.add(bt[:-1])
+            cls = bt[:-1]
+            sci = self.classes.get(cls) or (self.xclasses[cls][0]
+                                            if cls in self.xclasses else None)
+            if sci is not None:
+                owner = self.static_owner(sci, node.attr)
+                if owner:                       # class static via a typed ptr
+                    return "%s_%s" % (owner.name, cname(node.attr))
+            if cls in self.xclasses:
+                self.xstructs_needed.add(cls)
             return "(%s)->%s" % (self.expr(node.value), cname(node.attr))
         # reading an attribute off a Tier-2 obj: resolve the element's class by
         # which class declares this attribute, then offset into its struct.
@@ -2649,6 +2765,9 @@ class Transpiler:
                     return "pyrange(%s, %s, 1)" % (a[0], a[1])
                 if len(a) == 3:
                     return "pyrange(%s, %s, %s)" % (a[0], a[1], a[2])
+            if fn == "zip" and len(node.args) == 2:
+                return "pyzip(%s, %s)" % (self.wrap_obj(node.args[0]),
+                                          self.wrap_obj(node.args[1]))
             if fn == "enumerate" and node.args:
                 start = self.expr(node.args[1]) if len(node.args) > 1 else "0"
                 return "pyenumerate(%s, %s)" % (self.wrap_obj(node.args[0]),
@@ -3212,6 +3331,15 @@ class Transpiler:
             return True
         return False
 
+    def static_owner(self, ci, name):
+        """Class in ci's chain that declares class-static `name`, else None."""
+        c = ci
+        while c:
+            if name in getattr(c, "class_statics", {}):
+                return c
+            c = c.base
+        return None
+
     def static_type(self, node):
         if isinstance(node, ast.Name):
             if node.id == "self" and self.cur_class:
@@ -3228,6 +3356,16 @@ class Transpiler:
                     return info + "*"
             return infer_from_name(node.id)
         if isinstance(node, ast.Attribute):
+            if isinstance(node.value, ast.Name):
+                bn = node.value.id
+                # class-static (obj global)
+                if bn == "self" and self.cur_class and \
+                        self.static_owner(self.cur_class, node.attr):
+                    return OBJ
+                sci = self.classes.get(bn) or (self.xclasses[bn][0]
+                                               if bn in self.xclasses else None)
+                if sci is not None and self.static_owner(sci, node.attr):
+                    return OBJ
             if isinstance(node.value, ast.Name) and \
                     node.value.id == "self" and self.cur_class:
                 return self.cur_class.field_ctype(node.attr)
@@ -3474,6 +3612,34 @@ class Transpiler:
     def is_obj_val(self, node):
         return self.is_obj_word(node) or self.value_ctype(node) == OBJ
 
+    def const_dict_owner(self, attr_node):
+        """For an attribute `X.D` (X = self, a class name, or alias.Class),
+        return the class declaring D as a specialized const dict (walking
+        bases), else None. Registers an extern for imported owners."""
+        if not isinstance(attr_node, ast.Attribute):
+            return None
+        d, xv = attr_node.attr, attr_node.value
+        ci = None
+        if isinstance(xv, ast.Name):
+            if xv.id == "self":
+                ci = self.cur_class
+            else:
+                ci = self.classes.get(xv.id) or (self.xclasses[xv.id][0]
+                                                 if xv.id in self.xclasses
+                                                 else None)
+        elif isinstance(xv, ast.Attribute) and isinstance(xv.value, ast.Name) \
+                and xv.value.id in self.import_alias:
+            kind, info = self.xref(xv.attr, self.import_alias[xv.value.id])
+            if kind == "class":
+                ci = info
+        while ci:
+            if d in ci.const_dicts:
+                if ci.name not in self.classes:
+                    self.xconstdict_externs.add((ci.name, d))
+                return ci
+            ci = ci.base
+        return None
+
     def is_ptr_val(self, node):
         t = self.value_ctype(node)
         return bool(t) and t.endswith("*") and t != OBJ
@@ -3481,14 +3647,13 @@ class Transpiler:
     def ex_Subscript(self, node):
         if isinstance(node.value, ast.Subscript):
             inner = node.value
-            if isinstance(inner.value, ast.Attribute) and \
-                    isinstance(inner.value.value, ast.Name) and \
-                    inner.value.value.id == "self" and self.cur_class and \
-                    inner.value.attr in self.cur_class.const_dicts:
+            owner = self.const_dict_owner(inner.value) \
+                if isinstance(inner.value, ast.Attribute) else None
+            if owner is not None:
                 d = inner.value.attr
                 key = self.expr(inner.slice)
                 i = self.expr(node.slice)
-                return "%s_%s(%s, %s)" % (self.cur_class.name, d, key, i)
+                return "%s_%s(%s, %s)" % (owner.name, d, key, i)
         sl = node.slice
         if isinstance(sl, ast.Slice):
             lo = self.as_long(sl.lower) if sl.lower else "0"
