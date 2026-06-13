@@ -995,6 +995,7 @@ class ClassInfo:
         self.base = None
         self.base_name = None
         self.methods = {}
+        self.static_methods = set()  # names decorated @staticmethod (no self)
         self.own_fields = []
         self.const_dicts = {}
         self.class_statics = {}     # class-level obj constants (lists / dicts
@@ -1199,6 +1200,9 @@ def collect_classes(tree):
         for item in ci.node.body:
             if isinstance(item, ast.FunctionDef):
                 ci.methods[item.name] = item
+                if any(isinstance(d, ast.Name) and d.id == "staticmethod"
+                       for d in item.decorator_list):
+                    ci.static_methods.add(item.name)
             elif isinstance(item, ast.Assign) and len(item.targets) == 1 \
                     and isinstance(item.targets[0], ast.Name):
                 nm, val = item.targets[0].id, item.value
@@ -1221,6 +1225,8 @@ def collect_classes(tree):
         for mname in ci.methods:
             if mname == "__init__" or (mname.startswith("__") and
                                        mname.endswith("__")):
+                continue
+            if mname in ci.static_methods:   # @staticmethod: not virtual
                 continue
             if mname in root.methods:
                 vt.add(mname)
@@ -1630,6 +1636,12 @@ class Transpiler:
                         and mname != "__init__":
                     continue
                 ret = ann_to_ctype(fn.returns) or OBJ
+                if mname in ci.static_methods:   # @staticmethod: no self
+                    sp = self.param_list(fn, skip_self=False)
+                    protos.append("%s %s_%s(%s);" % (
+                        ret, ci.name, mname,
+                        ", ".join(sp) if sp else "void"))
+                    continue
                 params = self.param_list(fn, skip_self=True)
                 if mname == "__init__":
                     plist = ", ".join(["%s* self" % ci.name] + params)
@@ -1654,8 +1666,12 @@ class Transpiler:
         if self.mod_globals:
             self.emit("/* module-level globals (init in %s_init) */"
                       % self.modname)
-            for name, ctype, kind, _ in self.mod_globals:
-                self.emit("%s %s;" % (ctype, cname(name)))
+            for name, ctype, kind, val in self.mod_globals:
+                if kind == "const":     # literal: define with initializer here
+                    self.emit("%s %s = %s;" % (ctype, cname(name),
+                                               self.expr(val)))
+                else:                   # complex: declare now, init in _init()
+                    self.emit("%s %s;" % (ctype, cname(name)))
             self.emit()
         statics = [(ci, nm) for ci in self.class_order
                    for nm in ci.class_statics]
@@ -1978,6 +1994,12 @@ class Transpiler:
                 ct = self.value_ctype(val)
                 if ct and ct != OBJ:
                     self.mod_const_types[tgt.id] = ct
+                    # a literal scalar constant (e.g. PACK_REG = "xmm15") is
+                    # emitted at file scope with its initializer, ahead of the
+                    # functions that use it, rather than at its body position.
+                    if isinstance(val, ast.Constant):
+                        self.mod_globals.append((tgt.id, ct, "const", val))
+                        self.mod_global_names.add(tgt.id)
         # module-level statements that aren't declarations (attribute/subscript
         # assignments, aug-assignments, bare calls) run at import time, so they
         # are deferred into <module>_init() rather than emitted at file scope.
@@ -2206,11 +2228,16 @@ class Transpiler:
         self.emit()
 
     def emit_method(self, ci, fn, virtual):
-        self.enter_scope(fn, skip_self=True)
+        static = fn.name in ci.static_methods
+        self.enter_scope(fn, skip_self=not static)
         ret = ann_to_ctype(fn.returns) or OBJ
         self.cur_ret = ret
-        params = self.param_list(fn, skip_self=True)
-        if virtual:
+        params = self.param_list(fn, skip_self=not static)
+        if static:                          # @staticmethod: no receiver at all
+            plist = ", ".join(params) if params else "void"
+            self.emit("%s %s_%s(%s) {" % (ret, ci.name, fn.name, plist))
+            self.indent += 1
+        elif virtual:
             self.emit("%s %s_%s(Obj* self_%s) {" % (
                 ret, ci.name, fn.name,
                 (", " + ", ".join(params)) if params else ""))
@@ -2425,6 +2452,8 @@ class Transpiler:
         if not self.mod_globals:
             self.emit("/* none */")
         for name, ctype, kind, val in self.mod_globals:
+            if kind == "const":             # already defined at file scope
+                continue
             if kind == "singleton":
                 cls = ctype[:-1]
                 if cls in self.classes:
@@ -3664,6 +3693,12 @@ class Transpiler:
             owner = ci.find_method_owner(func.attr)
             if owner is None:
                 return None
+            if func.attr in owner.static_methods:    # @staticmethod: no receiver
+                m = owner.methods.get(func.attr)
+                pct = [arg_ctype(m, a) for a in m.args.args] if m else []
+                defs = self.defaults_for(m, False) if m else None
+                cargs = self.coerce_args(pct, node.args, defs)
+                return "%s_%s(%s)" % (owner.name, func.attr, ", ".join(cargs))
             if func.attr in VTABLE_METHODS:
                 return self.vcall(func.value, func.attr, node.args)
             m = owner.methods.get(func.attr)
@@ -3678,6 +3713,12 @@ class Transpiler:
             owner = ci.find_method_owner(func.attr)
             if owner is None:
                 return None
+            if func.attr in owner.static_methods:    # @staticmethod: no receiver
+                m = owner.methods.get(func.attr)
+                ret = (ann_to_ctype(m.returns) or OBJ) if m else OBJ
+                self.used_xmethods[(owner.name, func.attr)] = ret
+                args = [self.expr(a) for a in node.args]
+                return "%s_%s(%s)" % (owner.name, func.attr, ", ".join(args))
             m = owner.methods.get(func.attr)
             ret = (ann_to_ctype(m.returns) or OBJ) if m else OBJ
             self.used_xmethods[(owner.name, func.attr)] = ret
