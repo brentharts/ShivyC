@@ -204,6 +204,7 @@ void set_add(obj s, obj v);             /* add to a list-set if absent         *
 void list_remove(obj lst, obj v);       /* remove first matching element       */
 obj  list_pop(obj lst);                 /* remove & return last element        */
 obj  obj_augop(obj a, char op, obj b);  /* x op= y for obj (arith / set ops)   */
+void del_item(obj c, obj k);            /* del c[k] for dict (key) or list (i) */
 obj  pylist(obj it);                    /* shallow copy iterable into a list   */
 long pyord(obj c);
 str  pychr(long i);
@@ -703,6 +704,18 @@ obj obj_augop(obj a, char op, obj b) {
     }
     return obj_bin(op, a, b);
 }
+void del_item(obj c, obj k) {
+    if (c.tag == T_DICT) { dict_pop(c, k, OBJ_NONE); return; }
+    if (c.tag == T_LIST) {
+        List* l = (List*)c.u.o;
+        long i = as_num(k);
+        if (i < 0) i += l->len;
+        if (i >= 0 && i < l->len) {
+            for (long j = i; j + 1 < l->len; j++) l->data[j] = l->data[j + 1];
+            l->len--;
+        }
+    }
+}
 
 str char_at(str s, long i) {
     long n = (long)strlen(s);
@@ -800,7 +813,7 @@ def ann_text_to_ctype(text):
         return simple[text]
     head = text.split("[", 1)[0]
     if head in ("List", "list", "Dict", "dict", "Set", "set", "Tuple",
-                "tuple", "Optional", "Any"):
+                "tuple", "Optional", "Any", "object"):
         return OBJ
     if text and (text[0].isupper() or text[0] == "_") and text.isidentifier():
         return text + "*"
@@ -853,12 +866,43 @@ def optional_param_names(fn):
     return names
 
 
+def _param_used_as_container(fn, name):
+    """True if `name` is iterated, membership-tested, subscripted, or mutated as
+    a collection inside `fn` -- strong evidence it isn't the scalar its name
+    suggests (e.g. a set parameter called `defined`)."""
+    for n in ast.walk(fn):
+        if isinstance(n, ast.For) and isinstance(n.iter, ast.Name) \
+                and n.iter.id == name:
+            return True
+        if isinstance(n, ast.Compare):
+            for op, cmp in zip(n.ops, n.comparators):
+                if isinstance(op, (ast.In, ast.NotIn)) and \
+                        isinstance(cmp, ast.Name) and cmp.id == name:
+                    return True
+        if isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name) \
+                and n.value.id == name:
+            return True
+        if isinstance(n, ast.comprehension) and isinstance(n.iter, ast.Name) \
+                and n.iter.id == name:
+            return True
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) \
+                and isinstance(n.func.value, ast.Name) \
+                and n.func.value.id == name and n.func.attr in (
+                    "append", "add", "update", "extend", "pop", "remove",
+                    "keys", "values", "items", "get", "discard"):
+            return True
+    return False
+
+
 def arg_ctype(fn, arg):
     if arg.annotation is not None:
         return ann_to_ctype(arg.annotation) or OBJ
     if arg.arg in optional_param_names(fn):
         return OBJ
-    return infer_from_name(arg.arg) or OBJ
+    guess = infer_from_name(arg.arg)
+    if guess in ("bool", "int") and _param_used_as_container(fn, arg.arg):
+        return OBJ                  # usage contradicts the scalar name guess
+    return guess or OBJ
 
 
 # ==========================================================================
@@ -908,6 +952,122 @@ class ClassInfo:
                 return c
             c = c.base
         return None
+
+
+def _assigned_names(fn):
+    """Names truly *bound* (rebound) anywhere in fn. A subscript/attribute
+    target (a[i]=..., a.x=...) mutates an existing object rather than binding a
+    new local, so the base name is NOT counted -- it stays a free variable."""
+    out = set()
+
+    def bind_target(t):
+        if isinstance(t, ast.Name):
+            out.add(t.id)
+        elif isinstance(t, (ast.Tuple, ast.List)):
+            for e in t.elts:
+                bind_target(e)
+        elif isinstance(t, ast.Starred):
+            bind_target(t.value)
+        # Subscript / Attribute targets intentionally ignored (mutation)
+
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Assign):
+            for t in n.targets:
+                bind_target(t)
+        elif isinstance(n, ast.AnnAssign):
+            bind_target(n.target)
+        elif isinstance(n, (ast.AugAssign,)):
+            if isinstance(n.target, ast.Name):
+                out.add(n.target.id)
+        elif isinstance(n, ast.For):
+            bind_target(n.target)
+        elif isinstance(n, ast.comprehension):
+            bind_target(n.target)
+        elif isinstance(n, ast.withitem) and n.optional_vars is not None:
+            bind_target(n.optional_vars)
+    return out
+
+
+def _free_vars(sub, enclosing_names):
+    """Enclosing locals that `sub` reads but does not itself bind/param."""
+    params = {a.arg for a in sub.args.args}
+    bound = params | _assigned_names(sub)
+    used = {n.id for n in ast.walk(sub)
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+    return [nm for nm in sorted(used & enclosing_names) if nm not in bound]
+
+
+class _CallRewriter(ast.NodeTransformer):
+    """Rewrite calls to a lifted nested function: rename + prepend captures."""
+    def __init__(self, name_map):
+        self.name_map = name_map        # original name -> (mangled, captures)
+
+    def visit_Call(self, node):
+        self.generic_visit(node)
+        f = node.func
+        if isinstance(f, ast.Name) and f.id in self.name_map:
+            mangled, captures = self.name_map[f.id]
+            node.func = ast.Name(id=mangled, ctx=ast.Load())
+            node.args = [ast.Name(id=c, ctx=ast.Load()) for c in captures] \
+                + node.args
+        return node
+
+
+def lift_nested_functions(tree):
+    """Closure-convert one level of nested functions to file scope.
+
+    Each nested def is moved to module scope with a mangled name and its
+    captured enclosing locals prepended as parameters; all calls (including
+    recursive ones) are rewritten to pass those captures. Functions that
+    rebind a captured variable via `nonlocal` are left in place (unsupported).
+    """
+    lifted = []
+
+    def process(fn, prefix):
+        encl = {a.arg for a in fn.args.args} | _assigned_names(fn)
+        nested = [s for s in fn.body if isinstance(s, ast.FunctionDef)]
+        if not nested:
+            return
+        name_map = {}
+        for sub in nested:
+            if any(isinstance(n, ast.Nonlocal) for n in ast.walk(sub)):
+                continue                # rebinds enclosing var; can't lift
+            captures = _free_vars(sub, encl)
+            mangled = "%s__%s" % (prefix, sub.name)
+            name_map[sub.name] = (mangled, captures)
+        if not name_map:
+            return
+        rewriter = _CallRewriter(name_map)
+        # drop the nested defs from the parent body, rewrite remaining calls
+        fn.body = [s for s in fn.body if not (isinstance(s, ast.FunctionDef)
+                                              and s.name in name_map)]
+        rewriter.visit(fn)
+        for sub in nested:
+            if sub.name not in name_map:
+                continue
+            mangled, captures = name_map[sub.name]
+            rewriter.visit(sub)         # rewrite recursive/sibling calls
+            sub.name = mangled
+            # captured locals default to Tier-2 obj (their real type coerces in
+            # at the call site); a name-based guess like defined->bool is wrong.
+            cap_args = [ast.arg(arg=c, annotation=ast.Name(id="object",
+                                                           ctx=ast.Load()))
+                        for c in captures]
+            sub.args.args = cap_args + sub.args.args
+            sub.decorator_list = []
+            lifted.append(sub)
+            process(sub, mangled)       # handle deeper nesting
+
+    for top in list(tree.body):
+        if isinstance(top, ast.FunctionDef):
+            process(top, top.name)
+        elif isinstance(top, ast.ClassDef):
+            for item in top.body:
+                if isinstance(item, ast.FunctionDef):
+                    process(item, "%s_%s" % (top.name, item.name))
+    tree.body = lifted + tree.body
+    ast.fix_missing_locations(tree)
+    return tree
 
 
 def collect_classes(tree):
@@ -993,7 +1153,9 @@ class Unsupported(Exception):
 C_KEYWORDS = {"int", "char", "short", "long", "float", "double", "void",
               "struct", "union", "enum", "const", "register", "static",
               "return", "if", "else", "while", "for", "switch", "default",
-              "auto", "extern", "signed", "unsigned", "volatile", "goto"}
+              "auto", "extern", "signed", "unsigned", "volatile", "goto",
+              # runtime type/identifier names that must not be shadowed
+              "obj", "Obj", "List", "Dict", "TypeInfo"}
 
 
 def cname(name):
@@ -1030,6 +1192,7 @@ class Transpiler:
 
     def run(self, tree):
         global KNOWN_CLASSES, VTABLE_METHODS
+        lift_nested_functions(tree)
         self.classes, self.class_order, vt = collect_classes(tree)
         KNOWN_CLASSES = self.classes
         VTABLE_METHODS = vt
@@ -2005,8 +2168,21 @@ class Transpiler:
         return ["/* global %s */" % ", ".join(node.names)]
 
     def st_Delete(self, node):
-        return ["/* del %s */" % ", ".join(self.expr(t)
-                                           for t in node.targets)]
+        out = []
+        for t in node.targets:
+            if isinstance(t, ast.Subscript) and not isinstance(t.slice,
+                                                               ast.Slice):
+                out.append("del_item(%s, %s);" % (self.wrap_obj(t.value),
+                                                  self.wrap_obj(t.slice)))
+            else:
+                # no-op (arena reclaims in bulk); use source text, never the
+                # generated C, so inner /* */ can't break the comment
+                try:
+                    txt = ast.unparse(t)
+                except Exception:
+                    txt = "?"
+                out.append("/* del %s */" % txt.replace("*/", "* /"))
+        return out
 
     def st_Import(self, node):
         return ["/* " + self.src1(node) + " */"]
@@ -2624,6 +2800,7 @@ class Transpiler:
 
     BUILTIN_TYPE_TAGS = {"str": "T_STR", "bytes": "T_STR", "int": "T_INT",
                          "bool": "T_BOOL", "list": "T_LIST", "tuple": "T_LIST",
+                         "set": "T_LIST", "frozenset": "T_LIST",
                          "dict": "T_DICT"}
 
     def lower_isinstance(self, val_node, cls_node):
