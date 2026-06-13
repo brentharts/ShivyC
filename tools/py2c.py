@@ -3902,7 +3902,8 @@ class Transpiler:
                 if self._class_has_field(cls, node.attr):
                     ci = self.classes.get(cls) or self.xclasses[cls][0]
                     return ci.field_ctype(node.attr)
-            if self.is_obj_word(node.value):
+            if self.is_obj_word(node.value) or \
+                    self.value_ctype(node.value) == OBJ:
                 owner = self.resolve_attr_owner(node.attr)
                 if owner:
                     return owner.field_ctype(node.attr)
