@@ -179,6 +179,8 @@ obj  obj_mul(obj a, obj b);        /* *  (int, str/list repeat)               */
 obj  obj_fdiv(obj a, obj b);       /* // */
 obj  obj_mod(obj a, obj b);
 obj  obj_bin(char op, obj a, obj b);  /* &|^ and << >>                        */
+long ipow(long base, long exp);       /* integer ** (exp >= 0)                */
+obj  obj_pow(obj a, obj b);           /* Tier-2 **                            */
 long obj_cmp(obj a, obj b);        /* <0,0,>0 for < <= > >=                   */
 obj  pyrange(long lo, long hi, long step);
 
@@ -550,6 +552,12 @@ obj obj_mul(obj a, obj b) {
 }
 obj obj_fdiv(obj a, obj b) { long d = as_num(b); return OBJ_INT(d ? as_num(a) / d : 0); }
 obj obj_mod(obj a, obj b) { long d = as_num(b); return OBJ_INT(d ? as_num(a) % d : 0); }
+long ipow(long base, long exp) {
+    long r = 1;
+    while (exp > 0) { if (exp & 1) r *= base; base *= base; exp >>= 1; }
+    return r;
+}
+obj obj_pow(obj a, obj b) { return OBJ_INT(ipow(as_num(a), as_num(b))); }
 obj obj_bin(char op, obj a, obj b) {
     long x = as_num(a), y = as_num(b), r = 0;
     switch (op) {
@@ -1398,7 +1406,7 @@ class Transpiler:
         return out
 
     def build_externs(self):
-        classes, funcs, singles = set(), {}, {}
+        classes, funcs, singles, globs = set(), {}, {}, {}
         for (mod, name) in sorted(self.used_imports):
             kind, info = self.resolve_import(name, mod)
             if kind == "class" and name not in self.classes:
@@ -1409,6 +1417,8 @@ class Transpiler:
                 singles[name] = info
                 if info not in self.classes:
                     classes.add(info)
+            elif kind == "global":
+                globs[name] = info
         for (cls, meth) in self.used_xmethods:
             if cls not in self.classes:
                 classes.add(cls)
@@ -1429,7 +1439,7 @@ class Transpiler:
                     base = ct.rstrip("*")
                     if base in self.xclasses and base not in self.classes:
                         vt_fwd.add(base)
-        if not (classes or funcs or singles or self.used_xmethods or
+        if not (classes or funcs or singles or globs or self.used_xmethods or
                 self.xvt_needed or self.xtype_externs or self.xvtable_impls or
                 self.xconstdict_externs):
             return []
@@ -1445,6 +1455,8 @@ class Transpiler:
             out.append("extern %s %s();" % (funcs[n], n))
         for n in sorted(singles):
             out.append("extern %s* %s;" % (singles[n], n))
+        for n in sorted(globs):
+            out.append("extern %s %s;" % (globs[n], n))
         for (cls, meth) in sorted(self.used_xmethods):
             out.append("extern %s %s_%s();" % (self.used_xmethods[(cls, meth)],
                                                cls, meth))
@@ -1550,7 +1562,7 @@ class Transpiler:
             return cache[modname]
         cache[modname] = None       # guard against import cycles
         reg = {"classes": {}, "funcs": {}, "singletons": {}, "vt": set(),
-               "order": [], "imports": {}, "consts": {}}
+               "order": [], "imports": {}, "consts": {}, "globals": {}}
         if self.base_dir and modname.startswith("shivyc"):
             path = os.path.join(self.base_dir, *modname.split(".")) + ".py"
             try:
@@ -1587,6 +1599,14 @@ class Transpiler:
                             cls = f.attr
                         if cls:
                             reg["singletons"][n.targets[0].id] = cls
+                    elif isinstance(n, ast.Assign) and len(n.targets) == 1 \
+                            and isinstance(n.targets[0], ast.Name) \
+                            and isinstance(n.value, (ast.List, ast.Dict,
+                                ast.Set, ast.Tuple, ast.ListComp, ast.SetComp,
+                                ast.DictComp, ast.GeneratorExp)):
+                        # module-level obj global (e.g. xmm_arg_regs = [...]),
+                        # emitted unprefixed in its module as `obj <name>;`
+                        reg["globals"][n.targets[0].id] = OBJ
             except (OSError, SyntaxError):
                 pass
         cache[modname] = reg
@@ -1603,6 +1623,8 @@ class Transpiler:
             return ("func", reg["funcs"][name])
         if name in reg["singletons"]:
             return ("singleton", reg["singletons"][name])
+        if name in reg["globals"]:
+            return ("global", reg["globals"][name])
         return (None, None)
 
     def xref(self, name, modname):
@@ -1738,13 +1760,25 @@ class Transpiler:
                 return ret, params
         return OBJ, []
 
+    def ximported_method_fn(self, mod, mname):
+        """The AST FunctionDef for method `mname` in imported `mod`, or None
+        (used to recover default-argument values for vtable calls)."""
+        reg = self.load_xmod(mod)
+        for ci in reg["order"]:
+            fn = ci.methods.get(mname)
+            if fn:
+                return fn
+        return None
+
     def xvcall(self, mod, recv_node, mname, arg_nodes):
         """Cross-module virtual call: index the defining module's TypeInfo
         layout (replicated locally as a VT struct) through the object header."""
         self.xvt_needed.add(mod)
         xo = self.obj_ptr(recv_node)
         ret, pct = self.ximported_method_sig(mod, mname)
-        cargs = self.coerce_args(pct, arg_nodes)
+        fn = self.ximported_method_fn(mod, mname)
+        defs = self.defaults_for(fn, True) if fn else None
+        cargs = self.coerce_args(pct, arg_nodes, defs)
         vt = self.vt_struct_name(mod)
         return "((const %s*)((Obj*)%s)->type)->%s(%s)" % (
             vt, xo, mname, ", ".join([xo] + cargs))
@@ -2478,6 +2512,8 @@ class Transpiler:
                         return cname(f.attr) + "*"
                     if kind == "func":
                         return ann_to_ctype(info.returns) or OBJ
+                    if kind == "global":
+                        return OBJ
                     if not self.import_alias[f.value.id].startswith("shivyc"):
                         return OBJ
                 if f.attr == "get" and isinstance(f.value, ast.Attribute) \
@@ -2919,7 +2955,7 @@ class Transpiler:
                 if node.attr in consts:
                     return self.const_literal(consts[node.attr])
                 kind, info = self.xref(node.attr, modname)
-                if kind in ("singleton", "func"):
+                if kind in ("singleton", "func", "global"):
                     return cname(node.attr)      # bare exported symbol
                 if kind == "class":
                     self.class_values_needed.add(node.attr)
@@ -3635,9 +3671,13 @@ class Transpiler:
                     return OBJ
                 # alias.ClassName used as a value -> a constructor closure (obj)
                 if bn in self.import_alias:
-                    kind, _ = self.xref(node.attr, self.import_alias[bn])
+                    kind, info = self.xref(node.attr, self.import_alias[bn])
                     if kind == "class":
                         return OBJ
+                    if kind == "global":
+                        return OBJ
+                    if kind == "singleton":
+                        return info + "*"
             if isinstance(node.value, ast.Name) and \
                     node.value.id == "self" and self.cur_class:
                 return self.cur_class.field_ctype(node.attr)
@@ -3691,13 +3731,16 @@ class Transpiler:
         numeric = {"int", "bool", "double"}
         # both sides are concrete numbers -> plain C arithmetic
         if lt in numeric and rt in numeric:
+            if isinstance(node.op, ast.Pow):     # C has no ** operator
+                return "ipow(%s, %s)" % (self.expr(node.left),
+                                         self.expr(node.right))
             return "(%s %s %s)" % (self.expr(node.left),
                                    self.binop_sym(node.op),
                                    self.expr(node.right))
         # otherwise operate on Tier-2 values
         fns = {ast.Add: "obj_add", ast.Sub: "obj_sub", ast.Mult: "obj_mul",
                ast.FloorDiv: "obj_fdiv", ast.Div: "obj_fdiv",
-               ast.Mod: "obj_mod"}
+               ast.Mod: "obj_mod", ast.Pow: "obj_pow"}
         f = fns.get(type(node.op))
         if f:
             return "%s(%s, %s)" % (f, self.wrap_obj(node.left),
