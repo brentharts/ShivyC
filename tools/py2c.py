@@ -1207,9 +1207,28 @@ class Transpiler:
             if reg:
                 for cn, ci in reg["classes"].items():
                     self.xclasses.setdefault(cn, (ci, modname))
+        # transitively pull in imported base classes (e.g. a subclass module
+        # imports ILCommand from il_cmds.base) so the hierarchy root is known
+        for _ in range(8):           # fixpoint; depth is tiny in practice
+            added = False
+            for cn, (ci, mod) in list(self.xclasses.items()):
+                bn = ci.base_name
+                if not bn or bn in self.xclasses:
+                    continue
+                src = self.load_xmod(mod)["imports"].get(bn)
+                if not src:
+                    continue
+                breg = self.load_xmod(src)
+                if breg and bn in breg["classes"]:
+                    self.xclasses.setdefault(bn, (breg["classes"][bn], src))
+                    added = True
+            if not added:
+                break
         self.used_xmethods = {}     # (clsname, method) -> return ctype
         self.xstructs_needed = set()  # imported classes whose fields are read
         self.xvt_needed = set()     # imported modules needing a VT struct emitted
+        self.xtype_externs = set()  # imported TypeInfo singletons (Cls_type)
+        self.xvtable_impls = set()  # (clsname, method) imported vtable slot impls
         self.xclass_module = {}     # imported class name -> its module
         for cn, (ci, mod) in self.xclasses.items():
             self.xclass_module[cn] = mod
@@ -1224,6 +1243,21 @@ class Transpiler:
             for m in ci.methods:
                 if m != "__init__":
                     self.xmethod_owners.setdefault(m, []).append(ci)
+        self.link_cross_module_hierarchy(vt)
+        # cross-module-hierarchy dispatch: imported roots whose hierarchy spans
+        # modules. Any of the root's interface methods can be dispatched through
+        # the root module's (canonical) vtable layout.
+        self.hierarchy_method = {}   # method -> root module (for xvcall)
+        for cn, (ci, mod) in self.xclasses.items():
+            if ci.base is not None:          # not a root
+                continue
+            subs = [c for c, (c2, _m) in self.xclasses.items()
+                    if c2 is not ci and c2.root() is ci]
+            if not subs:
+                continue
+            for m in ci.methods:
+                if not (m.startswith("__") and m.endswith("__")):
+                    self.hierarchy_method.setdefault(m, mod)
         self.collect_module_globals(tree)
 
         self.prelude()
@@ -1298,7 +1332,7 @@ class Transpiler:
                     if base in self.xclasses and base not in self.classes:
                         vt_fwd.add(base)
         if not (classes or funcs or singles or self.used_xmethods or
-                self.xvt_needed):
+                self.xvt_needed or self.xtype_externs or self.xvtable_impls):
             return []
         out = ["/* ---- cross-module imports (extern declarations) ---- */"]
         for c in sorted(classes | (vt_fwd - classes)):  # forward typedefs first
@@ -1315,6 +1349,13 @@ class Transpiler:
         for (cls, meth) in sorted(self.used_xmethods):
             out.append("extern %s %s_%s();" % (self.used_xmethods[(cls, meth)],
                                                cls, meth))
+        for (cls, meth) in sorted(self.xvtable_impls):  # imported vtable slots
+            if (cls, meth) not in self.used_xmethods:
+                out.append("extern %s %s_%s();" % (
+                    self.ximported_method_sig(self.xclass_module.get(cls), meth)[0]
+                    if self.xclass_module.get(cls) else OBJ, cls, meth))
+        for cls in sorted(self.xtype_externs):          # imported TypeInfo
+            out.append("extern const TypeInfo %s_type;" % cls)
         for mod in sorted(self.xvt_needed):     # replicated TypeInfo layouts
             reg = self.load_xmod(mod)
             vt = self.vt_struct_name(mod)
@@ -1374,7 +1415,7 @@ class Transpiler:
             return cache[modname]
         cache[modname] = None       # guard against import cycles
         reg = {"classes": {}, "funcs": {}, "singletons": {}, "vt": set(),
-               "order": []}
+               "order": [], "imports": {}}
         if self.base_dir and modname.startswith("shivyc"):
             path = os.path.join(self.base_dir, *modname.split(".")) + ".py"
             try:
@@ -1383,6 +1424,13 @@ class Transpiler:
                 reg["classes"] = classes
                 reg["order"] = order
                 reg["vt"] = vt
+                for n in t.body:        # name -> defining module (for base res.)
+                    if isinstance(n, ast.ImportFrom) and n.module:
+                        for a in n.names:
+                            reg["imports"][a.asname or a.name] = n.module
+                    elif isinstance(n, ast.Import):
+                        for a in n.names:
+                            reg["imports"][a.asname or a.name] = a.name
                 for n in t.body:
                     if isinstance(n, ast.FunctionDef):
                         reg["funcs"][n.name] = n
@@ -1436,6 +1484,39 @@ class Transpiler:
                 if m == "__init__":
                     continue
                 self.method_owners.setdefault(m, []).append(ci)
+
+    def link_cross_module_hierarchy(self, local_vt):
+        """When local classes extend an *imported* base, link the chain so
+        find_method_owner/root() walk across the module boundary, and adopt the
+        hierarchy root's full virtual interface as the canonical vtable layout
+        (so every module in the hierarchy emits a byte-identical TypeInfo)."""
+        global VTABLE_METHODS
+        self.vt_root = None          # imported root ClassInfo of the hierarchy
+        self.vt_root_mod = None
+        for ci in self.class_order:  # link a local class's imported base
+            if ci.base is None and ci.base_name in self.xclasses \
+                    and ci.base_name not in self.classes:
+                ci.base = self.xclasses[ci.base_name][0]
+        for cn, (ci, _m) in self.xclasses.items():   # transitive imported links
+            if ci.base is None and ci.base_name in self.xclasses:
+                ci.base = self.xclasses[ci.base_name][0]
+        roots = {}                   # external roots of local classes
+        for ci in self.class_order:
+            r = ci.root()
+            if r is not ci and r.name in self.xclasses \
+                    and r.name not in self.classes:
+                roots[r.name] = r
+        if len(roots) != 1:
+            return                   # no / ambiguous external hierarchy
+        rname, r = next(iter(roots.items()))
+        self.vt_root = r
+        self.vt_root_mod = self.xclass_module.get(rname)
+        canon = {m for m in r.methods if not (m.startswith("__")
+                                              and m.endswith("__"))}
+        # The layout must match the root module's TypeInfo *exactly*, so it is
+        # precisely the root's virtual interface. Module-private helpers stay
+        # off the vtable (they are self-calls on concrete types).
+        VTABLE_METHODS = canon
 
     def is_ancestor(self, a, b):
         c = b
@@ -1626,6 +1707,14 @@ class Transpiler:
             params = [arg_ctype(fn, a) for a in fn.args.args[1:]]
             fndef = fn
             break
+        # canonical methods not overridden locally: take the imported root's
+        # signature so the slot layout matches the defining module exactly.
+        if fndef is None and getattr(self, "vt_root", None) is not None:
+            fn = self.vt_root.methods.get(mname)
+            if fn is not None:
+                ret = ann_to_ctype(fn.returns) or OBJ
+                params = [arg_ctype(fn, a) for a in fn.args.args[1:]]
+                fndef = fn
         return ret, params, fndef
 
     # ---- struct emission -------------------------------------------------
@@ -1757,10 +1846,16 @@ class Transpiler:
     def emit_vtable(self, ci):
         # Only a base that is a known class in this module gets a type pointer;
         # external/builtin bases (e.g. Exception) become NULL.
-        base = ("&%s_type" % ci.base.name) if ci.base else "NULL"
+        base = "NULL"
+        if ci.base:
+            base = "&%s_type" % ci.base.name
+            if ci.base.name not in self.classes:        # imported base type
+                self.xtype_externs.add(ci.base.name)
         slots = []
         for m in sorted(VTABLE_METHODS):
             owner = ci.find_method_owner(m)
+            if owner and owner.name not in self.classes:  # imported impl
+                self.xvtable_impls.add((owner.name, m))
             slots.append(".%s = %s" % (m, ("%s_%s" % (owner.name, m))
                                        if owner else "NULL"))
         init = ", ".join([".name = %s" % c_string(ci.name),
@@ -2144,6 +2239,9 @@ class Transpiler:
                     xmod = self.resolve_xvirtual(f.attr)
                     if xmod:
                         return self.ximported_method_sig(xmod, f.attr)[0]
+                    if f.attr in self.hierarchy_method:
+                        return self.ximported_method_sig(
+                            self.hierarchy_method[f.attr], f.attr)[0]
         return self.guess_from_value(node)
 
     def st_AnnAssign(self, node):
@@ -2845,6 +2943,11 @@ class Transpiler:
                 xmod = self.resolve_xvirtual(func.attr)
                 if xmod:
                     return self.xvcall(xmod, func.value, func.attr, node.args)
+                # method belonging to an imported hierarchy whose root spans
+                # modules: dispatch through the root module's canonical vtable
+                if func.attr in self.hierarchy_method:
+                    return self.xvcall(self.hierarchy_method[func.attr],
+                                       func.value, func.attr, node.args)
             recv = self.expr(func.value)
             return "%s(%s)" % (func.attr, ", ".join([recv] + argstrs))
 
@@ -3559,10 +3662,19 @@ def write_runtime(out_dir):
 
 def transpile_file(path, out_dir):
     src = open(path, encoding="utf-8").read()
-    modname = os.path.splitext(os.path.basename(path))[0]
-    # base_dir is the directory that contains the `shivyc` package
-    d = os.path.dirname(os.path.abspath(path))
-    base_dir = os.path.dirname(d) if os.path.basename(d) == "shivyc" else d
+    ap = os.path.abspath(path)
+    parts = ap.split(os.sep)
+    if "shivyc" in parts:
+        i = parts.index("shivyc")
+        base_dir = os.sep.join(parts[:i]) or os.sep
+        rel = parts[i:]                     # e.g. ['shivyc','il_cmds','value.py']
+        if len(rel) == 2:                   # top-level module: keep basename
+            modname = rel[1][:-3]
+        else:                               # submodule: dotted, unique output
+            modname = ".".join(rel)[:-3]
+    else:
+        base_dir = os.path.dirname(ap)
+        modname = os.path.splitext(os.path.basename(path))[0]
     try:
         tree = ast.parse(src, filename=path)
     except SyntaxError as e:
