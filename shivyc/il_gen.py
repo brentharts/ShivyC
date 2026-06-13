@@ -151,6 +151,8 @@ class ILValue:
     ILCode.register_literal_var function.
     """
 
+    ctype: CType        # type annotation: drives the transpiler's field typing
+
     def __init__(self, ctype):
         """Initialize IL value."""
         self.ctype = ctype

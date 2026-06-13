@@ -225,6 +225,8 @@ class PointerCType(CType):
 
     """
 
+    arg: "CType"
+
     def __init__(self, arg, const=False):
         """Initialize type."""
         self.arg = arg
@@ -296,6 +298,8 @@ class FunctionCType(CType):
     This occurs when the function is declared as `int f();` with nothing in
     between the parentheses.
     """
+
+    ret: "CType"
 
     def __init__(self, args, ret, no_info):
         """Initialize type."""
