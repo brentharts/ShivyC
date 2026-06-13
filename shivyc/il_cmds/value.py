@@ -6,6 +6,10 @@ import shivyc.spots as spots
 from shivyc.il_cmds.base import ILCommand
 from shivyc.spots import RegSpot, MemSpot, LiteralSpot
 
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:                       # avoids an import cycle at runtime;
+    from shivyc.il_gen import ILValue   # the transpiler reads this statically
+
 
 class _ValueCmd(ILCommand):
     """Abstract base class for value commands.
@@ -13,6 +17,10 @@ class _ValueCmd(ILCommand):
     This class defines a helper function for moving data from one location
     to another.
     """
+    output: "ILValue"
+    arg: "ILValue"
+    val: "ILValue"
+
     def move_data(self, target_spot, start_spot, size, reg, asm_code):
         """Emits code to move data from start to target.
 
@@ -63,7 +71,7 @@ class _ValueCmd(ILCommand):
 
             shift += reg_size
 
-    def _reg_size(self, size):
+    def _reg_size(self, size) -> int:
         """Return largest register size that does not overfit given size."""
         reg_sizes = [8, 4, 2, 1]
         for reg_size in reg_sizes:
@@ -88,6 +96,7 @@ class LoadArg(ILCommand):
     in order to load the first function argument into the variable a and
     the second function argument into the variable b.
     """
+    output: "ILValue"
     arg_regs = [spots.RDI, spots.RSI, spots.RDX, spots.RCX, spots.R8, spots.R9]
 
     def __init__(self, output, arg_num, all_stack=False, reg=None,
@@ -519,6 +528,7 @@ class AddrOf(ILCommand):
     `output` must have type pointer to the type of `var`.
 
     """
+    output: "ILValue"
 
     def __init__(self, output, var):  # noqa D102
         self.output = output
@@ -819,6 +829,7 @@ class VaStartAddr(ILCommand):
     variadic argument lives at [rbp + 16 + 8*named_count], where named_count
     is the number of named parameters.
     """
+    output: "ILValue"
 
     def __init__(self, output, named_count):
         self.output = output

@@ -3,6 +3,10 @@
 import shivyc.asm_cmds as asm_cmds
 import shivyc.spots as spots
 from shivyc.il_cmds.base import ILCommand
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:                       # type-only; no runtime import cycle
+    from shivyc.il_gen import ILValue
 from shivyc.spots import LiteralSpot, MemSpot, RegSpot
 
 
@@ -97,6 +101,7 @@ class Jump(ILCommand):
 
 class _GeneralJump(ILCommand):
     """General class for jumping to a label based on condition."""
+    cond: "ILValue"
 
     # ASM command to output for this jump IL command.
     # (asm_cmds.Je for JumpZero and asm_cmds.Jne for JumpNotZero)
@@ -149,6 +154,7 @@ class Return(ILCommand):
     in the return register. Today, only supports values that fit in one
     register.
     """
+    arg: "ILValue"
 
     def __init__(self, arg=None): # noqa D102
         # arg must already be cast to return type
@@ -219,6 +225,8 @@ class Call(ILCommand):
     ret - If function has non-void return type, IL value to save the return
     value. Its type must match the function return value.
     """
+    func: "ILValue"
+    ret: "ILValue"
 
     arg_regs = [spots.RDI, spots.RSI, spots.RDX, spots.RCX, spots.R8, spots.R9]
 
