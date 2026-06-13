@@ -215,6 +215,7 @@ obj  py_slice(obj seq, long lo, long hi);  /* str or list slice, Python rules  *
 str  char_at(str s, long i);            /* s[i] on a string -> 1-char string   */
 void set_add(obj s, obj v);             /* add to a list-set if absent         */
 void list_remove(obj lst, obj v);       /* remove first matching element       */
+obj  list_index(obj lst, obj v);        /* position of first match (else abort) */
 obj  list_pop(obj lst);                 /* remove & return last element        */
 obj  obj_augop(obj a, char op, obj b);  /* x op= y for obj (arith / set ops)   */
 void del_item(obj c, obj k);            /* del c[k] for dict (key) or list (i) */
@@ -728,6 +729,14 @@ obj list_pop(obj lst) {
     List* l = (List*)lst.u.o;
     if (l->len == 0) return OBJ_NONE;
     return l->data[--l->len];
+}
+obj list_index(obj lst, obj v) {
+    if (lst.tag == T_LIST) {
+        List* l = (List*)lst.u.o;
+        for (long i = 0; i < l->len; i++)
+            if (obj_eq(l->data[i], v)) return OBJ_INT(i);
+    }
+    fprintf(stderr, "list.index: value not found\n"); abort();
 }
 obj obj_augop(obj a, char op, obj b) {
     int set_like = (a.tag == T_LIST || b.tag == T_LIST);
@@ -3135,12 +3144,12 @@ class Transpiler:
     def ex_Attribute(self, node):
         if node.attr == "__name__" and isinstance(node.value, ast.Attribute) \
                 and node.value.attr == "__class__":
-            return "TYPE(%s)->name" % self.expr(node.value.value)
+            return "TYPE(%s)->name" % self.obj_ptr(node.value.value)
         # type(x).__name__  ->  TYPE(x)->name
         if node.attr == "__name__" and isinstance(node.value, ast.Call) \
                 and isinstance(node.value.func, ast.Name) \
                 and node.value.func.id == "type" and node.value.args:
-            return "TYPE(%s)->name" % self.expr(node.value.args[0])
+            return "TYPE(%s)->name" % self.obj_ptr(node.value.args[0])
         if isinstance(node.value, ast.Name):
             base = node.value.id
             if base in self.import_alias:
@@ -3238,7 +3247,8 @@ class Transpiler:
             if fn == "bool" and len(node.args) == 1:
                 return self.bool_expr(node.args[0])
             if fn == "range":
-                a = [self.expr(x) for x in node.args]
+                a = [self.coerce_to("int", x, self.expr(x))
+                     for x in node.args]
                 if len(a) == 1:
                     return "pyrange(0, %s, 1)" % a[0]
                 if len(a) == 2:
@@ -3322,6 +3332,11 @@ class Transpiler:
                     return "((%s*)AS_OBJ(%s))->%s" % (
                         owner.name, self.wrap_obj(node.args[0]), cname(attr))
                 return dflt
+            if fn == "getattr" and len(node.args) >= 2:
+                # dynamic attribute name (e.g. reflecting over a module): cannot
+                # be resolved statically, so fall back to the supplied default.
+                return self.wrap_obj(node.args[2]) if len(node.args) > 2 \
+                    else "OBJ_NONE /* getattr: dynamic attr, unsupported */"
             if fn in self.classes:
                 init = self.classes[fn].methods.get("__init__")
                 defs = self.defaults_for(init, True) if init else None
@@ -3413,6 +3428,10 @@ class Transpiler:
             if func.attr == "pop" and not node.args and \
                     func.attr not in self.method_owners:
                 return "list_pop(%s)" % self.wrap_obj(func.value)
+            if func.attr == "index" and len(node.args) == 1 and \
+                    func.attr not in self.method_owners:
+                return "list_index(%s, %s)" % (self.wrap_obj(func.value),
+                                               self.wrap_obj(node.args[0]))
             if func.attr == "sort":
                 return "list_sort(%s)" % self.expr(func.value)
             if func.attr == "reverse":
@@ -3867,8 +3886,13 @@ class Transpiler:
                 kind, info = self.xref(node.id, self.from_imports[node.id])
                 if kind == "singleton":
                     return info + "*"
+            for gname, gct, _gk, _gv in self.mod_globals:   # module global
+                if gname == node.id:
+                    return gct
             return infer_from_name(node.id)
         if isinstance(node, ast.Attribute):
+            if node.attr == "__name__":      # type(x).__name__ -> TYPE(x)->name
+                return "char*"
             if isinstance(node.value, ast.Name):
                 bn = node.value.id
                 # class-static (obj global)
@@ -4326,6 +4350,13 @@ class Transpiler:
                 return node.func.id + "*"
             if node.func.id == "str":
                 return "char*"
+            if node.func.id == "getattr" and not (
+                    len(node.args) >= 2 and isinstance(node.args[1], ast.Constant)
+                    and isinstance(node.args[1].value, str)):
+                return OBJ          # dynamic attribute -> Tier-2 obj
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr == "index":   # list.index -> list_index (obj int)
+                return OBJ
         if isinstance(node, ast.JoinedStr):
             return "char*"
         if isinstance(node, (ast.List, ast.Dict, ast.Set, ast.Tuple)):
