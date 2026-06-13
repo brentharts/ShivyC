@@ -1045,11 +1045,21 @@ class Transpiler:
                     self.xclasses.setdefault(cn, (ci, modname))
         self.used_xmethods = {}     # (clsname, method) -> return ctype
         self.xstructs_needed = set()  # imported classes whose fields are read
+        self.xvt_needed = set()     # imported modules needing a VT struct emitted
+        self.xclass_module = {}     # imported class name -> its module
+        for cn, (ci, mod) in self.xclasses.items():
+            self.xclass_module[cn] = mod
+        self.xmethod_owners = {}    # method name -> [imported ClassInfo] (sep.
+                                    # from method_owners so runtime-helper guards
+                                    # are unaffected)
         for cn, (ci, _m) in self.xclasses.items():
             if cn in self.classes:
                 continue
             for fn, _ in ci.own_fields:
                 self.field_owners.setdefault(fn, []).append(ci)
+            for m in ci.methods:
+                if m != "__init__":
+                    self.xmethod_owners.setdefault(m, []).append(ci)
         self.collect_module_globals(tree)
 
         self.prelude()
@@ -1114,10 +1124,20 @@ class Transpiler:
                 base = ft.rstrip("*")
                 if base in self.xclasses and base not in self.classes:
                     classes.add(base)
-        if not (classes or funcs or singles or self.used_xmethods):
+        vt_fwd = set()              # classes named only in VT slot signatures
+        for mod in self.xvt_needed:
+            reg = self.load_xmod(mod)
+            for m in reg["vt"]:
+                ret, params = self.ximported_method_sig(mod, m)
+                for ct in [ret] + params:
+                    base = ct.rstrip("*")
+                    if base in self.xclasses and base not in self.classes:
+                        vt_fwd.add(base)
+        if not (classes or funcs or singles or self.used_xmethods or
+                self.xvt_needed):
             return []
         out = ["/* ---- cross-module imports (extern declarations) ---- */"]
-        for c in sorted(classes):           # forward typedefs first
+        for c in sorted(classes | (vt_fwd - classes)):  # forward typedefs first
             out.append("typedef struct %s %s;" % (c, c))
         for c in sorted(needed):            # full layout for accessed classes
             out += self.struct_body_lines(self.xclasses[c][0])
@@ -1131,6 +1151,17 @@ class Transpiler:
         for (cls, meth) in sorted(self.used_xmethods):
             out.append("extern %s %s_%s();" % (self.used_xmethods[(cls, meth)],
                                                cls, meth))
+        for mod in sorted(self.xvt_needed):     # replicated TypeInfo layouts
+            reg = self.load_xmod(mod)
+            vt = self.vt_struct_name(mod)
+            out.append("typedef struct %s {" % vt)
+            out.append("    const char* name;")
+            out.append("    const struct %s* base;" % vt)
+            for m in sorted(reg["vt"]):
+                ret, params = self.ximported_method_sig(mod, m)
+                out.append("    %s (*%s)(%s);" % (
+                    ret, m, ", ".join(["Obj*"] + params)))
+            out.append("} %s;" % vt)
         out.append("")
         return out
 
@@ -1178,13 +1209,16 @@ class Transpiler:
         if modname in cache:
             return cache[modname]
         cache[modname] = None       # guard against import cycles
-        reg = {"classes": {}, "funcs": {}, "singletons": {}}
+        reg = {"classes": {}, "funcs": {}, "singletons": {}, "vt": set(),
+               "order": []}
         if self.base_dir and modname.startswith("shivyc"):
             path = os.path.join(self.base_dir, *modname.split(".")) + ".py"
             try:
                 t = ast.parse(open(path, encoding="utf-8").read())
-                classes, order, _ = collect_classes(t)
+                classes, order, vt = collect_classes(t)
                 reg["classes"] = classes
+                reg["order"] = order
+                reg["vt"] = vt
                 for n in t.body:
                     if isinstance(n, ast.FunctionDef):
                         reg["funcs"][n.name] = n
@@ -1263,6 +1297,61 @@ class Transpiler:
 
     def resolve_method_owner(self, attr):
         return self._resolve_owner(self.method_owners.get(attr, []))
+
+    def resolve_xmethod_owner(self, attr):
+        """Imported class declaring `attr`, only if it is the SOLE definer.
+
+        Multiple definers means the method is overridden (polymorphic); calling
+        any one statically would dispatch to the wrong override at runtime, and
+        cross-module vtables aren't available, so we decline rather than
+        miscompile."""
+        if attr in self.method_owners:     # a local method of the same name wins
+            return None
+        owners = self.xmethod_owners.get(attr, [])
+        return owners[0] if len(owners) == 1 else None
+
+    @staticmethod
+    def vt_struct_name(modname):
+        return "VT_" + modname.replace(".", "_")
+
+    def resolve_xvirtual(self, attr):
+        """A polymorphic imported method `attr` is dispatchable via a
+        cross-module vtable iff all its definers live in ONE module and it is
+        virtual there. Returns that module name, else None."""
+        if attr in self.method_owners or attr in VTABLE_METHODS:
+            return None
+        owners = self.xmethod_owners.get(attr, [])
+        if len(owners) < 2:                # single/zero -> handled elsewhere
+            return None
+        mods = {self.xclass_module.get(o.name) for o in owners}
+        if len(mods) != 1:
+            return None
+        mod = next(iter(mods))
+        reg = self.load_xmod(mod)
+        return mod if reg and attr in reg["vt"] else None
+
+    def ximported_method_sig(self, mod, mname):
+        """(ret_ctype, [param_ctypes]) for method `mname` in imported `mod`,
+        replicating that module's emitted slot signature."""
+        reg = self.load_xmod(mod)
+        for ci in reg["order"]:
+            fn = ci.methods.get(mname)
+            if fn:
+                ret = ann_to_ctype(fn.returns) or OBJ
+                params = [arg_ctype(fn, a) for a in fn.args.args[1:]]
+                return ret, params
+        return OBJ, []
+
+    def xvcall(self, mod, recv_node, mname, arg_nodes):
+        """Cross-module virtual call: index the defining module's TypeInfo
+        layout (replicated locally as a VT struct) through the object header."""
+        self.xvt_needed.add(mod)
+        xo = self.obj_ptr(recv_node)
+        ret, pct = self.ximported_method_sig(mod, mname)
+        cargs = self.coerce_args(pct, arg_nodes)
+        vt = self.vt_struct_name(mod)
+        return "((const %s*)((Obj*)%s)->type)->%s(%s)" % (
+            vt, xo, mname, ", ".join([xo] + cargs))
 
     def ctor_class(self, call):
         """If `call` constructs a known class (local/imported/alias), return its
@@ -1855,6 +1944,16 @@ class Transpiler:
                         if owner:
                             m = owner.methods.get(f.attr)
                             return (ann_to_ctype(m.returns) or OBJ) if m else OBJ
+                # method call on an untyped obj -> unique local/imported owner
+                if self.is_obj_word(f.value) or bt == OBJ:
+                    owner = self.resolve_method_owner(f.attr) or \
+                        self.resolve_xmethod_owner(f.attr)
+                    if owner:
+                        m = owner.methods.get(f.attr)
+                        return (ann_to_ctype(m.returns) or OBJ) if m else OBJ
+                    xmod = self.resolve_xvirtual(f.attr)
+                    if xmod:
+                        return self.ximported_method_sig(xmod, f.attr)[0]
         return self.guess_from_value(node)
 
     def st_AnnAssign(self, node):
@@ -2423,6 +2522,19 @@ class Transpiler:
                         owner.name, func.attr, owner.name,
                         self.expr(func.value),
                         (", " + ", ".join(cargs)) if cargs else "")
+                xowner = self.resolve_xmethod_owner(func.attr)
+                if xowner:
+                    m = xowner.methods.get(func.attr)
+                    ret = (ann_to_ctype(m.returns) or OBJ) if m else OBJ
+                    self.used_xmethods[(xowner.name, func.attr)] = ret
+                    args = [self.expr(a) for a in node.args]
+                    return "%s_%s((%s*)AS_OBJ(%s)%s)" % (
+                        xowner.name, func.attr, xowner.name,
+                        self.expr(func.value),
+                        (", " + ", ".join(args)) if args else "")
+                xmod = self.resolve_xvirtual(func.attr)
+                if xmod:
+                    return self.xvcall(xmod, func.value, func.attr, node.args)
             recv = self.expr(func.value)
             return "%s(%s)" % (func.attr, ", ".join([recv] + argstrs))
 
