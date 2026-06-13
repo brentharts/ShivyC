@@ -217,6 +217,7 @@ void set_add(obj s, obj v);             /* add to a list-set if absent         *
 void list_remove(obj lst, obj v);       /* remove first matching element       */
 obj  list_index(obj lst, obj v);        /* position of first match (else abort) */
 obj  list_pop(obj lst);                 /* remove & return last element        */
+void list_assign_slice(obj dst, obj src); /* dst[:] = src (replace contents)   */
 obj  obj_augop(obj a, char op, obj b);  /* x op= y for obj (arith / set ops)   */
 void del_item(obj c, obj k);            /* del c[k] for dict (key) or list (i) */
 obj  pylist(obj it);                    /* shallow copy iterable into a list   */
@@ -383,6 +384,15 @@ void list_append(obj lst, obj v) {
 void list_extend(obj lst, obj it) {
     long n = pylen(it);
     for (long i = 0; i < n; i++) list_append(lst, index_obj(it, i));
+}
+void list_assign_slice(obj dst, obj src) {
+    /* dst[:] = src  -- replace all of dst's contents with src's, in place.
+       Snapshot src first so the operation is safe even if src aliases dst. */
+    long n = pylen(src);
+    obj* tmp = (obj*)aalloc((n ? n : 1) * sizeof(obj));
+    for (long i = 0; i < n; i++) tmp[i] = index_obj(src, i);
+    ((List*)dst.u.o)->len = 0;
+    for (long i = 0; i < n; i++) list_append(dst, tmp[i]);
 }
 obj list_of(int n, ...) {
     obj r = list_new();
@@ -2569,6 +2579,13 @@ class Transpiler:
                                                    self.unwrap_obj(t, src)))
                 continue
             if isinstance(tgt, ast.Subscript):
+                # dst[:] = src  -- replace the list's contents in place.
+                if isinstance(tgt.slice, ast.Slice) and \
+                        tgt.slice.lower is None and tgt.slice.upper is None \
+                        and tgt.slice.step is None:
+                    lines.append("list_assign_slice(%s, %s);" % (
+                        self.expr(tgt.value), self.wrap_obj(node.value)))
+                    continue
                 if self.is_obj_word(tgt.value) or \
                         self.value_ctype(tgt.value) == OBJ:
                     lines.append("subscript_set(%s, %s, %s);" % (
@@ -3471,7 +3488,7 @@ class Transpiler:
                 return "list_remove(%s, %s)" % (self.wrap_obj(func.value),
                                                 self.wrap_obj(node.args[0]))
             if func.attr == "pop" and not node.args and \
-                    func.attr not in self.method_owners:
+                    not self._local_method_accepts_argc("pop", 0):
                 return "list_pop(%s)" % self.wrap_obj(func.value)
             if func.attr == "index" and len(node.args) == 1 and \
                     func.attr not in self.method_owners:
@@ -3696,6 +3713,23 @@ class Transpiler:
         nd = len(defs)
         n = len(params)
         return [None] * (n - nd) + list(defs)
+
+    def _local_method_accepts_argc(self, attr, argc):
+        """True if some local class declares a method `attr` callable with
+        `argc` positional args (beyond self). Used to disambiguate a builtin
+        container method (list/dict `.pop()`, etc.) from a user method of the
+        same name: if no user method can take the given argument count, the
+        call must be the builtin."""
+        for ci in self.method_owners.get(attr, []):
+            fn = ci.methods.get(attr)
+            if not fn:
+                continue
+            params = fn.args.args[1:]              # drop self
+            lo = len(params) - len(fn.args.defaults)
+            hi = (1 << 30) if fn.args.vararg else len(params)
+            if lo <= argc <= hi:
+                return True
+        return False
 
     def method_on_instance(self, func, node):
         """If `func.value` is a concrete class instance (local or imported) and
