@@ -8,7 +8,7 @@ from shivyc.errors import CompilerError
 from shivyc.il_gen import ILValue
 from shivyc.tree.expr_base import _RExprNode, _LExprNode
 from shivyc.tree.utils import DirectLValue
-from shivyc.tokens import parse_c_int
+from shivyc.tokens import parse_c_int, Token
 
 
 class MultiExpr(_RExprNode):
@@ -129,6 +129,8 @@ class String(_LExprNode):
 
 class Identifier(_LExprNode):
     """Expression that is a single identifier."""
+
+    identifier: Token
 
     def __init__(self, identifier):
         """Initialize node."""
