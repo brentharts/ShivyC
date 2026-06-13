@@ -578,6 +578,7 @@ class Transpiler:
         self.classes, self.class_order, vt = collect_classes(tree)
         KNOWN_CLASSES = self.classes
         VTABLE_METHODS = vt
+        self.build_owner_maps()
         self.collect_imports(tree)
         self.collect_module_globals(tree)
 
@@ -630,6 +631,45 @@ class Transpiler:
             if isinstance(node, ast.Import):
                 for a in node.names:
                     self.modules.add((a.asname or a.name).split(".")[0])
+
+    def build_owner_maps(self):
+        """Which class declares each attribute/method. Because attributes are a
+        fixed per-class set in this codebase, a `.attr` read off an untyped obj
+        usually identifies the element's type uniquely -> a real struct offset."""
+        self.field_owners = {}
+        self.method_owners = {}
+        for ci in self.class_order:
+            for fn, _ in ci.own_fields:
+                self.field_owners.setdefault(fn, []).append(ci)
+            for m in ci.methods:
+                if m == "__init__":
+                    continue
+                self.method_owners.setdefault(m, []).append(ci)
+
+    def is_ancestor(self, a, b):
+        c = b
+        while c:
+            if c is a:
+                return True
+            c = c.base
+        return False
+
+    def _resolve_owner(self, owners):
+        if not owners:
+            return None
+        if len(owners) == 1:
+            return owners[0]
+        # if one owner is a base of all others, casting to it is offset-safe
+        for cand in owners:
+            if all(self.is_ancestor(cand, o) for o in owners):
+                return cand
+        return None
+
+    def resolve_attr_owner(self, attr):
+        return self._resolve_owner(self.field_owners.get(attr, []))
+
+    def resolve_method_owner(self, attr):
+        return self._resolve_owner(self.method_owners.get(attr, []))
 
     def collect_module_globals(self, tree):
         for node in tree.body:
@@ -1261,9 +1301,13 @@ class Transpiler:
                 return "%s_%s" % (base, node.attr)
             if base == "self":
                 return "self->%s" % cname(node.attr)
-        # reading an attribute off an untyped Tier-2 obj: we have no struct to
-        # offset into, so degrade to a stub (revisit with typed containers).
+        # reading an attribute off a Tier-2 obj: resolve the element's class by
+        # which class declares this attribute, then offset into its struct.
         if self.is_obj_word(node.value):
+            owner = self.resolve_attr_owner(node.attr)
+            if owner:
+                return "((%s*)AS_OBJ(%s))->%s" % (
+                    owner.name, self.expr(node.value), cname(node.attr))
             return "OBJ_NONE /* %s.%s */" % (self.src1(node.value), node.attr)
         return "%s.%s" % (self.expr(node.value), cname(node.attr))
 
@@ -1340,6 +1384,18 @@ class Transpiler:
                     func.value.id in self.classes:
                 return "%s_%s(%s)" % (func.value.id, func.attr,
                                       ", ".join(argstrs))
+            # method call on an untyped obj: resolve a unique non-vtable owner
+            if self.is_obj_word(func.value):
+                owner = self.resolve_method_owner(func.attr)
+                if owner:
+                    m = owner.methods.get(func.attr)
+                    pct = [arg_ctype(m, a) for a in m.args.args[1:]] \
+                        if m else []
+                    cargs = self.coerce_args(pct, node.args)
+                    return "%s_%s((%s*)AS_OBJ(%s)%s)" % (
+                        owner.name, func.attr, owner.name,
+                        self.expr(func.value),
+                        (", " + ", ".join(cargs)) if cargs else "")
             recv = self.expr(func.value)
             return "%s(%s)" % (func.attr, ", ".join([recv] + argstrs))
 
@@ -1470,6 +1526,10 @@ class Transpiler:
             if isinstance(node.value, ast.Name) and \
                     node.value.id in self.modules:
                 return None
+            if self.is_obj_word(node.value):
+                owner = self.resolve_attr_owner(node.attr)
+                if owner:
+                    return owner.field_ctype(node.attr)
             return OBJ  # other attribute reads degrade to a Tier-2 obj
         if isinstance(node, ast.Constant):
             v = node.value
