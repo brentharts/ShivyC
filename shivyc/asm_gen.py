@@ -296,7 +296,7 @@ class NodeGraph:
         """Return all nodes in this graph, including pseudonodes."""
         return self._all_nodes
 
-    def copy(self):
+    def copy(self) -> "NodeGraph":
         """Return a deep copy of this graph, but with same ILValue objects."""
         g = NodeGraph()
 
@@ -818,7 +818,7 @@ class ASMGen:
 
         return live_vars
 
-    def _generate_graph(self, commands, free_values, live_vars):
+    def _generate_graph(self, commands, free_values, live_vars) -> "NodeGraph":
         """Generate the conflict/preference graph.
 
         free_values - List of ILValues to include in the graph
@@ -875,7 +875,7 @@ class ASMGen:
                         g.add_pref(v, s)
         return g
 
-    def _simplify_all(self, removed_nodes, g):
+    def _simplify_all(self, removed_nodes, g: "NodeGraph"):
         """Repeat the Simplify step until no more can be done.
 
         Returns False iff no simplification is done.
@@ -900,14 +900,14 @@ class ASMGen:
 
         return did_something
 
-    def _simplify_once(self, nodes, g):
+    def _simplify_once(self, nodes, g: "NodeGraph"):
         """Remove and return a node in nodes if it has low conflict degree."""
         for v in nodes:
             # If the node has low conflict degree remove it from the graph
             if len(g.confs(v)) < len(self.alloc_registers):
                 return g.pop(v)
 
-    def _coalesce_all(self, merged_nodes, g):
+    def _coalesce_all(self, merged_nodes, g: "NodeGraph"):
         """Repeat the coalesce step until no more can be done.
 
         Returns False iff no simplification is done.
@@ -929,7 +929,7 @@ class ASMGen:
 
         return did_something
 
-    def _coalesce_once(self, g):
+    def _coalesce_once(self, g: "NodeGraph"):
         """Perform one iteration of the coalesce step.
 
         Returns the merged pair if a merge was successfully completed. The
@@ -970,7 +970,7 @@ class ASMGen:
                     g.merge(v1, v2)
                     return v1, v2
 
-    def _freeze(self, g):
+    def _freeze(self, g: "NodeGraph"):
         """Remove one preference edge.
 
         This function finds two nodes, preferably of low conflict degree,
@@ -1004,7 +1004,7 @@ class ASMGen:
 
         return False
 
-    def _generate_spotmap(self, removed_nodes, merged_nodes, g):
+    def _generate_spotmap(self, removed_nodes, merged_nodes, g: "NodeGraph"):
         """Pop values off stack to generate spot assignments."""
 
         # Get a set of nodes which interfere with n or anything merged into it
