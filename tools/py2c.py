@@ -945,6 +945,23 @@ def _param_used_as_container(fn, name):
     return False
 
 
+def _param_used_as_object(fn, name):
+    """True if `name` is accessed via an attribute that isn't a string or
+    container method (e.g. `identifier.content`) -- evidence it's an object,
+    not the scalar string/int its name suggests."""
+    KNOWN = {"strip", "lstrip", "rstrip", "upper", "lower", "replace", "split",
+             "splitlines", "startswith", "endswith", "isdigit", "isalpha",
+             "isspace", "isalnum", "find", "rfind", "join", "encode", "decode",
+             "format", "count", "index", "append", "add", "update", "extend",
+             "pop", "remove", "keys", "values", "items", "get", "discard",
+             "sort", "copy", "setdefault"}
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) \
+                and n.value.id == name and n.attr not in KNOWN:
+            return True
+    return False
+
+
 def arg_ctype(fn, arg):
     if arg.annotation is not None:
         return ann_to_ctype(arg.annotation) or OBJ
@@ -953,6 +970,8 @@ def arg_ctype(fn, arg):
     guess = infer_from_name(arg.arg)
     if guess in ("bool", "int") and _param_used_as_container(fn, arg.arg):
         return OBJ                  # usage contradicts the scalar name guess
+    if guess in ("bool", "int", "char*") and _param_used_as_object(fn, arg.arg):
+        return OBJ                  # attribute access -> it's an object
     return guess or OBJ
 
 
@@ -1454,9 +1473,9 @@ class Transpiler:
         for n in sorted(funcs):
             out.append("extern %s %s();" % (funcs[n], n))
         for n in sorted(singles):
-            out.append("extern %s* %s;" % (singles[n], n))
+            out.append("extern %s* %s;" % (singles[n], cname(n)))
         for n in sorted(globs):
-            out.append("extern %s %s;" % (globs[n], n))
+            out.append("extern %s %s;" % (globs[n], cname(n)))
         for (cls, meth) in sorted(self.used_xmethods):
             out.append("extern %s %s_%s();" % (self.used_xmethods[(cls, meth)],
                                                cls, meth))
@@ -1525,7 +1544,7 @@ class Transpiler:
             self.emit("/* module-level globals (init in %s_init) */"
                       % self.modname)
             for name, ctype, kind, _ in self.mod_globals:
-                self.emit("%s %s;" % (ctype, name))
+                self.emit("%s %s;" % (ctype, cname(name)))
             self.emit()
         statics = [(ci, nm) for ci in self.class_order
                    for nm in ci.class_statics]
@@ -1843,6 +1862,18 @@ class Transpiler:
                 ct = self.value_ctype(val)
                 if ct and ct != OBJ:
                     self.mod_const_types[tgt.id] = ct
+        # module-level statements that aren't declarations (attribute/subscript
+        # assignments, aug-assignments, bare calls) run at import time, so they
+        # are deferred into <module>_init() rather than emitted at file scope.
+        self.mod_init_stmts = []
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                    and not isinstance(node.targets[0], ast.Name):
+                self.mod_init_stmts.append(node)
+            elif isinstance(node, ast.AugAssign):
+                self.mod_init_stmts.append(node)
+            elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+                self.mod_init_stmts.append(node)
 
     def prelude(self):
         bar = "/* " + "=" * 66 + " */"
@@ -2170,6 +2201,8 @@ class Transpiler:
     # ---- top level (non-class) -------------------------------------------
 
     def toplevel(self, node):
+        if getattr(self, "mod_init_stmts", None) and node in self.mod_init_stmts:
+            return                          # emitted inside <module>_init()
         if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) \
                 and isinstance(node.value.value, str):
             doc = node.value.value.strip().splitlines()
@@ -2279,14 +2312,18 @@ class Transpiler:
             if kind == "singleton":
                 cls = ctype[:-1]
                 if cls in self.classes:
+                    init = self.classes[cls].methods.get("__init__")
+                    defs = self.defaults_for(init, True) if init else None
                     args = self.coerce_args(
-                        self.init_param_ctypes(self.classes[cls]), val.args)
+                        self.init_param_ctypes(self.classes[cls]), val.args,
+                        defs)
                 else:                       # imported class -> unchecked args
                     args = [self.wrap_obj(a) if False else self.expr(a)
                             for a in val.args]
-                self.emit("%s = %s_new(%s);" % (name, cls, ", ".join(args)))
+                self.emit("%s = %s_new(%s);" % (cname(name), cls,
+                                                ", ".join(args)))
             else:
-                self.emit("%s = %s;" % (name, self.expr(val)))
+                self.emit("%s = %s;" % (cname(name), self.expr(val)))
         for ci in self.class_order:         # class-level statics
             prev = self.cur_class
             self.cur_class = ci
@@ -2294,6 +2331,9 @@ class Transpiler:
                 self.emit("%s_%s = %s;" % (ci.name, cname(nm),
                                            self.expr(val)))
             self.cur_class = prev
+        for stmt in getattr(self, "mod_init_stmts", []):  # deferred top-level
+            for ln in self.stmt(stmt):
+                self.emit(ln)
         self.indent -= 1
         self.emit("}")
 
@@ -3327,7 +3367,8 @@ class Transpiler:
                 return "%s_%s(%s)" % (func.value.id, func.attr,
                                       ", ".join(argstrs))
             # method call on an untyped obj: resolve a unique non-vtable owner
-            if self.is_obj_word(func.value):
+            if self.is_obj_word(func.value) or \
+                    self.value_ctype(func.value) == OBJ:
                 owner = self.resolve_method_owner(func.attr)
                 if owner:
                     m = owner.methods.get(func.attr)
@@ -3375,8 +3416,8 @@ class Transpiler:
 
     def obj_ptr(self, node):
         s = self.expr(node)
-        if self.is_obj_word(node):
-            return "%s.u.o" % s
+        if self.is_obj_word(node) or self.value_ctype(node) == OBJ:
+            return "AS_OBJ(%s)" % s
         return "(Obj*)(%s)" % s
 
     def vcall(self, recv_node, meth, arg_nodes):
@@ -3498,24 +3539,19 @@ class Transpiler:
         hit = "true" if fn == "any" else "false"
         if isinstance(arg, ast.GeneratorExp) and len(arg.generators) == 1:
             gen = arg.generators[0]
-            tgt = gen.target
-            tname = cname(tgt.id) if isinstance(tgt, ast.Name) else "_e"
-            saved = self.scope.get(getattr(tgt, "id", None))
-            if isinstance(tgt, ast.Name):
-                self.scope[tgt.id] = OBJ
+            saved = dict(self.scope)
+            binds = self.bind_target(gen.target,
+                                     "index_obj(%s, %s)" % (it, idx),
+                                     force_decl=True)
             conds = " && ".join("(%s)" % self.bool_expr(c) for c in gen.ifs)
             pred = self.bool_expr(arg.elt)
             if fn == "all":
                 pred = "!(%s)" % pred
             guard = ("if (%s) " % conds) if conds else ""
-            body = ("obj %s = index_obj(%s, %s); %sif (%s) { _r = %s; break; }"
-                    % (tname, it, idx, guard, pred, hit))
+            body = "%s %sif (%s) { _r = %s; break; }" % (
+                " ".join(binds), guard, pred, hit)
             src = self.expr(gen.iter)
-            if isinstance(tgt, ast.Name):
-                if saved is None:
-                    self.scope.pop(tgt.id, None)
-                else:
-                    self.scope[tgt.id] = saved
+            self.scope = saved
         else:
             pred = "truthy(_e)"
             if fn == "all":
