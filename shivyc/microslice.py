@@ -57,7 +57,9 @@ OP_COST = {
 }
 
 # A nominal clock so the report can quote nanoseconds (3 GHz -> 1 cycle ~ 0.33 ns).
-NS_PER_COST = 1.0 / 3.0
+# At ~3 GHz one cycle is ~0.33 ns, i.e. ~3 cost units per ns. We keep the
+# estimate in integer arithmetic (cost // COST_PER_NS) rather than floats.
+COST_PER_NS = 3
 
 
 class Fragment:
@@ -162,7 +164,7 @@ def plan_slice(frag, budget):
     per_iter = max(1, frag.iter_cost)
     iters = max(1, budget // per_iter)
     slice_cost = iters * per_iter
-    return iters, slice_cost, slice_cost * NS_PER_COST
+    return iters, slice_cost, slice_cost // COST_PER_NS
 
 
 def emit_scaffold(frag, iters):
@@ -197,7 +199,7 @@ def format_report(prog, frags, budget):
     out.append("micro-slicing analysis (productive spinning)")
     out.append("=" * 44)
     out.append(f"slice budget: {budget} cost units "
-               f"(~{budget * NS_PER_COST:.0f} ns at 3 GHz)")
+               f"(~{budget // COST_PER_NS} ns at 3 GHz)")
     out.append("")
 
     candidates = [f for f in frags.values() if f.pure and f.has_loop]
@@ -210,9 +212,9 @@ def format_report(prog, frags, budget):
             out.append(f"  {f.name}(): pure, hot loop over {f.body_blocks} "
                        f"block(s), ~{f.iter_cost} cost/iteration")
             out.append(f"      -> slice = {iters} iteration(s) per poll "
-                       f"(~{ns:.0f} ns); lock observed at least every slice")
+                       f"(~{ns} ns); lock observed at least every slice")
             out.append(f"      -> added acquisition latency bounded by "
-                       f"~{ns:.0f} ns (one slice)")
+                       f"~{ns} ns (one slice)")
     else:
         out.append("no interleavable fragment found "
                    "(need a pure function with a bounded loop)")
