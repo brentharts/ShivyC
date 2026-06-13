@@ -460,7 +460,7 @@ class ASMGen:
             # Declare the static scratch buffer (BSS) if this function used it.
             if self._near_active and self._near_size > 0:
                 size = self._near_size + (-self._near_size % 16)  # 16-align
-                self.asm_code.add_comm(self._near_label, size, local=True)
+                self.asm_code.add_comm(self._near_label, size, True)
             self._near_active = False
 
     def _apply_thread_budget(self, func):
