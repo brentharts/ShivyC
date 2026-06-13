@@ -2731,6 +2731,17 @@ class Transpiler:
                    ast.RShift: '>'}
 
     def st_AugAssign(self, node):
+        # `c[i] += v` on an obj container: read-modify-write via subscript_set,
+        # since `subscript(...)` is an rvalue and cannot be assigned to.
+        if isinstance(node.target, ast.Subscript) and \
+                (self.is_obj_word(node.target.value) or
+                 self.value_ctype(node.target.value) == OBJ):
+            cont = self.expr(node.target.value)
+            idx = self.wrap_obj(node.target.slice)
+            ch = self.AUG_OP_CHAR.get(type(node.op), '+')
+            cur = "subscript(%s, %s)" % (cont, idx)
+            return ["subscript_set(%s, %s, obj_augop(%s, '%c', %s));" % (
+                cont, idx, cur, ch, self.wrap_obj(node.value))]
         tgt = self.expr(node.target)
         tt = self.target_ctype(node.target) or self.value_ctype(node.target)
         if tt == OBJ or self.is_obj_word(node.target):
@@ -2963,8 +2974,19 @@ class Transpiler:
         lines.append("}")
         for h in node.handlers:
             et = self.src1(h.type) if h.type else "..."
-            lines.append("/* except %s */ {" % et)
-            lines += self.indent_lines(self.suite(h.body))
+            # `raise` aborts with no stack unwinding, so a handler can never be
+            # reached: if the try body raises it has already aborted, and if it
+            # completes there is no exception. Keep the body for readability but
+            # guard it so it never executes (and still type-checks / compiles).
+            lines.append("if (0) { /* except %s */" % et)
+            binds = []
+            if h.name:
+                if h.name in self.scope or h.name in self.hoisted:
+                    binds.append("%s = OBJ_NONE;" % cname(h.name))
+                else:
+                    self.scope[h.name] = OBJ
+                    binds.append("obj %s = OBJ_NONE;" % cname(h.name))
+            lines += self.indent_lines(binds + self.suite(h.body))
             lines.append("}")
         if node.finalbody:
             lines.append("/* finally */ {")
@@ -3275,6 +3297,17 @@ class Transpiler:
                 return "pyrepr(%s)" % self.wrap_obj(node.args[0])
             if fn == "vars":
                 return "dict_new() /* vars() unsupported */"
+            if fn == "hasattr" and len(node.args) == 2 and \
+                    isinstance(node.args[1], ast.Constant) and \
+                    isinstance(node.args[1].value, str):
+                # Structural approximation (yields a C bool): an object "has" an
+                # attribute iff it is an instance of the class that declares it.
+                # Dynamically-set attributes (no declared owner) read as absent.
+                owner = self.resolve_attr_owner(node.args[1].value)
+                if owner:
+                    return self.lower_isinstance(
+                        node.args[0], ast.Name(id=owner.name))
+                return "0 /* hasattr: dynamic attr, unsupported */"
             if fn == "getattr" and len(node.args) >= 2 and \
                     isinstance(node.args[1], ast.Constant) and \
                     isinstance(node.args[1].value, str):
