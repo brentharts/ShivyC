@@ -1179,6 +1179,108 @@ def lift_nested_functions(tree):
     return tree
 
 
+def convert_block_closures(tree):
+    """Closure-convert nested functions the call-rewriting lift cannot handle:
+    those defined inside a block (for/while/if/with/try) and used as a
+    first-class value (e.g. asm_gen's `get_reg`, defined per-command inside a
+    loop and handed to `command.make_asm`).
+
+    Each such function is moved to file scope with its captured enclosing
+    locals prepended as parameters; the original `def f(...)` is replaced by
+    `f = __closure_env__("mangled", cap0, cap1, ...)`, which the emitter lowers
+    to a make_closure carrying the captured values. The classic capture-via-
+    default idiom (`_i=i`) is honoured: such params are folded into the
+    captured environment (their value is the default expression at def time),
+    while params with constant/no defaults (`pref=None`) stay caller-supplied.
+
+    Returns {mangled: (lifted_node, n_caps, real_default_nodes)}.
+    """
+    specs = {}
+    lifted = []
+    used = {f.name for f in tree.body if isinstance(f, ast.FunctionDef)}
+
+    def process(fn, prefix, cls):
+        toplevel = {id(s) for s in fn.body}   # handled by the other lift
+        encl = {a.arg for a in fn.args.args} | _assigned_names(fn)
+
+        class T(ast.NodeTransformer):
+            def visit_FunctionDef(self, sub):
+                if sub is fn or id(sub) in toplevel:
+                    self.generic_visit(sub)
+                    return sub
+                if any(isinstance(n, ast.Nonlocal) for n in ast.walk(sub)):
+                    return sub                 # rebinds enclosing var; skip
+                return self.closure(sub)
+
+            def closure(self, sub):
+                params = sub.args.args
+                defaults = sub.args.defaults
+                dmap = {len(params) - len(defaults) + k: d
+                        for k, d in enumerate(defaults)}
+                defcap, real, real_defs = [], [], []
+                for idx, p in enumerate(params):
+                    d = dmap.get(idx)
+                    if d is not None and not isinstance(d, ast.Constant):
+                        defcap.append((p.arg, d))      # `_i=i` -> capture
+                    else:
+                        real.append(p)
+                        real_defs.append(d)
+                # free vars read in the BODY (not in default expressions)
+                bound = {a.arg for a in params} | _assigned_names(sub)
+                body_used = set()
+                for st in sub.body:
+                    for n in ast.walk(st):
+                        if isinstance(n, ast.Name) and \
+                                isinstance(n.ctx, ast.Load):
+                            body_used.add(n.id)
+                fv = [nm for nm in sorted(body_used & encl) if nm not in bound]
+                cap_names = list(fv) + [nm for nm, _ in defcap]
+                cap_vals = [ast.Name(id=nm, ctx=ast.Load()) for nm in fv] + \
+                    [d for _, d in defcap]
+                n_caps = len(cap_names)
+                orig_name = sub.name
+                mangled = "%s__%s" % (prefix, orig_name)
+                base, k = mangled, 2
+                while mangled in used:    # avoid colliding with the call-rewrite
+                    mangled = "%s__%d" % (base, k)   # lift or a same-named sibling
+                    k += 1
+                used.add(mangled)
+                new_args = []
+                for nm in cap_names:
+                    ann = ast.Name(id=(cls if (nm == "self" and cls)
+                                       else "object"), ctx=ast.Load())
+                    new_args.append(ast.arg(arg=nm, annotation=ann))
+                sub.name = mangled
+                sub.args.args = new_args + real
+                sub.args.defaults = []
+                sub.args.kwonlyargs = []
+                sub.args.kw_defaults = []
+                sub.decorator_list = []
+                self.generic_visit(sub)        # handle any deeper nesting
+                lifted.append(sub)
+                specs[mangled] = (sub, n_caps, real_defs)
+                marker = ast.Call(
+                    func=ast.Name(id="__closure_env__", ctx=ast.Load()),
+                    args=[ast.Constant(value=mangled)] + cap_vals,
+                    keywords=[])
+                return ast.Assign(
+                    targets=[ast.Name(id=orig_name, ctx=ast.Store())],
+                    value=marker)
+
+        T().visit(fn)
+
+    for top in list(tree.body):
+        if isinstance(top, ast.FunctionDef):
+            process(top, top.name, None)
+        elif isinstance(top, ast.ClassDef):
+            for item in top.body:
+                if isinstance(item, ast.FunctionDef):
+                    process(item, "%s_%s" % (top.name, item.name), top.name)
+    tree.body = lifted + tree.body
+    ast.fix_missing_locations(tree)
+    return specs
+
+
 def _const_dict_specializable(dnode):
     """Whether emit_const_dict has a fast-path for this dict literal
     (str -> list[str], or int -> str). Others become obj class-statics."""
@@ -1343,6 +1445,8 @@ class Transpiler:
     def run(self, tree):
         global KNOWN_CLASSES, VTABLE_METHODS
         lift_nested_functions(tree)
+        self.closure_specs = convert_block_closures(tree)
+        self.closure_values_needed = set()
         self.classes, self.class_order, vt = collect_classes(tree)
         KNOWN_CLASSES = self.classes
         VTABLE_METHODS = vt
@@ -1486,6 +1590,8 @@ class Transpiler:
         externs = self.build_externs()
         tramps = ["static obj %s__tramp(obj, obj);" % cname(fn)
                   for fn in sorted(self.func_values_needed)]
+        tramps += ["static obj %s__tramp(obj, obj);" % cname(m)
+                   for m in sorted(self.closure_values_needed)]
         tramps += ["static obj %s__ctortramp(obj, obj);" % cls
                    for cls in sorted(self.class_values_needed)]
         self.lines[self.extern_idx:self.extern_idx] = externs + tramps
@@ -2403,10 +2509,62 @@ class Transpiler:
         for ln in self.assign(node, toplevel=True):
             self.emit(ln)
 
+    def _coerce_obj_to(self, expr, ct):
+        """Coerce a Tier-2 obj expression `expr` to C type `ct`."""
+        if ct == "int":
+            return "AS_INT(%s)" % expr
+        if ct == "bool":
+            return "truthy(%s)" % expr
+        if ct == "char*":
+            return "AS_STR(%s)" % expr
+        if ct.endswith("*") and ct != OBJ:
+            return "(%s)AS_OBJ(%s)" % (ct, expr)
+        return expr
+
     def emit_trampolines(self):
         """Uniform-signature wrappers for functions used as first-class values:
         unpack the arg list, coerce to the real parameter types, call, and box
         the result back to a Tier-2 obj."""
+        # closure-converted nested functions: captures come from `env`, the
+        # caller-supplied params from `args` (filling defaults when short).
+        for mangled in sorted(self.closure_values_needed):
+            node, n_caps, real_defs = self.closure_specs[mangled]
+            pct = [arg_ctype(node, a) for a in node.args.args]
+            ret = ann_to_ctype(node.returns) or OBJ
+            parts = []
+            for i in range(n_caps):
+                parts.append(self._coerce_obj_to("index_obj(env, %d)" % i,
+                                                 pct[i]))
+            for j in range(n_caps, len(pct)):
+                k = j - n_caps
+                d = real_defs[k] if k < len(real_defs) else None
+                if d is None:
+                    raw = "index_obj(args, %d)" % k
+                else:
+                    dflt = self.wrap_obj(d)
+                    raw = "(pylen(args) > %d ? index_obj(args, %d) : %s)" % (
+                        k, k, dflt)
+                parts.append(self._coerce_obj_to(raw, pct[j]))
+            call = "%s(%s)" % (cname(mangled), ", ".join(parts))
+            self.emit("static obj %s__tramp(obj env, obj args) {" %
+                      cname(mangled))
+            self.indent += 1
+            self.emit("(void)env; (void)args;")
+            if ret == "void":
+                self.emit("%s; return OBJ_NONE;" % call)
+            elif ret == "int":
+                self.emit("return OBJ_INT(%s);" % call)
+            elif ret == "bool":
+                self.emit("return OBJ_BOOL(%s);" % call)
+            elif ret == "char*":
+                self.emit("return OBJ_STR(%s);" % call)
+            elif ret.endswith("*") and ret != OBJ:
+                self.emit("return OBJ_OBJ(%s);" % call)
+            else:
+                self.emit("return %s;" % call)
+            self.indent -= 1
+            self.emit("}")
+            self.emit()
         for fn in sorted(self.func_values_needed):
             node = self.func_nodes[fn]
             pct = self.func_params.get(fn, [])
@@ -2620,6 +2778,9 @@ class Transpiler:
 
     def value_ctype(self, node):
         """Best-effort C type of an expression, when determinable."""
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id == "__closure_env__":
+            return OBJ                  # make_closure(...) yields a Tier-2 obj
         t = self.static_type(node)
         if t:
             return t
@@ -3294,6 +3455,16 @@ class Transpiler:
 
         if isinstance(func, ast.Name):
             fn = func.id
+            if fn == "__closure_env__":
+                # closure-converted nested function used as a value: bundle the
+                # captured values into an env list and build the closure.
+                mangled = node.args[0].value
+                self.closure_values_needed.add(mangled)
+                caps = node.args[1:]
+                env = "list_of(%d, %s)" % (
+                    len(caps), ", ".join(self.wrap_obj(c) for c in caps)) \
+                    if caps else "list_new()"
+                return "make_closure(&%s__tramp, %s)" % (cname(mangled), env)
             if fn == "isinstance" and len(node.args) == 2:
                 return self.lower_isinstance(node.args[0], node.args[1])
             if fn == "str" and len(node.args) == 1:
@@ -3560,9 +3731,18 @@ class Transpiler:
                     func.value.id in self.modules:
                 return "%s_%s(%s)" % (func.value.id, func.attr,
                                       ", ".join(argstrs))
+            # a method name that collides between a local class method and an
+            # imported polymorphic hierarchy (e.g. `make_asm`: ASMCode defines
+            # a 0-arg make_asm, while ILCommand's is make_asm(spotmap, ...)).
+            # When the call's arity cannot fit any local method, it must be the
+            # hierarchy method -> dispatch through the cross-module vtable.
+            if func.attr in self.hierarchy_method and \
+                    not self._local_method_accepts_argc(func.attr,
+                                                         len(node.args)):
+                return self.xvcall(self.hierarchy_method[func.attr],
+                                   func.value, func.attr, node.args)
             if func.attr in VTABLE_METHODS:
                 return self.vcall(func.value, func.attr, node.args)
-            # isinstance-narrowed receiver: dispatch the method on its proven
             # concrete class. Safe to devirtualize only for a leaf class, so no
             # subclass can override the method at runtime.
             if isinstance(func.value, ast.Name) and \
