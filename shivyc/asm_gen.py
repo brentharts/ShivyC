@@ -427,7 +427,7 @@ class ASMGen:
                 self.all_registers = [r for r in self.all_registers
                                       if r not in cs]
 
-            self.asm_code.add(asm_cmds.Label(func))
+            self.asm_code.add(asm_cmds.AsmLabel(func))
 
             # Contract-proven SIMD reductions get a hand-synthesized,
             # fallback-free SSE2 body instead of the normal scalar codegen.
