@@ -1,61 +1,61 @@
 #!/usr/bin/env python3
-"""py2c.py -- a source-to-source transpiler from the ShivyCX compiler's
-Python source into (abstract) C.
+"""py2c.py -- a source-to-source transpiler from the ShivyCX compiler's Python
+source into C, specialized to the ShivyCX code base (not general Python).
 
-This is NOT a general Python->C transpiler. Writing one of those for arbitrary
-Python is effectively impossible. Instead, this tool only ever has to handle the
-ShivyCX code base, which evolves slowly and follows consistent conventions. That
-lets us cheat: where a value's type is not annotated and not easy to recover by
-tracing the call graph, we *guess the type from the variable's name*. This keeps
-the transpiler small and fast.
+See the NAMING CONVENTIONS section below: where a type is not annotated and not
+easily recovered, the transpiler guesses it from the variable's name. This is
+sound here because ShivyCX evolves slowly and follows consistent conventions.
 
-This first pass is deliberately ABSTRACT. The emitted .c files are meant to show
-"what the most direct C rendering of this Python looks like" -- they are not yet
-expected to compile or to faithfully emulate Python's runtime semantics. Things
-that have no direct C analogue (comprehensions, exceptions, dict/set/list
-literals, lambdas, ...) are lowered to clearly-marked placeholder helpers or
-left as `/* ... */` comments carrying the original source, so nothing is lost.
+OBJECT MODEL (why this can be smaller/faster than a PyObject*-based approach)
+---------------------------------------------------------------------------
+The codebase has no __getattr__/__setattr__, no metaclasses, no eval/exec, no
+runtime class creation, and a fixed per-class attribute set. So we do NOT need
+CPython's dict-based attributes or slot dispatch. Instead:
+
+  Tier 0  concrete C types from inference (int, char*, struct*) -- no `obj`.
+  Tier 1  each class -> a real C struct whose first member is an `Obj` header
+          carrying a `TypeInfo*` (name + base chain + vtable). This gives:
+            * isinstance  -> walk the base chain (isinstance_of)
+            * virtual call -> one indirect call through a vtable slot
+            * attributes  -> compile-time struct offsets (no dict)
+          Subclass structs repeat inherited fields *first*, so a common prefix
+          lays out identically across a family (header at 0, then base fields),
+          making base<->derived pointer casts valid.
+  Tier 2  a tagged `obj` word, used only where a value is genuinely dynamic
+          (e.g. MemSpot.base which the source documents as `str | Spot`).
+
+Memory: the whole compile is one arena (aalloc); freed in one shot. No
+refcounting, no GC -- a batch compiler can do this; CPython cannot.
+
+The C runtime (shivyc_rt.h / shivyc_rt.c) is embedded in this file as raw
+strings and written to the output directory at transpile time, so a generated
+module compiles with just `cc module.c shivyc_rt.c`.
 
 
-===========================================================================
 NAMING CONVENTIONS (the contract for ShivyCX contributors)
-===========================================================================
-When a name is not annotated, the transpiler infers its C type purely from the
-name. To keep the generated C accurate, ShivyCX code should honor these rules
-(or add a `: type` annotation to override them):
-
-  * Integers -- a variable is treated as `int` when its (lower-cased) name is
-    one of, or ends with, any of:
-        index, idx, i, j, k, n, n1, n2, count, size, offset, chunk, num,
-        length, len, pos, position, line, lineno, col, column, start, end,
-        depth, level, width, height, amount, total, addr, address, byte,
-        bytes, bits, rbp_offset, spot_size
-    Rationale: the code uses `index` everywhere for loop/array indices, etc.
-
-  * Strings (char*) -- treated as `str` (char*) when the name is one of:
-        name, text, s, string, msg, message, filename, fname, func_name,
-        tag, rep, content, spelling, label, identifier, prog, code,
-        asm_code, asm_str, text_repr, mangled, suffix, prefix
-
-  * Booleans -- treated as `bool` when the name starts with one of
-        is_, has_, can_, should_, was_, use_, allow_
-    or is exactly one of:
-        defined, ok, found, done, wide, signed, unsigned, const, volatile,
-        valid, empty, present, enabled, success
-
-  * `self` -- always a pointer to the enclosing class' struct.
-
-  * Capitalized annotations / 'ForwardRef' strings (e.g. `Spot`, `'Spot'`) are
-    treated as a pointer to that struct: `Spot*`.
-
-Everything else falls back to the generic `obj` type (see the prelude emitted
-at the top of each .c file).
-
+----------------------------------------------------------
+  * int   : index, idx, i, j, k, n, n1, n2, count, size, offset, chunk, num,
+            length, len, pos, position, line, lineno, col, column, start, end,
+            depth, level, width, height, amount, total, addr, address, byte,
+            bytes, bits, rbp_offset, spot_size; or a name ending in
+            _size/_offset/_count/_index/_len/_num/_idx.
+  * char* : name, text, s, string, msg, message, filename, fname, func_name,
+            tag, rep, content, spelling, label, identifier, prog, code,
+            asm_code, asm_str, text_repr, mangled, suffix, prefix; or a name
+            ending in _str.
+  * bool  : names starting is_/has_/can_/should_/was_/use_/allow_, or exactly
+            defined/ok/found/done/wide/signed/unsigned/const/volatile/valid/
+            empty/present/enabled/success.
+  * self  : pointer to the enclosing class' struct.
+  * A Capitalized annotation / 'ForwardRef' (e.g. Spot, 'Spot') -> `Spot*`.
+  Everything else falls back to the generic `obj`. A `: type` annotation always
+  overrides the name-based guess.
 
 Usage:
     python3 py2c.py                 # transpile every ../shivyc/*.py -> /tmp/*.c
-    python3 py2c.py a.py b.py       # transpile the given files -> /tmp
+    python3 py2c.py spots.py        # transpile the given file(s) -> /tmp
     python3 py2c.py --out DIR ...   # choose a different output directory
+    python3 py2c.py --conventions   # print the naming-convention rules
 """
 
 import ast
@@ -63,9 +63,153 @@ import os
 import sys
 
 
-# --------------------------------------------------------------------------
+# ==========================================================================
+# Embedded C runtime (written to the output dir at transpile time)
+# ==========================================================================
+
+RUNTIME_H = r'''#ifndef SHIVYC_RT_H
+#define SHIVYC_RT_H
+/* ShivyCX transpiler runtime -- generated by tools/py2c.py */
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+typedef char* str;
+
+/* ---- Tier 2: generic dynamic value (used only where the type is open) ---- */
+typedef struct Obj Obj;
+enum { T_NONE, T_INT, T_BOOL, T_STR, T_OBJ };
+typedef struct { unsigned char tag; union { long i; str s; Obj* o; } u; } obj;
+
+#define OBJ_NONE    ((obj){T_NONE,{0}})
+#define OBJ_INT(x)  ((obj){T_INT,{.i=(long)(x)}})
+#define OBJ_BOOL(x) ((obj){T_BOOL,{.i=(long)(x)}})
+#define OBJ_STR(x)  ((obj){T_STR,{.s=(str)(x)}})
+#define OBJ_OBJ(x)  ((obj){T_OBJ,{.o=(Obj*)(x)}})
+#define IS_OBJ(v)   ((v).tag==T_OBJ)
+#define IS_NONE(v)  ((v).tag==T_NONE)
+#define AS_OBJ(v)   ((v).u.o)
+#define AS_INT(v)   ((v).u.i)
+#define AS_STR(v)   ((v).u.s)
+
+/* ---- Tier 1: object header -- first member of every transpiled struct ---- */
+/* `type` points at a per-module TypeInfo; kept void* here so this header is
+   module-agnostic. Each module casts it to its own TypeInfo. The base chain
+   used by isinstance lives at a fixed offset, so isinstance_of works on any
+   module's TypeInfo as long as {name; base;} are the first two members. */
+struct Obj { const void* type; };
+
+typedef struct TypeInfoHdr {
+    const char* name;
+    const struct TypeInfoHdr* base;
+} TypeInfoHdr;
+
+static inline bool isinstance_of(Obj* o, const void* t) {
+    const TypeInfoHdr* want = (const TypeInfoHdr*)t;
+    const TypeInfoHdr* k = o ? (const TypeInfoHdr*)o->type : NULL;
+    for (; k; k = k->base) if (k == want) return true;
+    return false;
+}
+/* isinstance on an obj-word: true only if it boxes a matching Obj* */
+#define OBJ_ISINST(v, t) (IS_OBJ(v) && isinstance_of((v).u.o, (t)))
+
+/* fetch a transpiled value's TypeInfo (cast to the module's TypeInfo type) */
+#define TYPEINFO(T, o) ((const T*)((Obj*)(o))->type)
+
+/* ---- arena: bump-allocate; free the whole compile at once (no refcount) -- */
+void* aalloc(size_t n);
+void  arena_reset(void);
+
+/* ---- small python-ish helpers ---- */
+str  pystr(obj v);                 /* str(x)                                  */
+str  pyfmt(int n, const char* fmt, ...); /* f-strings: "{}..." + obj args     */
+str  pyconcat(str a, str b);       /* "x" + y                                 */
+bool in_str(str needle, const str* hay, int n); /* x in {string literals}     */
+bool truthy(obj v);                /* Python truthiness of a Tier-2 value     */
+
+#endif /* SHIVYC_RT_H */
+'''
+
+RUNTIME_C = r'''/* ShivyCX transpiler runtime -- generated by tools/py2c.py */
+#include "shivyc_rt.h"
+
+/* One big region for the whole compilation. Tune as needed. */
+static char   g_arena[1u << 26];
+static size_t g_ap = 0;
+
+void* aalloc(size_t n) {
+    size_t a = (n + 15u) & ~(size_t)15u;
+    if (g_ap + a > sizeof g_arena) { fprintf(stderr, "arena exhausted\n"); abort(); }
+    void* p = &g_arena[g_ap];
+    g_ap += a;
+    return p;
+}
+void arena_reset(void) { g_ap = 0; }
+
+str pystr(obj v) {
+    char* b;
+    switch (v.tag) {
+        case T_INT:  b = aalloc(24); sprintf(b, "%ld", v.u.i); return b;
+        case T_BOOL: return v.u.i ? "True" : "False";
+        case T_STR:  return v.u.s ? v.u.s : "";
+        case T_NONE: return "None";
+        default:     b = aalloc(24); sprintf(b, "<obj %p>", (void*)v.u.o); return b;
+    }
+}
+
+str pyfmt(int n, const char* fmt, ...) {
+    (void)n;
+    va_list ap; va_start(ap, fmt);
+    char* out = aalloc(strlen(fmt) + 256);
+    char* p = out; const char* f = fmt;
+    while (*f) {
+        if (f[0] == '{' && f[1] == '}') {
+            obj a = va_arg(ap, obj);
+            str s = pystr(a);
+            size_t l = strlen(s);
+            memcpy(p, s, l); p += l;
+            f += 2;
+        } else {
+            *p++ = *f++;
+        }
+    }
+    *p = 0;
+    va_end(ap);
+    return out;
+}
+
+str pyconcat(str a, str b) {
+    size_t la = a ? strlen(a) : 0, lb = b ? strlen(b) : 0;
+    char* out = aalloc(la + lb + 1);
+    if (a) memcpy(out, a, la);
+    if (b) memcpy(out + la, b, lb);
+    out[la + lb] = 0;
+    return out;
+}
+
+bool in_str(str needle, const str* hay, int n) {
+    for (int i = 0; i < n; i++) if (!strcmp(needle, hay[i])) return true;
+    return false;
+}
+
+bool truthy(obj v) {
+    switch (v.tag) {
+        case T_NONE: return false;
+        case T_INT:
+        case T_BOOL: return v.u.i != 0;
+        case T_STR:  return v.u.s && v.u.s[0];
+        default:     return v.u.o != NULL;
+    }
+}
+'''
+
+
+# ==========================================================================
 # Type inference from naming conventions
-# --------------------------------------------------------------------------
+# ==========================================================================
 
 INT_NAMES = {
     "index", "idx", "i", "j", "k", "n", "n1", "n2", "count", "size",
@@ -74,8 +218,6 @@ INT_NAMES = {
     "height", "amount", "total", "addr", "address", "byte", "bytes", "bits",
     "rbp_offset", "spot_size",
 }
-
-# Names that, as a *suffix* (after '_'), imply int.  e.g. "spot_size", "x_offset"
 INT_SUFFIXES = ("size", "offset", "count", "index", "len", "num", "idx")
 
 STR_NAMES = {
@@ -84,51 +226,47 @@ STR_NAMES = {
     "prog", "code", "asm_code", "asm_str", "text_repr", "mangled", "suffix",
     "prefix",
 }
+STR_SUFFIXES = ("str",)
 
 BOOL_NAMES = {
     "defined", "ok", "found", "done", "wide", "signed", "unsigned", "const",
     "volatile", "valid", "empty", "present", "enabled", "success",
 }
-
 BOOL_PREFIXES = ("is_", "has_", "can_", "should_", "was_", "use_", "allow_")
 
-# Generic dynamic / unknown type.
 OBJ = "obj"
 
-
-def ann_to_ctype(ann):
-    """Map an ast annotation node to a C type string, or None if unknown."""
-    if ann is None:
-        return None
-    try:
-        text = ast.unparse(ann)
-    except Exception:
-        return None
-    return ann_text_to_ctype(text)
+KNOWN_CLASSES = {}      # name -> ClassInfo
+VTABLE_METHODS = set()  # method names that are virtual somewhere in the module
 
 
 def ann_text_to_ctype(text):
     text = text.strip().strip("'\"")
-    simple = {
-        "int": "int", "bool": "bool", "None": "void",
-        "str": "char*", "float": "double", "bytes": "char*",
-    }
+    simple = {"int": "int", "bool": "bool", "None": "void", "str": "char*",
+              "float": "double", "bytes": "char*"}
     if text in simple:
         return simple[text]
-    # Container annotations have no direct C form in this abstract pass.
-    if text.split("[", 1)[0] in ("List", "list", "Dict", "dict", "Set",
-                                 "set", "Tuple", "tuple", "Optional", "Any"):
+    head = text.split("[", 1)[0]
+    if head in ("List", "list", "Dict", "dict", "Set", "set", "Tuple",
+                "tuple", "Optional", "Any"):
         return OBJ
-    # A bare Capitalized name -> pointer to that struct.
     if text and (text[0].isupper() or text[0] == "_") and text.isidentifier():
         return text + "*"
     return None
 
 
+def ann_to_ctype(ann):
+    if ann is None:
+        return None
+    try:
+        return ann_text_to_ctype(ast.unparse(ann))
+    except Exception:
+        return None
+
+
 def infer_from_name(name):
-    """Guess a C type purely from a variable name, per the documented rules."""
     if name == "self":
-        return None  # handled specially by the class context
+        return None
     low = name.lower()
     if low in INT_NAMES:
         return "int"
@@ -141,198 +279,573 @@ def infer_from_name(name):
     tail = low.rsplit("_", 1)[-1]
     if tail in INT_SUFFIXES:
         return "int"
+    if tail in STR_SUFFIXES:
+        return "char*"
     return None
 
 
 def infer_type(name, ann=None):
-    """Full inference: annotation wins, else naming convention, else `obj`."""
-    t = ann_to_ctype(ann)
-    if t:
-        return t
-    t = infer_from_name(name)
-    if t:
-        return t
-    return OBJ
+    return ann_to_ctype(ann) or infer_from_name(name) or OBJ
 
 
-# --------------------------------------------------------------------------
-# The transpiler
-# --------------------------------------------------------------------------
+def optional_param_names(fn):
+    """Params with a literal `None` default and no annotation are Optional,
+    hence must be boxed as `obj` (None has to be representable)."""
+    names = set()
+    defaults = fn.args.defaults
+    if defaults:
+        for arg, default in zip(fn.args.args[-len(defaults):], defaults):
+            if arg.annotation is None and isinstance(default, ast.Constant) \
+                    and default.value is None:
+                names.add(arg.arg)
+    return names
+
+
+def arg_ctype(fn, arg):
+    if arg.annotation is not None:
+        return ann_to_ctype(arg.annotation) or OBJ
+    if arg.arg in optional_param_names(fn):
+        return OBJ
+    return infer_from_name(arg.arg) or OBJ
+
+
+# ==========================================================================
+# Class model
+# ==========================================================================
+
+class ClassInfo:
+    def __init__(self, node):
+        self.node = node
+        self.name = node.name
+        self.base = None
+        self.base_name = None
+        self.methods = {}
+        self.own_fields = []
+        self.const_dicts = {}
+        bases = [b for b in node.bases if isinstance(b, ast.Name)]
+        if bases:
+            self.base_name = bases[0].id
+
+    def root(self):
+        c = self
+        while c.base:
+            c = c.base
+        return c
+
+    def full_fields(self):
+        out = []
+        if self.base:
+            out.extend(self.base.full_fields())
+        seen = {f[0] for f in out}
+        for f in self.own_fields:
+            if f[0] not in seen:
+                out.append(f)
+                seen.add(f[0])
+        return out
+
+    def field_ctype(self, cn):
+        for n, t in self.full_fields():
+            if n == cn:
+                return t
+        return None
+
+    def find_method_owner(self, mname):
+        c = self
+        while c:
+            if mname in c.methods:
+                return c
+            c = c.base
+        return None
+
+
+def collect_classes(tree):
+    classes = {}
+    order = []
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            ci = ClassInfo(node)
+            classes[ci.name] = ci
+            order.append(ci)
+    for ci in order:
+        if ci.base_name in classes:
+            ci.base = classes[ci.base_name]
+    for ci in order:
+        for item in ci.node.body:
+            if isinstance(item, ast.FunctionDef):
+                ci.methods[item.name] = item
+            elif isinstance(item, ast.Assign) and len(item.targets) == 1 \
+                    and isinstance(item.targets[0], ast.Name) \
+                    and isinstance(item.value, ast.Dict):
+                ci.const_dicts[item.targets[0].id] = item.value
+        ci.own_fields = discover_fields(ci.node)
+    vt = set()
+    for ci in order:
+        root = ci.root()
+        for mname in ci.methods:
+            if mname == "__init__" or (mname.startswith("__") and
+                                       mname.endswith("__")):
+                continue
+            if mname in root.methods:
+                vt.add(mname)
+    return classes, order, vt
+
+
+def discover_fields(classnode):
+    fields = []
+    seen = set()
+
+    def add(name, ctype):
+        if name not in seen:
+            seen.add(name)
+            fields.append((name, ctype))
+
+    for item in classnode.body:
+        if isinstance(item, ast.AnnAssign) and isinstance(item.target,
+                                                          ast.Name) \
+                and not isinstance(item.value, ast.Dict):
+            add(item.target.id, infer_type(item.target.id, item.annotation))
+    for item in classnode.body:
+        if not isinstance(item, ast.FunctionDef):
+            continue
+        opt = optional_param_names(item)
+        for sub in ast.walk(item):
+            targets, ann = [], None
+            if isinstance(sub, ast.Assign):
+                targets = sub.targets
+            elif isinstance(sub, ast.AnnAssign):
+                targets, ann = [sub.target], sub.annotation
+            else:
+                continue
+            for tgt in targets:
+                if isinstance(tgt, ast.Attribute) and \
+                        isinstance(tgt.value, ast.Name) and \
+                        tgt.value.id == "self":
+                    # self.x = <optional param>  ->  obj
+                    if ann is None and isinstance(sub, ast.Assign) and \
+                            isinstance(sub.value, ast.Name) and \
+                            sub.value.id in opt:
+                        add(tgt.attr, OBJ)
+                    else:
+                        add(tgt.attr, infer_type(tgt.attr, ann))
+    return fields
+
+
+# ==========================================================================
+# Transpiler
+# ==========================================================================
 
 class Unsupported(Exception):
     pass
 
 
+C_KEYWORDS = {"int", "char", "short", "long", "float", "double", "void",
+              "struct", "union", "enum", "const", "register", "static",
+              "return", "if", "else", "while", "for", "switch", "default",
+              "auto", "extern", "signed", "unsigned", "volatile", "goto"}
+
+
+def cname(name):
+    return name + "_" if name in C_KEYWORDS else name
+
+
 class Transpiler:
     def __init__(self, modname):
         self.modname = modname
-        self.lines = []          # output lines (top level)
-        self.cur_class = None     # name of class currently being emitted
-        self.modules = set()      # imported module names / aliases (for ns)
+        self.lines = []
+        self.cur_class = None
+        self.modules = set()
+        self.singletons = []
+        self.singleton_names = {}   # var -> ClassName (module-level instances)
+        self.str_sets = {}          # module-level set/list of string literals
+        self.func_returns = {}      # top-level function name -> return ctype
+        self.func_params = {}       # top-level function name -> [param ctypes]
+        self.scope = {}             # local/param name -> ctype (per function)
+        self.hoisted = set()        # locals declared at function top
+        self.cur_ret = OBJ          # current function's return ctype
         self.indent = 0
 
-    # ---- output helpers ---------------------------------------------------
-
     def emit(self, line=""):
-        if line:
-            self.lines.append("    " * self.indent + line)
-        else:
-            self.lines.append("")
+        self.lines.append(("    " * self.indent + line) if line else "")
 
-    def emit_block(self, text):
-        for ln in text.splitlines():
-            self.emit(ln)
-
-    # ---- module ----------------------------------------------------------
+    # ---- driver ----------------------------------------------------------
 
     def run(self, tree):
-        self.prelude()
+        global KNOWN_CLASSES, VTABLE_METHODS
+        self.classes, self.class_order, vt = collect_classes(tree)
+        KNOWN_CLASSES = self.classes
+        VTABLE_METHODS = vt
         self.collect_imports(tree)
+        self.collect_module_globals(tree)
+
+        self.prelude()
+        # forward typedefs so the TypeInfo vtable can mention class pointers
+        for ci in self.class_order:
+            self.emit("typedef struct %s %s;" % (ci.name, ci.name))
+        if self.class_order:
+            self.emit()
+        self.emit_typeinfo_struct()
+        for ci in self.class_order:
+            self.emit("static const TypeInfo %s_type;" % ci.name)
+        if self.class_order:
+            self.emit()
+        for ci in self.class_order:
+            self.emit_struct(ci)
+        self.emit_forward_decls(tree)
+        for ci in self.class_order:
+            self.emit_class_impl(ci)
         for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                continue
             self.toplevel(node)
+        self.emit_module_init()
         return "\n".join(self.lines) + "\n"
 
-    def prelude(self):
-        bar = "/* " + "=" * 64 + " */"
-        self.emit(bar)
-        self.emit("/*  Transpiled from shivyc/%s.py by tools/py2c.py%s*/"
-                  % (self.modname, " " * 8))
-        self.emit("/*  ABSTRACT first-pass C -- not yet expected to compile. */")
-        self.emit(bar)
-        self.emit('#include <stdbool.h>')
-        self.emit('#include <stddef.h>')
-        self.emit()
-        self.emit("/* Generic dynamic value used wherever a concrete C type "
-                  "could not be inferred. */")
-        self.emit("typedef void* obj;")
-        self.emit("typedef char* str;")
-        self.emit()
+    def emit_forward_decls(self, tree):
+        """Prototypes for top-level functions and module singletons, so methods
+        emitted before them still resolve."""
+        protos = []
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef):
+                protos.append(self.func_signature(node) + ";")
+        for var, cls in self.singleton_names.items():
+            protos.append("%s* %s;" % (cls, var))
+        if protos:
+            self.emit("/* forward declarations */")
+            for p in protos:
+                self.emit(p)
+            self.emit()
+
+    def func_signature(self, node):
+        ret = ann_to_ctype(node.returns) or OBJ
+        params = self.param_list(node, skip_self=False)
+        plist = ", ".join(params) if params else "void"
+        return "%s %s(%s)" % (ret, node.name, plist)
 
     def collect_imports(self, tree):
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for a in node.names:
                     self.modules.add((a.asname or a.name).split(".")[0])
-            elif isinstance(node, ast.ImportFrom):
-                # `from x import y` -> y is a usable symbol, not a module ns
-                pass
+
+    def collect_module_globals(self, tree):
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef):
+                self.func_returns[node.name] = ann_to_ctype(node.returns) or OBJ
+                self.func_params[node.name] = [arg_ctype(node, a)
+                                               for a in node.args.args]
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            tgt = node.targets[0]
+            if not isinstance(tgt, ast.Name):
+                continue
+            val = node.value
+            # module-level singleton instance:  NAME = ClassName(...)
+            if isinstance(val, ast.Call) and isinstance(val.func, ast.Name) \
+                    and val.func.id in self.classes:
+                self.singleton_names[tgt.id] = val.func.id
+            # module-level set/list of string literals
+            if isinstance(val, (ast.Set, ast.List)) and val.elts and \
+                    all(isinstance(e, ast.Constant) and isinstance(e.value, str)
+                        for e in val.elts):
+                self.str_sets[tgt.id] = [e.value for e in val.elts]
+
+    def prelude(self):
+        bar = "/* " + "=" * 66 + " */"
+        self.emit(bar)
+        self.emit("/*  Transpiled from shivyc/%s.py by tools/py2c.py        */"
+                  % self.modname)
+        self.emit("/*  Object model: arena + per-class vtable (see py2c.py).  */")
+        self.emit(bar)
+        self.emit('#include "shivyc_rt.h"')
+        self.emit()
+
+    def emit_typeinfo_struct(self):
+        self.emit("/* Per-module type descriptor: header + vtable slots. */")
+        self.emit("typedef struct TypeInfo {")
+        self.indent += 1
+        self.emit("const char* name;")
+        self.emit("const struct TypeInfo* base;")
+        for m in sorted(VTABLE_METHODS):
+            self.emit(self.vslot_signature(m) + ";")
+        self.indent -= 1
+        self.emit("} TypeInfo;")
+        self.emit()
+        self.emit("#define TYPE(o) (TYPEINFO(TypeInfo, (o)))")
+        self.emit()
+
+    def vslot_signature(self, mname):
+        ret, params = self.method_proto(mname)
+        return "%s (*%s)(%s)" % (ret, mname, ", ".join(["Obj*"] + params))
+
+    def method_proto(self, mname):
+        ret, params = OBJ, []
+        for ci in self.class_order:
+            fn = ci.methods.get(mname)
+            if not fn:
+                continue
+            ret = ann_to_ctype(fn.returns) or OBJ
+            params = [arg_ctype(fn, a) for a in fn.args.args[1:]]
+            break
+        return ret, params
+
+    # ---- struct emission -------------------------------------------------
+
+    def emit_struct(self, ci):
+        bn = (" : " + ci.base_name) if ci.base_name else ""
+        self.emit("/* class %s%s */" % (ci.name, bn))
+        self.emit("typedef struct %s {" % ci.name)
+        self.indent += 1
+        self.emit("Obj _hdr;")
+        ff = ci.full_fields()
+        if not ff:
+            self.emit("char _empty;")
+        for fn, ft in ff:
+            self.emit("%s %s;" % (ft, cname(fn)))
+        self.indent -= 1
+        self.emit("} %s;" % ci.name)
+        self.emit()
+
+    # ---- class implementation -------------------------------------------
+
+    def emit_class_impl(self, ci):
+        prev = self.cur_class
+        self.cur_class = ci
+        for dname, dnode in ci.const_dicts.items():
+            self.emit_const_dict(ci, dname, dnode)
+        if "__init__" in ci.methods:
+            self.emit_constructor(ci, ci.methods["__init__"])
+        for mname, fn in ci.methods.items():
+            if mname == "__init__":
+                continue
+            if mname.startswith("__") and mname.endswith("__"):
+                self.emit("/* %s.%s: dunder not lowered in this pass */"
+                          % (ci.name, mname))
+                self.emit()
+                continue
+            self.emit_method(ci, fn, virtual=(mname in VTABLE_METHODS))
+        self.emit_vtable(ci)
+        self.cur_class = prev
+
+    def emit_const_dict(self, ci, dname, dnode):
+        keys, vals = dnode.keys, dnode.values
+        all_str_keys = all(isinstance(k, ast.Constant) and
+                           isinstance(k.value, str) for k in keys)
+        all_int_keys = all(isinstance(k, ast.Constant) and
+                           isinstance(k.value, int) for k in keys)
+        list_vals = all(isinstance(v, ast.List) for v in vals)
+        const_str_vals = all(isinstance(v, ast.Constant) and
+                             isinstance(v.value, str) for v in vals)
+        if all_str_keys and list_vals:
+            self.emit("/* const dict %s.%s : str -> list[str] */" %
+                      (ci.name, dname))
+            self.emit("static str %s_%s(str key, int i) {" % (ci.name, dname))
+            self.indent += 1
+            for k, v in zip(keys, vals):
+                items = ", ".join(c_string(e.value) for e in v.elts
+                                  if isinstance(e, ast.Constant))
+                self.emit('if (!strcmp(key, %s)) { static const char* _r[] = {%s}; return (str)_r[i]; }'
+                          % (c_string(k.value), items))
+            self.emit('return (str)"";')
+            self.indent -= 1
+            self.emit("}")
+            self.emit()
+            return
+        if all_int_keys and const_str_vals:
+            self.emit("/* const dict %s.%s : int -> str */" % (ci.name, dname))
+            self.emit("static str %s_%s_get(long key, str dflt) {" %
+                      (ci.name, dname))
+            self.indent += 1
+            for k, v in zip(keys, vals):
+                self.emit("if (key == %d) return %s;" %
+                          (k.value, c_string(v.value)))
+            self.emit("return dflt;")
+            self.indent -= 1
+            self.emit("}")
+            self.emit()
+            return
+        self.emit("/* const dict %s.%s: shape not lowered */" %
+                  (ci.name, dname))
+        self.emit()
+
+    def emit_constructor(self, ci, fn):
+        self.enter_scope(fn, skip_self=True)
+        params = self.param_list(fn, skip_self=True)
+        plist = ", ".join(params) if params else "void"
+        argnames = [cname(a.arg) for a in fn.args.args[1:]]
+        # __init__ as its own function, so super().__init__ has something to call
+        sig = ", ".join(["%s* self" % ci.name] + params)
+        self.emit("void %s___init__(%s) {" % (ci.name, sig))
+        self.indent += 1
+        self.emit_hoisted_body(fn.body)
+        self.indent -= 1
+        self.emit("}")
+        self.emit()
+        # ClassName_new: allocate, set type, run __init__
+        self.emit("%s* %s_new(%s) {" % (ci.name, ci.name, plist))
+        self.indent += 1
+        self.emit("%s* self = aalloc(sizeof *self);" % ci.name)
+        self.emit("((Obj*)self)->type = &%s_type;" % ci.name)
+        self.emit("%s___init__(%s);" % (ci.name,
+                                        ", ".join(["self"] + argnames)))
+        self.emit("return self;")
+        self.indent -= 1
+        self.emit("}")
+        self.emit()
+
+    def emit_method(self, ci, fn, virtual):
+        self.enter_scope(fn, skip_self=True)
+        ret = ann_to_ctype(fn.returns) or OBJ
+        self.cur_ret = ret
+        params = self.param_list(fn, skip_self=True)
+        if virtual:
+            self.emit("%s %s_%s(Obj* self_%s) {" % (
+                ret, ci.name, fn.name,
+                (", " + ", ".join(params)) if params else ""))
+            self.indent += 1
+            self.emit("%s* self = (%s*)self_;" % (ci.name, ci.name))
+            self.emit("(void)self;")
+        else:
+            plist = ["%s* self" % ci.name] + params
+            self.emit("%s %s_%s(%s) {" % (ret, ci.name, fn.name,
+                                          ", ".join(plist)))
+            self.indent += 1
+        self.emit_hoisted_body(fn.body)
+        self.indent -= 1
+        self.emit("}")
+        self.emit()
+
+    def emit_vtable(self, ci):
+        base = ("&%s_type" % ci.base_name) if ci.base_name else "NULL"
+        slots = []
+        for m in sorted(VTABLE_METHODS):
+            owner = ci.find_method_owner(m)
+            slots.append(".%s = %s" % (m, ("%s_%s" % (owner.name, m))
+                                       if owner else "NULL"))
+        init = ", ".join([".name = %s" % c_string(ci.name),
+                          ".base = (const struct TypeInfo*)%s" % base] + slots)
+        self.emit("static const TypeInfo %s_type = { %s };" % (ci.name, init))
+        self.emit()
+
+    def param_list(self, fn, skip_self):
+        params = []
+        args = fn.args.args[1:] if skip_self else fn.args.args
+        for arg in args:
+            params.append("%s %s" % (arg_ctype(fn, arg), cname(arg.arg)))
+        if fn.args.vararg:
+            params.append("...")
+        return params
+
+    def enter_scope(self, fn, skip_self):
+        self.scope = {}
+        self.hoisted = set()
+        args = fn.args.args[1:] if skip_self else fn.args.args
+        for arg in args:
+            self.scope[arg.arg] = arg_ctype(fn, arg)
+
+    def hoist_locals(self, body):
+        """Find all assigned locals and their types, to declare at function top
+        (Python has function scope; C blocks would otherwise lose them)."""
+        order = []
+        types = {}
+
+        def consider(name, ctype):
+            if name in self.scope:
+                return
+            if name not in types:
+                order.append(name)
+                types[name] = ctype
+            elif types[name] == OBJ and ctype != OBJ:
+                types[name] = ctype
+
+        for stmt in body:
+            for sub in ast.walk(stmt):
+                if isinstance(sub, ast.Assign):
+                    for t in sub.targets:
+                        if isinstance(t, ast.Name):
+                            ct = self.value_ctype(sub.value) or \
+                                infer_from_name(t.id) or OBJ
+                            consider(t.id, ct)
+                elif isinstance(sub, ast.AnnAssign) and \
+                        isinstance(sub.target, ast.Name):
+                    consider(sub.target.id,
+                             infer_type(sub.target.id, sub.annotation))
+                elif isinstance(sub, ast.For) and \
+                        isinstance(sub.target, ast.Name):
+                    consider(sub.target.id, "int")
+        return [(n, types[n]) for n in order]
+
+    def emit_hoisted_body(self, body):
+        for name, ct in self.hoist_locals(body):
+            self.scope[name] = ct
+            self.hoisted.add(name)
+            self.emit("%s %s;" % (ct, cname(name)))
+        self.emit_body(body)
+
+    # ---- top level (non-class) -------------------------------------------
 
     def toplevel(self, node):
         if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) \
                 and isinstance(node.value.value, str):
-            # Module docstring.
-            self.emit("/* " + node.value.value.strip().splitlines()[0] + " */")
-            self.emit()
+            doc = node.value.value.strip().splitlines()
+            if doc:
+                self.emit("/* " + doc[0] + " */")
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            self.emit("/* " + self.src(node) + " */")
-        elif isinstance(node, ast.ClassDef):
-            self.class_def(node)
+            self.emit("/* " + self.src1(node) + " */")
         elif isinstance(node, ast.FunctionDef):
             self.func_def(node)
+            self.emit()
         elif isinstance(node, ast.Assign):
-            for ln in self.assign(node, toplevel=True):
+            self.toplevel_assign(node)
+        elif isinstance(node, ast.AnnAssign):
+            for ln in self.st_AnnAssign(node):
                 self.emit(ln)
-        elif isinstance(node, (ast.If, ast.For, ast.While, ast.AugAssign,
-                               ast.AnnAssign, ast.Try, ast.With)):
+        elif isinstance(node, (ast.If, ast.For, ast.While, ast.Try, ast.With,
+                               ast.AugAssign)):
             for ln in self.stmt(node):
                 self.emit(ln)
         else:
-            self.emit("/* unsupported top-level: " + self.src(node) + " */")
-        self.emit()
+            self.emit("/* top-level: " + self.src1(node) + " */")
 
-    # ---- classes ---------------------------------------------------------
+    def toplevel_assign(self, node):
+        if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) \
+                and isinstance(node.value, ast.Call) \
+                and isinstance(node.value.func, ast.Name) \
+                and node.value.func.id in self.classes:
+            var = node.targets[0].id
+            cls = node.value.func.id
+            args = self.coerce_args(
+                self.init_param_ctypes(self.classes[cls]), node.value.args)
+            self.emit("/* singleton %s = %s(...) constructed in %s_init() */"
+                      % (var, cls, self.modname))
+            self.singletons.append((var, cls, args))
+            return
+        if isinstance(node.value, (ast.List, ast.Dict, ast.Set, ast.Tuple,
+                                   ast.BinOp)):
+            self.emit("/* module data: " + self.src1(node) + " */")
+            return
+        for ln in self.assign(node, toplevel=True):
+            self.emit(ln)
 
-    def class_def(self, node):
-        bases = [self.src(b) for b in node.bases]
-        base_note = (" : " + ", ".join(bases)) if bases else ""
-        self.emit("/* class %s%s */" % (node.name, base_note))
-        # Discover fields: every `self.<x> = ...` across all methods, plus any
-        # class-level assignments.
-        fields = self.discover_fields(node)
-        self.emit("typedef struct %s {" % node.name)
+    def emit_module_init(self):
+        self.emit("/* Construct module-level singletons (Python import-time). */")
+        self.emit("void %s_init(void) {" % self.modname)
         self.indent += 1
-        if bases:
-            self.emit("/* inherited from: %s */" % ", ".join(bases))
-        if not fields:
-            self.emit("char _empty; /* no fields discovered */")
-        for fname, ftype in fields.items():
-            self.emit("%s %s;" % (ftype, fname))
+        if not self.singletons:
+            self.emit("/* none */")
+        for var, cls, args in self.singletons:
+            self.emit("%s = %s_new(%s);" % (var, cls, ", ".join(args)))
         self.indent -= 1
-        self.emit("} %s;" % node.name)
-        self.emit()
-        # Methods.
-        prev = self.cur_class
-        self.cur_class = node.name
-        for item in node.body:
-            if isinstance(item, ast.FunctionDef):
-                self.func_def(item, method=True)
-                self.emit()
-            elif isinstance(item, ast.Assign):
-                for ln in self.assign(item, toplevel=True):
-                    self.emit("/* class var */ " + ln)
-            elif isinstance(item, ast.Expr) and \
-                    isinstance(item.value, ast.Constant):
-                pass  # docstring already represented by the struct comment
-        self.cur_class = prev
+        self.emit("}")
 
-    def discover_fields(self, node):
-        fields = {}
-        # class-level simple assignments
-        for item in node.body:
-            if isinstance(item, ast.Assign):
-                for tgt in item.targets:
-                    if isinstance(tgt, ast.Name):
-                        fields.setdefault(tgt.id,
-                                          infer_type(tgt.id))
-            if isinstance(item, ast.AnnAssign) and \
-                    isinstance(item.target, ast.Name):
-                fields.setdefault(item.target.id,
-                                  infer_type(item.target.id, item.annotation))
-        # self.x = ... inside any method
-        for item in node.body:
-            if not isinstance(item, ast.FunctionDef):
-                continue
-            for sub in ast.walk(item):
-                tgts = []
-                if isinstance(sub, ast.Assign):
-                    tgts = sub.targets
-                elif isinstance(sub, ast.AnnAssign):
-                    tgts = [sub.target]
-                for tgt in tgts:
-                    if isinstance(tgt, ast.Attribute) and \
-                            isinstance(tgt.value, ast.Name) and \
-                            tgt.value.id == "self":
-                        ann = getattr(sub, "annotation", None)
-                        fields.setdefault(tgt.attr,
-                                          infer_type(tgt.attr, ann))
-        return fields
-
-    # ---- functions -------------------------------------------------------
-
-    def func_def(self, node, method=False):
+    def func_def(self, node):
+        self.enter_scope(node, skip_self=False)
         ret = ann_to_ctype(node.returns) or OBJ
-        params = []
-        a = node.args
-        all_args = list(a.args)
-        if method and all_args and all_args[0].arg == "self":
-            params.append("%s* self" % self.cur_class)
-            all_args = all_args[1:]
-        for arg in all_args:
-            ctype = infer_type(arg.arg, arg.annotation)
-            params.append("%s %s" % (ctype, arg.arg))
-        if a.vararg:
-            params.append("/* *%s */ ..." % a.vararg.arg)
-        if a.kwarg:
-            params.append("/* **%s */ ..." % a.kwarg.arg)
+        self.cur_ret = ret
+        params = self.param_list(node, skip_self=False)
         plist = ", ".join(params) if params else "void"
-
-        cname = (self.cur_class + "_" + node.name) if method else node.name
-        # Constructor convention note.
-        if method and node.name == "__init__":
-            self.emit("/* constructor */")
-        self.emit("%s %s(%s) {" % (ret, cname, plist))
+        self.emit("%s %s(%s) {" % (ret, node.name, plist))
         self.indent += 1
-        self.emit_body(node.body)
+        self.emit_hoisted_body(node.body)
         self.indent -= 1
         self.emit("}")
 
@@ -344,27 +857,25 @@ class Transpiler:
             for ln in self.stmt(stmt):
                 self.emit(ln)
 
-    # ---- statements (return list of un-indented-by-emit lines) -----------
+    # ---- statements ------------------------------------------------------
 
     def stmt(self, node):
         m = getattr(self, "st_" + type(node).__name__, None)
         if m is None:
-            return ["/* unsupported stmt %s: %s */"
-                    % (type(node).__name__, self.src1(node))]
+            return ["/* stmt %s: %s */" % (type(node).__name__,
+                                           self.src1(node))]
         try:
             return m(node)
         except Unsupported as e:
             return ["/* %s */" % e]
-        except Exception as e:  # never crash on a single statement
-            return ["/* transpile-error (%s): %s */"
-                    % (e, self.src1(node))]
+        except Exception as e:
+            return ["/* transpile-error (%s): %s */" % (e, self.src1(node))]
 
     def st_Expr(self, node):
         v = node.value
         if isinstance(v, ast.Constant) and isinstance(v.value, str):
-            # docstring / comment
-            first = v.value.strip().splitlines()[0] if v.value.strip() else ""
-            return ["/* " + first + " */"] if first else []
+            first = v.value.strip().splitlines()
+            return ["/* " + first[0] + " */"] if first else []
         return [self.expr(v) + ";"]
 
     def st_Assign(self, node):
@@ -375,38 +886,104 @@ class Transpiler:
         lines = []
         for tgt in node.targets:
             if isinstance(tgt, ast.Tuple):
-                # tuple unpacking -> one line per element (abstract)
-                lines.append("/* tuple unpack: %s = %s */"
-                             % (self.src1(tgt), rhs))
+                lines.append("/* tuple unpack: %s = %s */" %
+                             (self.src1(tgt), rhs))
                 for i, el in enumerate(tgt.elts):
-                    lines.append("%s = %s[%d];" % (self.expr(el), rhs, i))
+                    lines.append("%s = /* [%d] */ OBJ_NONE;" %
+                                 (self.expr(el), i))
                 continue
-            decl = ""
             if isinstance(tgt, ast.Name):
-                ctype = infer_from_name(tgt.id) or self.guess_from_value(
-                    node.value) or OBJ
-                decl = ctype + " "
-            lines.append("%s%s = %s;" % (decl, self.expr(tgt), rhs))
+                # already declared in this scope?  ->  plain reassignment
+                if tgt.id in self.scope and not toplevel:
+                    lines.append("%s = %s;" % (cname(tgt.id), rhs))
+                    continue
+                # the value's actual C type wins over the name guess
+                ctype = self.value_ctype(node.value) or \
+                    infer_from_name(tgt.id) or OBJ
+                if not toplevel:
+                    self.scope[tgt.id] = ctype
+                lines.append("%s %s = %s;" % (ctype, cname(tgt.id), rhs))
+            else:
+                lines.append("%s = %s;" % (self.expr(tgt), rhs))
         return lines
 
+    def value_ctype(self, node):
+        """Best-effort C type of an expression, when determinable."""
+        t = self.static_type(node)
+        if t:
+            return t
+        if isinstance(node, ast.BinOp):
+            if isinstance(node.op, ast.Add) and (self.looks_str(node.left) or
+                                                 self.looks_str(node.right)):
+                return "char*"
+            lt = self.value_ctype(node.left)
+            rt = self.value_ctype(node.right)
+            if lt == "int" and rt == "int":
+                return "int"
+        if isinstance(node, ast.UnaryOp):
+            if isinstance(node.op, ast.Not):
+                return "bool"
+            return self.value_ctype(node.operand)
+        if isinstance(node, ast.IfExp):
+            return self.value_ctype(node.body) or self.value_ctype(node.orelse)
+        if isinstance(node, ast.Subscript) and \
+                isinstance(node.value, ast.Subscript):
+            inner = node.value
+            if isinstance(inner.value, ast.Attribute) and \
+                    isinstance(inner.value.value, ast.Name) and \
+                    inner.value.value.id == "self" and self.cur_class and \
+                    inner.value.attr in self.cur_class.const_dicts:
+                return "char*"
+        if isinstance(node, ast.Call):
+            f = node.func
+            if isinstance(f, ast.Name):
+                if f.id == "isinstance":
+                    return "bool"
+                if f.id == "str":
+                    return "char*"
+                if f.id == "len":
+                    return "int"
+                if f.id in self.classes:
+                    return f.id + "*"
+                if f.id in self.func_returns:
+                    return self.func_returns[f.id]
+            if isinstance(f, ast.Attribute):
+                if f.attr == "get" and isinstance(f.value, ast.Attribute) \
+                        and isinstance(f.value.value, ast.Name) \
+                        and f.value.value.id == "self" and self.cur_class \
+                        and f.value.attr in self.cur_class.const_dicts:
+                    return "char*"
+                if f.attr in VTABLE_METHODS:
+                    return self.method_proto(f.attr)[0]
+        return self.guess_from_value(node)
+
     def st_AnnAssign(self, node):
-        ctype = infer_type(
-            getattr(node.target, "id", "x"), node.annotation)
+        ctype = infer_type(getattr(node.target, "id", "x"), node.annotation)
         tgt = self.expr(node.target)
         if node.value is None:
             return ["%s %s;" % (ctype, tgt)]
-        decl = (ctype + " ") if isinstance(node.target, ast.Name) else ""
+        already = isinstance(node.target, ast.Name) and \
+            node.target.id in self.scope
+        decl = "" if (already or not isinstance(node.target, ast.Name)) \
+            else (ctype + " ")
         return ["%s%s = %s;" % (decl, tgt, self.expr(node.value))]
 
     def st_AugAssign(self, node):
-        op = self.binop_sym(node.op)
-        return ["%s %s= %s;" % (self.expr(node.target), op,
+        return ["%s %s= %s;" % (self.expr(node.target),
+                                self.binop_sym(node.op),
                                 self.expr(node.value))]
 
     def st_Return(self, node):
         if node.value is None:
             return ["return;"]
-        return ["return %s;" % self.expr(node.value)]
+        val = self.expr(node.value)
+        ret = getattr(self, "cur_ret", OBJ)
+        # cast a subclass pointer to the declared base-pointer return type
+        if ret.endswith("*") and ret != OBJ:
+            vt = self.value_ctype(node.value)
+            if vt != ret:
+                val = "(%s)(%s)" % (ret, val)
+        return ["return %s;" % val]
 
     def st_Pass(self, node):
         return ["/* pass */"]
@@ -421,76 +998,71 @@ class Transpiler:
         return ["/* global %s */" % ", ".join(node.names)]
 
     def st_Delete(self, node):
-        return ["/* del %s */" % ", ".join(self.expr(t) for t in node.targets)]
+        return ["/* del %s */" % ", ".join(self.expr(t)
+                                           for t in node.targets)]
+
+    def st_Import(self, node):
+        return ["/* " + self.src1(node) + " */"]
+
+    def st_ImportFrom(self, node):
+        return ["/* " + self.src1(node) + " */"]
+
+    def st_Raise(self, node):
+        what = self.src1(node.exc) if node.exc else ""
+        return ['fprintf(stderr, "raise %s\\n"); abort();' %
+                what.replace('"', '\\"')]
 
     def st_If(self, node):
-        lines = ["if (%s) {" % self.expr(node.test)]
+        lines = ["if (%s) {" % self.bool_expr(node.test)]
         lines += self.indent_lines(self.suite(node.body))
         if node.orelse:
-            # else-if chain
             if len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
                 inner = self.st_If(node.orelse[0])
                 inner[0] = "} else " + inner[0]
-                lines += inner
-                return lines
+                return lines + inner
             lines.append("} else {")
             lines += self.indent_lines(self.suite(node.orelse))
         lines.append("}")
         return lines
 
     def st_While(self, node):
-        lines = ["while (%s) {" % self.expr(node.test)]
+        lines = ["while (%s) {" % self.bool_expr(node.test)]
         lines += self.indent_lines(self.suite(node.body))
         lines.append("}")
-        if node.orelse:
-            lines.append("/* while-else not represented */")
         return lines
 
     def st_For(self, node):
-        target = node.target
-        it = node.iter
-        # for x in range(...)
+        it, tgt = node.iter, node.target
         if isinstance(it, ast.Call) and isinstance(it.func, ast.Name) \
-                and it.func.id == "range" and isinstance(target, ast.Name):
-            var = target.id
-            args = [self.expr(a) for a in it.args]
-            if len(args) == 1:
-                start, stop, step = "0", args[0], "1"
-            elif len(args) == 2:
-                start, stop, step = args[0], args[1], "1"
+                and it.func.id == "range" and isinstance(tgt, ast.Name):
+            v = cname(tgt.id)
+            a = [self.expr(x) for x in it.args]
+            if len(a) == 1:
+                lo, hi, stp = "0", a[0], "1"
+            elif len(a) == 2:
+                lo, hi, stp = a[0], a[1], "1"
             else:
-                start, stop, step = args[0], args[1], args[2]
-            head = "for (int %s = %s; %s < %s; %s += %s) {" % (
-                var, start, var, stop, var, step)
-            lines = [head]
+                lo, hi, stp = a[0], a[1], a[2]
+            decl = "" if tgt.id in self.hoisted else "int "
+            lines = ["for (%s%s = %s; %s < %s; %s += %s) {" %
+                     (decl, v, lo, v, hi, v, stp)]
             lines += self.indent_lines(self.suite(node.body))
             lines.append("}")
             return lines
-        # for x in <iterable>  -> documented FOR_EACH lowering
-        tgt = self.src1(target)
-        lines = ["/* for %s in %s: */" % (tgt, self.src1(it))]
-        lines.append("FOR_EACH(%s, %s) {" % (tgt, self.expr(it)))
+        lines = ["/* for %s in %s: */" % (self.src1(tgt), self.src1(it))]
+        lines.append("FOR_EACH(%s, %s) {" % (self.src1(tgt), self.expr(it)))
         lines += self.indent_lines(self.suite(node.body))
         lines.append("}")
         return lines
-
-    def st_Raise(self, node):
-        what = self.expr(node.exc) if node.exc else ""
-        return ["RAISE(%s);" % what]
 
     def st_Try(self, node):
         lines = ["/* try */ {"]
         lines += self.indent_lines(self.suite(node.body))
         lines.append("}")
         for h in node.handlers:
-            etype = self.src1(h.type) if h.type else "..."
-            nm = (" as %s" % h.name) if h.name else ""
-            lines.append("/* except %s%s */ {" % (etype, nm))
+            et = self.src1(h.type) if h.type else "..."
+            lines.append("/* except %s */ {" % et)
             lines += self.indent_lines(self.suite(h.body))
-            lines.append("}")
-        if node.orelse:
-            lines.append("/* else */ {")
-            lines += self.indent_lines(self.suite(node.orelse))
             lines.append("}")
         if node.finalbody:
             lines.append("/* finally */ {")
@@ -505,49 +1077,39 @@ class Transpiler:
         lines.append("}")
         return lines
 
-    def st_Import(self, node):
-        return ["/* " + self.src1(node) + " */"]
-
-    def st_ImportFrom(self, node):
-        return ["/* " + self.src1(node) + " */"]
-
     def st_FunctionDef(self, node):
-        # nested function: emit a marker; bodies of nested funcs are rare here
-        return ["/* nested function %s(...) not lifted in this pass */"
-                % node.name]
-
-    def st_ClassDef(self, node):
-        return ["/* nested class %s not lifted in this pass */" % node.name]
+        return ["/* nested function %s not lifted */" % node.name]
 
     def suite(self, body):
         out = []
-        for stmt in body:
-            out += self.stmt(stmt)
+        for s in body:
+            out += self.stmt(s)
         return out
 
     def indent_lines(self, lines):
         return ["    " + ln for ln in lines]
 
-    # ---- expressions (return a C expression string) ----------------------
+    # ---- expressions -----------------------------------------------------
 
     def expr(self, node):
         m = getattr(self, "ex_" + type(node).__name__, None)
         if m is None:
-            return "/* %s: %s */ NULL" % (type(node).__name__, self.src1(node))
+            return "/* %s: %s */ OBJ_NONE" % (type(node).__name__,
+                                              self.src1(node))
         try:
             return m(node)
         except Unsupported as e:
-            return "/* %s */ NULL" % e
+            return "/* %s */ OBJ_NONE" % e
         except Exception as e:
-            return "/* expr-error %s */ NULL" % e
+            return "/* expr-error %s */ OBJ_NONE" % e
 
     def ex_Name(self, node):
-        return node.id
+        return cname(node.id)
 
     def ex_Constant(self, node):
         v = node.value
         if v is None:
-            return "NULL"
+            return "OBJ_NONE"
         if v is True:
             return "true"
         if v is False:
@@ -561,72 +1123,268 @@ class Transpiler:
         return str(v)
 
     def ex_Attribute(self, node):
-        # module.attr -> module_attr ; obj.attr -> self->attr or obj.attr
+        if node.attr == "__name__" and isinstance(node.value, ast.Attribute) \
+                and node.value.attr == "__class__":
+            return "TYPE(%s)->name" % self.expr(node.value.value)
         if isinstance(node.value, ast.Name):
             base = node.value.id
             if base in self.modules:
                 return "%s_%s" % (base, node.attr)
             if base == "self":
-                return "self->%s" % node.attr
-        return "%s.%s" % (self.expr(node.value), node.attr)
+                return "self->%s" % cname(node.attr)
+        return "%s.%s" % (self.expr(node.value), cname(node.attr))
 
     def ex_Call(self, node):
-        args = [self.expr(a) for a in node.args]
-        for kw in node.keywords:
-            if kw.arg is None:
-                args.append("/* **%s */" % self.src1(kw.value))
-            else:
-                args.append("/* %s= */ %s" % (kw.arg, self.expr(kw.value)))
         func = node.func
-        # method/attribute call
+        argstrs = [self.expr(a) for a in node.args]
+
+        if isinstance(func, ast.Name):
+            fn = func.id
+            if fn == "isinstance" and len(node.args) == 2:
+                return self.lower_isinstance(node.args[0], node.args[1])
+            if fn == "str" and len(node.args) == 1:
+                return "pystr(%s)" % self.wrap_obj(node.args[0])
+            if fn == "len" and len(node.args) == 1:
+                return "/* len */ 0"
+            if fn in self.classes:
+                cargs = self.coerce_args(
+                    self.init_param_ctypes(self.classes[fn]), node.args)
+                return "%s_new(%s)" % (fn, ", ".join(cargs))
+            if fn in self.func_params:
+                cargs = self.coerce_args(self.func_params[fn], node.args)
+                return "%s(%s)" % (fn, ", ".join(cargs))
+
+        if isinstance(func, ast.Attribute) and is_super_call(func.value):
+            base = self.cur_class.base if self.cur_class else None
+            bname = base.name if base else (self.cur_class.base_name
+                                            if self.cur_class else "Base")
+            if func.attr == "__init__":
+                pct = self.init_param_ctypes(base) if base else []
+                cargs = self.coerce_args(pct, node.args)
+                return "%s___init__((%s*)self%s)" % (
+                    bname, bname,
+                    (", " + ", ".join(cargs)) if cargs else "")
+            if func.attr in VTABLE_METHODS:
+                return "%s_%s((Obj*)self%s)" % (
+                    bname, func.attr,
+                    (", " + ", ".join(argstrs)) if argstrs else "")
+            return "%s_%s((%s*)self%s)" % (
+                bname, func.attr, bname,
+                (", " + ", ".join(argstrs)) if argstrs else "")
+
         if isinstance(func, ast.Attribute):
+            if func.attr == "get" and isinstance(func.value, ast.Attribute) \
+                    and isinstance(func.value.value, ast.Name) \
+                    and func.value.value.id == "self" and self.cur_class \
+                    and func.value.attr in self.cur_class.const_dicts:
+                d = func.value.attr
+                k = argstrs[0]
+                dflt = argstrs[1] if len(argstrs) > 1 else '""'
+                return "%s_%s_get(%s, %s)" % (self.cur_class.name, d, k, dflt)
             if isinstance(func.value, ast.Name) and \
                     func.value.id in self.modules:
-                # namespaced free function: module_func(args)
                 return "%s_%s(%s)" % (func.value.id, func.attr,
-                                      ", ".join(args))
-            # receiver-first method lowering: meth(recv, args)
+                                      ", ".join(argstrs))
+            if func.attr in VTABLE_METHODS:
+                return self.vcall(func.value, func.attr, argstrs)
+            if isinstance(func.value, ast.Name) and \
+                    func.value.id in self.classes:
+                return "%s_%s(%s)" % (func.value.id, func.attr,
+                                      ", ".join(argstrs))
             recv = self.expr(func.value)
-            allargs = [recv] + args
-            return "%s(%s)" % (func.attr, ", ".join(allargs))
-        return "%s(%s)" % (self.expr(func), ", ".join(args))
+            return "%s(%s)" % (func.attr, ", ".join([recv] + argstrs))
+
+        return "%s(%s)" % (self.expr(func), ", ".join(argstrs))
+
+    # ---- OO call lowering helpers ---------------------------------------
+
+    def obj_ptr(self, node):
+        s = self.expr(node)
+        if self.is_obj_word(node):
+            return "%s.u.o" % s
+        return "(Obj*)(%s)" % s
+
+    def vcall(self, recv_node, meth, argstrs):
+        xo = self.obj_ptr(recv_node)
+        return "TYPE(%s)->%s(%s)" % (xo, meth, ", ".join([xo] + argstrs))
+
+    def init_param_ctypes(self, ci):
+        init = ci.methods.get("__init__")
+        if not init:
+            return []
+        return [arg_ctype(init, a) for a in init.args.args[1:]]
+
+    def coerce_args(self, param_ctypes, arg_nodes):
+        out = []
+        for i, a in enumerate(arg_nodes):
+            target = param_ctypes[i] if i < len(param_ctypes) else None
+            if target == OBJ:
+                out.append(self.wrap_obj(a))
+            elif target == "char*" and self.is_obj_word(a):
+                out.append("AS_STR(%s)" % self.expr(a))
+            elif target == "int" and self.is_obj_word(a):
+                out.append("(int)AS_INT(%s)" % self.expr(a))
+            else:
+                out.append(self.expr(a))
+        return out
+
+    def lower_isinstance(self, val_node, cls_node):
+        cls = self.src1(cls_node)
+        type_sym = "&%s_type" % cls if cls in self.classes else "NULL"
+        if self.is_obj_word(val_node):
+            return "OBJ_ISINST(%s, %s)" % (self.expr(val_node), type_sym)
+        return "isinstance_of((Obj*)(%s), %s)" % (self.expr(val_node),
+                                                  type_sym)
+
+    def wrap_obj(self, node):
+        if self.is_obj_word(node) or self.value_ctype(node) == OBJ:
+            return self.expr(node)
+        t = self.value_ctype(node)
+        s = self.expr(node)
+        if t == "int":
+            return "OBJ_INT(%s)" % s
+        if t == "char*":
+            return "OBJ_STR(%s)" % s
+        if t == "bool":
+            return "OBJ_BOOL(%s)" % s
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, str):
+                return "OBJ_STR(%s)" % s
+            if isinstance(node.value, bool):
+                return "OBJ_BOOL(%s)" % s
+            if isinstance(node.value, int):
+                return "OBJ_INT(%s)" % s
+        return "OBJ_OBJ(%s)" % s
+
+    def is_obj_word(self, node):
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)\
+                and node.value.id == "self" and self.cur_class:
+            return self.cur_class.field_ctype(node.attr) == OBJ
+        if isinstance(node, ast.Name):
+            if node.id in self.scope:
+                return self.scope[node.id] == OBJ
+            if node.id in self.singleton_names:
+                return False
+            return infer_from_name(node.id) is None
+        if isinstance(node, ast.Constant) and node.value is None:
+            return True
+        return False
+
+    def static_type(self, node):
+        if isinstance(node, ast.Name):
+            if node.id in self.scope:
+                return self.scope[node.id]
+            if node.id in self.singleton_names:
+                return self.singleton_names[node.id] + "*"
+            return infer_from_name(node.id)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)\
+                and node.value.id == "self" and self.cur_class:
+            return self.cur_class.field_ctype(node.attr)
+        if isinstance(node, ast.Constant):
+            v = node.value
+            if isinstance(v, bool):
+                return "bool"
+            if isinstance(v, int):
+                return "int"
+            if isinstance(v, str):
+                return "char*"
+        return None
+
+    def bool_expr(self, node):
+        """Render `node` as a C truth test, boxing obj values via truthy()."""
+        s = self.expr(node)
+        if isinstance(node, (ast.Compare, ast.BoolOp, ast.UnaryOp)):
+            return s
+        if self.is_obj_word(node) or \
+                (self.static_type(node) or self.value_ctype(node)) == OBJ:
+            return "truthy(%s)" % s
+        return s
+
+    # ---- operators -------------------------------------------------------
 
     def ex_BinOp(self, node):
-        op = self.binop_sym(node.op)
-        return "(%s %s %s)" % (self.expr(node.left), op,
+        if isinstance(node.op, ast.Add) and (self.looks_str(node.left) or
+                                             self.looks_str(node.right)):
+            return "pyconcat(%s, %s)" % (self.str_operand(node.left),
+                                         self.str_operand(node.right))
+        return "(%s %s %s)" % (self.expr(node.left), self.binop_sym(node.op),
                                self.expr(node.right))
+
+    def looks_str(self, node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return True
+        return self.static_type(node) == "char*"
+
+    def str_operand(self, node):
+        s = self.expr(node)
+        return "AS_STR(%s)" % s if self.is_obj_word(node) else s
 
     def ex_BoolOp(self, node):
         op = "&&" if isinstance(node.op, ast.And) else "||"
-        return "(" + (" %s " % op).join(self.expr(v)
+        return "(" + (" %s " % op).join(self.bool_expr(v)
                                         for v in node.values) + ")"
 
     def ex_UnaryOp(self, node):
-        sym = {ast.Not: "!", ast.USub: "-", ast.UAdd: "+",
-               ast.Invert: "~"}[type(node.op)]
+        if isinstance(node.op, ast.Not):
+            return "(!%s)" % self.bool_expr(node.operand)
+        sym = {ast.USub: "-", ast.UAdd: "+", ast.Invert: "~"}[type(node.op)]
         return "(%s%s)" % (sym, self.expr(node.operand))
 
     def ex_Compare(self, node):
         parts = []
-        left = self.expr(node.left)
-        cur = left
+        cur = node.left
         for op, comp in zip(node.ops, node.comparators):
-            r = self.expr(comp)
-            parts.append(self.cmp_expr(cur, op, comp, r))
-            cur = r
+            parts.append(self.cmp(cur, op, comp))
+            cur = comp
         return "(" + " && ".join(parts) + ")"
 
-    def cmp_expr(self, left, op, comp_node, right):
-        if isinstance(op, ast.In):
-            return "IN(%s, %s)" % (left, right)
-        if isinstance(op, ast.NotIn):
-            return "(!IN(%s, %s))" % (left, right)
+    def cmp(self, left, op, right):
+        ls, rs = self.expr(left), self.expr(right)
+        if isinstance(op, (ast.In, ast.NotIn)):
+            if isinstance(right, ast.Name) and right.id in self.str_sets:
+                elems = self.str_sets[right.id]
+                arr = "(const str[]){%s}" % ", ".join(c_string(e)
+                                                      for e in elems)
+                inner = "in_str(%s, %s, %d)" % (
+                    self.str_operand(left), arr, len(elems))
+            else:
+                inner = "IN(%s, %s)" % (ls, rs)
+            return ("(!%s)" % inner) if isinstance(op, ast.NotIn) else inner
+        if isinstance(op, (ast.Is, ast.IsNot)):
+            if isinstance(right, ast.Constant) and right.value is None \
+                    and self.is_obj_word(left):
+                s = "IS_NONE(%s)" % ls
+                return ("(!%s)" % s) if isinstance(op, ast.IsNot) else s
+            sym = "==" if isinstance(op, ast.Is) else "!="
+            return "(%s %s %s)" % (ls, sym, rs)
         sym = {ast.Eq: "==", ast.NotEq: "!=", ast.Lt: "<", ast.LtE: "<=",
-               ast.Gt: ">", ast.GtE: ">=", ast.Is: "==", ast.IsNot: "!="}
-        s = sym.get(type(op), "/*?*/")
-        return "(%s %s %s)" % (left, s, right)
+               ast.Gt: ">", ast.GtE: ">="}[type(op)]
+        # obj-word compared against a pointer (e.g. self.base == RBP)
+        if sym in ("==", "!=") and \
+                (self.is_obj_word(left) != self.is_obj_word(right)):
+            if self.is_obj_word(left):
+                o, p = ls, rs
+            else:
+                o, p = rs, ls
+            core = "(IS_OBJ(%s) && AS_OBJ(%s) == (Obj*)(%s))" % (o, o, p)
+            return core if sym == "==" else "(!%s)" % core
+        if sym in ("==", "!=") and (self.looks_str(left) or
+                                    self.looks_str(right)):
+            return "(strcmp(%s, %s) %s 0)" % (self.str_operand(left),
+                                              self.str_operand(right), sym)
+        return "(%s %s %s)" % (ls, sym, rs)
 
     def ex_Subscript(self, node):
+        if isinstance(node.value, ast.Subscript):
+            inner = node.value
+            if isinstance(inner.value, ast.Attribute) and \
+                    isinstance(inner.value.value, ast.Name) and \
+                    inner.value.value.id == "self" and self.cur_class and \
+                    inner.value.attr in self.cur_class.const_dicts:
+                d = inner.value.attr
+                key = self.expr(inner.slice)
+                i = self.expr(node.slice)
+                return "%s_%s(%s, %s)" % (self.cur_class.name, d, key, i)
         sl = node.slice
         if isinstance(sl, ast.Slice):
             lo = self.expr(sl.lower) if sl.lower else "0"
@@ -635,70 +1393,61 @@ class Transpiler:
         return "%s[%s]" % (self.expr(node.value), self.expr(sl))
 
     def ex_IfExp(self, node):
-        return "(%s ? %s : %s)" % (self.expr(node.test),
+        return "(%s ? %s : %s)" % (self.bool_expr(node.test),
                                    self.expr(node.body),
                                    self.expr(node.orelse))
 
     def ex_List(self, node):
-        return "/* list[%d] */ NULL" % len(node.elts)
+        return "/* list[%d] */ OBJ_NONE" % len(node.elts)
 
     def ex_Tuple(self, node):
-        return "/* tuple(%s) */ NULL" % ", ".join(self.expr(e)
-                                                   for e in node.elts)
+        return "/* tuple(%s) */ OBJ_NONE" % ", ".join(self.src1(e)
+                                                      for e in node.elts)
 
     def ex_Set(self, node):
-        return "/* set[%d] */ NULL" % len(node.elts)
+        return "/* set[%d] */ OBJ_NONE" % len(node.elts)
 
     def ex_Dict(self, node):
-        return "/* dict[%d] */ NULL" % len(node.keys)
+        return "/* dict[%d] */ OBJ_NONE" % len(node.keys)
 
     def ex_ListComp(self, node):
-        return "/* listcomp: %s */ NULL" % self.src1(node)
+        return "/* listcomp: %s */ OBJ_NONE" % self.src1(node)
 
     def ex_SetComp(self, node):
-        return "/* setcomp: %s */ NULL" % self.src1(node)
+        return "/* setcomp: %s */ OBJ_NONE" % self.src1(node)
 
     def ex_DictComp(self, node):
-        return "/* dictcomp: %s */ NULL" % self.src1(node)
+        return "/* dictcomp: %s */ OBJ_NONE" % self.src1(node)
 
     def ex_GeneratorExp(self, node):
-        return "/* genexpr: %s */ NULL" % self.src1(node)
+        return "/* genexpr: %s */ OBJ_NONE" % self.src1(node)
 
     def ex_Lambda(self, node):
-        return "/* lambda: %s */ NULL" % self.src1(node)
+        return "/* lambda: %s */ OBJ_NONE" % self.src1(node)
 
     def ex_Starred(self, node):
         return "/* *%s */" % self.expr(node.value)
 
     def ex_JoinedStr(self, node):
-        # f-string -> pyfmt("...{}...", expr, expr, ...)
-        fmt = []
-        exprs = []
+        fmt, exprs = [], []
         for part in node.values:
             if isinstance(part, ast.Constant):
-                fmt.append(str(part.value).replace("%", "%%"))
+                fmt.append(str(part.value))
             elif isinstance(part, ast.FormattedValue):
                 fmt.append("{}")
-                exprs.append(self.expr(part.value))
+                exprs.append(self.wrap_obj(part.value))
         lit = c_string("".join(fmt))
-        if exprs:
-            return "pyfmt(%s, %s)" % (lit, ", ".join(exprs))
-        return "pyfmt(%s)" % lit
+        return "pyfmt(%d, %s%s)" % (len(exprs), lit,
+                                    (", " + ", ".join(exprs)) if exprs else "")
 
     def ex_FormattedValue(self, node):
         return self.expr(node.value)
 
-    # ---- operator symbols -------------------------------------------------
-
     def binop_sym(self, op):
-        return {
-            ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/",
-            ast.Mod: "%", ast.FloorDiv: "/", ast.BitOr: "|", ast.BitAnd: "&",
-            ast.BitXor: "^", ast.LShift: "<<", ast.RShift: ">>",
-            ast.Pow: "POW",
-        }.get(type(op), "/*op*/")
-
-    # ---- value-based type guess for declarations -------------------------
+        return {ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/",
+                ast.Mod: "%", ast.FloorDiv: "/", ast.BitOr: "|",
+                ast.BitAnd: "&", ast.BitXor: "^", ast.LShift: "<<",
+                ast.RShift: ">>", ast.Pow: "POW"}.get(type(op), "/*op*/")
 
     def guess_from_value(self, node):
         if isinstance(node, ast.Constant):
@@ -711,15 +1460,20 @@ class Transpiler:
                 return "char*"
             if isinstance(v, float):
                 return "double"
-        if isinstance(node, ast.Compare):
+        if isinstance(node, (ast.Compare, ast.BoolOp)):
             return "bool"
-        if isinstance(node, ast.BoolOp):
-            return "bool"
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in self.classes:
+                return node.func.id + "*"
+            if node.func.id == "str":
+                return "char*"
+        if isinstance(node, ast.JoinedStr):
+            return "char*"
         if isinstance(node, (ast.List, ast.Dict, ast.Set, ast.Tuple)):
             return OBJ
         return None
 
-    # ---- source helpers ---------------------------------------------------
+    # ---- source helpers --------------------------------------------------
 
     def src(self, node):
         try:
@@ -728,14 +1482,18 @@ class Transpiler:
             return type(node).__name__
 
     def src1(self, node):
-        """One-line, comment-safe unparse."""
         s = self.src(node).replace("\n", " ").replace("*/", "* /")
         return s if len(s) <= 120 else s[:117] + "..."
 
 
-# --------------------------------------------------------------------------
+def is_super_call(node):
+    return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+        and node.func.id == "super"
+
+
+# ==========================================================================
 # String literal helper
-# --------------------------------------------------------------------------
+# ==========================================================================
 
 def c_string(s):
     out = ['"']
@@ -758,9 +1516,16 @@ def c_string(s):
     return "".join(out)
 
 
-# --------------------------------------------------------------------------
+# ==========================================================================
 # Driver
-# --------------------------------------------------------------------------
+# ==========================================================================
+
+def write_runtime(out_dir):
+    with open(os.path.join(out_dir, "shivyc_rt.h"), "w") as f:
+        f.write(RUNTIME_H)
+    with open(os.path.join(out_dir, "shivyc_rt.c"), "w") as f:
+        f.write(RUNTIME_C)
+
 
 def transpile_file(path, out_dir):
     src = open(path, encoding="utf-8").read()
@@ -779,15 +1544,6 @@ def transpile_file(path, out_dir):
 
 def print_conventions():
     print(__doc__)
-    print("Integer names:", ", ".join(sorted(INT_NAMES)))
-    print()
-    print("Integer suffixes (after '_'):", ", ".join(INT_SUFFIXES))
-    print()
-    print("String (char*) names:", ", ".join(sorted(STR_NAMES)))
-    print()
-    print("Boolean names:", ", ".join(sorted(BOOL_NAMES)))
-    print()
-    print("Boolean prefixes:", ", ".join(BOOL_PREFIXES))
 
 
 def main(argv):
@@ -809,19 +1565,20 @@ def main(argv):
     if not files:
         here = os.path.dirname(os.path.abspath(__file__))
         shivyc = os.path.normpath(os.path.join(here, "..", "shivyc"))
-        files = sorted(
-            os.path.join(shivyc, f)
-            for f in os.listdir(shivyc) if f.endswith(".py"))
+        files = sorted(os.path.join(shivyc, f)
+                       for f in os.listdir(shivyc) if f.endswith(".py"))
         print("No files given; defaulting to %d files in %s" %
               (len(files), shivyc))
 
     os.makedirs(out_dir, exist_ok=True)
+    write_runtime(out_dir)
+    print("  runtime -> %s/shivyc_rt.{h,c}" % out_dir)
     ok = 0
     for path in files:
         res = transpile_file(path, out_dir)
         if res:
             ok += 1
-            print("  %-32s -> %s" % (os.path.basename(path), res))
+            print("  %-28s -> %s" % (os.path.basename(path), res))
     print("Transpiled %d/%d files into %s" % (ok, len(files), out_dir))
 
 
