@@ -270,6 +270,8 @@ class _Ctx:
 
 
 class Analyzer:
+    prog: Program
+
     def __init__(self, prog):
         self.prog = prog
         self.summaries = {}           # func -> Summary
@@ -309,7 +311,7 @@ class Analyzer:
         cmds = self.prog.functions[fn]
         params = _param_map(cmds)
         seeds = {}
-        ctx = _Ctx(fn, record=False)
+        ctx = _Ctx(fn, False)
         for idx, val in params.items():
             ct = getattr(val, "ctype", None)
             if ct is not None and ct.is_pointer():
@@ -334,7 +336,7 @@ class Analyzer:
     # -- full check (emit diagnostics + collect auto-free candidates) ------
     def _check(self, fn):
         cmds = self.prog.functions[fn]
-        ctx = _Ctx(fn, record=True)
+        ctx = _Ctx(fn, True)
         self._dataflow(fn, cmds, State(), ctx)
         for al, val in ctx.owned_local.items():
             if al in ctx.escaped_ever or al in ctx.freed_ever:
@@ -498,7 +500,7 @@ class Analyzer:
                 pt[c.output] = frozenset()
             return
 
-        for out in getattr(c, "outputs", lambda: [])():
+        for out in c.outputs():
             pt[out] = frozenset()
 
 
