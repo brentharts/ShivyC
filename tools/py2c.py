@@ -81,7 +81,7 @@ typedef char* str;
 
 /* ---- Tier 2: generic dynamic value (used only where the type is open) ---- */
 typedef struct Obj Obj;
-enum { T_NONE, T_INT, T_BOOL, T_STR, T_OBJ, T_LIST };
+enum { T_NONE, T_INT, T_BOOL, T_STR, T_OBJ, T_LIST, T_DICT };
 typedef struct { unsigned char tag; union { long i; str s; Obj* o; } u; } obj;
 
 #define OBJ_NONE    ((obj){T_NONE,{0}})
@@ -143,6 +143,34 @@ bool obj_eq(obj a, obj b);         /* == on Tier-2 values                     */
 bool pycontains(obj container, obj v);  /* v in container                     */
 void pyprint(obj v);               /* print(x)                                */
 
+/* ---- dicts: insertion-ordered obj->obj map, tagged obj (T_DICT) ----------- */
+typedef struct { obj key; obj val; } DEnt;
+typedef struct { DEnt* e; int len; int cap; } Dict;
+obj  dict_new(void);
+obj  dict_of(int n, ...);          /* {k1:v1, k2:v2, ...} (2n varargs)         */
+void dict_set(obj d, obj k, obj v);
+obj  dict_get(obj d, obj k, obj dflt);
+bool dict_contains(obj d, obj k);
+obj  dict_pop(obj d, obj k, obj dflt);
+obj  dict_setdefault(obj d, obj k, obj dflt);
+void dict_update(obj d, obj other);
+obj  dict_keys(obj d);
+obj  dict_values(obj d);
+obj  dict_items(obj d);            /* list of [k, v] pairs                     */
+
+obj  subscript(obj container, obj key);       /* container[key] (list/dict/str) */
+void subscript_set(obj container, obj key, obj v);  /* container[key] = v       */
+
+/* ---- arithmetic / comparison on Tier-2 values ---- */
+obj  obj_add(obj a, obj b);        /* +  (int, str concat, list concat)       */
+obj  obj_sub(obj a, obj b);
+obj  obj_mul(obj a, obj b);        /* *  (int, str/list repeat)               */
+obj  obj_fdiv(obj a, obj b);       /* // */
+obj  obj_mod(obj a, obj b);
+obj  obj_bin(char op, obj a, obj b);  /* &|^ and << >>                        */
+long obj_cmp(obj a, obj b);        /* <0,0,>0 for < <= > >=                   */
+obj  pyrange(long lo, long hi, long step);
+
 #endif /* SHIVYC_RT_H */
 '''
 
@@ -162,6 +190,8 @@ void* aalloc(size_t n) {
 }
 void arena_reset(void) { g_ap = 0; }
 
+static str pyrepr(obj v);   /* repr() — quotes strings inside containers */
+
 str pystr(obj v) {
     char* b;
     switch (v.tag) {
@@ -172,17 +202,42 @@ str pystr(obj v) {
         case T_LIST: {
             List* l = (List*)v.u.o;
             size_t cap = 3;
-            for (int i = 0; i < l->len; i++) cap += strlen(pystr(l->data[i])) + 2;
+            for (int i = 0; i < l->len; i++) cap += strlen(pyrepr(l->data[i])) + 2;
             b = aalloc(cap); char* p = b; *p++ = '[';
             for (int i = 0; i < l->len; i++) {
                 if (i) { *p++ = ','; *p++ = ' '; }
-                str s = pystr(l->data[i]); size_t n = strlen(s);
+                str s = pyrepr(l->data[i]); size_t n = strlen(s);
                 memcpy(p, s, n); p += n;
             }
             *p++ = ']'; *p = 0; return b;
         }
+        case T_DICT: {
+            Dict* d = (Dict*)v.u.o;
+            size_t cap = 3;
+            for (int i = 0; i < d->len; i++)
+                cap += strlen(pyrepr(d->e[i].key)) + strlen(pyrepr(d->e[i].val)) + 4;
+            b = aalloc(cap); char* p = b; *p++ = '{';
+            for (int i = 0; i < d->len; i++) {
+                if (i) { *p++ = ','; *p++ = ' '; }
+                str k = pyrepr(d->e[i].key); size_t kn = strlen(k);
+                memcpy(p, k, kn); p += kn; *p++ = ':'; *p++ = ' ';
+                str vv = pyrepr(d->e[i].val); size_t vn = strlen(vv);
+                memcpy(p, vv, vn); p += vn;
+            }
+            *p++ = '}'; *p = 0; return b;
+        }
         default:     b = aalloc(24); sprintf(b, "<obj %p>", (void*)v.u.o); return b;
     }
+}
+
+static str pyrepr(obj v) {
+    if (v.tag == T_STR) {
+        size_t n = v.u.s ? strlen(v.u.s) : 0;
+        char* b = aalloc(n + 3);
+        b[0] = '\''; if (v.u.s) memcpy(b + 1, v.u.s, n);
+        b[n + 1] = '\''; b[n + 2] = 0; return b;
+    }
+    return pystr(v);
 }
 
 str pyfmt(int n, const char* fmt, ...) {
@@ -227,6 +282,7 @@ bool truthy(obj v) {
         case T_BOOL: return v.u.i != 0;
         case T_STR:  return v.u.s && v.u.s[0];
         case T_LIST: return ((List*)v.u.o)->len != 0;
+        case T_DICT: return ((Dict*)v.u.o)->len != 0;
         default:     return v.u.o != NULL;
     }
 }
@@ -268,11 +324,18 @@ void list_set(obj lst, long i, obj v) {
 }
 long pylen(obj v) {
     if (v.tag == T_LIST) return ((List*)v.u.o)->len;
+    if (v.tag == T_DICT) return ((Dict*)v.u.o)->len;
     if (v.tag == T_STR)  return v.u.s ? (long)strlen(v.u.s) : 0;
     return 0;
 }
 obj index_obj(obj container, long i) {
     if (container.tag == T_LIST) return list_get(container, i);
+    if (container.tag == T_DICT) {   /* iterating a dict yields its keys */
+        Dict* d = (Dict*)container.u.o;
+        if (i < 0) i += d->len;
+        if (i < 0 || i >= d->len) return OBJ_NONE;
+        return d->e[i].key;
+    }
     if (container.tag == T_STR) {
         long n = (long)strlen(container.u.s);
         if (i < 0) i += n;
@@ -302,11 +365,134 @@ bool pycontains(obj container, obj v) {
         for (int i = 0; i < l->len; i++) if (obj_eq(l->data[i], v)) return true;
         return false;
     }
+    if (container.tag == T_DICT) return dict_contains(container, v);
     if (container.tag == T_STR && v.tag == T_STR)
         return strstr(container.u.s, v.u.s) != NULL;
     return false;
 }
 void pyprint(obj v) { printf("%s\n", pystr(v)); }
+
+/* ---- dicts ---- */
+obj dict_new(void) {
+    Dict* d = aalloc(sizeof *d);
+    d->len = 0; d->cap = 8; d->e = aalloc(sizeof(DEnt) * d->cap);
+    obj r; r.tag = T_DICT; r.u.o = (Obj*)d; return r;
+}
+static int dict_find(Dict* d, obj k) {
+    for (int i = 0; i < d->len; i++) if (obj_eq(d->e[i].key, k)) return i;
+    return -1;
+}
+void dict_set(obj dd, obj k, obj v) {
+    Dict* d = (Dict*)dd.u.o;
+    int i = dict_find(d, k);
+    if (i >= 0) { d->e[i].val = v; return; }
+    if (d->len == d->cap) {
+        int nc = d->cap * 2; DEnt* ne = aalloc(sizeof(DEnt) * nc);
+        memcpy(ne, d->e, sizeof(DEnt) * d->len); d->e = ne; d->cap = nc;
+    }
+    d->e[d->len].key = k; d->e[d->len].val = v; d->len++;
+}
+obj dict_of(int n, ...) {
+    obj r = dict_new();
+    va_list ap; va_start(ap, n);
+    for (int i = 0; i < n; i++) { obj k = va_arg(ap, obj); obj v = va_arg(ap, obj); dict_set(r, k, v); }
+    va_end(ap); return r;
+}
+obj dict_get(obj dd, obj k, obj dflt) {
+    Dict* d = (Dict*)dd.u.o; int i = dict_find(d, k);
+    return i >= 0 ? d->e[i].val : dflt;
+}
+bool dict_contains(obj dd, obj k) { return dict_find((Dict*)dd.u.o, k) >= 0; }
+obj dict_pop(obj dd, obj k, obj dflt) {
+    Dict* d = (Dict*)dd.u.o; int i = dict_find(d, k);
+    if (i < 0) return dflt;
+    obj v = d->e[i].val;
+    for (int j = i; j < d->len - 1; j++) d->e[j] = d->e[j + 1];
+    d->len--; return v;
+}
+obj dict_setdefault(obj dd, obj k, obj dflt) {
+    Dict* d = (Dict*)dd.u.o; int i = dict_find(d, k);
+    if (i >= 0) return d->e[i].val;
+    dict_set(dd, k, dflt); return dflt;
+}
+void dict_update(obj dd, obj other) {
+    if (other.tag != T_DICT) return;
+    Dict* o = (Dict*)other.u.o;
+    for (int i = 0; i < o->len; i++) dict_set(dd, o->e[i].key, o->e[i].val);
+}
+obj dict_keys(obj dd) {
+    Dict* d = (Dict*)dd.u.o; obj r = list_new();
+    for (int i = 0; i < d->len; i++) list_append(r, d->e[i].key);
+    return r;
+}
+obj dict_values(obj dd) {
+    Dict* d = (Dict*)dd.u.o; obj r = list_new();
+    for (int i = 0; i < d->len; i++) list_append(r, d->e[i].val);
+    return r;
+}
+obj dict_items(obj dd) {
+    Dict* d = (Dict*)dd.u.o; obj r = list_new();
+    for (int i = 0; i < d->len; i++)
+        list_append(r, list_of(2, d->e[i].key, d->e[i].val));
+    return r;
+}
+obj subscript(obj container, obj key) {
+    if (container.tag == T_DICT) return dict_get(container, key, OBJ_NONE);
+    if (container.tag == T_LIST) return list_get(container, AS_INT(key));
+    if (container.tag == T_STR)  return index_obj(container, AS_INT(key));
+    return OBJ_NONE;
+}
+void subscript_set(obj container, obj key, obj v) {
+    if (container.tag == T_DICT) { dict_set(container, key, v); return; }
+    if (container.tag == T_LIST) { list_set(container, AS_INT(key), v); return; }
+}
+
+/* ---- arithmetic / comparison on Tier-2 values ---- */
+static long as_num(obj v) { return (v.tag == T_INT || v.tag == T_BOOL) ? v.u.i : 0; }
+
+obj obj_add(obj a, obj b) {
+    if (a.tag == T_STR && b.tag == T_STR) return OBJ_STR(pyconcat(a.u.s, b.u.s));
+    if (a.tag == T_LIST && b.tag == T_LIST) {
+        obj r = list_new();
+        List* la = (List*)a.u.o; List* lb = (List*)b.u.o;
+        for (int i = 0; i < la->len; i++) list_append(r, la->data[i]);
+        for (int i = 0; i < lb->len; i++) list_append(r, lb->data[i]);
+        return r;
+    }
+    return OBJ_INT(as_num(a) + as_num(b));
+}
+obj obj_sub(obj a, obj b) { return OBJ_INT(as_num(a) - as_num(b)); }
+obj obj_mul(obj a, obj b) {
+    if (a.tag == T_STR && b.tag == T_INT) {
+        long n = b.u.i; size_t l = strlen(a.u.s);
+        char* o = aalloc(l * (n < 0 ? 0 : n) + 1); o[0] = 0;
+        for (long i = 0; i < n; i++) memcpy(o + i * l, a.u.s, l);
+        o[l * (n < 0 ? 0 : n)] = 0; return OBJ_STR(o);
+    }
+    return OBJ_INT(as_num(a) * as_num(b));
+}
+obj obj_fdiv(obj a, obj b) { long d = as_num(b); return OBJ_INT(d ? as_num(a) / d : 0); }
+obj obj_mod(obj a, obj b) { long d = as_num(b); return OBJ_INT(d ? as_num(a) % d : 0); }
+obj obj_bin(char op, obj a, obj b) {
+    long x = as_num(a), y = as_num(b), r = 0;
+    switch (op) {
+        case '&': r = x & y; break; case '|': r = x | y; break;
+        case '^': r = x ^ y; break; case 'l': r = x << y; break;
+        case 'r': r = x >> y; break;
+    }
+    return OBJ_INT(r);
+}
+long obj_cmp(obj a, obj b) {
+    if (a.tag == T_STR && b.tag == T_STR) return strcmp(a.u.s, b.u.s);
+    long x = as_num(a), y = as_num(b);
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+obj pyrange(long lo, long hi, long step) {
+    obj r = list_new();
+    if (step > 0) for (long i = lo; i < hi; i += step) list_append(r, OBJ_INT(i));
+    else if (step < 0) for (long i = lo; i > hi; i += step) list_append(r, OBJ_INT(i));
+    return r;
+}
 '''
 
 
@@ -911,16 +1097,24 @@ class Transpiler:
                             ct = self.value_ctype(sub.value) or \
                                 infer_from_name(t.id) or OBJ
                             consider(t.id, ct)
+                        elif isinstance(t, (ast.Tuple, ast.List)):
+                            for el in t.elts:
+                                if isinstance(el, ast.Name) and el.id != "_":
+                                    consider(el.id, OBJ)
                 elif isinstance(sub, ast.AnnAssign) and \
                         isinstance(sub.target, ast.Name):
                     consider(sub.target.id,
                              infer_type(sub.target.id, sub.annotation))
-                elif isinstance(sub, ast.For) and \
-                        isinstance(sub.target, ast.Name):
-                    is_range = isinstance(sub.iter, ast.Call) and \
-                        isinstance(sub.iter.func, ast.Name) and \
-                        sub.iter.func.id == "range"
-                    consider(sub.target.id, "int" if is_range else OBJ)
+                elif isinstance(sub, ast.For):
+                    if isinstance(sub.target, ast.Name):
+                        is_range = isinstance(sub.iter, ast.Call) and \
+                            isinstance(sub.iter.func, ast.Name) and \
+                            sub.iter.func.id == "range"
+                        consider(sub.target.id, "int" if is_range else OBJ)
+                    elif isinstance(sub.target, (ast.Tuple, ast.List)):
+                        for el in sub.target.elts:
+                            if isinstance(el, ast.Name) and el.id != "_":
+                                consider(el.id, OBJ)
         return [(n, types[n]) for n in order]
 
     def emit_hoisted_body(self, body):
@@ -1034,12 +1228,29 @@ class Transpiler:
         rhs = self.expr(node.value)
         lines = []
         for tgt in node.targets:
-            if isinstance(tgt, ast.Tuple):
-                lines.append("/* tuple unpack: %s = %s */" %
-                             (self.src1(tgt), rhs))
+            if isinstance(tgt, (ast.Tuple, ast.List)):
+                # a, b = expr  ->  bind each element from the materialized rhs
+                self.loop_n += 1
+                tmp = "_u%d" % self.loop_n
+                lines.append("obj %s = %s;" % (tmp, rhs))
                 for i, el in enumerate(tgt.elts):
-                    lines.append("%s = /* [%d] */ OBJ_NONE;" %
-                                 (self.expr(el), i))
+                    if isinstance(el, ast.Name) and el.id == "_":
+                        continue
+                    if isinstance(el, ast.Name) and el.id not in self.scope:
+                        self.scope[el.id] = OBJ
+                    decl = "obj " if (isinstance(el, ast.Name) and
+                                      el.id not in self.hoisted) else ""
+                    lines.append("%s%s = index_obj(%s, %d);" %
+                                 (decl, self.expr(el), tmp, i))
+                continue
+            if isinstance(tgt, ast.Subscript):
+                if self.is_obj_word(tgt.value) or \
+                        self.value_ctype(tgt.value) == OBJ:
+                    lines.append("subscript_set(%s, %s, %s);" % (
+                        self.expr(tgt.value), self.wrap_obj(tgt.slice),
+                        self.wrap_for_assign(node.value, rhs)))
+                else:
+                    lines.append("%s = %s;" % (self.expr(tgt), rhs))
                 continue
             if isinstance(tgt, ast.Name):
                 # already declared in this scope?  ->  plain reassignment
@@ -1056,6 +1267,11 @@ class Transpiler:
                 lines.append("%s = %s;" % (self.expr(tgt), rhs))
         return lines
 
+    def wrap_for_assign(self, value_node, rendered):
+        if self.value_ctype(value_node) in ("int", "bool", "char*"):
+            return self.wrap_obj(value_node)
+        return rendered
+
     def value_ctype(self, node):
         """Best-effort C type of an expression, when determinable."""
         t = self.static_type(node)
@@ -1067,8 +1283,23 @@ class Transpiler:
                 return "char*"
             lt = self.value_ctype(node.left)
             rt = self.value_ctype(node.right)
-            if lt == "int" and rt == "int":
+            if lt in ("int", "bool") and rt in ("int", "bool"):
                 return "int"
+            return OBJ  # obj arithmetic yields a Tier-2 obj
+        if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp,
+                             ast.GeneratorExp)):
+            return OBJ
+        if isinstance(node, ast.Subscript):
+            if isinstance(node.value, ast.Subscript):
+                inner = node.value
+                if isinstance(inner.value, ast.Attribute) and \
+                        isinstance(inner.value.value, ast.Name) and \
+                        inner.value.value.id == "self" and self.cur_class and \
+                        inner.value.attr in self.cur_class.const_dicts:
+                    return "char*"
+            if self.is_obj_word(node.value) or \
+                    self.value_ctype(node.value) == OBJ:
+                return OBJ
         if isinstance(node, ast.UnaryOp):
             if isinstance(node.op, ast.Not):
                 return "bool"
@@ -1088,10 +1319,15 @@ class Transpiler:
             if isinstance(f, ast.Name):
                 if f.id == "isinstance":
                     return "bool"
+                if f.id in ("any", "all"):
+                    return "bool"
                 if f.id == "str":
                     return "char*"
-                if f.id == "len":
+                if f.id in ("len", "ord", "int", "abs"):
                     return "int"
+                if f.id in ("range", "sorted", "list", "dict", "set",
+                            "reversed"):
+                    return OBJ
                 if f.id in self.classes:
                     return f.id + "*"
                 if f.id in self.func_returns:
@@ -1203,18 +1439,16 @@ class Transpiler:
             lines.append("}")
             return lines
         lines = ["/* for %s in %s: */" % (self.src1(tgt), self.src1(it))]
-        if isinstance(tgt, ast.Name):
+        if isinstance(tgt, (ast.Name, ast.Tuple, ast.List)):
             self.loop_n += 1
             itv = "_it%d" % self.loop_n
             idx = "_k%d" % self.loop_n
-            v = cname(tgt.id)
-            if tgt.id not in self.scope:
-                self.scope[tgt.id] = OBJ
             lines.append("{ obj %s = %s;" % (itv, self.expr(it)))
             lines.append("  for (long %s = 0; %s < pylen(%s); %s++) {" %
                          (idx, idx, itv, idx))
-            decl = "" if tgt.id in self.hoisted else "obj "
-            lines.append("    %s%s = index_obj(%s, %s);" % (decl, v, itv, idx))
+            binds = self.bind_target(tgt, "index_obj(%s, %s)" % (itv, idx))
+            for b in binds:
+                lines.append("    " + b)
             lines += self.indent_lines(self.indent_lines(self.suite(node.body)))
             lines.append("  }")
             lines.append("}")
@@ -1223,6 +1457,60 @@ class Transpiler:
         lines += self.indent_lines(self.suite(node.body))
         lines.append("}")
         return lines
+
+    def bind_target(self, target, src, force_decl=False):
+        """C statements binding `target` (Name or Tuple/List) from obj `src`."""
+        out = []
+        if isinstance(target, ast.Name):
+            if target.id == "_":
+                return ["(void)(%s);" % src]
+            if target.id not in self.scope:
+                self.scope[target.id] = OBJ
+            decl = "obj " if (force_decl or target.id not in self.hoisted) \
+                else ""
+            out.append("%s%s = %s;" % (decl, cname(target.id), src))
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            self.loop_n += 1
+            tmp = "_e%d" % self.loop_n
+            out.append("obj %s = %s;" % (tmp, src))
+            for i, el in enumerate(target.elts):
+                out += self.bind_target(el, "index_obj(%s, %d)" % (tmp, i),
+                                        force_decl=force_decl)
+        return out
+
+    def lower_comp(self, node, kind):
+        """Lower a comprehension/genexpr to a GCC statement-expression loop.
+        kind is 'list' (list/set/genexpr) or 'dict'."""
+        saved = dict(self.scope)
+        self.loop_n += 1
+        acc = "_acc%d" % self.loop_n
+        init = "dict_new()" if kind == "dict" else "list_new()"
+        gens = node.generators
+
+        def build(i):
+            if i == len(gens):
+                if kind == "dict":
+                    return "dict_set(%s, %s, %s);" % (
+                        acc, self.wrap_obj(node.key), self.wrap_obj(node.value))
+                return "list_append(%s, %s);" % (acc, self.wrap_obj(node.elt))
+            g = gens[i]
+            self.loop_n += 1
+            it = "_it%d" % self.loop_n
+            idx = "_k%d" % self.loop_n
+            binds = self.bind_target(g.target, "index_obj(%s, %s)" % (it, idx),
+                                     force_decl=True)
+            guard_open, guard_close = "", ""
+            if g.ifs:
+                conds = " && ".join("(%s)" % self.bool_expr(c) for c in g.ifs)
+                guard_open, guard_close = "if (%s) { " % conds, " }"
+            inner = build(i + 1)
+            body = " ".join(binds) + " " + guard_open + inner + guard_close
+            return "{ obj %s = %s; for (long %s = 0; %s < pylen(%s); %s++) " \
+                   "{ %s } }" % (it, self.expr(g.iter), idx, idx, it, idx, body)
+
+        body = build(0)
+        self.scope = saved
+        return "({ obj %s = %s; %s %s; })" % (acc, init, body, acc)
 
     def st_Try(self, node):
         lines = ["/* try */ {"]
@@ -1331,6 +1619,14 @@ class Transpiler:
                 return self.lower_any_all(fn, node.args[0])
             if fn == "bool" and len(node.args) == 1:
                 return self.bool_expr(node.args[0])
+            if fn == "range":
+                a = [self.expr(x) for x in node.args]
+                if len(a) == 1:
+                    return "pyrange(0, %s, 1)" % a[0]
+                if len(a) == 2:
+                    return "pyrange(%s, %s, 1)" % (a[0], a[1])
+                if len(a) == 3:
+                    return "pyrange(%s, %s, %s)" % (a[0], a[1], a[2])
             if fn in self.classes:
                 cargs = self.coerce_args(
                     self.init_param_ctypes(self.classes[fn]), node.args)
@@ -1360,12 +1656,7 @@ class Transpiler:
                 (", " + ", ".join(argstrs)) if argstrs else "")
 
         if isinstance(func, ast.Attribute):
-            # list methods on an obj/list receiver
-            if func.attr == "append" and len(node.args) == 1:
-                return "list_append(%s, %s)" % (self.expr(func.value),
-                                                self.wrap_obj(node.args[0]))
-            if func.attr in ("sort", "reverse"):
-                return "/* .%s() omitted */ (void)0" % func.attr
+            # const-dict .get() (e.g. self.size_map.get(...)) takes priority
             if func.attr == "get" and isinstance(func.value, ast.Attribute) \
                     and isinstance(func.value.value, ast.Name) \
                     and func.value.value.id == "self" and self.cur_class \
@@ -1374,6 +1665,38 @@ class Transpiler:
                 k = argstrs[0]
                 dflt = argstrs[1] if len(argstrs) > 1 else '""'
                 return "%s_%s_get(%s, %s)" % (self.cur_class.name, d, k, dflt)
+            # list methods on an obj/list receiver
+            if func.attr == "append" and len(node.args) == 1:
+                return "list_append(%s, %s)" % (self.expr(func.value),
+                                                self.wrap_obj(node.args[0]))
+            if func.attr in ("sort", "reverse"):
+                return "/* .%s() omitted */ (void)0" % func.attr
+            # dict methods on an obj receiver
+            if func.attr == "items" and not node.args:
+                return "dict_items(%s)" % self.expr(func.value)
+            if func.attr == "keys" and not node.args:
+                return "dict_keys(%s)" % self.expr(func.value)
+            if func.attr == "values" and not node.args:
+                return "dict_values(%s)" % self.expr(func.value)
+            if func.attr == "update" and len(node.args) == 1:
+                return "dict_update(%s, %s)" % (self.expr(func.value),
+                                                self.expr(node.args[0]))
+            if func.attr == "setdefault":
+                k = self.wrap_obj(node.args[0])
+                d = self.wrap_obj(node.args[1]) if len(node.args) > 1 \
+                    else "OBJ_NONE"
+                return "dict_setdefault(%s, %s, %s)" % (
+                    self.expr(func.value), k, d)
+            if func.attr == "pop" and node.args:
+                k = self.wrap_obj(node.args[0])
+                d = self.wrap_obj(node.args[1]) if len(node.args) > 1 \
+                    else "OBJ_NONE"
+                return "dict_pop(%s, %s, %s)" % (self.expr(func.value), k, d)
+            if func.attr == "get" and node.args:
+                k = self.wrap_obj(node.args[0])
+                d = self.wrap_obj(node.args[1]) if len(node.args) > 1 \
+                    else "OBJ_NONE"
+                return "dict_get(%s, %s, %s)" % (self.expr(func.value), k, d)
             if isinstance(func.value, ast.Name) and \
                     func.value.id in self.modules:
                 return "%s_%s(%s)" % (func.value.id, func.attr,
@@ -1558,6 +1881,27 @@ class Transpiler:
                                              self.looks_str(node.right)):
             return "pyconcat(%s, %s)" % (self.str_operand(node.left),
                                          self.str_operand(node.right))
+        lt = self.value_ctype(node.left)
+        rt = self.value_ctype(node.right)
+        numeric = {"int", "bool", "double"}
+        # both sides are concrete numbers -> plain C arithmetic
+        if lt in numeric and rt in numeric:
+            return "(%s %s %s)" % (self.expr(node.left),
+                                   self.binop_sym(node.op),
+                                   self.expr(node.right))
+        # otherwise operate on Tier-2 values
+        fns = {ast.Add: "obj_add", ast.Sub: "obj_sub", ast.Mult: "obj_mul",
+               ast.FloorDiv: "obj_fdiv", ast.Div: "obj_fdiv",
+               ast.Mod: "obj_mod"}
+        f = fns.get(type(node.op))
+        if f:
+            return "%s(%s, %s)" % (f, self.wrap_obj(node.left),
+                                   self.wrap_obj(node.right))
+        binop = {ast.BitAnd: "'&'", ast.BitOr: "'|'", ast.BitXor: "'^'",
+                 ast.LShift: "'l'", ast.RShift: "'r'"}.get(type(node.op))
+        if binop:
+            return "obj_bin(%s, %s, %s)" % (binop, self.wrap_obj(node.left),
+                                            self.wrap_obj(node.right))
         return "(%s %s %s)" % (self.expr(node.left), self.binop_sym(node.op),
                                self.expr(node.right))
 
@@ -1610,20 +1954,37 @@ class Transpiler:
             return "(%s %s %s)" % (ls, sym, rs)
         sym = {ast.Eq: "==", ast.NotEq: "!=", ast.Lt: "<", ast.LtE: "<=",
                ast.Gt: ">", ast.GtE: ">="}[type(op)]
-        # obj-word compared against a pointer (e.g. self.base == RBP)
-        if sym in ("==", "!=") and \
-                (self.is_obj_word(left) != self.is_obj_word(right)):
-            if self.is_obj_word(left):
-                o, p = ls, rs
-            else:
-                o, p = rs, ls
-            core = "(IS_OBJ(%s) && AS_OBJ(%s) == (Obj*)(%s))" % (o, o, p)
-            return core if sym == "==" else "(!%s)" % core
-        if sym in ("==", "!=") and (self.looks_str(left) or
-                                    self.looks_str(right)):
+        lo, ro = self.is_obj_val(left), self.is_obj_val(right)
+        lp, rp = self.is_ptr_val(left), self.is_ptr_val(right)
+        if sym in ("==", "!="):
+            # obj compared against a real pointer (e.g. self.base == RBP)
+            if (lo and rp) or (ro and lp):
+                o, p = (ls, rs) if lo else (rs, ls)
+                core = "(IS_OBJ(%s) && AS_OBJ(%s) == (Obj*)(%s))" % (o, o, p)
+                return core if sym == "==" else "(!%s)" % core
+            if lo or ro:
+                eq = "obj_eq(%s, %s)" % (self.wrap_obj(left),
+                                        self.wrap_obj(right))
+                return eq if sym == "==" else "(!%s)" % eq
+            if self.looks_str(left) or self.looks_str(right):
+                return "(strcmp(%s, %s) %s 0)" % (self.str_operand(left),
+                                                  self.str_operand(right), sym)
+            return "(%s %s %s)" % (ls, sym, rs)
+        # ordering
+        if lo or ro:
+            return "(obj_cmp(%s, %s) %s 0)" % (self.wrap_obj(left),
+                                               self.wrap_obj(right), sym)
+        if self.looks_str(left) or self.looks_str(right):
             return "(strcmp(%s, %s) %s 0)" % (self.str_operand(left),
                                               self.str_operand(right), sym)
         return "(%s %s %s)" % (ls, sym, rs)
+
+    def is_obj_val(self, node):
+        return self.is_obj_word(node) or self.value_ctype(node) == OBJ
+
+    def is_ptr_val(self, node):
+        t = self.value_ctype(node)
+        return bool(t) and t.endswith("*") and t != OBJ
 
     def ex_Subscript(self, node):
         if isinstance(node.value, ast.Subscript):
@@ -1641,11 +2002,11 @@ class Transpiler:
             lo = self.expr(sl.lower) if sl.lower else "0"
             hi = self.expr(sl.upper) if sl.upper else "END"
             return "SLICE(%s, %s, %s)" % (self.expr(node.value), lo, hi)
-        # indexing a Tier-2 obj (list or str) goes through index_obj
+        # indexing a Tier-2 obj (list/dict/str) dispatches at runtime
         if self.is_obj_word(node.value) or \
                 self.value_ctype(node.value) == OBJ:
-            return "index_obj(%s, %s)" % (self.expr(node.value),
-                                          self.expr(sl))
+            return "subscript(%s, %s)" % (self.expr(node.value),
+                                          self.wrap_obj(sl))
         return "%s[%s]" % (self.expr(node.value), self.expr(sl))
 
     def ex_IfExp(self, node):
@@ -1660,26 +2021,39 @@ class Transpiler:
         return "list_of(%d, %s)" % (len(node.elts), items)
 
     def ex_Tuple(self, node):
-        return "/* tuple(%s) */ OBJ_NONE" % ", ".join(self.src1(e)
-                                                      for e in node.elts)
+        if not node.elts:
+            return "list_new() /* () */"
+        items = ", ".join(self.wrap_obj(e) for e in node.elts)
+        return "list_of(%d, %s)" % (len(node.elts), items)
 
     def ex_Set(self, node):
-        return "/* set[%d] */ OBJ_NONE" % len(node.elts)
+        if not node.elts:
+            return "list_new() /* set */"
+        items = ", ".join(self.wrap_obj(e) for e in node.elts)
+        return "list_of(%d, %s) /* set */" % (len(node.elts), items)
 
     def ex_Dict(self, node):
-        return "/* dict[%d] */ OBJ_NONE" % len(node.keys)
+        pairs = [(k, v) for k, v in zip(node.keys, node.values)
+                 if k is not None]
+        if not pairs:
+            return "dict_new()"
+        flat = []
+        for k, v in pairs:
+            flat.append(self.wrap_obj(k))
+            flat.append(self.wrap_obj(v))
+        return "dict_of(%d, %s)" % (len(pairs), ", ".join(flat))
 
     def ex_ListComp(self, node):
-        return "/* listcomp: %s */ OBJ_NONE" % self.src1(node)
+        return self.lower_comp(node, "list")
 
     def ex_SetComp(self, node):
-        return "/* setcomp: %s */ OBJ_NONE" % self.src1(node)
+        return self.lower_comp(node, "list")
 
     def ex_DictComp(self, node):
-        return "/* dictcomp: %s */ OBJ_NONE" % self.src1(node)
+        return self.lower_comp(node, "dict")
 
     def ex_GeneratorExp(self, node):
-        return "/* genexpr: %s */ OBJ_NONE" % self.src1(node)
+        return self.lower_comp(node, "list")
 
     def ex_Lambda(self, node):
         return "/* lambda: %s */ OBJ_NONE" % self.src1(node)
