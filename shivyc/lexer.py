@@ -79,7 +79,7 @@ def split_to_tagged_lines(text, filename):
     return tagged_lines
 
 
-def join_extended_lines(lines):
+def join_extended_lines(lines: list):
     """Join together any lines which end in an escaped newline.
 
     This function modifies the given lines object in place.
@@ -110,7 +110,7 @@ def join_extended_lines(lines):
         i += 1
 
 
-def tokenize_line(line, in_comment):
+def tokenize_line(line: list, in_comment):
     """Tokenize the given single line.
 
     line - List of Tagged objects.
@@ -266,7 +266,7 @@ def tokenize_line(line, in_comment):
     return tokens, in_comment
 
 
-def chunk_to_str(chunk):
+def chunk_to_str(chunk: list):
     """Convert the given chunk to a string.
 
     chunk - list of Tagged characters.
@@ -275,7 +275,7 @@ def chunk_to_str(chunk):
     return "".join(c.c for c in chunk)
 
 
-def _continues_number(line, chunk_start, chunk_end):
+def _continues_number(line: list, chunk_start, chunk_end):
     """Whether the symbol at chunk_end continues a floating constant."""
     chunk = "".join(c.c for c in line[chunk_start:chunk_end])
     ch = line[chunk_end].c
@@ -292,7 +292,7 @@ def _continues_number(line, chunk_start, chunk_end):
     return False
 
 
-def match_symbol_kind_at(content, start):
+def match_symbol_kind_at(content: list, start):
     """Return the longest matching symbol token kind.
 
     content - List of Tagged objects in which to search for match.
@@ -322,7 +322,7 @@ def match_include_command(tokens):
             and tokens[-1].content == "include")
 
 
-def read_string(line, start, delim, null):
+def read_string(line: list, start, delim, null):
     """Return a lexed string list in input characters.
 
     Also returns the index of the string end quote.
@@ -397,7 +397,7 @@ def read_string(line, start, delim, null):
             i += 1
 
 
-def read_include_filename(line, start):
+def read_include_filename(line: list, start):
     """Read a filename that follows a #include directive.
 
     Expects line[start] to be one of `<` or `"`, then reads characters until a
@@ -429,7 +429,7 @@ def read_include_filename(line, start):
     return chunk_to_str(line[start:i + 1]), i
 
 
-def add_chunk(chunk, tokens):
+def add_chunk(chunk: list, tokens):
     """Convert chunk into a token if possible and add to tokens.
 
     If chunk is non-empty but cannot be made into a token, this function
