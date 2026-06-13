@@ -963,6 +963,7 @@ class ClassInfo:
         self.const_dicts = {}
         self.class_statics = {}     # class-level obj constants (lists / dicts
                                     # the const_dict fast-path can't specialize)
+        self.class_attrs = {}       # class-level scalar defaults (instance flds)
         bases = [b for b in node.bases if isinstance(b, ast.Name)]
         if bases:
             self.base_name = bases[0].id
@@ -1169,7 +1170,15 @@ def collect_classes(tree):
                     ci.const_dicts[nm] = val
                 elif isinstance(val, (ast.Dict, ast.List, ast.Set, ast.Tuple)):
                     ci.class_statics[nm] = val
+                else:
+                    # class-level scalar (e.g. `comm = False`, `name = "add"`,
+                    # `FInst_s = None`): a per-class default, possibly overridden
+                    # in subclasses -> becomes an instance field set in the ctor
+                    ci.class_attrs[nm] = val
         ci.own_fields = discover_fields(ci.node)
+        for nm in ci.class_attrs:           # ensure they get a struct slot
+            if not any(f == nm for f, _ in ci.own_fields):
+                ci.own_fields.append((nm, OBJ))
     vt = set()
     for ci in order:
         root = ci.root()
@@ -1467,6 +1476,13 @@ class Transpiler:
         module-level globals (initialized later in <module>_init)."""
         protos = []
         for ci in self.class_order:         # method + constructor prototypes
+            if "__init__" not in ci.methods:
+                ni = self._nearest_init(ci)  # inherit-only ctor still gets _new
+                if ni is not None:
+                    _, fn = ni
+                    params = self.param_list(fn, skip_self=True)
+                    cargs = ", ".join(params) if params else "void"
+                    protos.append("%s* %s_new(%s);" % (ci.name, ci.name, cargs))
             for mname, fn in ci.methods.items():
                 if mname.startswith("__") and mname.endswith("__") \
                         and mname != "__init__":
@@ -1868,6 +1884,11 @@ class Transpiler:
             self.emit_const_dict(ci, dname, dnode)
         if "__init__" in ci.methods:
             self.emit_constructor(ci, ci.methods["__init__"])
+        else:
+            ni = self._nearest_init(ci)     # inherit __init__ but get own _new
+            if ni is not None:
+                owner, fn = ni
+                self.emit_inherited_constructor(ci, owner, fn)
         for mname, fn in ci.methods.items():
             if mname == "__init__":
                 continue
@@ -1921,6 +1942,42 @@ class Transpiler:
                   (ci.name, dname))
         self.emit()
 
+    def _resolved_class_attrs(self, ci):
+        """attr -> value AST node for `ci`, walking root->leaf so a subclass
+        override wins over an inherited default."""
+        chain = []
+        c = ci
+        while c:
+            chain.append(c)
+            c = c.base
+        res = {}
+        for c in reversed(chain):
+            for k, v in c.class_attrs.items():
+                res[k] = v
+        return res
+
+    def emit_class_attr_init(self, ci):
+        """Set the instance fields backing class-level scalar attributes to this
+        class's most-derived value (polymorphic class data made per-instance)."""
+        attrs = self._resolved_class_attrs(ci)
+        if not attrs:
+            return
+        prev = self.cur_class
+        self.cur_class = ci
+        for nm, val in sorted(attrs.items()):
+            self.emit("self->%s = %s;" % (cname(nm), self.wrap_obj(val)))
+        self.cur_class = prev
+
+    def _nearest_init(self, ci):
+        """(owner, __init__ fn) for the nearest class in ci's chain that defines
+        __init__, or None."""
+        c = ci
+        while c:
+            if "__init__" in c.methods:
+                return c, c.methods["__init__"]
+            c = c.base
+        return None
+
     def emit_constructor(self, ci, fn):
         self.enter_scope(fn, skip_self=True)
         params = self.param_list(fn, skip_self=True)
@@ -1934,13 +1991,34 @@ class Transpiler:
         self.indent -= 1
         self.emit("}")
         self.emit()
-        # ClassName_new: allocate, set type, run __init__
+        # ClassName_new: allocate, set type, run __init__, init class attrs
         self.emit("%s* %s_new(%s) {" % (ci.name, ci.name, plist))
         self.indent += 1
         self.emit("%s* self = aalloc(sizeof *self);" % ci.name)
         self.emit("((Obj*)self)->type = &%s_type;" % ci.name)
         self.emit("%s___init__(%s);" % (ci.name,
                                         ", ".join(["self"] + argnames)))
+        self.emit_class_attr_init(ci)
+        self.emit("return self;")
+        self.indent -= 1
+        self.emit("}")
+        self.emit()
+
+    def emit_inherited_constructor(self, ci, owner, fn):
+        """A concrete class with no own __init__ still needs its own _new so it
+        sets its own type pointer and its own class-attr values; it delegates
+        construction to the nearest inherited __init__."""
+        params = self.param_list(fn, skip_self=True)
+        plist = ", ".join(params) if params else "void"
+        argnames = [cname(a.arg) for a in fn.args.args[1:]]
+        self.emit("%s* %s_new(%s) {" % (ci.name, ci.name, plist))
+        self.indent += 1
+        self.emit("%s* self = aalloc(sizeof *self);" % ci.name)
+        self.emit("((Obj*)self)->type = &%s_type;" % ci.name)
+        self.emit("%s___init__((%s*)self%s);" % (
+            owner.name, owner.name,
+            (", " + ", ".join(argnames)) if argnames else ""))
+        self.emit_class_attr_init(ci)
         self.emit("return self;")
         self.indent -= 1
         self.emit("}")
@@ -2133,7 +2211,8 @@ class Transpiler:
         for cls in sorted(self.class_values_needed):
             ci = self.classes.get(cls) or (self.xclasses[cls][0]
                                            if cls in self.xclasses else None)
-            init = ci.methods.get("__init__") if ci else None
+            ni = self._nearest_init(ci) if ci else None
+            init = ni[1] if ni else None
             pct = [arg_ctype(init, a) for a in init.args.args[1:]] \
                 if init else []
             args = []
@@ -2444,6 +2523,12 @@ class Transpiler:
                     if f.attr in self.hierarchy_method:
                         return self.ximported_method_sig(
                             self.hierarchy_method[f.attr], f.attr)[0]
+            # calling a *complex* obj-valued expression (closure/ctor returned
+            # by another call, a subscript, etc.) yields obj; Name/Attribute
+            # funcs are already handled above and must not fall through here
+            if not isinstance(f, (ast.Name, ast.Attribute)) and \
+                    (self.value_ctype(f) == OBJ or self.is_obj_word(f)):
+                return OBJ
         return self.guess_from_value(node)
 
     def st_AnnAssign(self, node):
@@ -2622,9 +2707,13 @@ class Transpiler:
         if isinstance(target, ast.Name):
             if target.id == "_":
                 return ["(void)(%s);" % src]
-            if target.id not in self.scope:
-                self.scope[target.id] = OBJ
             fresh = force_decl or target.id not in self.hoisted
+            if fresh:
+                # a freshly declared `obj name` shadows any outer binding of the
+                # same name; record its type as obj so value_ctype is correct
+                self.scope[target.id] = OBJ
+            elif target.id not in self.scope:
+                self.scope[target.id] = OBJ
             decl = "obj " if fresh else ""
             rhs = src
             declared = self.scope.get(target.id)
@@ -2753,6 +2842,16 @@ class Transpiler:
         if node.id in self.classes and node.id not in self.scope:
             self.class_values_needed.add(node.id)
             return "make_closure(&%s__ctortramp, OBJ_NONE)" % node.id
+        # an imported module global / singleton referenced by bare name: make
+        # sure it gets an extern declaration emitted by build_externs
+        if node.id in self.from_imports and node.id not in self.scope:
+            mod = self.from_imports[node.id]
+            kind, info = self.xref(node.id, mod)
+            if kind in ("singleton", "func", "class"):
+                self.used_imports.add((mod, node.id))
+                if kind == "class":
+                    self.class_values_needed.add(node.id)
+                    return "make_closure(&%s__ctortramp, OBJ_NONE)" % node.id
         return cname(node.id)
 
     def const_literal(self, v):
@@ -3224,6 +3323,16 @@ class Transpiler:
             recv = self.expr(func.value)
             return "%s(%s)" % (func.attr, ", ".join([recv] + argstrs))
 
+        # calling any *complex* obj-valued expression (e.g. the result of a
+        # method that returns a function/constructor) dispatches through the
+        # closure ABI; a bare Name here is an unhandled builtin -> plain call
+        if not isinstance(func, ast.Name) and \
+                (self.value_ctype(func) == OBJ or self.is_obj_word(func)):
+            wargs = [self.wrap_obj(a) for a in node.args]
+            if wargs:
+                return "call_obj(%s, %d, %s)" % (self.expr(func), len(wargs),
+                                                 ", ".join(wargs))
+            return "call_closure(%s, list_new())" % self.expr(func)
         return "%s(%s)" % (self.expr(func), ", ".join(argstrs))
 
     # ---- OO call lowering helpers ---------------------------------------
