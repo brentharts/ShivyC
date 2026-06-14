@@ -33,6 +33,10 @@ class ILCode:
         # constants in static initializers (e.g. `static char *p = "x";`).
         self.string_literal_names = {}
         self._str_lit_counter = 0
+        # optimization metadata attached by main.py's analysis passes
+        self.metamorphic_funcs = set()
+        self.simd_proven = set()
+        self.near_scratch_funcs = set()
 
     def copy(self):
         """Make copy of this object.
