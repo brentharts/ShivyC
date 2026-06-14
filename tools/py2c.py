@@ -2143,6 +2143,11 @@ class Transpiler:
                 return t
         return arg_ctype(fn, arg)
 
+    def _is_class_ptr(self, ct):
+        """True if `ct` is a pointer to a (local or imported) class struct."""
+        return bool(ct) and ct.endswith("*") and ct != OBJ \
+            and (ct[:-1] in self.classes or ct[:-1] in self.xclasses)
+
     def ctype_csym(self, ft):
         """Rewrite a C type so a pointer to an ambiguous class uses that class's
         qualified symbol (e.g. 'Mult*' -> 'shivyc_..._Mult*')."""
@@ -2759,8 +2764,13 @@ class Transpiler:
         params = []
         args = fn.args.args[1:] if skip_self else fn.args.args
         for arg in args:
-            params.append("%s %s" % (self.ctype_csym(self.arg_ctype_q(fn, arg)),
-                                     cname(arg.arg)))
+            ct = self.arg_ctype_q(fn, arg)
+            # A virtual (vtable) method must keep the uniform `obj` ABI for every
+            # parameter; a class-typed param is instead resolved internally by
+            # narrowing (see enter_scope), so emit `obj` in the signature here.
+            if fn.name in VTABLE_METHODS and self._is_class_ptr(ct):
+                ct = OBJ
+            params.append("%s %s" % (self.ctype_csym(ct), cname(arg.arg)))
         if fn.args.vararg:
             params.append("...")
         return params
@@ -2772,7 +2782,18 @@ class Transpiler:
         self.elem_types = {}        # list var -> element ctype (from List[T])
         args = fn.args.args[1:] if skip_self else fn.args.args
         for arg in args:
-            self.scope[arg.arg] = self.arg_ctype_q(fn, arg)
+            ct = self.arg_ctype_q(fn, arg)
+            if fn.name in VTABLE_METHODS and self._is_class_ptr(ct):
+                # boxed `obj` param (vtable ABI) with a known concrete class:
+                # keep it obj, but narrow so member/method access resolves to
+                # the typed struct (unwrapping with AS_OBJ at each use).
+                self.scope[arg.arg] = OBJ
+                self.narrowed[arg.arg] = ct
+                cls = ct[:-1]
+                if cls in self.xclasses and cls not in self.classes:
+                    self.xstructs_needed.add(cls)   # typed casts need its struct
+            else:
+                self.scope[arg.arg] = ct
             et = ann_elem_ctype(arg.annotation)
             if et:
                 self.elem_types[arg.arg] = et
