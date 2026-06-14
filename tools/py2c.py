@@ -1099,6 +1099,8 @@ class ClassInfo:
     def __init__(self, node):
         self.node = node
         self.name = node.name
+        self.csym = node.name       # C base symbol (module-qualified if the
+                                    # class name collides across modules)
         self.base = None
         self.base_name = None
         self.methods = {}
@@ -1609,6 +1611,48 @@ def cname(name):
     return name + "_" if name in C_KEYWORDS else name
 
 
+_AMBIG_CACHE = {}
+
+
+def ambiguous_class_names(base_dir):
+    """Class names defined in more than one shivyc module. Such names cannot use
+    a bare C symbol (it would collide at link time, e.g. tree.Mult vs the il_cmd
+    Mult), so they are module-qualified. Computed once over the whole package so
+    that every separately-compiled module agrees, even ones that import neither
+    side of a collision."""
+    if base_dir in _AMBIG_CACHE:
+        return _AMBIG_CACHE[base_dir]
+    name2mods = {}
+    pkg = os.path.join(base_dir or ".", "shivyc")
+    for dp, _dirs, fns in os.walk(pkg):
+        if "musl" in dp.split(os.sep):
+            continue
+        for fn in fns:
+            if not fn.endswith(".py"):
+                continue
+            p = os.path.join(dp, fn)
+            mod = os.path.relpath(p, base_dir or ".")[:-3].replace(os.sep, ".")
+            try:
+                t = ast.parse(open(p, encoding="utf-8").read())
+            except Exception:
+                continue
+            for n in t.body:
+                if isinstance(n, ast.ClassDef):
+                    name2mods.setdefault(n.name, set()).add(mod)
+    amb = {n for n, mods in name2mods.items() if len(mods) > 1}
+    _AMBIG_CACHE[base_dir] = amb
+    return amb
+
+
+def class_csym(name, modname, ambiguous):
+    """C base symbol for class `name` defined in `modname`: bare when unique
+    across the package, else module-qualified so collisions get distinct
+    symbols."""
+    if name in ambiguous and modname:
+        return "%s__%s" % (modname.replace(".", "_"), name)
+    return name
+
+
 class Transpiler:
     def __init__(self, modname, base_dir=None):
         self.modname = modname
@@ -1648,6 +1692,9 @@ class Transpiler:
         self.closure_specs.update(convert_block_closures(tree))
         self.closure_values_needed = set()
         self.classes, self.class_order, vt = collect_classes(tree)
+        self.ambiguous = ambiguous_class_names(self.base_dir)
+        for ci in self.class_order:     # qualify local colliding class symbols
+            ci.csym = class_csym(ci.name, self.modname, self.ambiguous)
         KNOWN_CLASSES = self.classes
         VTABLE_METHODS = vt
         self.build_owner_maps()
@@ -1659,6 +1706,7 @@ class Transpiler:
             reg = self.load_xmod(modname)
             if reg:
                 for cn, ci in reg["classes"].items():
+                    ci.csym = class_csym(cn, modname, self.ambiguous)
                     self.xclasses.setdefault(cn, (ci, modname))
         # transitively pull in imported base classes (e.g. a subclass module
         # imports ILCommand from il_cmds.base) so the hierarchy root is known
@@ -1726,7 +1774,7 @@ class Transpiler:
         self.prelude()
         # forward typedefs so the TypeInfo vtable can mention class pointers
         for ci in self.class_order:
-            self.emit("typedef struct %s %s;" % (ci.name, ci.name))
+            self.emit("typedef struct %s %s;" % (ci.csym, ci.csym))
         # imported classes used as local field types need a typedef too (and
         # their struct body, via xstructs_needed, for member access). This is
         # transitive: an imported field type (ILValue) may itself have imported
@@ -1771,7 +1819,7 @@ class Transpiler:
             self.emit()
         self.emit_typeinfo_struct()
         for ci in self.class_order:
-            self.emit("extern const TypeInfo %s_type;" % ci.name)
+            self.emit("extern const TypeInfo %s_type;" % ci.csym)
         if self.class_order:
             self.emit()
         for ci in self.class_order:
@@ -1802,7 +1850,7 @@ class Transpiler:
     def struct_body_lines(self, ci):
         """Tag definition `struct C { ... };` for an imported class whose
         fields are accessed (the typedef is forward-declared separately)."""
-        out = ["struct %s {" % ci.name, "    Obj _hdr;"]
+        out = ["struct %s {" % ci.csym, "    Obj _hdr;"]
         ff = ci.full_fields()
         if not ff:
             out.append("    char _empty;")
@@ -1913,16 +1961,18 @@ class Transpiler:
             return []
         out = ["/* ---- cross-module imports (extern declarations) ---- */"]
         for c in sorted(classes | (vt_fwd - classes)):  # forward typedefs first
-            out.append("typedef struct %s %s;" % (c, c))
+            cs = self.xcsym(c)
+            out.append("typedef struct %s %s;" % (cs, cs))
         for c in sorted(needed):            # full layout for accessed classes
             out += self.struct_body_lines(self.xclasses[c][0])
         for c in sorted(classes):
             # a class that is also a cross-module hierarchy base gets a full
             # `extern const TypeInfo c_type;` below; emitting a TypeInfoHdr one
             # here too would conflict, so emit only the constructor for it.
+            cs = self.xcsym(c)
             if c not in self.xtype_externs:
-                out.append("extern const TypeInfoHdr %s_type;" % c)
-            out.append("extern %s* %s_new();" % (c, c))
+                out.append("extern const TypeInfoHdr %s_type;" % cs)
+            out.append("extern %s* %s_new();" % (cs, cs))
         for n in sorted(funcs):
             out.append("extern %s %s();" % (funcs[n], n))
         for n in sorted(singles):
@@ -1931,16 +1981,17 @@ class Transpiler:
             out.append("extern %s %s;" % (globs[n], cname(n)))
         for (cls, meth) in sorted(self.used_xmethods):
             out.append("extern %s %s_%s();" % (self.used_xmethods[(cls, meth)],
-                                               cls, meth))
+                                               self.xcsym(cls), meth))
         for (cls, meth) in sorted(self.xvtable_impls):  # imported vtable slots
             if (cls, meth) not in self.used_xmethods:
                 out.append("extern %s %s_%s();" % (
                     self.ximported_method_sig(self.xclass_module.get(cls), meth)[0]
-                    if self.xclass_module.get(cls) else OBJ, cls, meth))
+                    if self.xclass_module.get(cls) else OBJ,
+                    self.xcsym(cls), meth))
         for cls in sorted(self.xtype_externs):          # imported TypeInfo
-            out.append("extern const TypeInfo %s_type;" % cls)
+            out.append("extern const TypeInfo %s_type;" % self.xcsym(cls))
         for (cls, d) in sorted(self.xconstdict_externs):  # imported const-dicts
-            out.append("extern str %s_%s();" % (cls, d))
+            out.append("extern str %s_%s();" % (self.xcsym(cls), d))
         for mod in sorted(self.xvt_needed):     # replicated TypeInfo layouts
             reg = self.load_xmod(mod)
             vt = self.vt_struct_name(mod)
@@ -1966,7 +2017,7 @@ class Transpiler:
                     _, fn = ni
                     params = self.param_list(fn, skip_self=True)
                     cargs = ", ".join(params) if params else "void"
-                    protos.append("%s* %s_new(%s);" % (ci.name, ci.name, cargs))
+                    protos.append("%s* %s_new(%s);" % (ci.csym, ci.csym, cargs))
             for mname, fn in ci.methods.items():
                 if mname.startswith("__") and mname.endswith("__") \
                         and mname != "__init__":
@@ -1975,22 +2026,22 @@ class Transpiler:
                 if mname in ci.static_methods:   # @staticmethod: no self
                     sp = self.param_list(fn, skip_self=False)
                     protos.append("%s %s_%s(%s);" % (
-                        ret, ci.name, mname,
+                        ret, ci.csym, mname,
                         ", ".join(sp) if sp else "void"))
                     continue
                 params = self.param_list(fn, skip_self=True)
                 if mname == "__init__":
-                    plist = ", ".join(["%s* self" % ci.name] + params)
-                    protos.append("void %s___init__(%s);" % (ci.name, plist))
+                    plist = ", ".join(["%s* self" % ci.csym] + params)
+                    protos.append("void %s___init__(%s);" % (ci.csym, plist))
                     cargs = ", ".join(params) if params else "void"
-                    protos.append("%s* %s_new(%s);" % (ci.name, ci.name, cargs))
+                    protos.append("%s* %s_new(%s);" % (ci.csym, ci.csym, cargs))
                 elif mname in VTABLE_METHODS:
                     protos.append("%s %s_%s(Obj* self_%s);" % (
-                        ret, ci.name, mname,
+                        ret, ci.csym, mname,
                         (", " + ", ".join(params)) if params else ""))
                 else:
-                    plist = ", ".join(["%s* self" % ci.name] + params)
-                    protos.append("%s %s_%s(%s);" % (ret, ci.name, mname, plist))
+                    plist = ", ".join(["%s* self" % ci.csym] + params)
+                    protos.append("%s %s_%s(%s);" % (ret, ci.csym, mname, plist))
         for node in tree.body:
             if isinstance(node, ast.FunctionDef) and \
                     node.name not in RUNTIME_INTRINSICS:
@@ -2016,7 +2067,7 @@ class Transpiler:
             self.emit("/* class-level statics (obj; init in %s_init) */"
                       % self.modname)
             for ci, nm in statics:
-                self.emit("obj %s_%s;" % (ci.name, cname(nm)))
+                self.emit("obj %s_%s;" % (ci.csym, cname(nm)))
             self.emit()
 
     def func_signature(self, node):
@@ -2038,6 +2089,33 @@ class Transpiler:
                     for a in node.names:
                         self.from_imports[a.asname or a.name] = mod
 
+    def ccls(self, name):
+        """C base symbol for a class referenced by `name` in local context:
+        the local class if one exists, else an imported class, else the bare
+        name. (Explicitly cross-module sites use the xclass's .csym directly.)"""
+        ci = self.classes.get(name)
+        if ci is not None:
+            return ci.csym
+        ent = self.xclasses.get(name)
+        if ent is not None:
+            return ent[0].csym
+        return class_csym(name, None, self.ambiguous)
+
+    def ctype_csym(self, ft):
+        """Rewrite a C type so a pointer to an ambiguous class uses that class's
+        qualified symbol (e.g. 'Mult*' -> 'shivyc_..._Mult*')."""
+        if ft.endswith("*") and ft[:-1] in self.ambiguous:
+            return self.ccls(ft[:-1]) + "*"
+        return ft
+
+    def xcsym(self, name):
+        """C base symbol for an *imported* class name (the cross-module one,
+        even when a local class shares the name)."""
+        ent = self.xclasses.get(name)
+        if ent is not None:
+            return ent[0].csym
+        return class_csym(name, self.xclass_module.get(name), self.ambiguous)
+
     def load_xmod(self, modname):
         """Parse an imported shivyc module and register its public symbols."""
         cache = _XMOD_CACHE
@@ -2051,6 +2129,9 @@ class Transpiler:
             try:
                 t = ast.parse(open(path, encoding="utf-8").read())
                 classes, order, vt = collect_classes(t)
+                amb = ambiguous_class_names(self.base_dir)
+                for cn, ci in classes.items():
+                    ci.csym = class_csym(cn, modname, amb)
                 reg["classes"] = classes
                 reg["order"] = order
                 reg["vt"] = vt
@@ -2408,16 +2489,16 @@ class Transpiler:
     def emit_struct(self, ci):
         bn = (" : " + ci.base_name) if ci.base_name else ""
         self.emit("/* class %s%s */" % (ci.name, bn))
-        self.emit("typedef struct %s {" % ci.name)
+        self.emit("typedef struct %s {" % ci.csym)
         self.indent += 1
         self.emit("Obj _hdr;")
         ff = ci.full_fields()
         if not ff:
             self.emit("char _empty;")
         for fn, ft in ff:
-            self.emit("%s %s;" % (ft, cname(fn)))
+            self.emit("%s %s;" % (self.ctype_csym(ft), cname(fn)))
         self.indent -= 1
-        self.emit("} %s;" % ci.name)
+        self.emit("} %s;" % ci.csym)
         self.emit()
 
     # ---- class implementation -------------------------------------------
@@ -2545,19 +2626,19 @@ class Transpiler:
         plist = ", ".join(params) if params else "void"
         argnames = [cname(a.arg) for a in fn.args.args[1:]]
         # __init__ as its own function, so super().__init__ has something to call
-        sig = ", ".join(["%s* self" % ci.name] + params)
-        self.emit("void %s___init__(%s) {" % (ci.name, sig))
+        sig = ", ".join(["%s* self" % ci.csym] + params)
+        self.emit("void %s___init__(%s) {" % (ci.csym, sig))
         self.indent += 1
         self.emit_hoisted_body(fn.body)
         self.indent -= 1
         self.emit("}")
         self.emit()
         # ClassName_new: allocate, set type, run __init__, init class attrs
-        self.emit("%s* %s_new(%s) {" % (ci.name, ci.name, plist))
+        self.emit("%s* %s_new(%s) {" % (ci.csym, ci.csym, plist))
         self.indent += 1
-        self.emit("%s* self = aalloc(sizeof *self);" % ci.name)
-        self.emit("((Obj*)self)->type = &%s_type;" % ci.name)
-        self.emit("%s___init__(%s);" % (ci.name,
+        self.emit("%s* self = aalloc(sizeof *self);" % ci.csym)
+        self.emit("((Obj*)self)->type = &%s_type;" % ci.csym)
+        self.emit("%s___init__(%s);" % (ci.csym,
                                         ", ".join(["self"] + argnames)))
         self.emit_class_attr_init(ci)
         self.emit("return self;")
@@ -2572,12 +2653,12 @@ class Transpiler:
         params = self.param_list(fn, skip_self=True)
         plist = ", ".join(params) if params else "void"
         argnames = [cname(a.arg) for a in fn.args.args[1:]]
-        self.emit("%s* %s_new(%s) {" % (ci.name, ci.name, plist))
+        self.emit("%s* %s_new(%s) {" % (ci.csym, ci.csym, plist))
         self.indent += 1
-        self.emit("%s* self = aalloc(sizeof *self);" % ci.name)
-        self.emit("((Obj*)self)->type = &%s_type;" % ci.name)
+        self.emit("%s* self = aalloc(sizeof *self);" % ci.csym)
+        self.emit("((Obj*)self)->type = &%s_type;" % ci.csym)
         self.emit("%s___init__((%s*)self%s);" % (
-            owner.name, owner.name,
+            owner.csym, owner.csym,
             (", " + ", ".join(argnames)) if argnames else ""))
         self.emit_class_attr_init(ci)
         self.emit("return self;")
@@ -2593,18 +2674,18 @@ class Transpiler:
         params = self.param_list(fn, skip_self=not static)
         if static:                          # @staticmethod: no receiver at all
             plist = ", ".join(params) if params else "void"
-            self.emit("%s %s_%s(%s) {" % (ret, ci.name, fn.name, plist))
+            self.emit("%s %s_%s(%s) {" % (ret, ci.csym, fn.name, plist))
             self.indent += 1
         elif virtual:
             self.emit("%s %s_%s(Obj* self_%s) {" % (
-                ret, ci.name, fn.name,
+                ret, ci.csym, fn.name,
                 (", " + ", ".join(params)) if params else ""))
             self.indent += 1
-            self.emit("%s* self = (%s*)self_;" % (ci.name, ci.name))
+            self.emit("%s* self = (%s*)self_;" % (ci.csym, ci.csym))
             self.emit("(void)self;")
         else:
-            plist = ["%s* self" % ci.name] + params
-            self.emit("%s %s_%s(%s) {" % (ret, ci.name, fn.name,
+            plist = ["%s* self" % ci.csym] + params
+            self.emit("%s %s_%s(%s) {" % (ret, ci.csym, fn.name,
                                           ", ".join(plist)))
             self.indent += 1
         self.emit_hoisted_body(fn.body)
@@ -2617,7 +2698,7 @@ class Transpiler:
         # external/builtin bases (e.g. Exception) become NULL.
         base = "NULL"
         if ci.base:
-            base = "&%s_type" % ci.base.name
+            base = "&%s_type" % ci.base.csym
             if ci.base.name not in self.classes:        # imported base type
                 self.xtype_externs.add(ci.base.name)
         slots = []
@@ -2625,18 +2706,19 @@ class Transpiler:
             owner = ci.find_method_owner(m)
             if owner and owner.name not in self.classes:  # imported impl
                 self.xvtable_impls.add((owner.name, m))
-            slots.append(".%s = %s" % (m, ("%s_%s" % (owner.name, m))
+            slots.append(".%s = %s" % (m, ("%s_%s" % (owner.csym, m))
                                        if owner else "NULL"))
         init = ", ".join([".name = %s" % c_string(ci.name),
                           ".base = (const struct TypeInfo*)%s" % base] + slots)
-        self.emit("const TypeInfo %s_type = { %s };" % (ci.name, init))
+        self.emit("const TypeInfo %s_type = { %s };" % (ci.csym, init))
         self.emit()
 
     def param_list(self, fn, skip_self):
         params = []
         args = fn.args.args[1:] if skip_self else fn.args.args
         for arg in args:
-            params.append("%s %s" % (arg_ctype(fn, arg), cname(arg.arg)))
+            params.append("%s %s" % (self.ctype_csym(arg_ctype(fn, arg)),
+                                     cname(arg.arg)))
         if fn.args.vararg:
             params.append("...")
         return params
@@ -2728,7 +2810,7 @@ class Transpiler:
         for name, ct in self.hoist_locals(body):
             self.scope[name] = ct
             self.hoisted.add(name)
-            self.emit("%s %s;" % (ct, cname(name)))
+            self.emit("%s %s;" % (self.ctype_csym(ct), cname(name)))
         self.emit_body(body)
 
     # ---- top level (non-class) -------------------------------------------
@@ -2883,7 +2965,8 @@ class Transpiler:
             self.emit("static obj %s__ctortramp(obj env, obj args) {" % cls)
             self.indent += 1
             self.emit("(void)env; (void)args;")
-            self.emit("return OBJ_OBJ(%s_new(%s));" % (cls, ", ".join(args)))
+            self.emit("return OBJ_OBJ(%s_new(%s));" % (ci.csym,
+                                                       ", ".join(args)))
             self.indent -= 1
             self.emit("}")
             self.emit()
@@ -2908,7 +2991,7 @@ class Transpiler:
                 else:                       # imported class -> unchecked args
                     args = [self.wrap_obj(a) if False else self.expr(a)
                             for a in val.args]
-                self.emit("%s = %s_new(%s);" % (cname(name), cls,
+                self.emit("%s = %s_new(%s);" % (cname(name), self.ccls(cls),
                                                 ", ".join(args)))
             else:
                 self.emit("%s = %s;" % (cname(name), self.expr(val)))
@@ -2916,7 +2999,7 @@ class Transpiler:
             prev = self.cur_class
             self.cur_class = ci
             for nm, val in ci.class_statics.items():
-                self.emit("%s_%s = %s;" % (ci.name, cname(nm),
+                self.emit("%s_%s = %s;" % (ci.csym, cname(nm),
                                            self.expr(val)))
             self.cur_class = prev
         for stmt in getattr(self, "mod_init_stmts", []):  # deferred top-level
@@ -3644,6 +3727,7 @@ class Transpiler:
     def _class_ptr_expr(self, node, cls):
         """Render `node` as a `cls*`. A Tier-2 obj (e.g. an isinstance-narrowed
         variable) must be unwrapped with AS_OBJ; a real pointer casts directly."""
+        cls = self.ccls(cls)            # qualify ambiguous class names
         e = self.expr(node)
         if self.is_obj_word(node):
             return "(%s*)AS_OBJ(%s)" % (cls, e)
@@ -3690,7 +3774,7 @@ class Transpiler:
                 if self.cur_class:
                     owner = self.static_owner(self.cur_class, node.attr)
                     if owner:
-                        return "%s_%s" % (owner.name, cname(node.attr))
+                        return "%s_%s" % (owner.csym, cname(node.attr))
                     return "self->%s" % cname(node.attr)
                 # cur_class is None (e.g. a lifted nested function): `self` is a
                 # typed param, so fall through to the concrete-pointer path.
@@ -3700,7 +3784,7 @@ class Transpiler:
             if ci is not None:
                 owner = self.static_owner(ci, node.attr)
                 if owner:
-                    return "%s_%s" % (owner.name, cname(node.attr))
+                    return "%s_%s" % (owner.csym, cname(node.attr))
             # isinstance-narrowed variable: access the field through its proven
             # concrete class (only when that class really declares the field).
             if base in self.narrowed:
@@ -3719,7 +3803,7 @@ class Transpiler:
             if sci is not None:
                 owner = self.static_owner(sci, node.attr)
                 if owner:                       # class static via a typed ptr
-                    return "%s_%s" % (owner.name, cname(node.attr))
+                    return "%s_%s" % (owner.csym, cname(node.attr))
             if cls not in self.xclasses and cls not in self.classes:
                 self._load_xclass_anywhere(cls)
             if cls in self.xclasses:
@@ -3730,7 +3814,7 @@ class Transpiler:
                     if sub in self.xclasses and sub not in self.classes:
                         self.xstructs_needed.add(sub)
                     return "((%s*)(%s))->%s" % (
-                        sub, self.expr(node.value), cname(node.attr))
+                        self.ccls(sub), self.expr(node.value), cname(node.attr))
             return "(%s)->%s" % (self.expr(node.value), cname(node.attr))
         # reading an attribute off a Tier-2 obj: resolve the element's class by
         # which class declares this attribute, then offset into its struct.
@@ -3741,7 +3825,7 @@ class Transpiler:
                         owner.name not in self.classes:
                     self.xstructs_needed.add(owner.name)
                 return "((%s*)AS_OBJ(%s))->%s" % (
-                    owner.name, self.expr(node.value), cname(node.attr))
+                    owner.csym, self.expr(node.value), cname(node.attr))
             return "OBJ_NONE /* %s.%s */" % (self.src1(node.value), node.attr)
         return "%s.%s" % (self.expr(node.value), cname(node.attr))
 
@@ -3867,7 +3951,7 @@ class Transpiler:
                             owner.name not in self.classes:
                         self.xstructs_needed.add(owner.name)
                     return "((%s*)AS_OBJ(%s))->%s" % (
-                        owner.name, self.wrap_obj(node.args[0]), cname(attr))
+                        owner.csym, self.wrap_obj(node.args[0]), cname(attr))
                 return dflt
             if fn == "getattr" and len(node.args) >= 2:
                 # dynamic attribute name (e.g. reflecting over a module): cannot
@@ -3879,7 +3963,7 @@ class Transpiler:
                 defs = self.defaults_for(init, True) if init else None
                 cargs = self.coerce_args(
                     self.init_param_ctypes(self.classes[fn]), node.args, defs)
-                return "%s_new(%s)" % (fn, ", ".join(cargs))
+                return "%s_new(%s)" % (self.classes[fn].csym, ", ".join(cargs))
             if fn in self.func_params:
                 defs = self.defaults_for(self.func_nodes[fn], False) \
                     if fn in self.func_nodes else None
@@ -3893,7 +3977,7 @@ class Transpiler:
                         if init else []
                     defs = self.defaults_for(init, True) if init else None
                     cargs = self.coerce_args(pct, node.args, defs)
-                    return "%s_new(%s)" % (fn, ", ".join(cargs))
+                    return "%s_new(%s)" % (info.csym, ", ".join(cargs))
                 if kind == "func":
                     pct = [arg_ctype(info, a) for a in info.args.args]
                     defs = self.defaults_for(info, False)
@@ -3923,14 +4007,14 @@ class Transpiler:
                     self.xstructs_needed.add(bname)
                     self.used_xmethods[(bname, "__init__")] = "void"
                 return "%s___init__((%s*)self%s)" % (
-                    bname, bname,
+                    base.csym, base.csym,
                     (", " + ", ".join(cargs)) if cargs else "")
             if func.attr in VTABLE_METHODS:
                 return "%s_%s((Obj*)self%s)" % (
-                    bname, func.attr,
+                    base.csym, func.attr,
                     (", " + ", ".join(argstrs)) if argstrs else "")
             return "%s_%s((%s*)self%s)" % (
-                bname, func.attr, bname,
+                base.csym, func.attr, base.csym,
                 (", " + ", ".join(argstrs)) if argstrs else "")
 
         if isinstance(func, ast.Attribute):
@@ -4022,7 +4106,7 @@ class Transpiler:
                         if init else []
                     defs = self.defaults_for(init, True) if init else None
                     cargs = self.coerce_args(pct, node.args, defs)
-                    return "%s_new(%s)" % (cname(func.attr), ", ".join(cargs))
+                    return "%s_new(%s)" % (info.csym, ", ".join(cargs))
                 if kind == "func":
                     pct = [arg_ctype(info, a) for a in info.args.args]
                     defs = self.defaults_for(info, False)
@@ -4074,8 +4158,8 @@ class Transpiler:
                         pct = [arg_ctype(m, a) for a in m.args.args[1:]]
                         cargs = self.coerce_args(pct, node.args)
                         return "%s_%s(%s%s)" % (
-                            owner.name, func.attr,
-                            self._class_ptr_expr(func.value, owner.name),
+                            owner.csym, func.attr,
+                            self._class_ptr_expr(func.value, owner.csym),
                             (", " + ", ".join(cargs)) if cargs else "")
             # non-virtual method on a concrete class pointer
             bt = self.value_ctype(func.value)
@@ -4088,8 +4172,8 @@ class Transpiler:
                         if m else []
                     cargs = self.coerce_args(pct, node.args)
                     return "%s_%s(%s%s)" % (
-                        owner.name, func.attr,
-                        self._class_ptr_expr(func.value, owner.name),
+                        owner.csym, func.attr,
+                        self._class_ptr_expr(func.value, owner.csym),
                         (", " + ", ".join(cargs)) if cargs else "")
             # method on a concrete *imported* class pointer (e.g. narrowed by
             # isinstance). Safe to devirtualize only when the static class is a
@@ -4122,7 +4206,7 @@ class Transpiler:
                         if m else []
                     cargs = self.coerce_args(pct, node.args)
                     return "%s_%s((%s*)AS_OBJ(%s)%s)" % (
-                        owner.name, func.attr, owner.name,
+                        owner.csym, func.attr, owner.csym,
                         self.expr(func.value),
                         (", " + ", ".join(cargs)) if cargs else "")
                 xowner = self.resolve_xmethod_owner(func.attr)
@@ -4132,7 +4216,7 @@ class Transpiler:
                     self.used_xmethods[(xowner.name, func.attr)] = ret
                     args = [self.expr(a) for a in node.args]
                     return "%s_%s((%s*)AS_OBJ(%s)%s)" % (
-                        xowner.name, func.attr, xowner.name,
+                        xowner.csym, func.attr, xowner.csym,
                         self.expr(func.value),
                         (", " + ", ".join(args)) if args else "")
                 xmod = self.resolve_xvirtual(func.attr)
@@ -4239,7 +4323,7 @@ class Transpiler:
                 pct = [arg_ctype(m, a) for a in m.args.args] if m else []
                 defs = self.defaults_for(m, False) if m else None
                 cargs = self.coerce_args(pct, node.args, defs)
-                return "%s_%s(%s)" % (owner.name, func.attr, ", ".join(cargs))
+                return "%s_%s(%s)" % (owner.csym, func.attr, ", ".join(cargs))
             if func.attr in VTABLE_METHODS:
                 return self.vcall(func.value, func.attr, node.args)
             m = owner.methods.get(func.attr)
@@ -4247,7 +4331,7 @@ class Transpiler:
             defs = self.defaults_for(m, True) if m else None
             cargs = self.coerce_args(pct, node.args, defs)
             return "%s_%s((%s*)(%s)%s)" % (
-                owner.name, func.attr, owner.name, self.expr(func.value),
+                owner.csym, func.attr, owner.csym, self.expr(func.value),
                 (", " + ", ".join(cargs)) if cargs else "")
         if cls in self.xclasses:
             ci, modname = self.xclasses[cls]
@@ -4259,13 +4343,13 @@ class Transpiler:
                 ret = (ann_to_ctype(m.returns) or OBJ) if m else OBJ
                 self.used_xmethods[(owner.name, func.attr)] = ret
                 args = [self.expr(a) for a in node.args]
-                return "%s_%s(%s)" % (owner.name, func.attr, ", ".join(args))
+                return "%s_%s(%s)" % (owner.csym, func.attr, ", ".join(args))
             m = owner.methods.get(func.attr)
             ret = (ann_to_ctype(m.returns) or OBJ) if m else OBJ
             self.used_xmethods[(owner.name, func.attr)] = ret
             args = [self.expr(a) for a in node.args]  # devirtualized direct call
             return "%s_%s((%s*)(%s)%s)" % (
-                owner.name, func.attr, owner.name, self.expr(func.value),
+                owner.csym, func.attr, owner.csym, self.expr(func.value),
                 (", " + ", ".join(args)) if args else "")
         return None
 
@@ -4303,7 +4387,7 @@ class Transpiler:
             clsname = cls_node.attr
             self.xref(clsname, self.import_alias[cls_node.value.id])
         if clsname:
-            return "&%s_type" % cname(clsname)
+            return "&%s_type" % self.ccls(clsname)
         return "NULL"
 
     def lower_any_all(self, fn, arg):
