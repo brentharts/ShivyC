@@ -2101,6 +2101,48 @@ class Transpiler:
             return ent[0].csym
         return class_csym(name, None, self.ambiguous)
 
+    def ann_ctype(self, ann):
+        """Annotation -> C type, extending ann_to_ctype with dotted
+        `module.Class` hints (e.g. `il_gen.ILValue`, `decl_nodes.Root`).
+
+        The dotted form is resolved to the referenced class's pointer type as a
+        *bare* `Class*` so the usual ClassInfo lookup and emit-time csym
+        qualification both keep working. Ambiguous class names are only typed
+        when the dotted module is the local one; an ambiguous name imported from
+        another module is declined (left as obj) because a bare `Class*` would
+        bind to the wrong same-named class."""
+        if ann is None:
+            return None
+        base = ann_to_ctype(ann)
+        if base is not None:
+            return base
+        try:
+            text = ast.unparse(ann).strip().strip("'\"")
+        except Exception:
+            return None
+        if "[" in text or "." not in text:
+            return None
+        alias, _, cls = text.rpartition(".")
+        if not (cls and (cls[0].isupper() or cls[0] == "_")
+                and cls.isidentifier()):
+            return None
+        if cls not in self.classes and cls not in self.xclasses:
+            return None                  # not a class whose fields we can resolve
+        if cls in self.ambiguous:
+            # bare `Class*` resolves locally; only safe if that is what the
+            # dotted module actually names.
+            if self.import_alias.get(alias) != self.modname:
+                return None
+        return cls + "*"
+
+    def arg_ctype_q(self, fn, arg):
+        """arg_ctype, but honoring dotted `module.Class` parameter annotations."""
+        if arg.annotation is not None:
+            t = self.ann_ctype(arg.annotation)
+            if t is not None:
+                return t
+        return arg_ctype(fn, arg)
+
     def ctype_csym(self, ft):
         """Rewrite a C type so a pointer to an ambiguous class uses that class's
         qualified symbol (e.g. 'Mult*' -> 'shivyc_..._Mult*')."""
@@ -2717,7 +2759,7 @@ class Transpiler:
         params = []
         args = fn.args.args[1:] if skip_self else fn.args.args
         for arg in args:
-            params.append("%s %s" % (self.ctype_csym(arg_ctype(fn, arg)),
+            params.append("%s %s" % (self.ctype_csym(self.arg_ctype_q(fn, arg)),
                                      cname(arg.arg)))
         if fn.args.vararg:
             params.append("...")
@@ -2730,7 +2772,7 @@ class Transpiler:
         self.elem_types = {}        # list var -> element ctype (from List[T])
         args = fn.args.args[1:] if skip_self else fn.args.args
         for arg in args:
-            self.scope[arg.arg] = arg_ctype(fn, arg)
+            self.scope[arg.arg] = self.arg_ctype_q(fn, arg)
             et = ann_elem_ctype(arg.annotation)
             if et:
                 self.elem_types[arg.arg] = et
