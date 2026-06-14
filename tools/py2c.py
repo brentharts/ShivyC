@@ -912,6 +912,23 @@ def ann_text_to_ctype(text):
     return None
 
 
+def ann_elem_ctype(ann):
+    """Element C type of a `List[T]`/`list[T]` annotation, e.g. List[ILValue]
+    -> 'ILValue*'. None if `ann` is not a typed-list annotation. Used to give a
+    concrete type to the loop variable of `for x in <annotated list>` (and to
+    subscripts of it) so member access on the elements resolves."""
+    if ann is None:
+        return None
+    try:
+        text = ast.unparse(ann).strip().strip("'\"")
+    except Exception:
+        return None
+    for pfx in ("List[", "list["):
+        if text.startswith(pfx) and text.endswith("]"):
+            return ann_text_to_ctype(text[len(pfx):-1])
+    return None
+
+
 def ann_to_ctype(ann):
     if ann is None:
         return None
@@ -2464,9 +2481,23 @@ class Transpiler:
         self.scope = {}
         self.hoisted = set()
         self.narrowed = {}          # name -> ctype, active in an isinstance block
+        self.elem_types = {}        # list var -> element ctype (from List[T])
         args = fn.args.args[1:] if skip_self else fn.args.args
         for arg in args:
             self.scope[arg.arg] = arg_ctype(fn, arg)
+            et = ann_elem_ctype(arg.annotation)
+            if et:
+                self.elem_types[arg.arg] = et
+
+    def iter_elem_ctype(self, node):
+        """Element ctype of an iterable expression when known from a List[T]
+        annotation (a bare list Name, or self.<field> declared List[T])."""
+        if isinstance(node, ast.Name):
+            return self.elem_types.get(node.id)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)\
+                and node.value.id == "self" and self.cur_class:
+            return getattr(self.cur_class, "field_elem_types", {}).get(node.attr)
+        return None
 
     def hoist_locals(self, body):
         """Find all assigned locals and their types, to declare at function top
@@ -2482,6 +2513,16 @@ class Transpiler:
                 types[name] = ctype
             elif types[name] == OBJ and ctype != OBJ:
                 types[name] = ctype
+
+        # pre-scan typed-list annotations so a `for x in <list>` below can give
+        # x the element type even when the list is a local declared earlier.
+        for stmt in body:
+            for sub in ast.walk(stmt):
+                if isinstance(sub, ast.AnnAssign) and \
+                        isinstance(sub.target, ast.Name):
+                    et = ann_elem_ctype(sub.annotation)
+                    if et:
+                        self.elem_types[sub.target.id] = et
 
         for stmt in body:
             for sub in ast.walk(stmt):
@@ -2504,7 +2545,9 @@ class Transpiler:
                         is_range = isinstance(sub.iter, ast.Call) and \
                             isinstance(sub.iter.func, ast.Name) and \
                             sub.iter.func.id == "range"
-                        consider(sub.target.id, "int" if is_range else OBJ)
+                        et = None if is_range else self.iter_elem_ctype(sub.iter)
+                        consider(sub.target.id,
+                                 "int" if is_range else (et or OBJ))
                     elif isinstance(sub.target, (ast.Tuple, ast.List)):
                         for el in sub.target.elts:
                             if isinstance(el, ast.Name) and el.id != "_":
@@ -2994,6 +3037,10 @@ class Transpiler:
 
     def st_AnnAssign(self, node):
         ctype = infer_type(getattr(node.target, "id", "x"), node.annotation)
+        if isinstance(node.target, ast.Name):
+            et = ann_elem_ctype(node.annotation)
+            if et:
+                self.elem_types[node.target.id] = et
         tgt = self.expr(node.target)
         if node.value is None:
             return ["%s %s;" % (ctype, tgt)]
