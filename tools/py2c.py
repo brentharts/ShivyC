@@ -1812,6 +1812,20 @@ class Transpiler:
                     imported_field_types.add(base)
                     bci, bmod = self.xclasses[base]
                     work.append((bci, bmod))
+        # virtual-return typing: a method whose annotated return is a leaf
+        # class may have its (obj-ABI) result recovered as a typed pointer at a
+        # call site in this module (see ex_Call), so ensure that class's struct
+        # is declared. Scan reachable method return annotations up front, since
+        # struct typedefs are emitted here, before any method body.
+        for _ci in list(self.classes.values()) + \
+                [c for (c, _m) in self.xclasses.values()]:
+            for _fn in _ci.methods.values():
+                _rt = ann_to_ctype(_fn.returns) if _fn.returns else None
+                if _rt and self._is_class_ptr(_rt):
+                    _cn = _rt[:-1]
+                    if _cn not in self.classes and _cn in self.xclasses \
+                            and self._class_is_leaf(_cn):
+                        imported_field_types.add(_cn)
         for c in sorted(imported_field_types):
             self.emit("typedef struct %s %s;" % (c, c))
             self.xstructs_needed.add(c)
@@ -2022,7 +2036,7 @@ class Transpiler:
                 if mname.startswith("__") and mname.endswith("__") \
                         and mname != "__init__":
                     continue
-                ret = ann_to_ctype(fn.returns) or OBJ
+                ret = self._c_ret(fn)
                 if mname in ci.static_methods:   # @staticmethod: no self
                     sp = self.param_list(fn, skip_self=False)
                     protos.append("%s %s_%s(%s);" % (
@@ -2147,6 +2161,96 @@ class Transpiler:
         """True if `ct` is a pointer to a (local or imported) class struct."""
         return bool(ct) and ct.endswith("*") and ct != OBJ \
             and (ct[:-1] in self.classes or ct[:-1] in self.xclasses)
+
+    def _logical_ret(self, fn):
+        """Logical (typing) return type of a method's call result. A class
+        return annotation is exposed to callers only when the class is a leaf
+        (no subclasses) -- a non-leaf base could be any subclass at runtime, so
+        statically typing the result to the base would make subclass-field
+        access unsound; those stay obj. Scalars/char* pass through unchanged."""
+        rt = (ann_to_ctype(fn.returns) or OBJ) if fn is not None else OBJ
+        if rt and rt != OBJ and rt.endswith("*") and rt[0].isupper():
+            cls = rt[:-1]
+            if cls not in self.classes and cls not in self.xclasses:
+                self._load_xclass_anywhere(cls)
+            if (cls in self.classes or cls in self.xclasses) \
+                    and self._class_is_leaf(cls):
+                return rt
+            return OBJ          # non-leaf or unresolvable here
+        return rt               # scalars, char*
+
+    def _c_ret(self, fn):
+        """C/ABI return type of a method: a class-pointer return is emitted as
+        `obj` so every dispatch path (direct, vtable, cross-module hierarchy)
+        shares one uniform ABI -- even when the class is not imported in this
+        module. The typed pointer is recovered at the call site via
+        `_logical_ret` + an AS_OBJ cast (see ex_Call)."""
+        rt = (ann_to_ctype(fn.returns) or OBJ) if fn is not None else OBJ
+        if rt and rt != OBJ and rt.endswith("*") and rt[0].isupper():
+            return OBJ
+        return rt
+
+    _CONTAINER_METHODS = {
+        "strip", "lstrip", "rstrip", "upper", "lower", "replace", "split",
+        "partition", "splitlines", "startswith", "endswith", "isdigit",
+        "isalpha", "isspace", "isalnum", "find", "rfind", "join", "encode",
+        "decode", "format", "count", "index", "append", "add", "update",
+        "extend", "pop", "remove", "keys", "values", "items", "get", "discard",
+        "sort", "copy", "setdefault", "insert", "clear", "reverse", "next"}
+
+    def _exclusive_vt_module(self, attr):
+        """Imported module whose canonical vtable provides `attr` when `attr` is
+        defined in *exactly one* reachable module's class hierarchy and nowhere
+        else (not locally, not in another module). Such a method is
+        unambiguously that hierarchy's -- e.g. the CType predicates
+        is_void/is_integral/is_pointer/... live only in `ctypes` -- so any call
+        to it can dispatch through that module's vtable, correct for a non-leaf
+        base and uniform across typed-pointer and bare-obj receivers. Cached."""
+        cache = self.__dict__.setdefault("_excl_vt_cache", {})
+        if attr in cache:
+            return cache[attr]
+        res = None
+        # never hijack builtin / container method names (pop, get, append, ...)
+        # which collide with list/dict/str operations on unrelated receivers.
+        if attr in self._CONTAINER_METHODS:
+            cache[attr] = None
+            return None
+        if not any(attr in ci.methods for ci in self.classes.values()):
+            roots = set(self.import_alias.values()) | \
+                set(self.from_imports.values())
+            seen, work, defining, vt_has = set(), list(roots), set(), set()
+            while work:
+                mod = work.pop()
+                if mod in seen:
+                    continue
+                seen.add(mod)
+                reg = self.load_xmod(mod)
+                if not reg:
+                    continue
+                if any(attr in ci.methods
+                       for ci in reg["classes"].values()):
+                    defining.add(mod)
+                if attr in reg["vt"]:
+                    vt_has.add(mod)
+                work += list(reg["imports"].values())
+            if len(defining) == 1:
+                m = next(iter(defining))
+                if m in vt_has:
+                    res = m
+        cache[attr] = res
+        return res
+
+    def _ximported_logical_ret(self, mod, mname):
+        """Logical (leaf-class) return type of imported method `mname` defined
+        in `mod`, used to type cross-module-dispatched call results whose slot
+        ABI is obj. Returns obj when absent/non-leaf/non-class."""
+        reg = self.load_xmod(mod)
+        if reg:
+            for ci in reg["classes"].values():
+                fn = ci.methods.get(mname)
+                if fn is not None:
+                    return self._logical_ret(fn)
+        return OBJ
 
     def ctype_csym(self, ft):
         """Rewrite a C type so a pointer to an ambiguous class uses that class's
@@ -2376,7 +2480,7 @@ class Transpiler:
         for ci in reg["order"]:
             fn = ci.methods.get(mname)
             if fn:
-                ret = ann_to_ctype(fn.returns) or OBJ
+                ret = self._c_ret(fn)
                 params = [arg_ctype(fn, a) for a in fn.args.args[1:]]
                 return ret, params
         return OBJ, []
@@ -2517,7 +2621,7 @@ class Transpiler:
             fn = ci.methods.get(mname)
             if not fn:
                 continue
-            ret = ann_to_ctype(fn.returns) or OBJ
+            ret = self._c_ret(fn)
             params = [arg_ctype(fn, a) for a in fn.args.args[1:]]
             fndef = fn
             break
@@ -2526,7 +2630,7 @@ class Transpiler:
         if fndef is None and getattr(self, "vt_root", None) is not None:
             fn = self.vt_root.methods.get(mname)
             if fn is not None:
-                ret = ann_to_ctype(fn.returns) or OBJ
+                ret = self._c_ret(fn)
                 params = [arg_ctype(fn, a) for a in fn.args.args[1:]]
                 fndef = fn
         return ret, params, fndef
@@ -2716,7 +2820,7 @@ class Transpiler:
     def emit_method(self, ci, fn, virtual):
         static = fn.name in ci.static_methods
         self.enter_scope(fn, skip_self=not static)
-        ret = ann_to_ctype(fn.returns) or OBJ
+        ret = self._c_ret(fn)
         self.cur_ret = ret
         params = self.param_list(fn, skip_self=not static)
         if static:                          # @staticmethod: no receiver at all
@@ -3291,6 +3395,19 @@ class Transpiler:
                 if f.attr == "fromhex" and isinstance(f.value, ast.Name) \
                         and f.value.id == "float":
                     return OBJ
+                # a method dispatched through an imported module's vtable (see
+                # ex_Call's _exclusive_vt_module): report its logical return --
+                # obj/scalar for predicates (matching the obj slot so boolean
+                # lowering wraps truthy), or a leaf class pointer for class
+                # returns (so ex_Call recovers the typed pointer via AS_OBJ).
+                if not (isinstance(f.value, ast.Name) and (
+                        f.value.id in self.import_alias
+                        or f.value.id in self.modules
+                        or f.value.id in self.classes
+                        or f.value.id in self.xclasses)):
+                    _xm = self._exclusive_vt_module(f.attr)
+                    if _xm is not None:
+                        return self._ximported_logical_ret(_xm, f.attr)
                 # isinstance-narrowed receiver: report the concrete method's
                 # return type, matching ex_Call's narrowing dispatch.
                 if isinstance(f.value, ast.Name) and \
@@ -3305,7 +3422,7 @@ class Transpiler:
                             owner = ci
                         if owner is not None and f.attr in owner.methods:
                             m = owner.methods[f.attr]
-                            return ann_to_ctype(m.returns) or OBJ
+                            return self._logical_ret(m)
                 if isinstance(f.value, ast.Name) and \
                         f.value.id in self.import_alias:
                     kind, info = self.resolve_import(
@@ -3324,7 +3441,7 @@ class Transpiler:
                         and f.value.attr in self.cur_class.const_dicts:
                     return "char*"
                 if f.attr in VTABLE_METHODS:
-                    return self.method_proto(f.attr)[0]
+                    return self._logical_ret(self.method_proto(f.attr)[2])
                 if f.attr not in self.method_owners:
                     if f.attr in ("startswith", "endswith", "isdigit",
                                   "isalpha", "isspace", "isalnum"):
@@ -3347,20 +3464,27 @@ class Transpiler:
                         owner = ci.find_method_owner(f.attr)
                         if owner:
                             m = owner.methods.get(f.attr)
-                            return (ann_to_ctype(m.returns) or OBJ) if m else OBJ
+                            return self._logical_ret(m) if m else OBJ
                 # method call on an untyped obj -> unique local/imported owner
                 if self.is_obj_word(f.value) or bt == OBJ:
+                    # a cross-module-hierarchy-dispatched method (e.g. make_il)
+                    # is resolved through its hierarchy root's canonical return,
+                    # not an arbitrary (unannotated) local/imported override, so
+                    # the typed result matches the xvcall dispatch.
+                    if f.attr in self.hierarchy_method:
+                        return self._ximported_logical_ret(
+                            self.hierarchy_method[f.attr], f.attr)
                     owner = self.resolve_method_owner(f.attr) or \
                         self.resolve_xmethod_owner(f.attr)
                     if owner:
                         m = owner.methods.get(f.attr)
-                        return (ann_to_ctype(m.returns) or OBJ) if m else OBJ
+                        return self._logical_ret(m) if m else OBJ
                     xmod = self.resolve_xvirtual(f.attr)
                     if xmod:
-                        return self.ximported_method_sig(xmod, f.attr)[0]
+                        return self._ximported_logical_ret(xmod, f.attr)
                     if f.attr in self.hierarchy_method:
-                        return self.ximported_method_sig(
-                            self.hierarchy_method[f.attr], f.attr)[0]
+                        return self._ximported_logical_ret(
+                            self.hierarchy_method[f.attr], f.attr)
             # calling a *complex* obj-valued expression (closure/ctor returned
             # by another call, a subscript, etc.) yields obj; Name/Attribute
             # funcs are already handled above and must not fall through here
@@ -3894,6 +4018,28 @@ class Transpiler:
         return "%s.%s" % (self.expr(node.value), cname(node.attr))
 
     def ex_Call(self, node):
+        s = self._ex_call_inner(node)
+        # virtual-return typing: an instance method's annotated leaf-class
+        # return is emitted with an obj ABI (see _c_ret); recover the typed
+        # pointer here so chained member/method access on the result resolves.
+        # Module/alias/class-qualified calls and constructors return real
+        # pointers already and are skipped.
+        f = node.func
+        if isinstance(f, ast.Attribute) and not self.ctor_class(node):
+            fv = f.value
+            qualified = isinstance(fv, ast.Name) and (
+                fv.id in self.import_alias or fv.id in self.modules
+                or fv.id in self.classes or fv.id in self.xclasses)
+            if not qualified:
+                rt = self.value_ctype(node)
+                if self._is_class_ptr(rt):
+                    cls = rt[:-1]
+                    if cls in self.xclasses and cls not in self.classes:
+                        self.xstructs_needed.add(cls)
+                    return "(%s)AS_OBJ(%s)" % (rt, s)
+        return s
+
+    def _ex_call_inner(self, node):
         func = node.func
         argstrs = [self.expr(a) for a in node.args]
 
@@ -4095,6 +4241,17 @@ class Transpiler:
                 k = argstrs[0]
                 dflt = argstrs[1] if len(argstrs) > 1 else '""'
                 return "%s_%s_get(%s, %s)" % (self.cur_class.name, d, k, dflt)
+            # a method defined in exactly one imported hierarchy (e.g. the
+            # CType predicates is_void/is_integral/...) dispatches through that
+            # module's canonical vtable -- correct for a non-leaf base and
+            # uniform whether the receiver is a typed pointer or a bare obj.
+            xm = self._exclusive_vt_module(func.attr)
+            if xm is not None and not self.ctor_class(node):
+                fv = func.value
+                if not (isinstance(fv, ast.Name) and (
+                        fv.id in self.import_alias or fv.id in self.modules
+                        or fv.id in self.classes or fv.id in self.xclasses)):
+                    return self.xvcall(xm, func.value, func.attr, node.args)
             # method call on a concrete class instance (local or imported) is
             # resolved before the generic list/dict/str heuristics so that an
             # instance method named append/add/get/pop/etc. wins.
@@ -4215,7 +4372,7 @@ class Transpiler:
                         owner = ci
                     if owner is not None and func.attr in owner.methods:
                         m = owner.methods[func.attr]
-                        ret = ann_to_ctype(m.returns) or OBJ
+                        ret = self._c_ret(m)
                         if owner.name in self.xclasses and \
                                 owner.name not in self.classes:
                             self.used_xmethods[(owner.name, func.attr)] = ret
@@ -4248,7 +4405,7 @@ class Transpiler:
                 ci = self.xclasses[cls][0]
                 m = ci.methods.get(func.attr)
                 if m is not None:
-                    ret = ann_to_ctype(m.returns) or OBJ
+                    ret = self._c_ret(m)
                     self.used_xmethods[(cls, func.attr)] = ret
                     pct = [arg_ctype(m, a) for a in m.args.args[1:]]
                     cargs = self.coerce_args(pct, node.args)
@@ -4276,7 +4433,7 @@ class Transpiler:
                 xowner = self.resolve_xmethod_owner(func.attr)
                 if xowner:
                     m = xowner.methods.get(func.attr)
-                    ret = (ann_to_ctype(m.returns) or OBJ) if m else OBJ
+                    ret = self._c_ret(m) if m else OBJ
                     self.used_xmethods[(xowner.name, func.attr)] = ret
                     args = [self.expr(a) for a in node.args]
                     return "%s_%s((%s*)AS_OBJ(%s)%s)" % (
@@ -4404,12 +4561,12 @@ class Transpiler:
                 return None
             if func.attr in owner.static_methods:    # @staticmethod: no receiver
                 m = owner.methods.get(func.attr)
-                ret = (ann_to_ctype(m.returns) or OBJ) if m else OBJ
+                ret = self._c_ret(m) if m else OBJ
                 self.used_xmethods[(owner.name, func.attr)] = ret
                 args = [self.expr(a) for a in node.args]
                 return "%s_%s(%s)" % (owner.csym, func.attr, ", ".join(args))
             m = owner.methods.get(func.attr)
-            ret = (ann_to_ctype(m.returns) or OBJ) if m else OBJ
+            ret = self._c_ret(m) if m else OBJ
             self.used_xmethods[(owner.name, func.attr)] = ret
             args = [self.expr(a) for a in node.args]  # devirtualized direct call
             return "%s_%s((%s*)(%s)%s)" % (
