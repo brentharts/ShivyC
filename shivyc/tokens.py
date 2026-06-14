@@ -73,6 +73,9 @@ def _kind_by_name(name):
     return _NAME_TO_KIND[name]
 
 
+from shivyc.errors import Range  # noqa: F401  (Token.r type)
+
+
 class Token:
     """Single unit element of the input as produced by the tokenizer.
 
@@ -86,6 +89,8 @@ class Token:
     r (Range) - Range of positions that this token covers.
 
     """
+
+    r: "Range"        # token source range (errors.Range)
 
     def __init__(self, kind, content="", rep="", r=None):
         """Initialize this token."""

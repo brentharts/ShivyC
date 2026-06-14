@@ -209,7 +209,7 @@ _cmdline_define_prelude = (
     "#define __builtin_va_copy(dst, src) ((dst) = (src))\n")
 
 
-def set_defines(defines):
+def set_defines(defines: "list[str]"):
     """Record command-line ``-D`` macros (each ``NAME`` or ``NAME=VALUE``).
 
     The compiler always predefines ``__SHIVYC__`` so source (e.g. a musl built

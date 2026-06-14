@@ -50,6 +50,8 @@ class Position:
     Specifically, full_line[col + 1] should be this position.
     """
 
+    file: str
+
     def __init__(self, file, line, col, full_line):
         """Initialize Position object."""
         self.file = file
@@ -68,6 +70,9 @@ class Range:
     start (Position) - start position, inclusive
     end (Position) - end position, inclusive
     """
+
+    start: "Position"
+    end: "Position"
 
     def __init__(self, start, end=None):
         """Initialize Range objects."""
