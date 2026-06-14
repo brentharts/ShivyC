@@ -1883,10 +1883,11 @@ class Transpiler:
                     elif isinstance(n, ast.Assign) and len(n.targets) == 1 \
                             and isinstance(n.targets[0], ast.Name) \
                             and isinstance(n.value, (ast.List, ast.Dict,
-                                ast.Set, ast.Tuple, ast.ListComp, ast.SetComp,
-                                ast.DictComp, ast.GeneratorExp)):
-                        # module-level obj global (e.g. xmm_arg_regs = [...]),
-                        # emitted unprefixed in its module as `obj <name>;`
+                                ast.Set, ast.Tuple, ast.BinOp, ast.ListComp,
+                                ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                        # module-level obj global (e.g. xmm_arg_regs = [...] or
+                        # registers = caller_saved + callee_saved), emitted
+                        # unprefixed in its module as `obj <name>;`
                         reg["globals"][n.targets[0].id] = OBJ
             except (OSError, SyntaxError):
                 pass
@@ -2291,6 +2292,19 @@ class Transpiler:
                 res[k] = v
         return res
 
+    def _resolve_class_default(self, ci, attr, seen=None):
+        """Resolve a class-level attribute's default value, following bare-Name
+        references to sibling class attributes (so `all_registers =
+        alloc_registers` resolves through to alloc_registers's own default).
+        Returns an AST value node, or None if `attr` has no class default."""
+        seen = seen if seen is not None else set()
+        attrs = self._resolved_class_attrs(ci)
+        val = attrs.get(attr)
+        if isinstance(val, ast.Name) and val.id in attrs and val.id not in seen:
+            seen.add(val.id)
+            return self._resolve_class_default(ci, val.id, seen)
+        return val
+
     def emit_class_attr_init(self, ci):
         """Set the instance fields backing class-level scalar attributes to this
         class's most-derived value (polymorphic class data made per-instance)."""
@@ -2300,7 +2314,10 @@ class Transpiler:
         prev = self.cur_class
         self.cur_class = ci
         for nm, val in sorted(attrs.items()):
-            self.emit("self->%s = %s;" % (cname(nm), self.wrap_obj(val)))
+            # a default that names a sibling class attr resolves to that
+            # sibling's own default value, not a (nonexistent) bare local.
+            dflt = self._resolve_class_default(ci, nm)
+            self.emit("self->%s = %s;" % (cname(nm), self.wrap_obj(dflt)))
         self.cur_class = prev
 
     def _nearest_init(self, ci):
@@ -3373,6 +3390,17 @@ class Transpiler:
                 and isinstance(node.value.func, ast.Name) \
                 and node.value.func.id == "type" and node.value.args:
             return "TYPE(%s)->name" % self.obj_ptr(node.value.args[0])
+        # type(self).<class-attr>  ->  the attribute's class-level *default*
+        # (used to reset an instance field to the original, e.g. restoring the
+        # full register list). Resolved by following sibling-name defaults.
+        if isinstance(node.value, ast.Call) \
+                and isinstance(node.value.func, ast.Name) \
+                and node.value.func.id == "type" and len(node.value.args) == 1 \
+                and isinstance(node.value.args[0], ast.Name) \
+                and node.value.args[0].id == "self" and self.cur_class:
+            dflt = self._resolve_class_default(self.cur_class, node.attr)
+            if dflt is not None:
+                return self.wrap_obj(dflt)
         if isinstance(node.value, ast.Name):
             base = node.value.id
             if base in self.import_alias:
