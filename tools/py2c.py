@@ -181,6 +181,8 @@ obj  obj_sub(obj a, obj b);
 obj  obj_mul(obj a, obj b);        /* *  (int, str/list repeat)               */
 obj  obj_fdiv(obj a, obj b);       /* // */
 obj  obj_mod(obj a, obj b);
+obj  obj_neg(obj a);               /* unary -  */
+obj  obj_invert(obj a);            /* unary ~  */
 obj  obj_bin(char op, obj a, obj b);  /* &|^ and << >>                        */
 long ipow(long base, long exp);       /* integer ** (exp >= 0)                */
 obj  obj_pow(obj a, obj b);           /* Tier-2 **                            */
@@ -192,6 +194,7 @@ bool str_startswith(str s, str p);
 bool str_endswith(str s, str p);
 str  str_strip(str s, int mode);   /* 0 both, 1 left, 2 right                 */
 obj  str_split(str s, str sep);    /* sep NULL -> split on whitespace runs    */
+obj  str_partition(str s, str sep);/* (before, sep_or_'', after) as a 3-list  */
 obj  str_splitlines(str s);
 str  str_replace(str s, str a, str b);
 long str_find(str s, str sub, bool last);
@@ -222,6 +225,7 @@ obj  list_index(obj lst, obj v);        /* position of first match (else abort) 
 obj  list_pop(obj lst);                 /* remove & return last element        */
 obj  float_to_bits(obj val, long size); /* IEEE-754 float -> int bit pattern   */
 void list_assign_slice(obj dst, obj src); /* dst[:] = src (replace contents)   */
+void list_set_slice(obj dst, long lo, long hi, obj src); /* dst[lo:hi] = src   */
 obj  obj_augop(obj a, char op, obj b);  /* x op= y for obj (arith / set ops)   */
 void del_item(obj c, obj k);            /* del c[k] for dict (key) or list (i) */
 obj  pylist(obj it);                    /* shallow copy iterable into a list   */
@@ -416,6 +420,27 @@ void list_assign_slice(obj dst, obj src) {
     ((List*)dst.u.o)->len = 0;
     for (long i = 0; i < n; i++) list_append(dst, tmp[i]);
 }
+void list_set_slice(obj dst, long lo, long hi, obj src) {
+    /* dst[lo:hi] = src  -- splice src's elements in place of dst[lo:hi],
+       resizing as needed. Snapshots src and the surviving tail first so the
+       operation is safe even if src aliases dst. */
+    List* d = (List*)dst.u.o;
+    long n = d->len;
+    if (lo < 0) lo += n;
+    if (hi < 0) hi += n;
+    if (lo < 0) lo = 0;
+    if (lo > n) lo = n;
+    if (hi < lo) hi = lo;
+    if (hi > n) hi = n;
+    long m = pylen(src), tail = n - hi;
+    obj* sp = (obj*)aalloc((m ? m : 1) * sizeof(obj));
+    for (long i = 0; i < m; i++) sp[i] = index_obj(src, i);
+    obj* tl = (obj*)aalloc((tail ? tail : 1) * sizeof(obj));
+    for (long i = 0; i < tail; i++) tl[i] = d->data[hi + i];
+    d->len = lo;                              /* keep head [0:lo] */
+    for (long i = 0; i < m; i++) list_append(dst, sp[i]);
+    for (long i = 0; i < tail; i++) list_append(dst, tl[i]);
+}
 obj list_of(int n, ...) {
     obj r = list_new();
     va_list ap; va_start(ap, n);
@@ -585,6 +610,8 @@ obj obj_mul(obj a, obj b) {
 }
 obj obj_fdiv(obj a, obj b) { long d = as_num(b); return OBJ_INT(d ? as_num(a) / d : 0); }
 obj obj_mod(obj a, obj b) { long d = as_num(b); return OBJ_INT(d ? as_num(a) % d : 0); }
+obj obj_neg(obj a) { return OBJ_INT(-as_num(a)); }
+obj obj_invert(obj a) { return OBJ_INT(~as_num(a)); }
 long ipow(long base, long exp) {
     long r = 1;
     while (exp > 0) { if (exp & 1) r *= base; base *= base; exp >>= 1; }
@@ -646,6 +673,24 @@ obj str_split(str s, str sep) {
         list_append(r, OBJ_STR(o)); p = q + sl;
     }
     list_append(r, OBJ_STR((str)p));
+    return r;
+}
+obj str_partition(str s, str sep) {
+    /* str.partition: (head, sep, tail) at the first occurrence of sep, else
+       (s, "", "").  Returned as a 3-element list for tuple unpacking. */
+    obj r = list_new();
+    const char* q = (sep && sep[0]) ? strstr(s, sep) : NULL;
+    if (!q) {
+        list_append(r, OBJ_STR(s));
+        list_append(r, OBJ_STR(""));
+        list_append(r, OBJ_STR(""));
+        return r;
+    }
+    size_t hl = q - s;
+    char* head = aalloc(hl + 1); memcpy(head, s, hl); head[hl] = 0;
+    list_append(r, OBJ_STR(head));
+    list_append(r, OBJ_STR(sep));
+    list_append(r, OBJ_STR((str)(q + strlen(sep))));
     return r;
 }
 obj str_splitlines(str s) {
@@ -1008,6 +1053,7 @@ def _param_used_as_object(fn, name):
     container method (e.g. `identifier.content`) -- evidence it's an object,
     not the scalar string/int its name suggests."""
     KNOWN = {"strip", "lstrip", "rstrip", "upper", "lower", "replace", "split",
+             "partition",
              "splitlines", "startswith", "endswith", "isdigit", "isalpha",
              "isspace", "isalnum", "find", "rfind", "join", "encode", "decode",
              "format", "count", "index", "append", "add", "update", "extend",
@@ -1158,6 +1204,24 @@ class _CallRewriter(ast.NodeTransformer):
         return node
 
 
+class _ValueUseReplacer(ast.NodeTransformer):
+    """Replace a *value* use of a lifted nested function (the bare name, not a
+    call — those are already rewritten) with a closure-construction marker, so
+    `callback(emitting)` builds a real closure carrying the captured env."""
+    def __init__(self, vmap):
+        self.vmap = vmap                # orig name -> (mangled, captures)
+
+    def visit_Name(self, node):
+        if isinstance(node.ctx, ast.Load) and node.id in self.vmap:
+            mangled, captures = self.vmap[node.id]
+            return ast.Call(
+                func=ast.Name(id="__closure_env__", ctx=ast.Load()),
+                args=[ast.Constant(value=mangled)] +
+                     [ast.Name(id=c, ctx=ast.Load()) for c in captures],
+                keywords=[])
+        return node
+
+
 def lift_nested_functions(tree):
     """Closure-convert one level of nested functions to file scope.
 
@@ -1167,6 +1231,7 @@ def lift_nested_functions(tree):
     rebind a captured variable via `nonlocal` are left in place (unsupported).
     """
     lifted = []
+    specs = {}
 
     def process(fn, prefix, cls=None):
         encl = {a.arg for a in fn.args.args} | _assigned_names(fn)
@@ -1174,12 +1239,16 @@ def lift_nested_functions(tree):
         if not nested:
             return
         name_map = {}
+        orig_defaults = {}              # sub.name -> original-param default nodes
         for sub in nested:
             if any(isinstance(n, ast.Nonlocal) for n in ast.walk(sub)):
                 continue                # rebinds enclosing var; can't lift
             captures = _free_vars(sub, encl)
             mangled = "%s__%s" % (prefix, sub.name)
             name_map[sub.name] = (mangled, captures)
+            np = len(sub.args.args)
+            nd = len(sub.args.defaults)
+            orig_defaults[sub.name] = [None] * (np - nd) + list(sub.args.defaults)
         if not name_map:
             return
         rewriter = _CallRewriter(name_map)
@@ -1187,11 +1256,13 @@ def lift_nested_functions(tree):
         fn.body = [s for s in fn.body if not (isinstance(s, ast.FunctionDef)
                                               and s.name in name_map)]
         rewriter.visit(fn)
+        my_subs = []
         for sub in nested:
             if sub.name not in name_map:
                 continue
             mangled, captures = name_map[sub.name]
             rewriter.visit(sub)         # rewrite recursive/sibling calls
+            real_defs = orig_defaults[sub.name]
             sub.name = mangled
             # captured locals default to Tier-2 obj (their real type coerces in
             # at the call site); a name-based guess like defined->bool is wrong.
@@ -1204,7 +1275,16 @@ def lift_nested_functions(tree):
             sub.args.args = cap_args + sub.args.args
             sub.decorator_list = []
             lifted.append(sub)
+            my_subs.append(sub)
+            # a value use of this fn (passed as an argument, stored, returned)
+            # needs a real closure; register a spec so a trampoline is emitted.
+            specs[mangled] = (sub, len(captures), real_defs)
             process(sub, mangled, cls)  # handle deeper nesting
+        # any remaining bare references to a lifted name are value uses
+        repl = _ValueUseReplacer(dict(name_map))
+        repl.visit(fn)
+        for sub in my_subs:
+            repl.visit(sub)
 
     for top in list(tree.body):
         if isinstance(top, ast.FunctionDef):
@@ -1215,7 +1295,7 @@ def lift_nested_functions(tree):
                     process(item, "%s_%s" % (top.name, item.name), top.name)
     tree.body = lifted + tree.body
     ast.fix_missing_locations(tree)
-    return tree
+    return specs
 
 
 def convert_block_closures(tree):
@@ -1488,8 +1568,8 @@ class Transpiler:
 
     def run(self, tree):
         global KNOWN_CLASSES, VTABLE_METHODS
-        lift_nested_functions(tree)
-        self.closure_specs = convert_block_closures(tree)
+        self.closure_specs = lift_nested_functions(tree)
+        self.closure_specs.update(convert_block_closures(tree))
         self.closure_values_needed = set()
         self.classes, self.class_order, vt = collect_classes(tree)
         KNOWN_CLASSES = self.classes
@@ -2492,6 +2572,12 @@ class Transpiler:
     def iter_elem_ctype(self, node):
         """Element ctype of an iterable expression when known from a List[T]
         annotation (a bare list Name, or self.<field> declared List[T])."""
+        if isinstance(node, ast.BoolOp):           # `xs or []` defaulting idiom
+            for v in node.values:
+                et = self.iter_elem_ctype(v)
+                if et:
+                    return et
+            return None
         if isinstance(node, ast.Name):
             return self.elem_types.get(node.id)
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)\
@@ -2832,6 +2918,18 @@ class Transpiler:
                         and tgt.slice.step is None:
                     lines.append("list_assign_slice(%s, %s);" % (
                         self.expr(tgt.value), self.wrap_obj(node.value)))
+                    continue
+                # dst[lo:hi] = src  -- splice (step must be absent)
+                if isinstance(tgt.slice, ast.Slice) and tgt.slice.step is None:
+                    lo = self.coerce_to("int", tgt.slice.lower,
+                                        self.expr(tgt.slice.lower)) \
+                        if tgt.slice.lower is not None else "0"
+                    hi = self.coerce_to("int", tgt.slice.upper,
+                                        self.expr(tgt.slice.upper)) \
+                        if tgt.slice.upper is not None else "pylen(%s)" % \
+                        self.expr(tgt.value)
+                    lines.append("list_set_slice(%s, %s, %s, %s);" % (
+                        self.expr(tgt.value), lo, hi, self.wrap_obj(node.value)))
                     continue
                 if self.is_obj_word(tgt.value) or \
                         self.value_ctype(tgt.value) == OBJ:
@@ -3208,7 +3306,7 @@ class Transpiler:
             self.loop_n += 1
             itv = "_it%d" % self.loop_n
             idx = "_k%d" % self.loop_n
-            lines.append("{ obj %s = %s;" % (itv, self.expr(it)))
+            lines.append("{ obj %s = %s;" % (itv, self.wrap_obj(it)))
             lines.append("  for (long %s = 0; %s < pylen(%s); %s++) {" %
                          (idx, idx, itv, idx))
             binds = self.bind_target(tgt, "index_obj(%s, %s)" % (itv, idx))
@@ -3287,7 +3385,8 @@ class Transpiler:
             inner = build(i + 1)
             body = " ".join(binds) + " " + guard_open + inner + guard_close
             return "{ obj %s = %s; for (long %s = 0; %s < pylen(%s); %s++) " \
-                   "{ %s } }" % (it, self.expr(g.iter), idx, idx, it, idx, body)
+                   "{ %s } }" % (it, self.wrap_obj(g.iter), idx, idx, it, idx,
+                                 body)
 
         body = build(0)
         self.scope = saved
@@ -4432,6 +4531,8 @@ class Transpiler:
         if m == "split":
             sep = self.as_str(a[0]) if a else "NULL"
             return "str_split(%s, %s)" % (recv(), sep)
+        if m == "partition":
+            return "str_partition(%s, %s)" % (recv(), self.as_str(a[0]))
         if m == "splitlines":
             return "str_splitlines(%s)" % recv()
         if m == "replace":
@@ -4454,9 +4555,9 @@ class Transpiler:
         return None
 
     STR_METHODS = {"startswith", "endswith", "strip", "lstrip", "rstrip",
-                   "split", "splitlines", "replace", "find", "rfind",
-                   "isdigit", "isalpha", "isspace", "isalnum", "lower",
-                   "upper", "join", "encode"}
+                   "split", "partition", "splitlines", "replace", "find",
+                   "rfind", "isdigit", "isalpha", "isspace", "isalnum",
+                   "lower", "upper", "join", "encode"}
 
     def truth_test(self, node, rendered):
         """A C truth test for `rendered` (the expr of `node`)."""
@@ -4512,7 +4613,14 @@ class Transpiler:
         if isinstance(node.op, ast.Not):
             return "(!%s)" % self.bool_expr(node.operand)
         sym = {ast.USub: "-", ast.UAdd: "+", ast.Invert: "~"}[type(node.op)]
-        return "(%s%s)" % (sym, self.expr(node.operand))
+        operand = node.operand
+        if self.is_obj_word(operand) or self.value_ctype(operand) == OBJ:
+            if isinstance(node.op, ast.USub):
+                return "obj_neg(%s)" % self.expr(operand)
+            if isinstance(node.op, ast.Invert):
+                return "obj_invert(%s)" % self.expr(operand)
+            return self.expr(operand)        # unary plus: identity
+        return "(%s%s)" % (sym, self.expr(operand))
 
     def ex_Compare(self, node):
         parts = []
