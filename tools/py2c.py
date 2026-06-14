@@ -82,19 +82,22 @@ typedef char* str;
 
 /* ---- Tier 2: generic dynamic value (used only where the type is open) ---- */
 typedef struct Obj Obj;
-enum { T_NONE, T_INT, T_BOOL, T_STR, T_OBJ, T_LIST, T_DICT, T_FUNC };
-typedef struct { unsigned char tag; union { long i; str s; Obj* o; } u; } obj;
+enum { T_NONE, T_INT, T_BOOL, T_STR, T_OBJ, T_LIST, T_DICT, T_FUNC, T_FLOAT };
+typedef struct { unsigned char tag; union { long i; str s; Obj* o; double d; } u; } obj;
 
 #define OBJ_NONE    ((obj){T_NONE,{0}})
 #define OBJ_INT(x)  ((obj){T_INT,{.i=(long)(x)}})
 #define OBJ_BOOL(x) ((obj){T_BOOL,{.i=(long)(x)}})
 #define OBJ_STR(x)  ((obj){T_STR,{.s=(str)(x)}})
 #define OBJ_OBJ(x)  ((obj){T_OBJ,{.o=(Obj*)(x)}})
+#define OBJ_FLOAT(x) ((obj){T_FLOAT,{.d=(double)(x)}})
 #define IS_OBJ(v)   ((v).tag==T_OBJ)
 #define IS_NONE(v)  ((v).tag==T_NONE)
+#define IS_FLOAT(v) ((v).tag==T_FLOAT)
 #define AS_OBJ(v)   ((v).u.o)
 #define AS_INT(v)   ((v).u.i)
 #define AS_STR(v)   ((v).u.s)
+#define AS_FLOAT(v) ((v).u.d)
 
 /* ---- Tier 1: object header -- first member of every transpiled struct ---- */
 /* `type` points at a per-module TypeInfo; kept void* here so this header is
@@ -217,6 +220,7 @@ void set_add(obj s, obj v);             /* add to a list-set if absent         *
 void list_remove(obj lst, obj v);       /* remove first matching element       */
 obj  list_index(obj lst, obj v);        /* position of first match (else abort) */
 obj  list_pop(obj lst);                 /* remove & return last element        */
+obj  float_to_bits(obj val, long size); /* IEEE-754 float -> int bit pattern   */
 void list_assign_slice(obj dst, obj src); /* dst[:] = src (replace contents)   */
 obj  obj_augop(obj a, char op, obj b);  /* x op= y for obj (arith / set ops)   */
 void del_item(obj c, obj k);            /* del c[k] for dict (key) or list (i) */
@@ -269,10 +273,28 @@ obj call_obj(obj f, int n, ...) {
 
 static str pyrepr(obj v);   /* repr() — quotes strings inside containers */
 
+obj float_to_bits(obj val, long size) {
+    /* IEEE-754 reinterpret of a float initializer to its integer bit pattern,
+       for an assembler .int/.quad directive. Integer initializers (the common
+       case) pass through unchanged. */
+    if (val.tag != T_FLOAT) return val;
+    if (size == 4) {
+        float f = (float)val.u.d;
+        unsigned int u;
+        memcpy(&u, &f, sizeof u);
+        return OBJ_INT((long)u);
+    }
+    double d = val.u.d;
+    unsigned long u;
+    memcpy(&u, &d, sizeof u);
+    return OBJ_INT((long)u);
+}
+
 str pystr(obj v) {
     char* b;
     switch (v.tag) {
         case T_INT:  b = aalloc(24); sprintf(b, "%ld", v.u.i); return b;
+        case T_FLOAT: b = aalloc(32); sprintf(b, "%g", v.u.d); return b;
         case T_BOOL: return v.u.i ? "True" : "False";
         case T_STR:  return v.u.s ? v.u.s : "";
         case T_NONE: return "None";
@@ -1405,6 +1427,11 @@ C_KEYWORDS = {"int", "char", "short", "long", "float", "double", "void",
               # runtime type/identifier names that must not be shadowed
               "obj", "Obj", "List", "Dict", "TypeInfo"}
 
+# Module-level helper functions whose Python body is not transpilable (they use
+# the stdlib `struct` module) but which the runtime provides directly. Their
+# `def` is skipped and calls are lowered to the runtime function.
+RUNTIME_INTRINSICS = {"_float_to_bits"}
+
 
 def cname(name):
     return name + "_" if name in C_KEYWORDS else name
@@ -1786,7 +1813,8 @@ class Transpiler:
                     plist = ", ".join(["%s* self" % ci.name] + params)
                     protos.append("%s %s_%s(%s);" % (ret, ci.name, mname, plist))
         for node in tree.body:
-            if isinstance(node, ast.FunctionDef):
+            if isinstance(node, ast.FunctionDef) and \
+                    node.name not in RUNTIME_INTRINSICS:
                 protos.append(self.func_signature(node) + ";")
         if protos:
             self.emit("/* forward declarations */")
@@ -2503,8 +2531,9 @@ class Transpiler:
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             self.emit("/* " + self.src1(node) + " */")
         elif isinstance(node, ast.FunctionDef):
-            self.func_def(node)
-            self.emit()
+            if node.name not in RUNTIME_INTRINSICS:
+                self.func_def(node)
+                self.emit()
         elif isinstance(node, ast.Assign):
             self.toplevel_assign(node)
         elif isinstance(node, ast.AnnAssign):
@@ -3495,6 +3524,12 @@ class Transpiler:
                 return "make_closure(&%s__tramp, %s)" % (cname(mangled), env)
             if fn == "isinstance" and len(node.args) == 2:
                 return self.lower_isinstance(node.args[0], node.args[1])
+            if fn == "_float_to_bits" and len(node.args) == 2:
+                size = node.args[1]
+                sz = self.expr(size) if self.value_ctype(size) in \
+                    ("int", "bool") else "AS_INT(%s)" % self.wrap_obj(size)
+                return "float_to_bits(%s, %s)" % (
+                    self.wrap_obj(node.args[0]), sz)
             if fn == "str" and len(node.args) == 1:
                 return "pystr(%s)" % self.wrap_obj(node.args[0])
             if fn == "len" and len(node.args) == 1:
@@ -4131,6 +4166,8 @@ class Transpiler:
             return "OBJ_STR(%s)" % s
         if t == "bool":
             return "OBJ_BOOL(%s)" % s
+        if t == "double":
+            return "OBJ_FLOAT(%s)" % s
         if isinstance(node, ast.Constant):
             if isinstance(node.value, str):
                 return "OBJ_STR(%s)" % s
