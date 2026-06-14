@@ -2,6 +2,7 @@
 
 import shivyc.il_cmds.control as control_cmds
 from shivyc.errors import CompilerError
+from shivyc.tokens import Token
 from shivyc.il_gen import ILValue
 from shivyc.tree.base_nodes import Node
 from shivyc.tree.utils import report_err, set_type, check_cast
@@ -340,7 +341,7 @@ class DefaultStatement(Node):
 class LabelStatement(Node):
     """Node for a labeled statement: `name: STMT`."""
 
-    def __init__(self, name, stat):
+    def __init__(self, name: "Token", stat):
         """Initialize node. `name` is the label identifier token."""
         super().__init__()
         self.name = name
@@ -361,7 +362,7 @@ class LabelStatement(Node):
 class GotoStatement(Node):
     """Node for a `goto name;` statement."""
 
-    def __init__(self, name):
+    def __init__(self, name: "Token"):
         """Initialize node. `name` is the target label identifier token."""
         super().__init__()
         self.name = name
