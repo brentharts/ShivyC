@@ -23,7 +23,7 @@ class Root(Node):
         super().__init__()
         self.nodes = nodes
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make code for the root."""
         for node in self.nodes:
             with report_err():
@@ -39,7 +39,7 @@ class Compound(Node):
         super().__init__()
         self.items = items
 
-    def make_il(self, il_code, symbol_table, c, no_scope=False):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c, no_scope=False):
         """Make IL code for every block item, in order.
 
         If no_scope is True, then do not create a new symbol table scope.
@@ -65,7 +65,7 @@ class EmptyStatement(Node):
         """Initialize node."""
         super().__init__()
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Nothing to do for a blank statement."""
         pass
 
@@ -78,7 +78,7 @@ class ExprStatement(Node):
         super().__init__()
         self.expr = expr
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make code for this expression, and ignore the resulting ILValue."""
         self.expr.make_il(il_code, symbol_table, c)
 
@@ -99,7 +99,7 @@ class InlineAsm(Node):
         self.inputs = inputs
         self.clobbers = clobbers
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Generate the inline-asm IL command and store back any outputs."""
         import shivyc.il_cmds.asm as asm_cmds_il
         from shivyc.il_gen import ILValue
@@ -953,7 +953,7 @@ class Declaration(Node):
         self.node = node
         self.body = body
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make code for this declaration."""
 
         self.set_self_vars(il_code, symbol_table, c)

@@ -23,7 +23,7 @@ class _ArithBinOp(_RExprNode):
         self.right = right
         self.op = op
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make code for this node."""
 
         left = self.left.make_il(il_code, symbol_table, c)

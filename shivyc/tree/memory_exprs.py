@@ -18,7 +18,7 @@ class AddrOf(_RExprNode):
         super().__init__()
         self.expr = expr
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make code for this node."""
         lvalue = self.expr.lvalue(il_code, symbol_table, c)
         if lvalue:

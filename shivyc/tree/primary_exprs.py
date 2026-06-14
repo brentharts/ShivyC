@@ -21,7 +21,7 @@ class MultiExpr(_RExprNode):
         self.right = right
         self.op = op
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make code for this node."""
         self.left.make_il(il_code, symbol_table, c)
         return self.right.make_il(il_code, symbol_table, c)
@@ -35,7 +35,7 @@ class Number(_RExprNode):
         super().__init__()
         self.number = number
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make code for a literal number.
 
         This function does not actually make any code in the IL, it just
@@ -141,7 +141,7 @@ class Identifier(_LExprNode):
         var = symbol_table.lookup_variable(self.identifier)
         return DirectLValue(var)
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Resolve an enum constant to an integer literal, else load lvalue."""
         enum_val = symbol_table.lookup_enum_const(self.identifier.content)
         if enum_val is not None:
@@ -150,7 +150,7 @@ class Identifier(_LExprNode):
             return out
         return super().make_il(il_code, symbol_table, c)
 
-    def make_il_raw(self, il_code, symbol_table, c):
+    def make_il_raw(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Same as make_il for enum constants (no lvalue to decay)."""
         if symbol_table.lookup_enum_const(self.identifier.content) is not None:
             return self.make_il(il_code, symbol_table, c)
@@ -175,11 +175,11 @@ class ParenExpr(general_nodes.Node):
         """Return lvalue of this expression."""
         return self.expr.lvalue(il_code, symbol_table, c)
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make IL code for this expression."""
         return self.expr.make_il(il_code, symbol_table, c)
 
-    def make_il_raw(self, il_code, symbol_table, c):
+    def make_il_raw(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make raw IL code for this expression."""
         return self.expr.make_il_raw(il_code, symbol_table, c)
 
@@ -197,7 +197,7 @@ class StmtExpr(_RExprNode):
         super().__init__()
         self.items = items
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Generate IL for the block, returning the last expression's value."""
         symbol_table.new_scope()
         c = c.set_global(False)

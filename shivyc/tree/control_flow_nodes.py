@@ -16,7 +16,7 @@ class Return(Node):
         super().__init__()
         self.return_value = return_value
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make IL code for returning this value."""
 
         if self.return_value and c.sret_ptr is not None:
@@ -58,7 +58,7 @@ class _BreakContinue(Node):
         """Initialize node."""
         super().__init__()
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make IL code for returning this value."""
         label = self.get_label(c)
         if label:
@@ -100,7 +100,7 @@ class IfStatement(Node):
         self.stat = stat
         self.else_stat = else_stat
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make code for this if statement."""
 
         endif_label = il_code.get_label()
@@ -136,7 +136,7 @@ class WhileStatement(Node):
         self.cond = cond
         self.stat = stat
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make code for this node."""
         start = il_code.get_label()
         end = il_code.get_label()
@@ -172,7 +172,7 @@ class ForStatement(Node):
         self.third = third
         self.stat = stat
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make code for this node."""
         symbol_table.new_scope()
         if self.first:
@@ -217,7 +217,7 @@ class DoWhileStatement(Node):
         self.cond = cond
         self.stat = stat
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make code for this node."""
         start = il_code.get_label()
         cont = il_code.get_label()
@@ -260,7 +260,7 @@ class SwitchStatement(Node):
         self.cond = cond
         self.stat = stat
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make code for this node."""
         import shivyc.il_cmds.math as math_cmds
         val = self.cond.make_il(il_code, symbol_table, c)
@@ -304,7 +304,7 @@ class CaseStatement(Node):
         self.expr = expr
         self.stat = stat
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make code for this node."""
         if c.switch is None:
             err = "'case' label not within a switch statement"
@@ -327,7 +327,7 @@ class DefaultStatement(Node):
         super().__init__()
         self.stat = stat
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make code for this node."""
         if c.switch is None:
             err = "'default' label not within a switch statement"
@@ -347,7 +347,7 @@ class LabelStatement(Node):
         self.name = name
         self.stat = stat
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make code for this node."""
         if c.labels is None:
             err = "label not within a function"
@@ -367,7 +367,7 @@ class GotoStatement(Node):
         super().__init__()
         self.name = name
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make code for this node."""
         if c.labels is None:
             err = "goto not within a function"

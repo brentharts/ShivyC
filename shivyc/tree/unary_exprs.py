@@ -21,7 +21,7 @@ class _IncrDecr(_RExprNode):
     cmd = None
     return_new = None
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make code for this node."""
         lval = self.expr.lvalue(il_code, symbol_table, c)
 
@@ -107,7 +107,7 @@ class _ArithUnOp(_RExprNode):
         super().__init__()
         self.expr = expr
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make code for this node."""
         expr = self.expr.make_il(il_code, symbol_table, c)
         if not self._check_type(expr):

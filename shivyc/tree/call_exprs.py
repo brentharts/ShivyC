@@ -20,7 +20,7 @@ class FuncCall(_RExprNode):
         self.func = func
         self.args = args
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make code for this node."""
 
         # This is of function pointer type, so func.arg is the function type.
@@ -138,7 +138,7 @@ class VaStartAddr(_RExprNode):
         """Initialize node."""
         super().__init__()
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make code for this node."""
         import shivyc.il_cmds.value as value_cmds
         from shivyc.ctypes import PointerCType
@@ -166,7 +166,7 @@ class VaArg(_RExprNode):
         self.ap = ap
         self.node = node
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make code for this node."""
         import shivyc.il_cmds.value as value_cmds
         import shivyc.il_cmds.math as math_cmds

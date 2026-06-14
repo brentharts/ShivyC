@@ -25,7 +25,7 @@ class _BoolAndOr(_RExprNode):
     # 1 for &&, 0 for ||
     initial_value = 1
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         # ILValue for storing the output of this boolean operation
         out = ILValue(ctypes.integer)
 
@@ -84,7 +84,7 @@ class BoolNot(_RExprNode):
         super().__init__()
         self.expr = expr
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make code for this node."""
 
         expr = self.expr.make_il(il_code, symbol_table, c)
@@ -136,7 +136,7 @@ class Conditional(_RExprNode):
         self.els = els
         self.op = op
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make code for this node."""
         cond = self.cond.make_il(il_code, symbol_table, c)
         if not cond.ctype.is_scalar():

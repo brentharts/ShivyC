@@ -47,7 +47,7 @@ class SizeofExpr(_SizeofNode):
         super().__init__()
         self.expr = expr
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Return a compile-time integer literal as the expression size."""
 
         dummy_il_code = il_code.copy()
@@ -64,7 +64,7 @@ class SizeofType(_SizeofNode, Declaration):
         _SizeofNode.__init__(self)
         Declaration.__init__(self, node)   # sets self.node = node
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Return a compile-time integer literal as the expression size."""
 
         self.set_self_vars(il_code, symbol_table, c)
@@ -101,7 +101,7 @@ class AlignofExpr(_AlignofNode):
         super().__init__()
         self.expr = expr
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         dummy_il_code = il_code.copy()
         expr = self.expr.make_il_raw(dummy_il_code, symbol_table, c)
         return self.alignof_ctype(expr.ctype, self.expr.r, il_code)
@@ -114,7 +114,7 @@ class AlignofType(_AlignofNode, Declaration):
         _AlignofNode.__init__(self)
         Declaration.__init__(self, node)
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         self.set_self_vars(il_code, symbol_table, c)
         base_type, _ = self.make_specs_ctype(self.node.specs, True)
         ctype, _ = self.make_ctype(self.node.decls[0], base_type)
@@ -134,7 +134,7 @@ class OffsetofType(Declaration, _RExprNode):
         _RExprNode.__init__(self)
         self.designator = designator
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Return a size_t literal equal to the member's byte offset."""
         self.set_self_vars(il_code, symbol_table, c)
         base_type, _ = self.make_specs_ctype(self.node.specs, True)
@@ -185,7 +185,7 @@ class Cast(Declaration, _RExprNode):
 
         self.expr = expr
 
-    def make_il(self, il_code, symbol_table, c):
+    def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make IL for this cast operation."""
 
         self.set_self_vars(il_code, symbol_table, c)
