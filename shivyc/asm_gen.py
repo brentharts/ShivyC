@@ -9,6 +9,9 @@ import shivyc.simd_pack as simd_pack
 from shivyc.spots import Spot, RegSpot, MemSpot, LiteralSpot
 from shivyc.il_cmds.base import ILCommand  # noqa: F401  (polymorphic interface
 # dispatched on the IL commands asm_gen consumes; see command.inputs()/etc.)
+from typing import List
+from shivyc.il_gen import ILValue
+from shivyc.ctypes import CType  # noqa: F401
 
 
 
@@ -513,7 +516,7 @@ class ASMGen:
 
         # If any variable may have its address referenced, assign it a
         # permanent memory spot if it doesn't yet have one.
-        move_to_mem = []
+        move_to_mem: List["ILValue"] = []
         for command in commands:
             refs = command.references().values()
             for line in refs:
