@@ -5,6 +5,7 @@ import shivyc.ctypes as ctypes
 import shivyc.il_cmds.control as control_cmds
 import shivyc.il_cmds.value as value_cmds
 import shivyc.token_kinds as token_kinds
+from shivyc.tokens import Token
 import shivyc.tree.decl_nodes as decl_nodes
 from shivyc.ctypes import (PointerCType, ArrayCType, FunctionCType,
                            StructCType, UnionCType)
@@ -190,10 +191,11 @@ class DeclInfo:
     EXTERN = 3
     TYPEDEF = 4
 
-    def __init__(self, identifier, ctype, range,
+    def __init__(self, identifier: "Token", ctype, range,
                  storage=None, init=None, body=None, param_names=None):
         self.identifier = identifier
         self.ctype = ctype
+        self.asm_reg = None     # explicit register binding (asm() declarations)
         self.range = range
         self.storage = storage
         self.init = init
@@ -568,7 +570,7 @@ class DeclInfo:
             return None
 
         if isinstance(node, memory_exprs.AddrOf):
-            ref = self._symbol_ref(node.expr, symbol_table, decay=False)
+            ref = self._symbol_ref(node.expr, symbol_table, False)
             if ref is not None:
                 return ref
             # &OBJ.m1.m2... : the address of a (possibly nested) member of a
@@ -591,7 +593,7 @@ class DeclInfo:
                 return ("sym", symbol_table.asm_name(lval.il_value), 0)
             return None
         if isinstance(node, primary_exprs.Identifier):
-            return self._symbol_ref(node, symbol_table, decay=True)
+            return self._symbol_ref(node, symbol_table, True)
 
         # A bare member access `OBJ.m1.m2...` whose member type is an array
         # decays to the address of that member (C11 6.3.2.1p3) and is therefore
