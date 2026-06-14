@@ -3348,7 +3348,8 @@ class Transpiler:
             return ["%s = pyconcat(%s, %s);" % (tgt, tgt,
                                                 self.as_str(node.value))]
         return ["%s %s= %s;" % (tgt, self.binop_sym(node.op),
-                                self.expr(node.value))]
+                                self.coerce_to(tt, node.value,
+                                               self.expr(node.value)))]
 
     def st_Return(self, node):
         if node.value is None:
