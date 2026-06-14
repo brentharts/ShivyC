@@ -161,6 +161,7 @@ class ILValue:
         """Initialize IL value."""
         self.ctype = ctype
         self.literal = None
+        self.asm_reg = None     # explicit register binding (asm() declarations)
 
     def __str__(self):  # pragma: no cover
         return f'{id(self) % 1000:03}'
