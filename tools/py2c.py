@@ -1222,6 +1222,19 @@ class _ValueUseReplacer(ast.NodeTransformer):
         return node
 
 
+def _is_dunder_main_guard(node):
+    """True for `if __name__ == "__main__":` -- the script-entry idiom. The C
+    program has its own entry point, so this block is skipped when transpiling."""
+    return (isinstance(node, ast.If) and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "__name__"
+            and len(node.test.ops) == 1
+            and isinstance(node.test.ops[0], ast.Eq)
+            and len(node.test.comparators) == 1
+            and isinstance(node.test.comparators[0], ast.Constant)
+            and node.test.comparators[0].value == "__main__")
+
+
 def lift_nested_functions(tree):
     """Closure-convert one level of nested functions to file scope.
 
@@ -1707,6 +1720,8 @@ class Transpiler:
         for node in tree.body:
             if isinstance(node, ast.ClassDef):
                 continue
+            if _is_dunder_main_guard(node):
+                continue            # script-entry guard; C entry is separate
             self.toplevel(node)
         self.emit_trampolines()
         self.emit_module_init()
@@ -2032,6 +2047,8 @@ class Transpiler:
             return ("singleton", reg["singletons"][name])
         if name in reg["globals"]:
             return ("global", reg["globals"][name])
+        if name in reg["consts"]:
+            return ("const", reg["consts"][name])
         return (None, None)
 
     def xref(self, name, modname):
@@ -3479,6 +3496,9 @@ class Transpiler:
         if node.id in self.from_imports and node.id not in self.scope:
             mod = self.from_imports[node.id]
             kind, info = self.xref(node.id, mod)
+            if kind == "const":
+                # a module-level constant (e.g. an error-message string): inline
+                return self.const_literal(info)
             if kind in ("singleton", "func", "class"):
                 self.used_imports.add((mod, node.id))
                 if kind == "class":
