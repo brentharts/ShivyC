@@ -1234,6 +1234,48 @@ class _ValueUseReplacer(ast.NodeTransformer):
         return node
 
 
+class _NameRenamer(ast.NodeTransformer):
+    """Rename references to a single local name within an expression."""
+    def __init__(self, old, new):
+        self.old, self.new = old, new
+
+    def visit_Name(self, node):
+        if node.id == self.old:
+            return ast.copy_location(ast.Name(id=self.new, ctx=node.ctx), node)
+        return node
+
+
+def rewrite_class_lambdas(tree):
+    """A class-level `name = lambda self_, *args: body` is, in Python, just a
+    method (a function stored as a class attribute binds as one). Rewrite each
+    such assignment into a real method def so it participates in normal method
+    dispatch -- including polymorphic override across subclasses."""
+    for cls in ast.walk(tree):
+        if not isinstance(cls, ast.ClassDef):
+            continue
+        new_body = []
+        for stmt in cls.body:
+            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 \
+                    and isinstance(stmt.targets[0], ast.Name) \
+                    and isinstance(stmt.value, ast.Lambda):
+                lam = stmt.value
+                name = stmt.targets[0].id
+                body = lam.body
+                if lam.args.args and lam.args.args[0].arg != "self":
+                    # the first parameter is the (conventionally `_`) self slot
+                    body = _NameRenamer(lam.args.args[0].arg, "self").visit(body)
+                    lam.args.args[0] = ast.arg(arg="self")
+                fn = ast.FunctionDef(name=name, args=lam.args,
+                                     body=[ast.Return(value=body)],
+                                     decorator_list=[], returns=None)
+                new_body.append(ast.copy_location(fn, stmt))
+            else:
+                new_body.append(stmt)
+        cls.body = new_body
+    ast.fix_missing_locations(tree)
+    return tree
+
+
 def _is_dunder_main_guard(node):
     """True for `if __name__ == "__main__":` -- the script-entry idiom. The C
     program has its own entry point, so this block is skipped when transpiling."""
@@ -1507,6 +1549,8 @@ def discover_fields(classnode):
         if not isinstance(item, ast.FunctionDef):
             continue
         opt = optional_param_names(item)
+        param_ann = {a.arg: a.annotation
+                     for a in item.args.args if a.annotation is not None}
         for sub in ast.walk(item):
             targets, ann = [], None
             if isinstance(sub, ast.Assign):
@@ -1529,6 +1573,12 @@ def discover_fields(classnode):
                                 isinstance(sub.value, ast.Name) and \
                                 sub.value.id in opt:
                             add(st.attr, OBJ)
+                        # self.x = <annotated param>  ->  the param's type
+                        elif ann is None and isinstance(sub, ast.Assign) and \
+                                isinstance(sub.value, ast.Name) and \
+                                sub.value.id in param_ann:
+                            add(st.attr, infer_type(st.attr,
+                                                    param_ann[sub.value.id]))
                         else:
                             add(st.attr, infer_type(st.attr, ann))
     return fields
@@ -1593,6 +1643,7 @@ class Transpiler:
 
     def run(self, tree):
         global KNOWN_CLASSES, VTABLE_METHODS
+        rewrite_class_lambdas(tree)
         self.closure_specs = lift_nested_functions(tree)
         self.closure_specs.update(convert_block_closures(tree))
         self.closure_values_needed = set()
