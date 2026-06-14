@@ -224,6 +224,8 @@ void list_remove(obj lst, obj v);       /* remove first matching element       *
 obj  list_index(obj lst, obj v);        /* position of first match (else abort) */
 obj  list_pop(obj lst);                 /* remove & return last element        */
 obj  float_to_bits(obj val, long size); /* IEEE-754 float -> int bit pattern   */
+obj  float_fromhex(str s);              /* float.fromhex: strtod (hex floats)  */
+obj  pyfloat(obj v);                    /* float(x): str/int/float -> double    */
 void list_assign_slice(obj dst, obj src); /* dst[:] = src (replace contents)   */
 void list_set_slice(obj dst, long lo, long hi, obj src); /* dst[lo:hi] = src   */
 obj  obj_augop(obj a, char op, obj b);  /* x op= y for obj (arith / set ops)   */
@@ -292,6 +294,16 @@ obj float_to_bits(obj val, long size) {
     unsigned long u;
     memcpy(&u, &d, sizeof u);
     return OBJ_INT((long)u);
+}
+obj float_fromhex(str s) {
+    /* float.fromhex: C99 strtod parses hex-float syntax ("0x1.8p3") directly. */
+    return OBJ_FLOAT(strtod(s, NULL));
+}
+obj pyfloat(obj v) {
+    /* float(x): parse a string, or widen an int/bool; floats pass through. */
+    if (v.tag == T_STR) return OBJ_FLOAT(strtod(v.u.s, NULL));
+    if (v.tag == T_FLOAT) return v;
+    return OBJ_FLOAT((double)((v.tag == T_INT || v.tag == T_BOOL) ? v.u.i : 0));
 }
 
 str pystr(obj v) {
@@ -1854,7 +1866,11 @@ class Transpiler:
         for c in sorted(needed):            # full layout for accessed classes
             out += self.struct_body_lines(self.xclasses[c][0])
         for c in sorted(classes):
-            out.append("extern const TypeInfoHdr %s_type;" % c)
+            # a class that is also a cross-module hierarchy base gets a full
+            # `extern const TypeInfo c_type;` below; emitting a TypeInfoHdr one
+            # here too would conflict, so emit only the constructor for it.
+            if c not in self.xtype_externs:
+                out.append("extern const TypeInfoHdr %s_type;" % c)
             out.append("extern %s* %s_new();" % (c, c))
         for n in sorted(funcs):
             out.append("extern %s %s();" % (funcs[n], n))
@@ -3051,6 +3067,8 @@ class Transpiler:
                         else OBJ
                 if f.id in ("len", "ord", "int", "abs"):
                     return "int"
+                if f.id == "float":
+                    return OBJ          # pyfloat(...) yields a Tier-2 obj
                 if f.id in ("range", "sorted", "list", "dict", "set",
                             "reversed", "enumerate", "max", "min", "sum",
                             "zip", "map", "filter", "vars"):
@@ -3072,6 +3090,10 @@ class Transpiler:
                     if kind == "func":
                         return ann_to_ctype(info.returns) or OBJ
             if isinstance(f, ast.Attribute):
+                # float.fromhex("0x..") -> a Tier-2 float obj
+                if f.attr == "fromhex" and isinstance(f.value, ast.Name) \
+                        and f.value.id == "float":
+                    return OBJ
                 # isinstance-narrowed receiver: report the concrete method's
                 # return type, matching ex_Call's narrowing dispatch.
                 if isinstance(f.value, ast.Name) and \
@@ -3765,6 +3787,8 @@ class Transpiler:
                     else "0"
             if fn == "abs" and node.args:
                 return "pyabs(%s)" % self.as_long(node.args[0])
+            if fn == "float" and node.args:
+                return "pyfloat(%s)" % self.wrap_obj(node.args[0])
             if fn == "repr" and node.args:
                 return "pyrepr(%s)" % self.wrap_obj(node.args[0])
             if fn == "vars":
@@ -3844,6 +3868,9 @@ class Transpiler:
                 pct = self.init_param_ctypes(base) if base else []
                 defs = self.defaults_for(init, True) if init else None
                 cargs = self.coerce_args(pct, node.args, defs)
+                if bname not in self.classes:       # imported base: extern decls
+                    self.xstructs_needed.add(bname)
+                    self.used_xmethods[(bname, "__init__")] = "void"
                 return "%s___init__((%s*)self%s)" % (
                     bname, bname,
                     (", " + ", ".join(cargs)) if cargs else "")
@@ -3856,6 +3883,10 @@ class Transpiler:
                 (", " + ", ".join(argstrs)) if argstrs else "")
 
         if isinstance(func, ast.Attribute):
+            # float.fromhex("0x1.8p3") -- C's strtod parses hex float literals.
+            if func.attr == "fromhex" and isinstance(func.value, ast.Name) \
+                    and func.value.id == "float" and node.args:
+                return "float_fromhex(%s)" % self.as_str(node.args[0])
             # const-dict .get() (e.g. self.size_map.get(...)) takes priority
             if func.attr == "get" and isinstance(func.value, ast.Attribute) \
                     and isinstance(func.value.value, ast.Name) \
