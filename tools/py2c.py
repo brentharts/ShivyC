@@ -3247,7 +3247,27 @@ class Transpiler:
             self.emit('#include "mp_stdlib_bridge.h"')
         self.emit()
 
+    def _shallow_copy(self, node):
+        """copy.copy(x) on a class instance -> a fresh arena node bit-copied
+        from the source (shallow copy), keeping x's type. Returns None when the
+        argument's type isn't a known struct pointer (caller falls back)."""
+        if len(node.args) != 1:
+            return None
+        ct = self.value_ctype(node.args[0])
+        if ct and ct.endswith("*") and ct not in ("char*", "void*", OBJ):
+            struct = ct[:-1].strip()
+            e = self.expr(node.args[0])
+            return ("({ %s _cp = aalloc(sizeof(%s)); *_cp = *(%s); _cp; })"
+                    % (ct, struct, e))
+        return None
+
     def _mp_import_call(self, mod, attr, node):
+        # copy.copy(x) on a class instance is a shallow struct copy, so a
+        # self-hosted ShivyCX needs no dynamic `copy` module.
+        if mod == "copy" and attr == "copy":
+            cc = self._shallow_copy(node)
+            if cc:
+                return cc
         nargs = len(node.args)
         wrapped = [self.wrap_obj(a) for a in node.args]
         sm, sa = c_string(mod), c_string(attr)
@@ -4397,6 +4417,15 @@ class Transpiler:
 
     def value_ctype(self, node):
         """Best-effort C type of an expression, when determinable."""
+        if isinstance(node, ast.Call) and len(node.args) == 1:
+            f = node.func
+            is_copy = (
+                (isinstance(f, ast.Attribute) and f.attr == "copy"
+                 and isinstance(f.value, ast.Name) and f.value.id == "copy")
+                or (isinstance(f, ast.Name) and f.id == "copy"
+                    and self.from_imports.get("copy") == "copy"))
+            if is_copy:
+                return self.value_ctype(node.args[0])  # shallow copy keeps type
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
                 and node.func.id == "__closure_env__":
             return OBJ                  # make_closure(...) yields a Tier-2 obj
@@ -5767,6 +5796,10 @@ class Transpiler:
                 if self.stdlib_root:
                     return self._mp_import_call(modname, func.attr, node)
                 if not modname.startswith("shivyc"):
+                    if modname == "copy" and func.attr == "copy":
+                        cc = self._shallow_copy(node)
+                        if cc:
+                            return cc
                     for a in node.args:
                         self.expr(a)
                     return "OBJ_NONE /* %s.%s(...) unsupported */" % (
@@ -6397,6 +6430,19 @@ class Transpiler:
                 return self.mod_const_types[node.id] == OBJ
             if node.id in self.mod_global_types:
                 return self.mod_global_types[node.id] == OBJ
+            if node.id in self.from_imports:
+                # A name imported from another module: a singleton is a typed
+                # Cls* pointer (not a tagged obj), a func/class is a typed
+                # symbol, and a global carries its own declared ctype. Without
+                # this, an imported singleton like `error_collector` falls to
+                # the name-guess below and is wrongly treated as an obj word,
+                # so a method call wraps it in AS_OBJ() and the C won't compile.
+                kind, info = self.resolve_import(node.id,
+                                                 self.from_imports[node.id])
+                if kind in ("singleton", "func", "class"):
+                    return False
+                if kind == "global":
+                    return info == OBJ
             return infer_from_name(node.id) is None
         if isinstance(node, ast.Constant) and node.value is None:
             return True
