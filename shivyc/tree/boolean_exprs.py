@@ -3,6 +3,7 @@
 import shivyc.ctypes as ctypes
 import shivyc.il_cmds.control as control_cmds
 import shivyc.il_cmds.value as value_cmds
+import shivyc.il_gen as il_gen
 from shivyc.errors import CompilerError
 from shivyc.il_gen import ILValue
 from shivyc.tree.expr_base import _RExprNode
@@ -26,27 +27,53 @@ class _BoolAndOr(_RExprNode):
     initial_value = 1
 
     def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
-        # ILValue for storing the output of this boolean operation
-        out = ILValue(ctypes.integer)
-
-        # ILValue for initial value of output variable.
-        init = ILValue(ctypes.integer)
-        il_code.register_literal_var(init, self.initial_value)
-
-        # ILValue for other value of output variable.
-        other = ILValue(ctypes.integer)
-        il_code.register_literal_var(other, 1 - self.initial_value)
-
-        # Label which immediately precedes the line which sets out to 0 or 1.
-        set_out = il_code.get_label()
-
-        # Label which skips the line which sets out to 0 or 1.
-        end = il_code.get_label()
-
         err = f"'{str(self.op)}' operator requires scalar operands"
         left = self.left.make_il(il_code, symbol_table, c)
         if not left.ctype.is_scalar():
             raise CompilerError(err, self.left.r)
+
+        # `other_val` is the result when an operand makes the jump fire: 0 for
+        # `&&`, 1 for `||`. `initial_value` is the result otherwise.
+        other_val = 1 - self.initial_value
+
+        # Constant-fold when the operands are compile-time constants, so `&&`
+        # and `||` may appear in constant contexts -- array sizes, bit-field
+        # widths, and the glibc `_Static_assert` fallback, whose bit-field
+        # width is `(A && B) ? 2 : -1`. Short-circuit semantics are respected:
+        # a left operand that already determines the result (`0 && x`,
+        # `1 || x`) folds without the right operand contributing.
+        #
+        # gcc type-checks *both* operands even when the value short-circuits, so
+        # the right operand is probed for its type. The probe runs into a
+        # throwaway IL buffer, emitting no IL into the real stream -- which both
+        # keeps a folded result free of stray code and lets a runtime
+        # short-circuit (`1 || f()`) skip the right operand's side effects.
+        if left.literal is not None:
+            right_probe = self._probe_type(self.right, symbol_table, c)
+            if not right_probe.ctype.is_scalar():
+                raise CompilerError(err, self.right.r)
+            if self._jump_fires(left):
+                return self._literal(il_code, other_val)
+            if right_probe.literal is not None:
+                fired = self._jump_fires(right_probe)
+                return self._literal(
+                    il_code, other_val if fired else self.initial_value)
+            # Left is constant but does not decide the result and the right
+            # operand is not constant: fall through to the runtime code below,
+            # which re-evaluates the right operand (guarded by the left jump).
+
+        # Runtime path (unchanged from the non-folding case): the right operand
+        # is evaluated after the left jump so a runtime short-circuit skips it.
+        out = ILValue(ctypes.integer)
+
+        init = ILValue(ctypes.integer)
+        il_code.register_literal_var(init, self.initial_value)
+
+        other = ILValue(ctypes.integer)
+        il_code.register_literal_var(other, other_val)
+
+        set_out = il_code.get_label()
+        end = il_code.get_label()
 
         il_code.add(value_cmds.Set(out, init))
         il_code.add(self.jump_cmd(left, set_out))
@@ -59,6 +86,30 @@ class _BoolAndOr(_RExprNode):
         il_code.add(control_cmds.Label(set_out))
         il_code.add(value_cmds.Set(out, other))
         il_code.add(control_cmds.Label(end))
+        return out
+
+    def _probe_type(self, node, symbol_table, c):
+        """Evaluate `node` into a throwaway ILCode purely to obtain and validate
+        its type, emitting no IL into the real stream. The returned ILValue's
+        `.ctype` and `.literal` are valid for the folding decisions above."""
+        scratch = il_gen.ILCode()
+        scratch.start_func("<boolop-type-probe>")
+        return node.make_il(scratch, symbol_table, c)
+
+    def _jump_fires(self, val):
+        """Whether jump_cmd fires for the constant operand `val`: `&&` (which
+        jumps on zero) fires when the operand is false; `||` when it is true."""
+        try:
+            truthy = float(val.literal.val) != 0.0
+        except (TypeError, ValueError):
+            truthy = bool(val.literal.val)
+        # initial_value 1 => && / JumpZero (fires on false); 0 => || / JumpNotZero.
+        return (not truthy) if self.initial_value == 1 else truthy
+
+    def _literal(self, il_code, value):
+        """Build a literal integer ILValue holding 0 or 1."""
+        out = ILValue(ctypes.integer)
+        il_code.register_literal_var(out, str(value))
         return out
 
 
