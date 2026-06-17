@@ -23,6 +23,28 @@ MPY_DIR  ?= $(ROOT)/micropython
 MPY_PORT := $(MPY_DIR)/ports/objcore
 MPY_GENHDR := $(MPY_PORT)/build/genhdr/qstrdefs.generated.h
 
+# Large external codebases compiled via the generic runner tools/bigtest.py.
+# These targets are NOT part of `make test`/`make default`; they are opt-in and
+# slow. bigtest skips large .c files by default (override via MAX_KB) and
+# forwards extra defines/includes (DEFS / INCS) so quick experiments are easy:
+#     make test_cpython DEFS='-D FOO=1' MAX_KB=128
+MAX_KB ?= 64
+DEFS   ?=
+INCS   ?=
+# Parallel compile jobs for the big-codebase targets; 0 = one job per CPU.
+JOBS   ?= 0
+
+# CPython object model, compiled against the built-in musl (--musl).
+CPY_REPO ?= https://github.com/OpenSourceJesus/cpython-tinier
+CPY_DIR  ?= $(ROOT)/cpython-tinier
+CPY_CONFIG := $(CPY_DIR)/pyconfig.h
+CPY_DEFS := -D Py_BUILD_CORE -D thread_local=_Thread_local \
+            -D _Py_USE_GCC_BUILTIN_ATOMICS=1
+
+# 2.11BSD userland, compiled with BSD's own headers.
+BSD_REPO ?= https://github.com/brentharts/2.11BSD-riscv
+BSD_DIR  ?= $(ROOT)/2.11BSD-riscv
+
 default: shim
 	cd tests && pypy3 ./test_all.py
 	cd tests && pypy3 ./test_float.py
@@ -97,6 +119,68 @@ clean_micropython:
 	rm -rf $(MPY_DIR)
 
 # ---------------------------------------------------------------------------
+# CPython targets (minimal, single-threaded, compiled against built-in musl).
+# Opt-in and slow; large files are skipped by default (see MAX_KB).
+
+install_cpython:
+	@if [ -d "$(CPY_DIR)/.git" ]; then \
+		echo "Updating cpython in $(CPY_DIR)"; \
+		git -C "$(CPY_DIR)" pull --ff-only; \
+	else \
+		echo "Cloning $(CPY_REPO) into $(CPY_DIR)"; \
+		git clone --depth 1 "$(CPY_REPO)" "$(CPY_DIR)"; \
+	fi
+	$(MAKE) $(CPY_CONFIG)
+
+# pyconfig.h via configure (minimal build). Threads stay on (modern CPython
+# requires them); ShivyCX treats _Thread_local as a plain global, which is
+# correct for a single-threaded compile-check.
+$(CPY_CONFIG):
+	@test -d $(CPY_DIR) || { echo "Run 'make install_cpython' first."; exit 1; }
+	cd $(CPY_DIR) && ./configure --without-pymalloc --disable-test-modules >/dev/null
+	@test -f $(CPY_CONFIG) || { \
+		echo "ERROR: configure did not produce pyconfig.h."; \
+		echo "Run 'make install_cpython' first."; exit 1; }
+
+# Compile-check CPython's object model. test_cpython == test_cpython_objects.
+test_cpython test_cpython_objects: $(CPY_CONFIG)
+	pypy3 tools/bigtest.py $(CPY_DIR) 'Objects/*.c' --musl --quiet \
+		--jobs $(JOBS) --max-kb $(MAX_KB) -I . -I Include -I Include/internal \
+		$(CPY_DEFS) $(DEFS) $(INCS)
+
+clean_cpython:
+	rm -rf $(CPY_DIR)
+
+# ---------------------------------------------------------------------------
+# 2.11BSD targets (classic Unix userland, BSD's own headers). Opt-in and slow.
+
+install_bsd:
+	@if [ -d "$(BSD_DIR)/.git" ]; then \
+		echo "Updating 2.11BSD in $(BSD_DIR)"; \
+		git -C "$(BSD_DIR)" pull --ff-only; \
+	else \
+		echo "Cloning $(BSD_REPO) into $(BSD_DIR)"; \
+		git clone --depth 1 "$(BSD_REPO)" "$(BSD_DIR)"; \
+	fi
+	@# Classic 2.11BSD expects <sys/...> to resolve to the sys/h tree.
+	ln -sfn ../sys/h $(BSD_DIR)/include/sys
+	@echo "2.11BSD ready in $(BSD_DIR)"
+
+# Compile-check the BSD userland utilities.
+test_bsd test_bsd_bin:
+	@test -d $(BSD_DIR) || { echo "Run 'make install_bsd' first."; exit 1; }
+	pypy3 tools/bigtest.py $(BSD_DIR) 'bin/**/*.c' --quiet \
+		--jobs $(JOBS) --max-kb $(MAX_KB) -I include $(DEFS) $(INCS)
+
+test_bsd_usrbin:
+	@test -d $(BSD_DIR) || { echo "Run 'make install_bsd' first."; exit 1; }
+	pypy3 tools/bigtest.py $(BSD_DIR) 'usr.bin/**/*.c' --quiet \
+		--jobs $(JOBS) --max-kb $(MAX_KB) -I include $(DEFS) $(INCS)
+
+clean_bsd:
+	rm -rf $(BSD_DIR)
+
+# ---------------------------------------------------------------------------
 # Bare-metal demos
 #
 # Compile a freestanding ShivyCX app and link it against the inlined mini-OS
@@ -140,4 +224,6 @@ self:
         baremetal-kernel baremetal-irq minikraft run-irq \
         install_micropython clean_micropython test_micropython \
         test_micropython_core test_micropython_objects \
-        test_micropython_modules test_micropython_emitters test_micropython_port
+        test_micropython_modules test_micropython_emitters test_micropython_port \
+        install_cpython clean_cpython test_cpython test_cpython_objects \
+        install_bsd clean_bsd test_bsd test_bsd_bin test_bsd_usrbin
