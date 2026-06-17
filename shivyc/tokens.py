@@ -101,6 +101,8 @@ class Token:
         self.r = r
         # True for wide (L-prefixed) string/char literals.
         self.wide = False
+        # Source logical line; set by the lexer, read by the preprocessor.
+        self.logical_line = None
 
     def __repr__(self):  # pragma: no cover
         return self.content

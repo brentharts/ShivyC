@@ -37,6 +37,9 @@ class ILCode:
         self.metamorphic_funcs = set()
         self.simd_proven = set()
         self.near_scratch_funcs = set()
+        # Per-function call-structure flags, set by the stackless pass.
+        # Defaults to {} to match readers' getattr(il_code, ..., {}).
+        self.stackless_info = {}
 
     def copy(self):
         """Make copy of this object.
