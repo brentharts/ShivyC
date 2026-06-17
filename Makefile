@@ -12,6 +12,17 @@ ROOT := $(shell pwd)
 export PYTHONPATH := $(ROOT)$(if $(PYTHONPATH),:$(PYTHONPATH),)
 export PATH := $(ROOT)/bin:$(PATH)
 
+# ---------------------------------------------------------------------------
+# Micropython compile-testing
+#
+# `make install_micropython` clones (or updates) the objcore micropython fork
+# and generates its qstr/module headers. The `test_micropython*` targets then
+# compile-check slices of it through ShivyCX (under PyPy3) via tools/mpy_test.py.
+MPY_REPO ?= https://github.com/OpenSourceJesus/micropython
+MPY_DIR  ?= $(ROOT)/micropython
+MPY_PORT := $(MPY_DIR)/ports/objcore
+MPY_GENHDR := $(MPY_PORT)/build/genhdr/qstrdefs.generated.h
+
 default: shim
 	cd tests && pypy3 ./test_all.py
 	cd tests && pypy3 ./test_float.py
@@ -33,6 +44,57 @@ install:
 
 clean:
 	rm -rf bin build
+
+# ---------------------------------------------------------------------------
+# Micropython targets
+
+# Clone the objcore micropython fork (or fast-forward an existing checkout),
+# then generate the headers its sources need.
+install_micropython:
+	@if [ -d "$(MPY_DIR)/.git" ]; then \
+		echo "Updating micropython in $(MPY_DIR)"; \
+		git -C "$(MPY_DIR)" pull --ff-only; \
+	else \
+		echo "Cloning $(MPY_REPO) into $(MPY_DIR)"; \
+		git clone "$(MPY_REPO)" "$(MPY_DIR)"; \
+	fi
+	$(MAKE) $(MPY_GENHDR)
+
+# Generate micropython's qstr/module headers (required to preprocess its
+# sources). micropython generates these before compiling any .c, so the headers
+# appear even though the port's gcc build then trips the known hal.c
+# warn_unused_result error -- which is why the gcc step's failure is ignored and
+# success is verified by the header's presence instead.
+$(MPY_GENHDR):
+	-$(MAKE) -C $(MPY_PORT)
+	@test -f $(MPY_GENHDR) || { \
+		echo "ERROR: could not generate micropython headers."; \
+		echo "Run 'make install_micropython' first."; exit 1; }
+
+# Compile-check every part of micropython through ShivyCX (one warm PyPy3
+# process). Reports a per-file summary; exits non-zero if any file fails.
+test_micropython: $(MPY_GENHDR)
+	pypy3 tools/mpy_test.py all --mpy-dir $(MPY_DIR) --quiet
+
+# Individual slices, each usable as a standalone regression gate.
+test_micropython_core: $(MPY_GENHDR)
+	pypy3 tools/mpy_test.py core --mpy-dir $(MPY_DIR) --quiet
+
+test_micropython_objects: $(MPY_GENHDR)
+	pypy3 tools/mpy_test.py objects --mpy-dir $(MPY_DIR) --quiet
+
+test_micropython_modules: $(MPY_GENHDR)
+	pypy3 tools/mpy_test.py modules --mpy-dir $(MPY_DIR) --quiet
+
+test_micropython_emitters: $(MPY_GENHDR)
+	pypy3 tools/mpy_test.py emitters --mpy-dir $(MPY_DIR) --quiet
+
+test_micropython_port: $(MPY_GENHDR)
+	pypy3 tools/mpy_test.py port --mpy-dir $(MPY_DIR) --quiet
+
+# Remove the micropython checkout entirely.
+clean_micropython:
+	rm -rf $(MPY_DIR)
 
 # ---------------------------------------------------------------------------
 # Bare-metal demos
@@ -75,4 +137,7 @@ self:
 	cd tools && pypy3 py2c.py
 
 .PHONY: default test shim install clean baremetal baremetal-hello \
-        baremetal-kernel baremetal-irq minikraft run-irq
+        baremetal-kernel baremetal-irq minikraft run-irq \
+        install_micropython clean_micropython test_micropython \
+        test_micropython_core test_micropython_objects \
+        test_micropython_modules test_micropython_emitters test_micropython_port
