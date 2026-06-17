@@ -30,6 +30,14 @@ class _Equality(_ArithBinOp):
     def _nonarith(self, left, right, il_code):
         """Check equality of non-arithmetic expressions."""
 
+        # Capture object identity before any pointer cast below replaces the
+        # operands: `&a == &b` and `&a != &b` are compile-time constants because
+        # distinct named objects have distinct addresses (and `&a == &a` is
+        # true). This lets the address-comparison build-assert
+        # `sizeof(char[1 - 2 * !(&a != &b)])` evaluate at compile time.
+        left_obj = left.addr_of
+        right_obj = right.addr_of
+
         # If either operand is a null pointer constant, cast it to the
         # other's pointer type.
         if (left.ctype.is_pointer()
@@ -65,6 +73,15 @@ class _Equality(_ArithBinOp):
             with report_err():
                 err = "comparison between distinct pointer types"
                 raise CompilerError(err, self.op.r)
+
+        # Both operands are addresses of whole named objects: fold to a
+        # constant from object identity rather than emitting a runtime compare.
+        if left_obj is not None and right_obj is not None:
+            same = left_obj is right_obj
+            out = ILValue(ctypes.integer)
+            il_code.register_literal_var(
+                out, self._arith_const(0, 0 if same else 1, ctypes.integer))
+            return out
 
         # Now, we can do comparison
         out = ILValue(ctypes.integer)

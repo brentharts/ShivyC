@@ -80,6 +80,9 @@ class DirectLValue(LValue):
     def addr(self, il_code):  # noqa D102
         out = ILValue(PointerCType(self.il_value.ctype))
         il_code.add(value_cmds.AddrOf(out, self.il_value))
+        # Record that `out` is the address of this whole named object, so that
+        # comparisons of two such addresses can fold (see _Equality._nonarith).
+        out.addr_of = self.il_value
         return out
 
     def val(self, il_code):  # noqa D102
