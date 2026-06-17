@@ -4392,6 +4392,13 @@ class Transpiler:
             return True
         if self.is_obj_word(tgt.value) or bt == OBJ or \
                 isinstance(tgt.value, ast.Call):
+            # An untyped (obj) base whose attribute uniquely identifies one
+            # class is a real struct field, not a dynamic attribute: let it
+            # lower to a field store (the lvalue path casts via the unique
+            # owner), exactly as attribute *reads* already do. Only an
+            # attribute owned by no known class needs dynamic setattr.
+            if self.resolve_attr_owner(tgt.attr) is not None:
+                return False
             return True
         return False
 
