@@ -27,7 +27,7 @@ class Tagged:
         self.r = Range(p, p)
 
 
-def tokenize(code, filename):
+def tokenize(code, filename) -> "list[Token]":
     """Convert given code into a flat list of Tokens.
 
     lines - List of list of Tagged objects, where each embedded list is a
