@@ -4381,6 +4381,15 @@ class Transpiler:
         """Attribute store that cannot lower to a struct field offset."""
         if not isinstance(tgt, ast.Attribute):
             return False
+        # `module_alias.attr = v` is a store to that module's global, which the
+        # attribute-read path already resolves (e.g. p.cur_func_name reads as
+        # the module global). Let the write resolve the same way rather than
+        # falling back to dynamic setattr; the module global is declared in the
+        # source, so this stays pure C.
+        if isinstance(tgt.value, ast.Name) and \
+                (tgt.value.id in self.import_alias or
+                 tgt.value.id in self.modules):
+            return False
         if isinstance(tgt.value, ast.Name) and tgt.value.id == "self" \
                 and self.cur_class:
             if self.cur_class.field_ctype(tgt.attr) is not None:
