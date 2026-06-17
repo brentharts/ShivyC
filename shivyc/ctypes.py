@@ -261,7 +261,10 @@ class ArrayCType(CType):
         """Initialize type."""
         self.el = el
         self.n = n
-        super().__init__((n or 1) * self.el.size)
+        # n == 0 is a GNU zero-length array (a complete type of size 0, used for
+        # trailing variable-length struct members); n is None for an incomplete
+        # array, whose size is a placeholder of one element.
+        super().__init__((1 if n is None else n) * self.el.size)
 
     def alignment(self):
         """An array's alignment is that of its element type."""
