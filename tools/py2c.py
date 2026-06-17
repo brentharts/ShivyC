@@ -3884,6 +3884,20 @@ class Transpiler:
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)\
                 and node.value.id == "self" and self.cur_class:
             return getattr(self.cur_class, "field_elem_types", {}).get(node.attr)
+        if isinstance(node, ast.Call):
+            # `for x in f(...)` where f is annotated `-> list[T]`: x has type T.
+            # Resolves both local functions and imported `mod.f` calls.
+            f, fn = node.func, None
+            if isinstance(f, ast.Name) and f.id in self.func_nodes:
+                fn = self.func_nodes[f.id]
+            elif isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) \
+                    and f.value.id in self.import_alias:
+                kind, info = self.resolve_import(f.attr,
+                                                 self.import_alias[f.value.id])
+                if kind == "func":
+                    fn = info
+            if fn is not None and getattr(fn, "returns", None) is not None:
+                return ann_elem_ctype(fn.returns)
         return None
 
     def hoist_locals(self, body):
@@ -3912,6 +3926,14 @@ class Transpiler:
                     et = ann_elem_ctype(sub.annotation)
                     if et:
                         self.elem_types[sub.target.id] = et
+                elif isinstance(sub, ast.Assign):
+                    # `xs = f(...)` where f is annotated `-> list[T]`: a later
+                    # `for x in xs` can then give x the element type T.
+                    et = self.iter_elem_ctype(sub.value)
+                    if et:
+                        for t in sub.targets:
+                            if isinstance(t, ast.Name):
+                                self.elem_types[t.id] = et
 
         for stmt in body:
             for sub in ast.walk(stmt):
@@ -4177,6 +4199,15 @@ class Transpiler:
                           {ci.csym for ci in self.class_order}):
             ci = self.classes.get(cls) or (self.xclasses[cls][0]
                                            if cls in self.xclasses else None)
+            if ci is None:
+                # `cls` may be a csym (mangled, module-qualified name) rather
+                # than a short class name, e.g. for an ambiguous class. Without
+                # this, ci stays None, init looks empty, and the trampoline
+                # calls Class_new() with no args -> "too few arguments".
+                ci = next((c for c in self.classes.values()
+                           if c.csym == cls), None) \
+                    or next((c for c, _ in self.xclasses.values()
+                             if c.csym == cls), None)
             ni = self._nearest_init(ci) if ci else None
             init = ni[1] if ni else (ci.methods.get("__init__") if ci else None)
             self._emit_ctortramp(cls, ci, init)
