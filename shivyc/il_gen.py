@@ -162,6 +162,10 @@ class ILValue:
         self.ctype = ctype
         self.literal = None
         self.asm_reg = None     # explicit register binding (asm() declarations)
+        # When this value is the address of a whole named object (`&obj`), the
+        # object's ILValue is recorded here. It lets `&a == &b` / `&a != &b`
+        # fold at compile time: distinct named objects have distinct addresses.
+        self.addr_of = None
 
     def __str__(self):  # pragma: no cover
         return f'{id(self) % 1000:03}'
