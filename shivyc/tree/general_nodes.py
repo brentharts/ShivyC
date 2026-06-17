@@ -1045,7 +1045,7 @@ class Declaration(Node):
             if not il_value.literal:
                 err = "array size must be compile-time constant"
                 raise CompilerError(err, decl.r)
-            if il_value.literal.val <= 0:
+            if il_value.literal.val < 0:
                 err = "array size must be positive"
                 raise CompilerError(err, decl.r)
             if not prev_ctype.is_complete():
