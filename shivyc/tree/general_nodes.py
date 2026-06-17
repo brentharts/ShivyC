@@ -903,11 +903,15 @@ class DeclInfo:
         """
         if c.is_global and self.storage == DeclInfo.STATIC:
             linkage = symbol_table.INTERNAL
-        elif self.storage == DeclInfo.EXTERN:
+        elif (self.storage == DeclInfo.EXTERN
+              or (self.ctype.is_function() and not self.storage)):
+            # `extern`, and (per 6.2.2p5) a function with no storage-class
+            # specifier, take the linkage of a prior visible declaration if one
+            # exists; otherwise external. This makes a `static` forward
+            # declaration followed by a plain definition keep internal linkage
+            # (a common idiom: `static T f(...); ... T f(...) { ... }`).
             cur_linkage = symbol_table.lookup_linkage(self.identifier)
             linkage = cur_linkage or symbol_table.EXTERNAL
-        elif self.ctype.is_function() and not self.storage:
-            linkage = symbol_table.EXTERNAL
         elif c.is_global and not self.storage:
             linkage = symbol_table.EXTERNAL
         else:
