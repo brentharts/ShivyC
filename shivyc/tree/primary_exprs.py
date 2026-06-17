@@ -138,6 +138,13 @@ class Identifier(_LExprNode):
         self.identifier = identifier
 
     def _lvalue(self, il_code, symbol_table, c):
+        # An enum constant is an rvalue, not an lvalue, so it has no lvalue
+        # form. Returning None (rather than looking it up as a variable, which
+        # would wrongly report it undeclared) lets nodes that probe an operand's
+        # lvalue -- e.g. array subscript `a[ENUM]` or `&x` -- handle it via
+        # make_il instead.
+        if symbol_table.lookup_enum_const(self.identifier.content) is not None:
+            return None
         var = symbol_table.lookup_variable(self.identifier)
         return DirectLValue(var)
 
