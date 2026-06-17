@@ -134,6 +134,13 @@ def tokenize_line(line: list, in_comment):
     # Flag that is set True if the line is an include directive and the
     # filename has been seen and succesfully parsed.
     seen_filename = False
+    # Flag that is set True for a computed include (`#include MACRO`), whose
+    # operand is neither "FILENAME" nor <FILENAME>. Such an operand is left to
+    # tokenize as ordinary tokens; the preprocessor macro-expands it and
+    # re-reads the resulting spelling (C11 6.10.2p4). Sticky so that re-matching
+    # `#include` while the operand is still mid-chunk does not re-arm the
+    # include-filename path.
+    computed_include = False
 
     while chunk_end < len(line):
         symbol_kind = match_symbol_kind_at(line, chunk_end)
@@ -147,8 +154,21 @@ def tokenize_line(line: list, in_comment):
         next_c = line[chunk_end + 1].c if chunk_end + 1 < len(line) else ""
 
         # Set include_line flag True as soon as a `#include` is detected.
-        if match_include_command(tokens):
+        if match_include_command(tokens) and not computed_include:
             include_line = True
+
+        # At the first operand character of an include directive, decide whether
+        # it is a literal "FILENAME"/<FILENAME> or a computed include. If the
+        # operand does not begin with `"` or `<` (and is not whitespace or a
+        # comment), treat the line as a computed include: stop the
+        # include-filename path so the operand tokenizes normally.
+        if (include_line and not seen_filename
+                and chunk_start == chunk_end
+                and not cur_c.isspace()
+                and not (cur_c == "/" and next_c in ("*", "/"))
+                and cur_c not in ('"', "<")):
+            include_line = False
+            computed_include = True
 
         if in_comment:
             # If next characters end the comment...
