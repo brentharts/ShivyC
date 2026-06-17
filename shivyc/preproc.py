@@ -498,9 +498,18 @@ class _Preprocessor:
         if rest[0].kind is token_kinds.include_file:
             header = rest[0].content
         else:
-            # Computed include: expand macros then read the spelling.
+            # Computed include: expand macros then read the spelling. The
+            # result must still name a header in "..." or <...> form; otherwise
+            # it is not a valid include directive (e.g. `#include blah`).
             exp = self._expand_line(rest, this_file)
             header = "".join(spell(t) for t in exp).strip()
+            if not ((len(header) >= 2 and header[0] == '"' and header[-1] == '"')
+                    or (len(header) >= 2 and header[0] == "<"
+                        and header[-1] == ">")):
+                error_collector.add(CompilerError(
+                    'expected "FILENAME" or <FILENAME> after include directive',
+                    rest[0].r))
+                return
         try:
             text, filename = read_file(header, this_file)
             inc = lexer.tokenize(text, filename)
