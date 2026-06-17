@@ -93,6 +93,13 @@ class TestMacroInclude(unittest.TestCase):
             "int main(void){ return add(40, 2); }\n",
             {"lib.h": "int add(int a, int b){ return a + b; }\n"}), 42)
 
+    def test_non_filename_operand_errors(self):
+        # A computed include whose expansion is not a "FILENAME"/<FILENAME>
+        # spelling (here a bare, undefined identifier) is rejected -- matching
+        # gcc's `#include expects "FILENAME" or <FILENAME>`. Compilation fails.
+        with self.assertRaises(AssertionError):
+            _run("#include blah\nint main(void){ return 0; }\n")
+
 
 if __name__ == "__main__":
     unittest.main()
