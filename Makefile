@@ -99,6 +99,42 @@ selfhost_coverage_musl:
 	python3 tools/selfhost.py coverage --musl
 
 # ---------------------------------------------------------------------------
+# rpython examples
+#
+# Compile each rpython example straight to a native binary through
+# shivyc.main's `.py` path (transpile -> C -> ShivyCX -> link) and check its
+# exit code. Examples without a `main()` are libraries and are not listed here.
+#     make rpython
+RPY    := examples/rpython2c
+RPYBIN := build/rpython
+rpython:
+	@mkdir -p $(RPYBIN)
+	@fail=0; \
+	run() { \
+	  src=$$1; exp=$$2; in=$$3; out=$(RPYBIN)/`basename $$src .py`; \
+	  if ! python3 -m shivyc.main --no-cache $$src -o $$out >/dev/null 2>&1; then \
+	    echo "  FAIL(compile) $$src"; fail=1; return; fi; \
+	  if [ -n "$$in" ]; then echo "$$in" | timeout 20 $$out >/dev/null 2>&1; \
+	  else timeout 20 $$out >/dev/null 2>&1; fi; rc=$$?; \
+	  if [ "$$rc" = "$$exp" ]; then echo "  ok    $$src (exit $$rc)"; \
+	  else echo "  FAIL  $$src (exit $$rc, expected $$exp)"; fail=1; fi; }; \
+	run $(RPY)/numpy/simd_kernels.py 55 ""; \
+	run $(RPY)/numpy/simd_blas.py   186 ""; \
+	run $(RPY)/numpy/ufuncs.py       49 ""; \
+	run $(RPY)/numpy/matmul.py      239 ""; \
+	run $(RPY)/io/simple_io.py        5 world; \
+	run $(RPY)/net/socket_echo.py     5 ""; \
+	run $(RPY)/mandelbrot/mandelbrot.py 70 ""; \
+	if [ $$fail = 0 ]; then echo "rpython examples: all passed"; \
+	else echo "rpython examples: FAILURES"; fi; exit $$fail
+
+# ---------------------------------------------------------------------------
+# Benchmarks: whole-program SIMD vs gcc -O0/-O2, memory-safety table, etc.
+#     make benchmarks
+benchmarks:
+	cd benchmarks && python3 run_benchmarks.py
+
+# ---------------------------------------------------------------------------
 # Micropython targets
 
 # Clone the objcore micropython fork (or fast-forward an existing checkout),
@@ -254,6 +290,7 @@ self:
 .PHONY: default test shim install clean baremetal baremetal-hello \
         selfhost selfhost_objcore selfhost_bench selfhost_coverage \
         selfhost_coverage_musl \
+        rpython benchmarks \
         baremetal-kernel baremetal-irq minikraft run-irq \
         install_micropython clean_micropython test_micropython \
         test_micropython_core test_micropython_objects \

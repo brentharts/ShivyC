@@ -30,7 +30,10 @@ On top of standard C, ShivyCX adds:
   automatic `free` insertion for unannotated C.
 - **Bare-metal operation** — freestanding, bootable 64-bit images with an inlined
   mini-OS.
-- **A Python→C transpiler** — toward compiling the front end with itself.
+- **A Python→C transpiler** — toward compiling the front end with itself, which
+  doubles as **rpython**: a fast, runtime-free Python subset (typed numpy-style
+  arrays, auto-contract SIMD, libm, file/socket I/O) that `shivyc.main` compiles
+  straight from `.py` to a native binary.
 
 
 ---
@@ -230,6 +233,47 @@ python3 tools/py2c.py --out /tmp/out
 # or a single module
 python3 tools/py2c.py --out /tmp/out shivyc/il_cmds/value.py
 ```
+
+---
+
+## rpython — a fast, safe Python subset that compiles to native C
+
+The same transpiler doubles as **rpython**: a restricted-Python dialect that
+compiles, with *no runtime and no boxing*, straight to native C and on to a
+ShivyCX binary. `shivyc.main` accepts `.py` sources directly — it transpiles
+through `tools/py2c.py`, supplies the few libc prototypes the kernel needs, and
+compiles and links:
+
+```sh
+python3 -m shivyc.main examples/rpython2c/numpy/simd_kernels.py -o simd && ./simd
+```
+
+What makes it fast and small:
+
+- **Name- and flow-based type inference.** Unannotated integer drivers (`i`,
+  `n`, `count`, `iters`, …) become `int`; locals assigned float literals or
+  division become `double` (via a fixpoint). No annotations needed for ordinary
+  numeric loops, which lower to plain C with zero boxing.
+- **numpy-style typed arrays.** `"f32*"`, `"f64*"`, `"i32*"` (and fixed-size
+  `"f32[256]"`) are real C arrays with native indexing — not boxed lists.
+- **Auto-contracts → SIMD.** A leading `assert len(x) % 4 == 0` (or an inferred
+  divisibility fact from a fixed-size array) is lowered to a ShivyCX contract;
+  the compiler proves it at the call site and emits a packed-SSE body with no
+  scalar remainder. On an element-wise recurrence this **matches `gcc -O2` and
+  beats `gcc -O0` ~20×** (see [`benchmarks/`](benchmarks/)).
+- **libm ufuncs.** `exp`, `log`, `sin`, `sqrt`, `tanh`, … (bare, or `math.`/
+  `np.`-qualified) type as `double` and lower to native libm calls.
+- **System glue.** File I/O (`open`/`read`/`write`/`close`), `input()`,
+  `os.system`, `os.fork`, BSD **sockets** (`socket`/`bind`/`connect`/`accept`/
+  `send`/`recv`), and `sys.argv` all lower to plain C — enough to write real
+  programs (a TCP echo server, a Mandelbrot renderer) with no runtime.
+- **Build reports.** `--pdf` renders any build (C or rpython) as a PDF: overview,
+  TikZ call graph, safety findings in red, the Python source beside the
+  generated C with its auto-inferred contracts, and the program output.
+
+Worked examples live in [`examples/rpython2c/`](examples/rpython2c/): `numpy/`
+(SIMD kernels, BLAS, ufuncs, matmul), `io/`, `net/`, and `mandelbrot/`. Run them
+all with `make rpython`.
 
 ---
 
