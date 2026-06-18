@@ -122,6 +122,8 @@ rpython:
 	run $(RPY)/numpy/simd_blas.py   186 ""; \
 	run $(RPY)/numpy/ufuncs.py       49 ""; \
 	run $(RPY)/numpy/matmul.py      239 ""; \
+	run $(RPY)/nn/neural_net.py     199 ""; \
+	run $(RPY)/nbody/nbody.py        11 ""; \
 	run $(RPY)/io/simple_io.py        5 world; \
 	run $(RPY)/net/socket_echo.py     5 ""; \
 	run $(RPY)/mandelbrot/mandelbrot.py 70 ""; \

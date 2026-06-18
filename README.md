@@ -263,6 +263,12 @@ What makes it fast and small:
   beats `gcc -O0` ~20×** (see [`benchmarks/`](benchmarks/)).
 - **libm ufuncs.** `exp`, `log`, `sin`, `sqrt`, `tanh`, … (bare, or `math.`/
   `np.`-qualified) type as `double` and lower to native libm calls.
+- **Classes become structs.** A plain data class (no inheritance or dynamic
+  dispatch) is lowered POD-style to a bare C `struct` with `malloc` and direct
+  method calls — no object header, vtable, or runtime. Instances pass by
+  pointer, so a function or method can take them directly
+  (`def pull(p: "Body*", q: "Body*")` → `void pull(Body* p, Body* q)`). Richer
+  classes keep the tagged-object model automatically.
 - **System glue.** File I/O (`open`/`read`/`write`/`close`), `input()`,
   `os.system`, `os.fork`, BSD **sockets** (`socket`/`bind`/`connect`/`accept`/
   `send`/`recv`), and `sys.argv` all lower to plain C — enough to write real
@@ -272,8 +278,9 @@ What makes it fast and small:
   generated C with its auto-inferred contracts, and the program output.
 
 Worked examples live in [`examples/rpython2c/`](examples/rpython2c/): `numpy/`
-(SIMD kernels, BLAS, ufuncs, matmul), `io/`, `net/`, and `mandelbrot/`. Run them
-all with `make rpython`.
+(SIMD kernels, BLAS, ufuncs, matmul), `nn/` (a feed-forward neural net showing
+classes→structs), `nbody/` (a gravity sim that passes class instances by
+pointer), `io/`, `net/`, and `mandelbrot/`. Run them all with `make rpython`.
 
 ---
 
