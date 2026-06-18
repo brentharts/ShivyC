@@ -35,7 +35,7 @@ class ILCode:
         self._str_lit_counter = 0
         # optimization metadata attached by main.py's analysis passes
         self.metamorphic_funcs = set()
-        self.simd_proven = set()
+        self.simd_proven = {}
         self.near_scratch_funcs = set()
         # Per-function call-structure flags, set by the stackless pass.
         # Defaults to {} to match readers' getattr(il_code, ..., {}).

@@ -443,11 +443,18 @@ class ASMGen:
 
             self.asm_code.add(asm_cmds.AsmLabel(func))
 
-            # Contract-proven SIMD reductions get a hand-synthesized,
-            # fallback-free SSE2 body instead of the normal scalar codegen.
-            if func in getattr(self.il_code, "simd_proven", set()):
+            # Contract-proven SIMD kernels get a hand-synthesized,
+            # fallback-free SSE body instead of the normal scalar codegen.
+            _simd_desc = getattr(self.il_code, "simd_proven", {})
+            _simd_desc = _simd_desc.get(func) \
+                if isinstance(_simd_desc, dict) else None
+            if _simd_desc is not None:
                 import shivyc.simd_contracts as simd_contracts
-                simd_contracts.synth_sse2_reduce(self.asm_code, None)
+                if _simd_desc.get("kind") == "reduce":
+                    simd_contracts.synth_sse2_reduce(self.asm_code, None)
+                else:
+                    simd_contracts.synth_sse_elementwise(
+                        self.asm_code, _simd_desc)
             else:
                 # Tell IL commands whether we are inside a hot/interrupt routine
                 # (controls the zero-latency register read path).
