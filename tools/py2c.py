@@ -4665,6 +4665,12 @@ class Transpiler:
                     lines.append("subscript_set(%s, %s, %s);" % (
                         self.expr(tgt.value), self.wrap_obj(tgt.slice),
                         self.wrap_obj(node.value)))
+                elif self.value_ctype(tgt.value) == "char*" and \
+                        not isinstance(tgt.slice, ast.Slice):
+                    # mutable byte buffer (e.g. malloc'd char*): store the byte
+                    # directly rather than through the string read-accessor.
+                    lines.append("%s[%s] = %s;" % (
+                        self.expr(tgt.value), self.as_long(tgt.slice), rhs))
                 else:
                     lines.append("%s = %s;" % (self.expr(tgt), rhs))
                 continue
@@ -5831,6 +5837,11 @@ class Transpiler:
             if self.value_ctype(recv) == "FILE*":
                 fe = self.expr(recv)
                 if f.attr == "write" and node.args:
+                    if len(node.args) >= 2:          # write(buf, n) -> fwrite
+                        self._io_used.add("fwrite")
+                        return "fwrite(%s, 1, %s, %s)" % (
+                            self.expr(node.args[0]),
+                            self.as_long(node.args[1]), fe)
                     self._io_used.add("fputs")
                     return "fputs(%s, %s)" % (self.as_str(node.args[0]), fe)
                 if f.attr == "close":
