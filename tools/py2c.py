@@ -2345,6 +2345,7 @@ class Transpiler:
         self.class_typedef_names = {ci.csym for ci in self.class_order}
         KNOWN_CLASSES = self.classes
         VTABLE_METHODS = vt
+        self._compute_pod_set(tree)
         self.build_owner_maps()
         self.collect_imports(tree)
         # cross-module class registry: clsname -> (ClassInfo, modname)
@@ -2481,39 +2482,6 @@ class Transpiler:
             self.xstructs_needed.add(c)
         if self.class_order:
             self.emit()
-        # rpython POD classes: a plain data class (no inheritance, no dynamic
-        # dispatch, no class-level statics/attrs) is lowered to a bare C struct
-        # with malloc and no Obj header / TypeInfo / vtable, so it stays
-        # runtime-free. Rich classes (the self-host front end) keep the tagged
-        # object model.
-        self._has_subclass = set()
-        for ci in self.class_order:
-            if ci.base is not None:
-                self._has_subclass.add(ci.base.name)
-        # A class used as anything other than a direct constructor call
-        # (`X(...)`) -- an isinstance target, a value passed/stored, a
-        # classmethod/attribute access -- needs its TypeInfo and the object
-        # model, so it is never POD.
-        class_names = {ci.name for ci in self.class_order}
-        value_used = set()
-        for parent in ast.walk(tree):
-            for _f, child in ast.iter_fields(parent):
-                kids = child if isinstance(child, list) else [child]
-                for c in kids:
-                    if isinstance(c, ast.Name) and c.id in class_names:
-                        if isinstance(parent, ast.Call) and parent.func is c:
-                            continue            # construction X(...) is fine
-                        value_used.add(c.id)
-        self._pod_set = set()
-        for ci in self.class_order:
-            if (self._pod_enabled
-                    and ci.base is None and not getattr(ci, "base_name", None)
-                    and ci.name not in self._has_subclass
-                    and ci.name not in value_used
-                    and not getattr(ci, "const_dicts", None)
-                    and not getattr(ci, "class_statics", None)
-                    and not self._resolved_class_attrs(ci)):
-                self._pod_set.add(ci.csym)
         non_pod = [ci for ci in self.class_order
                    if ci.csym not in self._pod_set]
 
@@ -2875,6 +2843,18 @@ class Transpiler:
         base = ann_to_ctype(ann)
         if base is not None:
             return base
+        # A bare POD class annotation (`"Body"` / `"Body*"`) resolves to a plain
+        # struct pointer: POD classes are passed by pointer, not via the boxed
+        # `obj` ABI, so a function can take a `Body*` directly.
+        try:
+            _text = ast.unparse(ann).strip().strip("'\"")
+        except Exception:
+            _text = None
+        if _text:
+            _bare = _text[:-1] if _text.endswith("*") else _text
+            _ci = self.classes.get(_bare)
+            if _ci is not None and _ci.csym in getattr(self, "_pod_set", set()):
+                return _ci.csym + "*"
         try:
             text = ast.unparse(ann).strip().strip("'\"")
         except Exception:
@@ -3380,7 +3360,7 @@ class Transpiler:
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
                 self.func_returns[node.name] = ann_to_ctype(node.returns) or OBJ
-                self.func_params[node.name] = [arg_ctype(node, a)
+                self.func_params[node.name] = [self.arg_ctype_q(node, a)
                                                for a in node.args.args]
                 self.func_nodes[node.name] = node
             if not isinstance(node, ast.Assign):
@@ -3609,6 +3589,46 @@ class Transpiler:
         return parts
 
     # ---- struct emission -------------------------------------------------
+
+    def _compute_pod_set(self, tree):
+        """Decide which classes get the POD lowering (a bare struct passed by
+        pointer, with malloc and no Obj header / vtable / runtime). A class is
+        POD only if it has no base, no subclass, no class-level statics/attrs,
+        and is never used as a value (isinstance target, passed/stored, or used
+        as a base) -- anything but a direct constructor call `X(...)`. Computed
+        early (before func/param ctypes) so a `Body*` annotation resolves to a
+        plain struct pointer rather than the boxed obj ABI."""
+        self._has_subclass = set()
+        for ci in self.class_order:
+            if getattr(ci, "base_name", None):
+                self._has_subclass.add(ci.base_name)
+        class_names = {ci.name for ci in self.class_order}
+        value_used = set()
+        for parent in ast.walk(tree):
+            for _f, child in ast.iter_fields(parent):
+                kids = child if isinstance(child, list) else [child]
+                for c in kids:
+                    if isinstance(c, ast.Name) and c.id in class_names:
+                        if isinstance(parent, ast.Call) and parent.func is c:
+                            continue            # construction X(...) is fine
+                        value_used.add(c.id)
+        self._pod_set = set()
+        for ci in self.class_order:
+            if (self._pod_enabled
+                    and not getattr(ci, "base_name", None)
+                    and ci.name not in self._has_subclass
+                    and ci.name not in value_used
+                    and not getattr(ci, "const_dicts", None)
+                    and not getattr(ci, "class_statics", None)
+                    and not self._resolved_class_attrs(ci)):
+                self._pod_set.add(ci.csym)
+        # method AST nodes belonging to POD classes: their class-pointer params
+        # must stay typed pointers (POD methods are direct, non-virtual calls).
+        self._pod_method_nodes = set()
+        for ci in self.class_order:
+            if ci.csym in self._pod_set:
+                for fn in ci.methods.values():
+                    self._pod_method_nodes.add(id(fn))
 
     def emit_struct(self, ci):
         bn = (" : " + ci.base_name) if ci.base_name else ""
@@ -3989,7 +4009,8 @@ class Transpiler:
         args = fn.args.args[1:] if skip_self else fn.args.args
         for arg in args:
             ct = self.arg_ctype_q(fn, arg)
-            if fn.name in VTABLE_METHODS and self._is_class_ptr(ct):
+            if fn.name in VTABLE_METHODS and self._is_class_ptr(ct) \
+                    and id(fn) not in self._pod_method_nodes:
                 ct = OBJ
             params.append("%s %s" % (self.ctype_csym(ct), self.pname(arg.arg)))
         if fn.args.kwarg:
@@ -4008,7 +4029,8 @@ class Transpiler:
         args = fn.args.args[1:] if skip_self else fn.args.args
         for arg in args:
             ct = self.arg_ctype_q(fn, arg)
-            if fn.name in VTABLE_METHODS and self._is_class_ptr(ct):
+            if fn.name in VTABLE_METHODS and self._is_class_ptr(ct) \
+                    and id(fn) not in self._pod_method_nodes:
                 ct = OBJ
             params.append("%s %s" % (self.ctype_csym(ct), self.pname(arg.arg)))
         if fn.args.kwarg:
@@ -4029,7 +4051,8 @@ class Transpiler:
         args = fn.args.args[1:] if skip_self else fn.args.args
         for arg in args:
             ct = self.arg_ctype_q(fn, arg)
-            if fn.name in VTABLE_METHODS and self._is_class_ptr(ct):
+            if fn.name in VTABLE_METHODS and self._is_class_ptr(ct) \
+                    and id(fn) not in self._pod_method_nodes:
                 # boxed `obj` param (vtable ABI) with a known concrete class:
                 # keep it obj, but narrow so member/method access resolves to
                 # the typed struct (unwrapping with AS_OBJ at each use).
@@ -6814,7 +6837,7 @@ class Transpiler:
             if ci is not None and ci.csym in self._pod_set and \
                     meth in ci.methods:
                 fn = ci.methods[meth]
-                pct = [arg_ctype(fn, a) for a in fn.args.args[1:]]
+                pct = [self.arg_ctype_q(fn, a) for a in fn.args.args[1:]]
                 defs = self.defaults_for(fn, True)
                 cargs = self.coerce_args(pct, arg_nodes, defs)
                 recv = self.expr(recv_node)
