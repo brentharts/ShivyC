@@ -299,6 +299,7 @@ def process_py_file(file, args):
                 ("fopen", "void *fopen(const char *, const char *);"),
                 ("fputs", "int fputs(const char *, void *);"),
                 ("fgets", "char *fgets(char *, int, void *);"),
+                ("fwrite", "unsigned long fwrite(const void *, unsigned long, unsigned long, void *);"),
                 ("fclose", "int fclose(void *);"),
                 ("system", "int system(const char *);"),
                 ("puts", "int puts(const char *);"),
