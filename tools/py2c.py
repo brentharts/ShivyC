@@ -1190,8 +1190,22 @@ INT_NAMES = {
     "lineno", "col", "column", "start", "end", "depth", "level", "width",
     "height", "amount", "total", "addr", "address", "byte", "bytes", "bits",
     "rbp_offset", "spot_size",
+    # rpython numeric-loop conventions
+    "limit", "terms", "iters", "iterations", "steps", "seed", "rows", "cols",
+    "rank", "dim", "dims", "stride", "nrows", "ncols", "iter", "reps",
 }
 INT_SUFFIXES = ("size", "offset", "count", "index", "len", "num", "idx")
+
+# Float-by-name: numeric scalars that are conventionally real-valued. Kept
+# narrow and domain-flavoured (stats / signals / geometry) so it does not
+# collide with the integer-heavy names above.
+FLOAT_NAMES = {
+    "ratio", "rate", "pct", "percent", "scale", "factor", "mean", "avg",
+    "average", "alpha", "beta", "gamma", "theta", "freq", "frequency",
+    "prob", "probability", "weight", "epsilon", "eps", "tolerance", "tol",
+    "magnitude", "amplitude", "phase", "angle", "radius",
+}
+FLOAT_SUFFIXES = ("ratio", "rate", "pct", "scale", "factor", "freq", "prob")
 
 STR_NAMES = {
     "name", "text", "s", "string", "msg", "message", "filename", "fname",
@@ -1265,11 +1279,15 @@ def infer_from_name(name):
         return "char*"
     if low in BOOL_NAMES:
         return "bool"
+    if low in FLOAT_NAMES:
+        return "double"
     if low.startswith(BOOL_PREFIXES):
         return "bool"
     tail = low.rsplit("_", 1)[-1]
     if tail in INT_SUFFIXES and not name.startswith("_"):
         return "int"
+    if tail in FLOAT_SUFFIXES and not name.startswith("_"):
+        return "double"
     if tail in STR_SUFFIXES:
         return "char*"
     return None
@@ -1365,12 +1383,20 @@ def _param_assigned_from_call(fn, name, call_names):
 
 
 def _param_used_in_str_compare(fn, name):
-    """True if `name` is compared with ==/!= (likely a str in stdlib code)."""
+    """True if `name` is equality-compared (==/!=) against a string literal --
+    a strong hint it is a str. Ordering comparisons (<, <=, >, >=) are numeric
+    and must NOT trigger this, or a plain `i < n` would wrongly force `n` to
+    obj and defeat the int-by-name inference."""
     for n in ast.walk(fn):
         if not isinstance(n, ast.Compare):
             continue
+        if not all(isinstance(op, (ast.Eq, ast.NotEq)) for op in n.ops):
+            continue
         sides = [n.left] + list(n.comparators)
-        if any(isinstance(s, ast.Name) and s.id == name for s in sides):
+        if not any(isinstance(s, ast.Name) and s.id == name for s in sides):
+            continue
+        if any(isinstance(s, ast.Constant) and isinstance(s.value, str)
+               for s in sides):
             return True
     return False
 
