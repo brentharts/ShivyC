@@ -125,6 +125,8 @@ rpython:
 	run $(RPY)/nn/neural_net.py     199 ""; \
 	run $(RPY)/nbody/nbody.py        11 ""; \
 	run $(RPY)/classes/polymorphism.py 22 ""; \
+	run $(RPY)/memory/del_demo.py    60 ""; \
+	run $(RPY)/memory/autofree.py   135 ""; \
 	run $(RPY)/io/simple_io.py        5 world; \
 	run $(RPY)/net/socket_echo.py     5 ""; \
 	run $(RPY)/mandelbrot/mandelbrot.py 70 ""; \

@@ -282,8 +282,10 @@ What makes it fast and small:
 Worked examples live in [`examples/rpython2c/`](examples/rpython2c/): `numpy/`
 (SIMD kernels, BLAS, ufuncs, matmul), `nn/` (a feed-forward neural net showing
 classes→structs), `nbody/` (a gravity sim that passes class instances by
-pointer), `classes/` (inheritance + polymorphism via the object model), `io/`,
-`net/`, and `mandelbrot/`. Run them all with `make rpython`.
+pointer), `classes/` (inheritance + polymorphism via the object model),
+`memory/` (`del`, compiler-inserted `free` via whole-program escape analysis,
+and the `--pdf` memory report), `io/`, `net/`, and `mandelbrot/`. Run them all
+with `make rpython`.
 
 ---
 
