@@ -293,6 +293,16 @@ def process_py_file(file, args):
             prelude.append("int printf(const char *, ...);")
         if re.search(r"\bsqrt\b", code):
             prelude.append("double sqrt(double);")
+        for fn in ("cbrt", "exp", "exp2", "expm1", "log", "log2", "log10",
+                   "log1p", "sin", "cos", "tan", "asin", "acos", "atan",
+                   "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "fabs",
+                   "floor", "ceil", "round", "trunc"):
+            if re.search(r"\b" + fn + r"\b", code):
+                prelude.append("double %s(double);" % fn)
+        for fn in ("pow", "fmod", "fmax", "fmin", "atan2", "hypot",
+                   "copysign"):
+            if re.search(r"\b" + fn + r"\b", code):
+                prelude.append("double %s(double, double);" % fn)
         if re.search(r"\batoi\b", code):
             prelude.append("int atoi(const char *);")
         for sym, proto in [
@@ -874,7 +884,7 @@ def link(binary_name, obj_names, writable_text=False):
         # Writable text for metamorphic returns is arranged via the .text
         # section's "awx" flag (set in asm_gen), which is compatible with the
         # glibc crt startup; the older -N/OMAGIC route is not.
-        cmd += ["-dynamic-linker", linux_so, crtnum, crti, "-lc"]
+        cmd += ["-dynamic-linker", linux_so, crtnum, crti, "-lc", "-lm"]
 
         # find files to link
         subprocess.check_call(cmd + obj_names + [crtn, "-o", binary_name])
