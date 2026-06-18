@@ -246,6 +246,68 @@ def _sysv_regs(layout):
     return regs
 
 
+def _classify_dot(cmds, ptrs, layout):
+    """Recognize a float dot product `acc = acc + a[i]*b[i]` over a loop that
+    returns the accumulator. Two pointer inputs, no store; the value added each
+    iteration is the product of the two loads, written back into the
+    accumulator. Returns a descriptor (kind 'dot') or None."""
+    defmap = {}
+    for c in cmds:
+        for o in c.outputs():
+            defmap[o] = c
+    reads = [c for c in cmds if isinstance(c, value_cmds.ReadAt)]
+    read_outs = {r.output for r in reads}
+
+    def origin(v):
+        d = defmap.get(v)
+        while isinstance(d, value_cmds.Set):
+            v = d.arg
+            d = defmap.get(v)
+        return d
+
+    def is_load(v):
+        d = defmap.get(v)
+        while isinstance(d, value_cmds.Set):
+            v = d.arg
+            d = defmap.get(v)
+        return v in read_outs
+
+    set_targets = {}
+    for c in cmds:
+        if isinstance(c, value_cmds.Set):
+            set_targets.setdefault(c.arg, []).append(c.output)
+
+    for c in cmds:
+        if not isinstance(c, math_cmds.Add):
+            continue
+        a, b = c.arg1, c.arg2
+        for acc, term in ((a, b), (b, a)):
+            dt = origin(term)
+            if isinstance(dt, math_cmds.Mult) and \
+                    is_load(dt.arg1) and is_load(dt.arg2) and \
+                    not is_load(acc) and \
+                    acc in set_targets.get(c.output, []):
+                load_ct = reads[0].output.ctype
+                # accumulator and array element type must match (no mixed
+                # float-array / double-accumulator widths)
+                if not load_ct.is_floating() or \
+                        not c.output.ctype.is_floating() or \
+                        c.output.ctype.size != load_ct.size:
+                    return None
+                regs = _sysv_regs(layout)
+                ints = [a for a in layout if a["is_int"]]
+                return {
+                    "kind": "dot",
+                    "elem_size": load_ct.size,
+                    "in_regs": [regs[p["index"]] for p in ptrs],
+                    "out_reg": None,
+                    "scalar_reg": None,
+                    "len_reg": (_REG32[regs[ints[0]["index"]]]
+                                if ints else None),
+                }
+    return None
+
+
 def _classify_elementwise(cmds, ptrs, layout, name_of=None):
     """Recognize a float element-wise store kernel and return a descriptor with
     the System V registers the synthesizer needs. Supported shapes:
@@ -267,6 +329,14 @@ def _classify_elementwise(cmds, ptrs, layout, name_of=None):
             defmap[o] = c
     reads = [c for c in cmds if isinstance(c, value_cmds.ReadAt)]
     stores = [c for c in cmds if isinstance(c, value_cmds.SetAt)]
+
+    # float dot product: acc = acc + a[i]*b[i] over a loop, returns a float.
+    # No store; two pointer inputs; the accumulated term is a product of loads.
+    if len(stores) == 0 and len(reads) == 2 and len(ptrs) == 2:
+        dotdesc = _classify_dot(cmds, ptrs, layout)
+        if dotdesc:
+            return dotdesc
+
     if len(stores) != 1:
         return None
     store = stores[0]
@@ -294,6 +364,8 @@ def _classify_elementwise(cmds, ptrs, layout, name_of=None):
     out_reg = regs[ptrs[-1]["index"]]
     floats = [a for a in layout if a["is_float"]]
     scalar_reg = regs[floats[0]["index"]] if floats else None
+    ints = [a for a in layout if a["is_int"]]
+    len_reg = _REG32[regs[ints[0]["index"]]] if ints else None
 
     def base(extra):
         d = dict(extra)
@@ -301,6 +373,7 @@ def _classify_elementwise(cmds, ptrs, layout, name_of=None):
         d["in_regs"] = in_regs
         d["out_reg"] = out_reg
         d["scalar_reg"] = scalar_reg
+        d["len_reg"] = len_reg
         return d
 
     d = origin(store.val)
@@ -317,6 +390,18 @@ def _classify_elementwise(cmds, ptrs, layout, name_of=None):
         if target in _MAP_FUNCS and any(is_load(a) for a in d.inputs()):
             return base({"kind": "map", "op": _MAP_FUNCS[target]})
         return None
+
+    # single-input scalar broadcast: out[i] = x[i] {*,+,-} s  (2 ptr + fp scalar)
+    if len(reads) == 1 and len(ptrs) == 2 and scalar_reg is not None and \
+            isinstance(d, (math_cmds.Mult, math_cmds.Add, math_cmds.Subtr)):
+        op = {math_cmds.Mult: "mul", math_cmds.Add: "add",
+              math_cmds.Subtr: "sub"}[type(d)]
+        la, lb = is_load(d.arg1), is_load(d.arg2)
+        # exactly one operand is the load; the other is the broadcast scalar.
+        if la and not lb:
+            return base({"kind": "scale", "op": op})
+        if lb and not la and op != "sub":   # commutative: scalar on the left
+            return base({"kind": "scale", "op": op})
 
     if len(reads) == 2 and isinstance(d, math_cmds.Add) and len(ptrs) == 3:
         a, b = d.arg1, d.arg2
@@ -532,20 +617,48 @@ def synth_sse_elementwise(asm_code, desc):
     lanes = 16 // elem
     loop = asm_code.get_label()
 
+    # ---- dot product: returns the reduced scalar in xmm0 -------------------
+    if desc["kind"] == "dot":
+        raw = ["push rbp", "mov rbp, rsp", "xorps xmm0, xmm0"]
+        if fixed is not None:
+            raw.append("mov r8d, %d" % (fixed // lanes))
+        else:
+            raw += ["mov r8d, %s" % desc["len_reg"], "shr r8d, %d" % shift]
+        raw += ["xor rax, rax", loop + ":",
+                "%s xmm1, [%s + rax]" % (mov, ins[0]),
+                "%s xmm2, [%s + rax]" % (mov, ins[1]),
+                "mul%s xmm1, xmm2" % suf,
+                "add%s xmm0, xmm1" % suf,
+                "add rax, 16", "dec r8d", "jnz " + loop]
+        # horizontal sum of the lane accumulator into xmm0[0]
+        if elem == 4:
+            raw += ["movaps xmm1, xmm0", "shufps xmm1, xmm0, 0x0e",
+                    "addps xmm0, xmm1", "movaps xmm1, xmm0",
+                    "shufps xmm1, xmm0, 0x01", "addss xmm0, xmm1"]
+        else:
+            raw += ["movapd xmm1, xmm0", "unpckhpd xmm1, xmm1",
+                    "addsd xmm0, xmm1"]
+        raw += ["mov rsp, rbp", "pop rbp", "ret"]
+        for line in raw:
+            asm_code.add(asm_cmds.Raw(line))
+        return
+
     raw = ["push rbp", "mov rbp, rsp"]
-    if desc["kind"] == "saxpy" and scalar:
+    if desc["kind"] in ("saxpy", "scale") and scalar:
         raw.append(bcast % (scalar, scalar))    # broadcast the scalar lane-wise
     if fixed is not None:
         raw.append("mov r8d, %d" % (fixed // lanes))
     else:
-        # length is the integer argument right after the pointers
-        len_reg32 = _REG32[_INT_REGS64[len(ins) + 1]]
-        raw += ["mov r8d, %s" % len_reg32, "shr r8d, %d" % shift]
+        raw += ["mov r8d, %s" % desc["len_reg"], "shr r8d, %d" % shift]
     raw += ["xor rax, rax", loop + ":"]
 
     if desc["kind"] == "map":
         raw += ["%s xmm1, [%s + rax]" % (mov, ins[0]),
                 "sqrt%s xmm1, xmm1" % suf,
+                "%s [%s + rax], xmm1" % (mov, out)]
+    elif desc["kind"] == "scale":
+        raw += ["%s xmm1, [%s + rax]" % (mov, ins[0]),
+                "%s%s xmm1, %s" % (desc["op"], suf, scalar),
                 "%s [%s + rax], xmm1" % (mov, out)]
     elif desc["kind"] == "saxpy":
         raw += [
