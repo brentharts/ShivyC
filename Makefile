@@ -68,6 +68,37 @@ clean:
 	rm -rf bin build
 
 # ---------------------------------------------------------------------------
+# Self-hosting: transpile ShivyCX's own source to C and build/test/bench it.
+#
+# tools/selfhost.py transpiles ShivyCX modules with tools/py2c.py, compiles
+# them, and links runnable test/benchmark exes. Two link backends: `host`
+# (plain gcc, for pure-C modules like tokens) and `objcore` (links the
+# micropython objcore core, for code that uses the dynamic mp bridge). All C
+# test/bench harnesses are inlined in the script and written to /tmp at build
+# time. These targets are NOT part of `make test`; they are opt-in.
+#     make selfhost                 # end-to-end module tests (host backend)
+#     make selfhost_objcore         # also the objcore-bridge test (needs the
+#                                   #   objcore build: see install_micropython
+#                                   #   + a built ports/objcore/build/py)
+#     make selfhost_bench           # transpiled-code microbenchmarks
+#     make selfhost_coverage        # how many modules gcc-compile (glibc)
+#     make selfhost_coverage_musl   # ... against the packaged musl headers
+selfhost:
+	python3 tools/selfhost.py test
+
+selfhost_objcore:
+	python3 tools/selfhost.py test --objcore
+
+selfhost_bench:
+	python3 tools/selfhost.py bench
+
+selfhost_coverage:
+	python3 tools/selfhost.py coverage
+
+selfhost_coverage_musl:
+	python3 tools/selfhost.py coverage --musl
+
+# ---------------------------------------------------------------------------
 # Micropython targets
 
 # Clone the objcore micropython fork (or fast-forward an existing checkout),
@@ -221,6 +252,8 @@ self:
 	cd tools && pypy3 py2c.py
 
 .PHONY: default test shim install clean baremetal baremetal-hello \
+        selfhost selfhost_objcore selfhost_bench selfhost_coverage \
+        selfhost_coverage_musl \
         baremetal-kernel baremetal-irq minikraft run-irq \
         install_micropython clean_micropython test_micropython \
         test_micropython_core test_micropython_objects \
