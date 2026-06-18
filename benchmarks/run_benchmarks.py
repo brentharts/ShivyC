@@ -211,6 +211,64 @@ def bench_contracts():
     return {"benchmark": "contracts_simd", "configs": _finish(cfgs)}
 
 
+def _py2c(py_src, out_c):
+    """Transpile an rpython .py to C via tools/py2c.py and post-process it the
+    way shivyc.main's .py path does: drop the unused runtime include (these
+    kernels reference no runtime) and re-supply the malloc prototype. Returns
+    the C path, or None on failure."""
+    tools = os.path.join(REPO, "tools")
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+    import tempfile
+    import py2c
+    d = tempfile.mkdtemp()
+    cpath, err = py2c.transpile_file(py_src, d)
+    if err or not cpath:
+        return None
+    code = open(cpath).read()
+    code = re.sub(r'#include "shivyc_rt\.h"\n', "", code)
+    code = "void *malloc(unsigned long);\n" + code
+    with open(out_c, "w") as f:
+        f.write(code)
+    return out_c
+
+
+def bench_simd_py():
+    """rpython SIMD kernel (.py) vs gcc -O0. One transpiled C source is compiled
+    three ways: ShivyCX with the contract intact (vectorized saxpy), ShivyCX
+    with the contract stripped (scalar), and gcc -O0 (scalar). All must agree on
+    the exit code; the speedup isolates the contract-driven SSE body."""
+    d = os.path.join(HERE, "simd_py")
+    py_src = os.path.join(d, "bench_saxpy.py")
+    simd_c = os.path.join(d, "bench_saxpy_simd.c")
+    scal_c = os.path.join(d, "bench_saxpy_scalar.c")
+    cfgs = []
+
+    if _py2c(py_src, simd_c) is None:
+        return {"benchmark": "simd_py_saxpy", "configs": _finish(cfgs)}
+    _write_baseline(simd_c, scal_c, _strip_contract_clauses)
+
+    _shivyc(simd_c, os.path.join(d, "bin_shivyc_simd"))
+    fn = _extract_function(_read_asm(simd_c), "saxpy")
+    vec = "mulps" in fn and "addps" in fn
+    cfgs.append({"name": "ShivyCX .py (+contract SIMD)",
+                 "binary": os.path.join(d, "bin_shivyc_simd"), "baseline": False,
+                 "metric": "mulps+addps packed body" if vec else "scalar",
+                 "metric_val": vec})
+
+    _shivyc(scal_c, os.path.join(d, "bin_shivyc_scalar"))
+    cfgs.append({"name": "ShivyCX .py (scalar, no contract)",
+                 "binary": os.path.join(d, "bin_shivyc_scalar"), "baseline": True,
+                 "metric": "scalar loop", "metric_val": False})
+
+    _gcc(scal_c, os.path.join(d, "bin_gcc0"))
+    cfgs.append({"name": "gcc -O0", "binary": os.path.join(d, "bin_gcc0"),
+                 "baseline": False, "metric": "scalar loop", "metric_val": None})
+    _add_ccc(cfgs, scal_c, d, metric="external unoptimizing C compiler")
+
+    return {"benchmark": "simd_py_saxpy", "configs": _finish(cfgs)}
+
+
 # ===========================================================================
 # Benchmark 3: -fstackless-calls (direct call + tail-call + FPO)
 # ===========================================================================
@@ -363,6 +421,7 @@ def main():
     results = []
     for label, fn in [("_Nbit globals", bench_nbit),
                       ("contracts SIMD", bench_contracts),
+                      ("SIMD .py vs gcc -O0", bench_simd_py),
                       ("stackless calls", bench_stackless),
                       ("metamorphic returns", bench_metamorphic)]:
         print("Running %s benchmark ..." % label)
@@ -380,7 +439,7 @@ def main():
     with open(os.path.join(RESULTS_DIR, "results.json"), "w") as f:
         json.dump(results, f, indent=2)
 
-    for bench in results[:4]:
+    for bench in results[:5]:
         print("\n=== %s ===" % bench["benchmark"])
         exits = {c["exit_code"] for c in bench["configs"]}
         print("  differential correctness: %s (exit codes: %s)"

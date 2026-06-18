@@ -65,7 +65,19 @@ of the SSE2 width across the whole call graph, so it emits an SSE2 loop with
 ShivyCX's own scalar code**, and it beats gcc -O0 by ~26×. This is the paper's
 "guarantee gcc and clang cannot make without runtime checks" made concrete.
 
-## 3 — `-fstackless-calls` (direct call + tail-call + FPO)
+## 3 — rpython `.py` SIMD kernel vs gcc -O0
+
+`simd_py/bench_saxpy.py` is an *rpython* source (`out[i] = alpha*x[i] + y[i]`
+with a `len(x) % 4` contract). ShivyCX now reads `.py` directly: the harness
+transpiles it once with `tools/py2c.py`, then compiles the same C three ways --
+ShivyCX with the contract (a packed-single `mulps`+`addps` body), ShivyCX with
+the contract stripped (scalar), and gcc -O0 (scalar). All three agree on the
+exit code; the SIMD body runs ~**13× faster than ShivyCX's own scalar code and
+~11× faster than gcc -O0** on this element-wise workload. This is the end-to-end
+story: high-level restricted Python compiled, via proven contracts, to vector
+code that beats an ordinary unoptimizing C compiler by an order of magnitude.
+
+## 3b — `-fstackless-calls` (direct call + tail-call + FPO)
 
 `bench_stackless.c` is the deeply-nested wrapper chain (`sum/foo/bar/boo/zoo`).
 Tail wrappers collapse from a 9-instruction framed body with an indirect
