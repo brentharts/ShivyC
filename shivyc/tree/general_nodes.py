@@ -788,7 +788,13 @@ class DeclInfo:
         # named-parameter count so va_start can locate the first vararg.
         variadic = getattr(self.ctype, "variadic", False)
         if variadic:
-            c = c.set_vararg_named(len(self.ctype.args))
+            # Named args are passed on the stack, each struct occupying
+            # ceil(size/8) eightbyte slots; va_start must skip the *slots*, not
+            # the parameter count, to find the first vararg.
+            named_slots = sum(
+                (ct.size + 7) // 8 if (ct.is_struct_union() and ct.size > 8)
+                else 1 for ct in self.ctype.args)
+            c = c.set_vararg_named(named_slots)
         il_code.start_func(self.identifier.content)
 
         symbol_table.new_scope()
@@ -796,6 +802,7 @@ class DeclInfo:
         num_params = len(self.ctype.args)
         iter = zip(self.ctype.args, self.param_names, range(num_params))
         int_i, flt_i, stack_i = 0, 0, 0
+        vstack_i = 0    # running eightbyte slot index for the all-stack variadic ABI
         int_regs = value_cmds.LoadArg.arg_regs
         xmm_regs = spots.xmm_arg_regs
 
@@ -816,8 +823,20 @@ class DeclInfo:
             arg = symbol_table.add_variable(
                 param, ctype, symbol_table.DEFINED, None,
                 symbol_table.AUTOMATIC)
-            if (not variadic and ctype.is_struct_union()
-                    and ctype.size > 8):
+            if variadic:
+                # Variadic functions take every argument on the stack; a struct
+                # occupies ceil(size/8) eightbyte slots and is copied from them.
+                if ctype.is_struct_union() and ctype.size > 8:
+                    n = (ctype.size + 7) // 8
+                    il_code.add(value_cmds.LoadStructArg(
+                        arg, stack_index=vstack_i))
+                    vstack_i += n
+                else:
+                    il_code.add(value_cmds.LoadArg(
+                        arg, vstack_i, all_stack=True))
+                    vstack_i += 1
+                continue
+            if (ctype.is_struct_union() and ctype.size > 8):
                 # SysV: a struct of 9..16 bytes (INTEGER class) arrives in two
                 # consecutive integer registers, all-or-nothing; a larger one,
                 # or one that does not fit the remaining registers, arrives on
@@ -832,10 +851,7 @@ class DeclInfo:
                         arg, stack_index=stack_i))
                     stack_i += n
                 continue
-            if variadic:
-                # Variadic functions take every argument on the stack.
-                il_code.add(value_cmds.LoadArg(arg, i, all_stack=True))
-            elif ctype.is_floating() and flt_i < len(xmm_regs):
+            if ctype.is_floating() and flt_i < len(xmm_regs):
                 il_code.add(value_cmds.LoadArg(
                     arg, i, reg=xmm_regs[flt_i], is_float=True))
                 flt_i += 1

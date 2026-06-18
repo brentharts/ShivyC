@@ -205,6 +205,23 @@ class ObjMember(_ObjLookup):
 
     def _lvalue(self, il_code, symbol_table, c):
         head_lv = self.head.lvalue(il_code, symbol_table, c)
+        if head_lv is None:
+            # `.` applied to a struct *rvalue* (C99 6.5.2.3): e.g. `f().m` or
+            # `(cond ? a : b).m`. There is no lvalue to address, so materialize
+            # the struct into a temporary and read the member from it. The
+            # result is a non-assignable rvalue (writing it updates the temp).
+            import shivyc.il_cmds.value as value_cmds
+            head_val = self.head.make_il(il_code, symbol_table, c)
+            offset, ctype = self.get_offset_info(head_val.ctype)
+            tmp = ILValue(head_val.ctype)
+            il_code.add(value_cmds.Set(tmp, head_val))
+            struct_addr = ILValue(PointerCType(head_val.ctype))
+            il_code.add(value_cmds.AddrOf(struct_addr, tmp))
+            shift = ILValue(ctypes.longint)
+            il_code.register_literal_var(shift, str(offset))
+            out = ILValue(PointerCType(ctype))
+            il_code.add(math_cmds.Add(out, struct_addr, shift))
+            return self._wrap_bitfield(IndirectLValue(out), head_val.ctype)
         struct_ctype = head_lv.ctype() if head_lv else None
         offset, ctype = self.get_offset_info(struct_ctype)
 
