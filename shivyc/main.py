@@ -101,6 +101,10 @@ def main():
         import shivyc.memory_safety as memory_safety
         return memory_safety.run(arguments.files, arguments)
 
+    if getattr(arguments, "pdf", None):
+        import shivyc.pdf_report as pdf_report
+        return pdf_report.run(arguments.files, arguments, arguments.pdf)
+
     # Micro-slicing analysis: find pure, independent fragments and a slice plan
     # for productive spin-waiting, then exit.
     if getattr(arguments, "microslice", False):
@@ -780,6 +784,13 @@ def get_arguments():
                         metavar="OUT.c", default=None,
                         help="with --microslice, write a work-injected acquire "
                              "scaffold for the hottest fragment to OUT.c")
+
+    parser.add_argument("--pdf", dest="pdf", nargs="?", const="/tmp",
+                        default=None, metavar="DIR",
+                        help="generate a LaTeX/PDF build report (overview, "
+                             "per-module sections, safety findings in red, a "
+                             "TikZ call graph, and the run output in an "
+                             "appendix). Output directory defaults to /tmp.")
 
     return parser.parse_args()
 

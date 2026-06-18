@@ -507,9 +507,93 @@ class Analyzer:
 # ---------------------------------------------------------------------------
 # Driver + reporting
 # ---------------------------------------------------------------------------
+def _passthrough_params(prog):
+    """func -> set of parameter indices it returns unchanged (an identity-like
+    'launderer'). Used to follow a stack address that is returned indirectly
+    through a helper -- the obfuscation gcc's -Wreturn-local-addr loses."""
+    res = {}
+    for fn, cmds in prog.functions.items():
+        defmap = {}
+        for c in cmds:
+            for o in c.outputs():
+                defmap[o] = c
+        pmap = _param_map(cmds)
+        inv = {v: k for k, v in pmap.items()}
+
+        def origin_val(v):
+            d = defmap.get(v)
+            while isinstance(d, value_cmds.Set):
+                v = d.arg
+                d = defmap.get(v)
+            return v
+
+        rps = set()
+        for c in cmds:
+            if isinstance(c, control_cmds.Return) and c.arg is not None:
+                ov = origin_val(c.arg)
+                if ov in inv:
+                    rps.add(inv[ov])
+        res[fn] = rps
+    return res
+
+
+def _dangling_stack_diags(prog):
+    """Whole-program check: a function that returns the address of one of its
+    own locals (`return &x;`), directly or laundered through a passthrough
+    helper. After the call the stack frame is gone, so the caller holds a
+    dangling pointer. gcc's -Wreturn-local-addr catches the direct form but
+    loses it once the address is returned indirectly through another function;
+    because we see the whole call graph we can follow it."""
+    passthrough = _passthrough_params(prog)
+    diags = []
+    for fn, cmds in prog.functions.items():
+        defmap = {}
+        for c in cmds:
+            for o in c.outputs():
+                defmap[o] = c
+
+        def origin(v):
+            d = defmap.get(v)
+            while isinstance(d, value_cmds.Set):
+                v = d.arg
+                d = defmap.get(v)
+            return d
+
+        def is_local_addr(v):
+            d = origin(v)
+            return (isinstance(d, value_cmds.AddrOf)
+                    and d.var not in prog.globals), d
+
+        for c in cmds:
+            if not (isinstance(c, control_cmds.Return) and c.arg is not None):
+                continue
+            d = origin(c.arg)
+            if isinstance(d, value_cmds.AddrOf) and d.var not in prog.globals:
+                nm = prog.names.get(d.var, "a local")
+                diags.append(Diagnostic(
+                    fn, "dangling-stack-pointer", None,
+                    "returns the address of local '%s'; that stack memory is "
+                    "reclaimed when the function returns" % nm))
+            elif isinstance(d, control_cmds.Call) and \
+                    getattr(d, "direct_name", None) in passthrough:
+                args = getattr(d, "args", [])
+                for k in passthrough[d.direct_name]:
+                    if k < len(args):
+                        bad, ad = is_local_addr(args[k])
+                        if bad:
+                            nm = prog.names.get(ad.var, "a local")
+                            diags.append(Diagnostic(
+                                fn, "dangling-stack-pointer", None,
+                                "returns the address of local '%s' laundered "
+                                "through %s(); the stack frame is gone on "
+                                "return" % (nm, d.direct_name)))
+    return diags
+
+
 def analyze_program(files, args):
     prog, ok = load_program(files, args)
     diags, autofree = Analyzer(prog).run()
+    diags = list(diags) + _dangling_stack_diags(prog)
     return prog, diags, autofree, ok
 
 
