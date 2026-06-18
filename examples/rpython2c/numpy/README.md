@@ -129,3 +129,33 @@ side step:
 So today: py2c emits the vectorizable float C + the contracts, gcc -O3 turns it
 into `mulps`/`addps`, and the ShivyCX path is wired for the int reduction with
 the float element-wise synthesizer identified as the next addition.
+
+## vec_simd.py — ShivyCX *itself* vectorizes float element-wise kernels
+
+Earlier (`saxpy.py`) the packed-float result came from `gcc -O3`; ShivyCX's own
+contract vectorizer only handled the int reduction. That gap is now closed.
+`shivyc/simd_contracts.py` gained:
+
+- a **multi-argument proof** (`_prove_one_call_multi`): a kernel like
+  `saxpy(alpha, x, y, out, n)` has several pointer arguments and one length, so
+  the old 2-arg `(ptr, len)` assumption is replaced by one that finds the length
+  argument and proves *every* pointer traces to a large-enough allocation;
+- an element-wise **classifier** (`_classify_elementwise`) recognizing
+  `out[i] = a[i] {+,-,*} b[i]` and `out[i] = alpha*x[i] + y[i]`; and
+- a packed-SSE **synthesizer** (`synth_sse_elementwise`) that emits a
+  fallback-free loop: `movups` load, `mulps`/`addps`/`subps` (or `pd` for
+  doubles), `movups` store, with `shufps`/`unpcklpd` to broadcast the saxpy
+  scalar.
+
+`./build_vec_simd.sh` compiles the f32 `vadd`/`vmul`/`saxpy` kernels **with
+ShivyCX** (no gcc auto-vectorizer) and shows its output:
+
+```
+simd-contracts: 'vadd'/'vmul'/'saxpy': contracts proven at all 1 call site(s)
+   2 addps   2 mulps   1 shufps   9 movups
+exit code = 30   (vadd=30, vmul=200, saxpy=50)
+```
+
+`f32`/`f64`/`i32` are numpy-style dtype annotations: `f32*` is a real 32-bit
+float array (single precision, 4-wide → `mulps`/`addps`); `float*` is 64-bit
+(2-wide → `mulpd`/`addpd`). The int reduction path (`simd_sum.py`) is unchanged.
