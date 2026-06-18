@@ -19,7 +19,7 @@ class TokenKind:
 
     """
 
-    def __init__(self, text_repr="", kinds=[]):
+    def __init__(self, text_repr="", kinds: "list[TokenKind]" = []):
         """Initialize a new TokenKind and add it to `kinds`.
 
         kinds (List[TokenKind]) - List of kinds to which this TokenKind is

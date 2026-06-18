@@ -19,7 +19,7 @@ The recorded aliases are emitted as ``.weak`` / ``.set`` assembler directives.
 import shivyc.token_kinds as token_kinds
 
 
-def _spell(t):
+def _spell(t: "Token"):
     if t.rep:
         return t.rep
     if isinstance(t.content, str):
@@ -27,7 +27,7 @@ def _spell(t):
     return str(t.kind)
 
 
-def _ident(t):
+def _ident(t: "Token"):
     return t.content if t.kind is token_kinds.identifier else None
 
 
@@ -36,7 +36,7 @@ def _norm(name):
     return name.strip("_") if name else name
 
 
-def extract_aliases(tokens):
+def extract_aliases(tokens: "list[Token]"):
     """Return (filtered_tokens, aliases).
 
     aliases is a list of (alias_name, target_name, is_weak) tuples.
