@@ -146,12 +146,25 @@ the whole call graph. On the four `examples/memory/*.c` cases:
 * `dangling_alias`, `double_free` — both ShivyCX and gcc `-Wall` catch them.
 * `wrapper_uaf` — a `free` hidden in one callee and a deref hidden in another:
   **ShivyCX flags the cross-function use-after-free; gcc does not.**
+* `return_local` — `return &local;`. ShivyCX flags a `dangling-stack-pointer`;
+  gcc also catches the direct form via `-Wreturn-local-addr`, so both detect it
+  (it is a category ShivyCX now reports, not a gcc-vs-ShivyCX differentiator).
 * `autofree_leak` — ShivyCX's escape analysis proves a local allocation is dead
   and, with `--auto-free`, inserts the `free` automatically (the program still
   runs correctly). gcc has no equivalent.
 
 This is a safety/capability benchmark, not a speed race: the point is *which
 bugs are caught and which frees are recovered* on unannotated C.
+
+## Visualizing a build: `--pdf`
+
+`python3 -m shivyc.main <inputs> --pdf [DIR]` renders the whole build as a PDF
+(via `pdflatex`, default `DIR=/tmp`) instead of terminal noise: an overview, a
+TikZ call-graph diagram, the whole-program safety findings (**bugs in red, a
+clean build in green**), a per-module section showing the rpython source of
+truth beside the generated C and its auto-inferred contracts, and an appendix
+with the program's captured output. `.py` inputs are transpiled first, so the
+report shows the Python-to-C-with-contracts translation directly.
 
 ## Files
 

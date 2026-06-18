@@ -436,6 +436,7 @@ def bench_memory_safety():
         ("dangling_alias", "use-after-free", "intra-function, via alias"),
         ("double_free", "double-free", "intra-function"),
         ("wrapper_uaf", "use-after-free", "CROSS-function (free+deref in callees)"),
+        ("return_local", "dangling-stack-pointer", "returns &local (both catch direct form)"),
         ("autofree_leak", "auto-free", "leak closed automatically"),
     ]
     rows = []
@@ -450,8 +451,12 @@ def bench_memory_safety():
         g = subprocess.run(["gcc", "-O0", "-Wall", "-Wextra", src, "-o", "/tmp/_msg"],
                            capture_output=True, text=True)
         gtext = g.stdout + g.stderr
-        gcc_detect = ("use-after-free" in gtext or "double" in gtext) \
-            if kind != "auto-free" else False
+        if kind == "auto-free":
+            gcc_detect = False
+        elif kind == "dangling-stack-pointer":
+            gcc_detect = "returns address of local" in gtext  # gcc -Wreturn-local-addr
+        else:
+            gcc_detect = ("use-after-free" in gtext or "double" in gtext)
         rows.append({"case": name, "bug": kind, "desc": desc,
                      "shivyc_detects": shivy, "gcc_detects": gcc_detect})
     return {"benchmark": "memory_safety", "kind": "detection", "rows": rows}
