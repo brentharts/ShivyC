@@ -268,7 +268,9 @@ What makes it fast and small:
   method calls — no object header, vtable, or runtime. Instances pass by
   pointer, so a function or method can take them directly
   (`def pull(p: "Body*", q: "Body*")` → `void pull(Body* p, Body* q)`). Richer
-  classes keep the tagged-object model automatically.
+  classes (inheritance, `isinstance`, virtual dispatch) use the tagged-object
+  model, which ShivyCX now compiles end to end — including its own object-model
+  runtime — so polymorphism works in self-compiled code, not just under gcc.
 - **System glue.** File I/O (`open`/`read`/`write`/`close`), `input()`,
   `os.system`, `os.fork`, BSD **sockets** (`socket`/`bind`/`connect`/`accept`/
   `send`/`recv`), and `sys.argv` all lower to plain C — enough to write real
@@ -280,7 +282,8 @@ What makes it fast and small:
 Worked examples live in [`examples/rpython2c/`](examples/rpython2c/): `numpy/`
 (SIMD kernels, BLAS, ufuncs, matmul), `nn/` (a feed-forward neural net showing
 classes→structs), `nbody/` (a gravity sim that passes class instances by
-pointer), `io/`, `net/`, and `mandelbrot/`. Run them all with `make rpython`.
+pointer), `classes/` (inheritance + polymorphism via the object model), `io/`,
+`net/`, and `mandelbrot/`. Run them all with `make rpython`.
 
 ---
 
