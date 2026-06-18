@@ -161,8 +161,38 @@ double mp_obj_get_float(mp_obj_t o){(void)o; return 0;}
 const mp_obj_type_t mp_type_float;
 '''
 
-# ==========================================================================
-# Target registry
+# Cross-module harness: il_cmds.base's _is_imm runs isinstance(spot,
+# LiteralSpot) where LiteralSpot is defined in the *spots* module -- so this
+# links two transpiled modules and exercises a cross-module isinstance over the
+# generated vtable/TypeInfo.
+ILBASE_DEMO_C = r'''
+#include "shivyc_rt.h"
+#include <stdio.h>
+#include <string.h>
+typedef struct LiteralSpot LiteralSpot;
+typedef struct RegSpot RegSpot;
+LiteralSpot* LiteralSpot_new(obj value);
+RegSpot*     RegSpot_new(char* name);
+char*        LiteralSpot_asm_str(Obj* self_, int size);
+obj          ILCommand__is_imm(Obj* self_, obj spot);   /* il_cmds.base */
+void         spots_init(void);
+
+int main(void) {
+    spots_init();                              /* cross-module: spots */
+    LiteralSpot* lit = LiteralSpot_new(OBJ_INT(5));
+    RegSpot*     reg = RegSpot_new("rax");
+    int is_lit = truthy(ILCommand__is_imm((Obj*)0, OBJ_OBJ(lit)));
+    int is_reg = truthy(ILCommand__is_imm((Obj*)0, OBJ_OBJ(reg)));
+    printf("_is_imm(LiteralSpot) = %d (expect 1)\n", is_lit);
+    printf("_is_imm(RegSpot)     = %d (expect 0)\n", is_reg);
+    char* a = LiteralSpot_asm_str((Obj*)lit, 4);
+    printf("LiteralSpot.asm_str = %s\n", a);
+    int ok = is_lit && !is_reg && a && strchr(a, '5');
+    printf("%s\n", ok ? "ALL CHECKS PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+'''
+
 # ==========================================================================
 # Each target self-hosts one ShivyCX module end to end: transpile the listed
 # .py module(s), compile, link a harness, run, and check the output.
@@ -181,6 +211,14 @@ TARGETS = {
         "backend": "objcore",
         "expect": "ALL CHECKS PASS",
         "desc": "dynamic call (abs) routed through the objcore mp bridge",
+    },
+    "ilbase": {
+        "modules": ["shivyc/il_cmds/base.py", "shivyc/spots.py"],
+        "harness": ("ilbase_demo.c", ILBASE_DEMO_C),
+        "backend": "host",
+        "expect": "ALL CHECKS PASS",
+        "desc": "cross-module: il_cmds.base._is_imm isinstance(spot, "
+                "spots.LiteralSpot) over 2 linked modules",
     },
 }
 
