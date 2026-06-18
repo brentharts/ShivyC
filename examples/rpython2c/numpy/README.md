@@ -71,3 +71,61 @@ Strip the two asserts and the identical loop compiles to ShivyCX's ordinary
 scalar code (0 SSE instructions) — the contracts are exactly the AST-level size
 information that unlocks the SIMD path. (Note: ShivyCX's variadic `printf` ABI
 is unreliable, so the harness verifies the result via the exit code instead.)
+
+## saxpy.py — element-wise float32 kernels -> mulps/addps
+
+`saxpy` and `vadd` operate on `f32*` (real 32-bit C float arrays, i.e. numpy
+float32). The element-wise expressions lower to native packed-float-friendly C:
+
+```c
+void saxpy(float alpha, float* x, float* y, float* out, int n) { ...
+    out[i] = ((alpha * x[i]) + y[i]); }
+void vadd(float* x, float* y, float* out, int n) { ...
+    out[i] = (x[i] + y[i]); }
+```
+
+`./build_saxpy.sh` compiles that with `gcc -O3` and shows the SSE single-
+precision instructions, then runs for correctness:
+
+```
+== SSE single-precision instructions emitted ==
+   5 addps   2 mulps   9 movups   2 movaps
+saxpy: out[100]=500.0   vadd: out[100]=300.0
+```
+
+### Contracts inferred from a fixed size — no assert needed
+
+`vadd256(x: "f32[256]", y: "f32[256]", out: "f32[256]")` writes **no** assert.
+Because the element count 256 is a compile-time multiple of the 4-wide single-
+precision lane, py2c infers the divisibility + minimum-length contracts itself:
+
+```c
+void vadd256(float* x, float* y, float* out)
+assert not len(x) % 4
+assert len(x) >= 4
+...   (same for y and out)
+```
+
+This is the "the user shouldn't have to write the assert" step: a known array
+size at the AST level is enough for py2c to emit the SIMD contract.
+
+### Honest scope: ShivyCX vs gcc for these kernels
+
+The packed-float result above is from `gcc -O3`. ShivyCX's own contract
+vectorizer (`shivyc/simd_contracts.py`) currently recognizes exactly one shape:
+the `(int* ptr, len)` **reduction**, which it replaces with a hand-written SSE2
+`paddd` loop (see `simd_sum.py`). It does not yet vectorize multi-array float
+element-wise stores — two things are missing and are the clear next compiler-
+side step:
+
+1. `_prove_one_call` assumes a 2-argument `(ptr, len)` signature
+   (`call.args[1 - arg_index]`), so a `(alpha, x, y, out, n)` kernel can't be
+   proven; it needs to locate the length argument among >2 args and prove every
+   pointer argument.
+2. `synth_sse2_reduce` is a fixed int32-reduction template; an element-wise
+   `synth_sse_elementwise` (load `movups`, op `mulps`/`addps`, store `movups`)
+   would be a new synthesizer.
+
+So today: py2c emits the vectorizable float C + the contracts, gcc -O3 turns it
+into `mulps`/`addps`, and the ShivyCX path is wired for the int reduction with
+the float element-wise synthesizer identified as the next addition.
