@@ -1223,6 +1223,11 @@ BOOL_PREFIXES = ("is_", "has_", "can_", "should_", "was_", "use_", "allow_")
 
 OBJ = "obj"
 
+# C scalar types whose pointer form is a real array (native indexing), as
+# opposed to a class pointer (Foo*) or the boxed `obj`.
+_SCALAR_CTYPES = {"int", "double", "float", "char", "long", "short",
+                  "bool", "unsigned"}
+
 KNOWN_CLASSES = {}      # name -> ClassInfo
 VTABLE_METHODS = set()  # method names that are virtual somewhere in the module
 _XMOD_CACHE = {}        # dotted module name -> imported-symbol registry
@@ -1238,6 +1243,15 @@ def ann_text_to_ctype(text):
     if head in ("List", "list", "Dict", "dict", "Set", "set", "Tuple",
                 "tuple", "Optional", "Any", "object"):
         return OBJ
+    # pointer-to-scalar arrays, e.g. "int*", "float*", "double*" -- the rpython
+    # way to take a real C array (numpy-style) rather than a boxed list, so
+    # `a[i]` lowers to native indexing and the loop can be vectorized.
+    if text.endswith("*"):
+        base = text[:-1].strip()
+        if base in simple and simple[base] != "void":
+            return simple[base] + "*"
+        if base in ("char", "long", "short", "unsigned", "signed", "void"):
+            return base + "*"
     if text and (text[0].isupper() or text[0] == "_") and text.isidentifier():
         return text + "*"
     return None
@@ -3948,7 +3962,7 @@ class Transpiler:
         def non_numeric(node):
             if isinstance(node, ast.Constant):
                 return not isinstance(node.value, (int, float, bool))
-            if isinstance(node, (ast.Str, ast.List, ast.Dict, ast.Set,
+            if isinstance(node, (ast.List, ast.Dict, ast.Set,
                                  ast.Tuple, ast.ListComp, ast.DictComp,
                                  ast.SetComp, ast.JoinedStr)):
                 return True
@@ -4354,16 +4368,66 @@ class Transpiler:
         self.indent -= 1
         self.emit("}")
 
+    def _extract_contracts(self, node):
+        """Pull leading `assert len(arr) ...` statements off the body and render
+        them as ShivyCX contract clauses (which sit between the parameter list
+        and `{` and let the compiler prove SIMD-divisible / bounded lengths and
+        emit a vectorized loop). Returns (clauses, remaining_body). Asserts that
+        are not array-length contracts are left in the body as ordinary asserts.
+        """
+        clauses = []
+        body = list(node.body)
+        while body and isinstance(body[0], ast.Assert):
+            test = body[0].test
+            clause = self._contract_clause(test)
+            if clause is None:
+                break
+            clauses.append(clause)
+            body.pop(0)
+        return clauses, body
+
+    def _contract_clause(self, test):
+        def is_len(n):
+            return (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                    and n.func.id == "len" and len(n.args) == 1
+                    and isinstance(n.args[0], ast.Name))
+        def lenexpr(n):
+            return "len(%s)" % cname(n.args[0].id)
+        if not isinstance(test, ast.Compare) or len(test.ops) != 1:
+            return None
+        op = test.ops[0]
+        left, right = test.left, test.comparators[0]
+        # len(arr) % K == 0  ->  assert not len(arr) % K
+        if isinstance(op, ast.Eq) and isinstance(left, ast.BinOp) \
+                and isinstance(left.op, ast.Mod) and is_len(left.left) \
+                and isinstance(left.right, ast.Constant) \
+                and isinstance(right, ast.Constant) and right.value == 0:
+            return "assert not %s %% %d" % (lenexpr(left.left), left.right.value)
+        # len(arr) >= N  /  len(arr) <= N
+        if is_len(left) and isinstance(right, ast.Constant) \
+                and isinstance(op, (ast.GtE, ast.LtE)):
+            sym = ">=" if isinstance(op, ast.GtE) else "<="
+            return "assert %s %s %d" % (lenexpr(left), sym, right.value)
+        return None
+
     def func_def(self, node):
         self.enter_scope(node, skip_self=False)
         ret = ann_to_ctype(node.returns) or OBJ
         self.cur_ret = ret
         params = self.param_list(node, skip_self=False)
         plist = ", ".join(params) if params else "void"
-        self.emit("%s {" % self.func_signature(node).rstrip(";"))
+        clauses, body = self._extract_contracts(node)
+        sig = self.func_signature(node).rstrip(";")
+        if clauses:
+            self.emit(sig)
+            for c in clauses:
+                self.emit(c)
+            self.emit("{")
+        else:
+            self.emit("%s {" % sig)
         self.indent += 1
         self._emit_vararg_setup(node)
-        self.emit_hoisted_body(node.body)
+        self.emit_hoisted_body(body)
         self.indent -= 1
         self.emit("}")
 
@@ -4613,6 +4677,9 @@ class Transpiler:
                 return OBJ
             if self.value_ctype(node.value) == "char*":
                 return "char*"
+            vc = self.value_ctype(node.value)
+            if vc and vc.endswith("*") and vc[:-1] in _SCALAR_CTYPES:
+                return vc[:-1]          # a[i] of a scalar pointer -> element type
         if isinstance(node, ast.UnaryOp):
             if isinstance(node.op, ast.Not):
                 return "bool"
@@ -7133,6 +7200,10 @@ class Transpiler:
                                           self.wrap_obj(sl))
         if self.value_ctype(node.value) == "char*":   # s[i] -> 1-char string
             return "char_at(%s, %s)" % (self.expr(node.value), self.as_long(sl))
+        # scalar-pointer array (int*/double*/float*/...): native C indexing for
+        # ANY index (a numpy-style array), not just literal indices.
+        if vct and vct.endswith("*") and vct[:-1] in _SCALAR_CTYPES:
+            return "%s[%s]" % (self.expr(node.value), self.as_long(sl))
         if not isinstance(sl, ast.Slice):
             idx = self.expr(sl)
             if not idx.lstrip("-").isdigit():
