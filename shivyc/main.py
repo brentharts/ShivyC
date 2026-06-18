@@ -302,7 +302,10 @@ def process_py_file(file, args):
                 ("fclose", "int fclose(void *);"),
                 ("system", "int system(const char *);"),
                 ("puts", "int puts(const char *);"),
-                ("strlen", "unsigned long strlen(const char *);")]:
+                ("strlen", "unsigned long strlen(const char *);"),
+                ("fork", "int fork(void);"),
+                ("_exit", "void _exit(int);"),
+                ("waitpid", "int waitpid(int, int *, int);")]:
             if re.search(r"\b" + sym + r"\b", code):
                 prelude.append(proto)
         for stream in ("stdin", "stdout", "stderr"):
