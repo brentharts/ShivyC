@@ -44,6 +44,33 @@ class Program:
         self.globals = set()    # ILValues with static storage or linkage
 
 
+def _transpile_py_for_analysis(file):
+    """Transpile an rpython `.py` input to a C file the memory analyzer can
+    parse, and return its path. The runtime header is written alongside so the
+    generated `#include "shivyc_rt.h"` (and the `obj` types it defines) resolve.
+    Returns the .c path, or None on failure."""
+    import os
+    import sys
+    import tempfile
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    tools = os.path.join(repo, "tools")
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+    try:
+        import py2c
+    except Exception:
+        return None
+    d = tempfile.mkdtemp(prefix="shivyc_mem_")
+    try:
+        cpath, err = py2c.transpile_file(file, d)
+        py2c.write_runtime(d)        # so #include "shivyc_rt.h" resolves
+    except Exception:
+        return None
+    if err or not cpath:
+        return None
+    return cpath
+
+
 def load_program(files, args):
     import shivyc.lexer as lexer
     import shivyc.preproc as preproc
@@ -59,10 +86,17 @@ def load_program(files, args):
     prog = Program()
     ok = True
     for file in files:
-        if not file.endswith(".c"):
+        if file.endswith(".py"):
+            src_path = _transpile_py_for_analysis(file)
+            if src_path is None:
+                ok = False
+                continue
+        elif file.endswith(".c"):
+            src_path = file
+        else:
             continue
         try:
-            code = open(file).read()
+            code = open(src_path).read()
         except OSError:
             ok = False
             continue
@@ -73,7 +107,7 @@ def load_program(files, args):
             continue
 
         error_collector.clear()
-        tokens = preproc.process(lexer.tokenize(code, file), file)
+        tokens = preproc.process(lexer.tokenize(code, src_path), src_path)
         tokens, _ = weak_alias.extract_aliases(tokens)
         tokens = main_mod._concat_adjacent_strings(tokens)
         key = cache.token_key(tokens)
@@ -651,14 +685,24 @@ def _program_from_il(il_code, symbol_table):
 
 
 def _find_free_template(il_code):
-    """Return a (func ILValue) usable to build a `free` call, by reusing one
-    that already appears in the program, or None if the program never frees."""
+    """Return a (func ILValue, name) usable to build a `free` call.
+
+    Prefer an existing free/deallocator call (reuse its target verbatim).
+    Otherwise synthesize a `free` function value with the libc signature
+    `void free(void*)`; `free` resolves at link time. This lets the compiler
+    insert frees even when the program never frees anything itself (the common
+    case the whole-program analysis is meant to handle).
+    """
     for cmds in il_code.commands.values():
         for c in cmds:
             if (isinstance(c, control_cmds.Call)
                     and c.direct_name in DEALLOCATORS):
                 return c.func, c.direct_name
-    return None, None
+    # None present: synthesize `void free(void*)`.
+    from shivyc.ctypes import FunctionCType, PointerCType, void
+    from shivyc.il_gen import ILValue
+    free_ftype = FunctionCType([PointerCType(void)], void, False)
+    return ILValue(PointerCType(free_ftype)), "free"
 
 
 def insert_auto_frees(il_code, symbol_table, args=None):

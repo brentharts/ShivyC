@@ -286,7 +286,10 @@ def run(files, args, out_dir):
     os.makedirs(out_dir, exist_ok=True)
 
     c_files, modules = _prepare(files)
-    prog, diags, autofree, _ = memory_safety.analyze_program(c_files, args)
+    # Analyze the original inputs: load_program transpiles .py itself (keeping
+    # the runtime header) so rpython allocations are tracked; _prepare's
+    # header-stripped C is only for source display.
+    prog, diags, autofree, _ = memory_safety.analyze_program(files, args)
     run_rc, run_out = _capture_run(files, args, out_dir)
 
     tex = _build_tex(files, modules, prog, diags, autofree, run_rc, run_out)
