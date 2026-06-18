@@ -5140,7 +5140,15 @@ class Transpiler:
             node.target.id in self.scope
         decl = "" if (already or not isinstance(node.target, ast.Name)) \
             else (ctype + " ")
-        return ["%s%s = %s;" % (decl, tgt, self.expr(node.value))]
+        rhs = self.expr(node.value)
+        # A class instance assigned to an obj-typed target (e.g. a non-leaf
+        # base annotation `base: "Shape*"`, which is typed obj for sound
+        # dynamic dispatch) must be boxed into the tagged union.
+        vt = self.value_ctype(node.value)
+        if ctype == OBJ and vt and vt != OBJ and vt.endswith("*") \
+                and vt[:-1] in self.classes:
+            rhs = self.wrap_obj(node.value)
+        return ["%s%s = %s;" % (decl, tgt, rhs)]
 
     AUG_OP_CHAR = {ast.Add: '+', ast.Sub: '-', ast.Mult: '*', ast.Div: '/',
                    ast.FloorDiv: '/', ast.Mod: '%', ast.BitOr: '|',
