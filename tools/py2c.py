@@ -2712,6 +2712,8 @@ class Transpiler:
 
     def func_signature(self, node):
         ret = ann_to_ctype(node.returns) or OBJ
+        if self._uses_argv(node):
+            return "%s %s(int argc, char** argv)" % (ret, self.fnsym(node.name))
         params = self.param_list(node, skip_self=False)
         plist = ", ".join(params) if params else "void"
         return "%s %s(%s)" % (ret, self.fnsym(node.name), plist)
@@ -4474,10 +4476,28 @@ class Transpiler:
                 clauses.append("assert len(%s) >= %d" % (nm, lanes))
         return clauses
 
+    def _uses_argv(self, node):
+        """True if this is `main` and its body reads `sys.argv` -- then main
+        takes (int argc, char** argv) instead of (void), so a runtime command
+        line argument can drive the program (and defeat constant folding)."""
+        if node.name != "main":
+            return False
+        for sub in ast.walk(node):
+            if self._is_sys_argv(sub):
+                return True
+        return False
+
+    def _is_sys_argv(self, node):
+        return (isinstance(node, ast.Attribute) and node.attr == "argv"
+                and isinstance(node.value, ast.Name) and node.value.id == "sys")
+
     def func_def(self, node):
         self.enter_scope(node, skip_self=False)
         ret = ann_to_ctype(node.returns) or OBJ
         self.cur_ret = ret
+        if self._uses_argv(node):
+            self.scope["argc"] = "int"
+            self.scope["argv"] = "char**"
         params = self.param_list(node, skip_self=False)
         plist = ", ".join(params) if params else "void"
         clauses, body = self._extract_contracts(node)
@@ -4736,6 +4756,8 @@ class Transpiler:
             return types[0] if len(set(types)) == 1 and \
                 types[0] in ("int", "bool", "char*") else OBJ
         if isinstance(node, ast.Subscript):
+            if self._is_sys_argv(node.value):
+                return "char*"
             if isinstance(node.slice, ast.Slice):
                 return OBJ
             if isinstance(node.value, ast.Subscript):
@@ -5768,6 +5790,8 @@ class Transpiler:
                 if self.stdlib_root and node.args:
                     return self._mp_import_call("builtins", "str", node)
             if fn == "len" and len(node.args) == 1:
+                if self._is_sys_argv(node.args[0]):
+                    return "argc"
                 return "pylen(%s)" % self.wrap_obj(node.args[0])
             if fn == "print":
                 if node.args:
@@ -5838,6 +5862,8 @@ class Transpiler:
                     if vt in ("int", "bool", "double", "float", "long",
                               "short", "char"):
                         return "((long)%s)" % self.expr(node.args[0])
+                    if vt == "char*":
+                        return "atoi(%s)" % self.expr(node.args[0])
                     return "pyint(%s)" % self.wrap_obj(node.args[0])
                 return "0"
             if fn == "abs" and node.args:
@@ -7253,6 +7279,8 @@ class Transpiler:
         return bool(t) and t.endswith("*") and t != OBJ
 
     def ex_Subscript(self, node):
+        if self._is_sys_argv(node.value) and not isinstance(node.slice, ast.Slice):
+            return "argv[%s]" % self.as_long(node.slice)   # char* command-line arg
         if isinstance(node.value, ast.Subscript):
             inner = node.value
             owner = self.const_dict_owner(inner.value) \
