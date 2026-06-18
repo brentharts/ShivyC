@@ -159,3 +159,34 @@ exit code = 30   (vadd=30, vmul=200, saxpy=50)
 `f32`/`f64`/`i32` are numpy-style dtype annotations: `f32*` is a real 32-bit
 float array (single precision, 4-wide → `mulps`/`addps`); `float*` is 64-bit
 (2-wide → `mulpd`/`addpd`). The int reduction path (`simd_sum.py`) is unchanged.
+
+## main.py reads .py directly + wider SIMD (simd_kernels.py)
+
+ShivyCX's driver now accepts `.py` sources. `process_py_file` runs them through
+`tools/py2c.py`, supplies any runtime support C (and drops the unused runtime
+include for pure kernels, re-adding just the libc prototypes used), then
+compiles and links. So an rpython example needs no hand-written `.c` copy and no
+build script:
+
+    python3 -m shivyc.main examples/rpython2c/numpy/simd_kernels.py -o simd && ./simd
+    echo $?     # 55
+
+You can also mix sources in one call: `shivyc.main kernels.py harness.c -o run`
+(note: the contract proof is per-translation-unit, so a kernel whose only call
+site is in a separate `.c` stays correct but scalar; put the call site in the
+same `.py` to vectorize).
+
+The contract vectorizer (`shivyc/simd_contracts.py`) grew three shapes beyond
+binary `a op b` and saxpy:
+
+- **no-length fixed-size** — `vadd256(x: "f32[256]", ...)` has no `n` argument
+  and no assert; py2c infers the contract from the size and ShivyCX proves the
+  element count from the allocation, baking a literal trip count into the loop;
+- **single-input map** — `out[i] = sqrt(x[i])` lowers to `sqrtps` (the indirect
+  libm call is recognized via its `AddrOf`, then replaced wholesale);
+- **fused multiply-add** — `out[i] = a[i]*b[i] + c[i]` → `mulps` + `addps`.
+
+The synthesizer is now register-driven (System V assignment computed from the
+signature) rather than hardcoded to one shape, so 2-, 3- and 4-pointer kernels
+and an fp scalar all land in the right registers. `simd_kernels.py` exercises
+all three and returns 55 (= 30 + 4 + 21) as the proof of correctness.
