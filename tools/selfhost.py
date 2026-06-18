@@ -193,6 +193,37 @@ int main(void) {
 }
 '''
 
+# Three-module closure: weak_alias._ident reads a tokens.Token's fields and
+# compares its kind against the token_kinds.identifier singleton. Relies on
+# list.sort(key=lambda) and imported-class default args working in
+# token_kinds' module init.
+WA_DEMO_C = r'''
+#include "shivyc_rt.h"
+#include <stdio.h>
+#include <string.h>
+typedef struct Range Range;
+typedef struct TokenKind TokenKind;
+typedef struct Token { Obj _hdr; Range* r; obj kind; char* content;
+                       char* rep; bool wide; obj logical_line; } Token;
+extern TokenKind* identifier;            /* token_kinds singleton */
+void   token_kinds_init(void);
+Token* Token_new(obj kind, char* content, char* rep, obj r);
+obj    _ident(Token* t);                 /* weak_alias */
+
+int main(void) {
+    token_kinds_init();
+    Token* id = Token_new(OBJ_OBJ(identifier), "myalias", "", OBJ_NONE);
+    obj a = _ident(id);
+    printf("_ident(identifier 'myalias') = %s (expect myalias)\n", pystr(a));
+    Token* other = Token_new(OBJ_INT(0), "nope", "", OBJ_NONE);
+    obj b = _ident(other);
+    printf("_ident(non-identifier) is_none = %d (expect 1)\n", b.tag == T_NONE);
+    int ok = a.tag == T_STR && !strcmp(AS_STR(a), "myalias") && b.tag == T_NONE;
+    printf("%s\n", ok ? "ALL CHECKS PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+'''
+
 # ==========================================================================
 # Each target self-hosts one ShivyCX module end to end: transpile the listed
 # .py module(s), compile, link a harness, run, and check the output.
@@ -219,6 +250,15 @@ TARGETS = {
         "expect": "ALL CHECKS PASS",
         "desc": "cross-module: il_cmds.base._is_imm isinstance(spot, "
                 "spots.LiteralSpot) over 2 linked modules",
+    },
+    "weak_alias": {
+        "modules": ["shivyc/weak_alias.py", "shivyc/token_kinds.py",
+                    "shivyc/tokens.py"],
+        "harness": ("wa_demo.c", WA_DEMO_C),
+        "backend": "host",
+        "expect": "ALL CHECKS PASS",
+        "desc": "3-module closure: weak_alias._ident vs token_kinds.identifier "
+                "(exercises list.sort(key=) in token_kinds init)",
     },
 }
 

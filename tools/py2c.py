@@ -4229,9 +4229,17 @@ class Transpiler:
                     args = self.coerce_args(
                         self.init_param_ctypes(self.classes[cls]), val.args,
                         defs)
-                else:                       # imported class -> unchecked args
-                    args = [self.wrap_obj(a) if False else self.expr(a)
-                            for a in val.args]
+                else:                       # imported class
+                    xinfo = self.xclasses[cls][0] if cls in self.xclasses \
+                        else None
+                    init = xinfo.methods.get("__init__") if xinfo else None
+                    if init:                # pad omitted args with __init__ defaults
+                        pct = [arg_ctype(init, a)
+                               for a in init.args.args[1:]]
+                        defs = self.defaults_for(init, True)
+                        args = self.coerce_args(pct, val.args, defs)
+                    else:
+                        args = [self.expr(a) for a in val.args]
                 self.emit("%s = %s_new(%s);" % (self._msym(name), self.ccls(cls),
                                                 ", ".join(args)))
             else:
@@ -5407,6 +5415,56 @@ class Transpiler:
         cargs = self.coerce_args(self.func_params[fn], merged, defs)
         return "%s(%s)" % (self.fnsym(fn), ", ".join(cargs))
 
+    def _sort_with_key(self, func, node):
+        """Lower ``LIST.sort(key=lambda P: BODY[, reverse=R])`` to an inline
+        decorate-sort-undecorate.
+
+        The lambda's single parameter is typed from the list's element type so
+        attribute access in BODY resolves to real struct fields; each element's
+        key is computed once, boxed to obj, and compared with obj_cmp (which
+        handles int and str keys). Emitted as a GCC statement-expression that
+        evaluates to OBJ_NONE (sort is in-place). Returns None for unsupported
+        key forms, so the caller falls back to a natural list_sort.
+        """
+        kw = {k.arg: k.value for k in node.keywords if k.arg}
+        key = kw.get("key")
+        if not isinstance(key, ast.Lambda) or len(key.args.args) != 1:
+            return None
+        param = key.args.args[0].arg
+        etype = self.iter_elem_ctype(func.value) or OBJ
+        # Bind the lambda parameter in scope while emitting the key body, so
+        # `param.attr` resolves against the element type.
+        had = param in self.scope
+        saved = self.scope.get(param)
+        self.scope[param] = etype
+        try:
+            keyobj = self.wrap_obj(key.body)
+        finally:
+            if had:
+                self.scope[param] = saved
+            else:
+                self.scope.pop(param, None)
+        if etype != OBJ and etype.endswith("*"):
+            bind = "%s %s = (%s)AS_OBJ(_e);" % (etype, param, etype)
+        else:
+            bind = "obj %s = _e; (void)%s;" % (param, param)
+        rev = kw.get("reverse")
+        cmp_sign = "<" if (isinstance(rev, ast.Constant) and
+                           rev.value is True) else ">"
+        lst = self.expr(func.value)
+        return (
+            "({ obj _lst = %s; long _n = pylen(_lst); "
+            "obj* _ks = aalloc((size_t)_n*sizeof(obj)); "
+            "obj* _es = aalloc((size_t)_n*sizeof(obj)); "
+            "for (long _i=0;_i<_n;_i++){ obj _e=index_obj(_lst,_i); _es[_i]=_e; "
+            "%s _ks[_i]=%s; } "
+            "for (long _i=1;_i<_n;_i++){ obj _k=_ks[_i],_ev=_es[_i]; "
+            "long _j=_i-1; while(_j>=0 && obj_cmp(_ks[_j],_k) %s 0){ "
+            "_ks[_j+1]=_ks[_j]; _es[_j+1]=_es[_j]; _j--; } "
+            "_ks[_j+1]=_k; _es[_j+1]=_ev; } "
+            "for (long _i=0;_i<_n;_i++) list_set(_lst,_i,_es[_i]); OBJ_NONE; })"
+            % (lst, bind, keyobj, cmp_sign))
+
     def _ex_call_inner(self, node):
         func = node.func
         argstrs = [self.expr(a) for a in node.args]
@@ -5782,6 +5840,9 @@ class Transpiler:
                 return "list_index(%s, %s)" % (self.wrap_obj(func.value),
                                                self.wrap_obj(node.args[0]))
             if func.attr == "sort":
+                ks = self._sort_with_key(func, node)
+                if ks is not None:
+                    return ks
                 return "list_sort(%s)" % self.expr(func.value)
             if func.attr == "reverse":
                 return "/* .reverse() omitted */ (void)0"
