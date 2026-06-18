@@ -5833,11 +5833,20 @@ class Transpiler:
                 if len(node.args) == 2:
                     return "py_int_base(%s, %s)" % (self.as_str(node.args[0]),
                                                     self.expr(node.args[1]))
-                return "pyint(%s)" % self.wrap_obj(node.args[0]) if node.args \
-                    else "0"
+                if node.args:
+                    vt = self.value_ctype(node.args[0])
+                    if vt in ("int", "bool", "double", "float", "long",
+                              "short", "char"):
+                        return "((long)%s)" % self.expr(node.args[0])
+                    return "pyint(%s)" % self.wrap_obj(node.args[0])
+                return "0"
             if fn == "abs" and node.args:
                 return "pyabs(%s)" % self.as_long(node.args[0])
             if fn == "float" and node.args:
+                vt = self.value_ctype(node.args[0])
+                if vt in ("int", "bool", "double", "float", "long",
+                          "short", "char"):
+                    return "((double)%s)" % self.expr(node.args[0])
                 return "pyfloat(%s)" % self.wrap_obj(node.args[0])
             if fn == "repr" and node.args:
                 return "pyrepr(%s)" % self.wrap_obj(node.args[0])
