@@ -295,6 +295,19 @@ def process_py_file(file, args):
             prelude.append("double sqrt(double);")
         if re.search(r"\batoi\b", code):
             prelude.append("int atoi(const char *);")
+        for sym, proto in [
+                ("fopen", "void *fopen(const char *, const char *);"),
+                ("fputs", "int fputs(const char *, void *);"),
+                ("fgets", "char *fgets(char *, int, void *);"),
+                ("fclose", "int fclose(void *);"),
+                ("system", "int system(const char *);"),
+                ("puts", "int puts(const char *);"),
+                ("strlen", "unsigned long strlen(const char *);")]:
+            if re.search(r"\b" + sym + r"\b", code):
+                prelude.append(proto)
+        for stream in ("stdin", "stdout", "stderr"):
+            if re.search(r"\b" + stream + r"\b", code):
+                prelude.append("extern void *" + stream + ";")
         if prelude:
             code = "\n".join(prelude) + "\n" + code
         with open(out_c, "w", encoding="utf-8") as f:
