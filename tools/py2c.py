@@ -2111,6 +2111,39 @@ RUNTIME_API_NAMES = {
 # `def` is skipped and calls are lowered to the runtime function.
 RUNTIME_INTRINSICS = {"_float_to_bits"}
 
+SOCKET_PRELUDE = r"""/* ---- rpython socket support: BSD sockets, fds are opaque int ---- */
+int socket(int, int, int);
+int connect(int, void*, unsigned int);
+int bind(int, void*, unsigned int);
+int listen(int, int);
+int accept(int, void*, void*);
+long send(int, void*, unsigned long, int);
+long recv(int, void*, unsigned long, int);
+int setsockopt(int, int, int, void*, unsigned int);
+int close(int);
+unsigned short htons(unsigned short);
+unsigned int inet_addr(const char*);
+struct __py_sin { unsigned short fam; unsigned short port;
+                  unsigned int addr; unsigned char zero[8]; };
+static int __py_sock_connect(int fd, char* host, int port) {
+    struct __py_sin a; int i = 0;
+    a.fam = 2; a.port = htons((unsigned short)port); a.addr = inet_addr(host);
+    while (i < 8) { a.zero[i] = 0; i = i + 1; }
+    return connect(fd, &a, 16);
+}
+static int __py_sock_bind(int fd, char* host, int port) {
+    struct __py_sin a; int i = 0;
+    a.fam = 2; a.port = htons((unsigned short)port);
+    a.addr = (host[0] == 0) ? 0 : inet_addr(host);
+    while (i < 8) { a.zero[i] = 0; i = i + 1; }
+    return bind(fd, &a, 16);
+}
+"""
+
+_SOCK_CONSTS = {"AF_INET": "2", "AF_INET6": "10", "AF_UNIX": "1",
+                "SOCK_STREAM": "1", "SOCK_DGRAM": "2",
+                "SOL_SOCKET": "1", "SO_REUSEADDR": "2"}
+
 # Bare names routed through mp_call_import("builtins", ...) in stdlib mode.
 STDLIB_BUILTINS = {
     "open", "next", "globals", "locals", "type", "__import__", "dir", "round",
@@ -2328,6 +2361,7 @@ class Transpiler:
         self.used_xmethods = {}     # (clsname, method) -> return ctype
         self.xstructs_needed = set()  # imported classes whose fields are read
         self._io_used = set()       # libc I/O symbols referenced (fopen, ...)
+        self._sock_used = set()     # socket symbols referenced (-> prelude)
         self.xvt_needed = set()     # imported modules needing a VT struct emitted
         self.xtype_externs = set()  # imported TypeInfo singletons (Cls_type)
         self.xvtable_impls = set()  # (clsname, method) imported vtable slot impls
@@ -2461,6 +2495,9 @@ class Transpiler:
                    for cls in sorted(set(self.class_values_needed) |
                                      {ci.csym for ci in self.class_order})]
         self.lines[self.extern_idx:self.extern_idx] = externs + tramps
+        if self._sock_used:
+            self.lines[self.extern_idx:self.extern_idx] = \
+                SOCKET_PRELUDE.splitlines()
         return "\n".join(self.lines) + "\n"
 
     def struct_body_lines(self, ci):
@@ -2911,6 +2948,8 @@ class Transpiler:
         qualified symbol (e.g. 'Mult*' -> 'shivyc_..._Mult*')."""
         if ft == "FILE*":           # rpython file handle -> opaque void*
             return "void*"
+        if ft == "sockfd":          # rpython socket handle -> int fd
+            return "int"
         if ft.endswith("*") and ft[:-1] in self.ambiguous:
             return self.ccls(ft[:-1]) + "*"
         return ft
@@ -4801,9 +4840,25 @@ class Transpiler:
                 return "char*"
         if self._std_stream(node) is not None:
             return "FILE*"
+        if isinstance(node, ast.Attribute) and \
+                isinstance(node.value, ast.Name) and node.value.id == "socket" \
+                and node.attr in _SOCK_CONSTS:
+            return "int"
         if isinstance(node, ast.Call):
             f = node.func
             if isinstance(f, ast.Attribute):
+                if isinstance(f.value, ast.Name) and f.value.id == "socket" \
+                        and f.attr == "socket":
+                    return "sockfd"
+                if isinstance(f.value, ast.Name) and f.value.id == "os" \
+                        and f.attr == "fork":
+                    return "int"
+                if self.value_ctype(f.value) == "sockfd":
+                    if f.attr == "accept":
+                        return "sockfd"
+                    if f.attr in ("connect", "bind", "listen", "send", "recv",
+                                  "setsockopt", "close"):
+                        return "int"
                 if isinstance(f.value, ast.Name) and f.value.id == "os" \
                         and f.attr == "system":
                     return "int"
@@ -5497,6 +5552,9 @@ class Transpiler:
         if stream is not None:
             self._io_used.add(stream)
             return stream
+        if isinstance(node.value, ast.Name) and node.value.id == "socket" \
+                and node.attr in _SOCK_CONSTS:
+            return _SOCK_CONSTS[node.attr]
         if node.attr == "__name__" and isinstance(node.value, ast.Attribute) \
                 and node.value.attr == "__class__":
             return "TYPE(%s)->name" % self.obj_ptr(node.value.value)
@@ -5796,10 +5854,89 @@ class Transpiler:
                         "if (_n && _b[_n-1] == '\\n') _b[_n-1] = 0; _b; })")
         return None
 
+    def _addr_pair(self, node):
+        """A Python (host, port) address tuple -> (host_expr, port_expr)."""
+        if isinstance(node, ast.Tuple) and len(node.elts) == 2:
+            return self.as_str(node.elts[0]), self.as_long(node.elts[1])
+        return self.as_str(node), "0"
+
+    def _sock_call(self, node):
+        """Lower socket / fork operations to BSD sockets C (fds are int):
+            socket.socket(af, ty)   -> socket(af, ty, 0)
+            s.bind((host, port))    -> __py_sock_bind     s.listen(n) -> listen
+            s.connect((host, port)) -> __py_sock_connect   s.accept()  -> accept
+            s.send(data[, n])       -> send                s.recv(b,n) -> recv
+            s.setsockopt(l, o, v)   -> setsockopt          s.close()   -> close
+            os.fork() -> fork()     os._exit(n) -> _exit(n)
+        """
+        f = node.func
+        if not isinstance(f, ast.Attribute):
+            return None
+        recv = f.value
+        if isinstance(recv, ast.Name) and recv.id == "socket" \
+                and f.attr == "socket":
+            self._sock_used.add("socket")
+            af = self.as_long(node.args[0]) if node.args else "2"
+            ty = self.as_long(node.args[1]) if len(node.args) > 1 else "1"
+            return "socket(%s, %s, 0)" % (af, ty)
+        if isinstance(recv, ast.Name) and recv.id == "os":
+            if f.attr == "fork":
+                self._io_used.add("fork")
+                return "fork()"
+            if f.attr == "_exit":
+                self._io_used.add("_exit")
+                n = self.as_long(node.args[0]) if node.args else "0"
+                return "_exit(%s)" % n
+        if self.value_ctype(recv) != "sockfd":
+            return None
+        fd = self.expr(recv)
+        a = f.attr
+        if a == "connect":
+            self._sock_used.add("connect")
+            host, port = self._addr_pair(node.args[0])
+            return "__py_sock_connect(%s, %s, %s)" % (fd, host, port)
+        if a == "bind":
+            self._sock_used.add("bind")
+            host, port = self._addr_pair(node.args[0])
+            return "__py_sock_bind(%s, %s, %s)" % (fd, host, port)
+        if a == "listen":
+            self._sock_used.add("listen")
+            n = self.as_long(node.args[0]) if node.args else "1"
+            return "listen(%s, %s)" % (fd, n)
+        if a == "accept":
+            self._sock_used.add("accept")
+            return "accept(%s, 0, 0)" % fd
+        if a == "send":
+            self._sock_used.add("send")
+            data = self.as_str(node.args[0])
+            if len(node.args) > 1:
+                ln = self.as_long(node.args[1])
+            else:
+                self._io_used.add("strlen")
+                ln = "strlen(%s)" % data
+            return "send(%s, %s, %s, 0)" % (fd, data, ln)
+        if a == "recv":
+            self._sock_used.add("recv")
+            buf = self.expr(node.args[0])
+            ln = self.as_long(node.args[1])
+            return "recv(%s, %s, %s, 0)" % (fd, buf, ln)
+        if a == "setsockopt":
+            self._sock_used.add("setsockopt")
+            return ("({ int _v = %s; setsockopt(%s, %s, %s, &_v, 4); })"
+                    % (self.as_long(node.args[2]), fd,
+                       self.as_long(node.args[0]), self.as_long(node.args[1])))
+        if a == "close":
+            self._sock_used.add("close")
+            return "close(%s)" % fd
+        return None
+
     def _ex_call_inner(self, node):
         io = self._io_call(node)
         if io is not None:
             return io
+        sk = self._sock_call(node)
+        if sk is not None:
+            return sk
         func = node.func
         argstrs = [self.expr(a) for a in node.args]
 
