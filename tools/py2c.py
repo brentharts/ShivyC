@@ -1237,24 +1237,64 @@ def ann_text_to_ctype(text):
     text = text.strip().strip("'\"")
     simple = {"int": "int", "bool": "bool", "None": "void", "str": "char*",
               "float": "double", "bytes": "char*"}
+    # numpy-style dtype aliases -> real C scalar types. f32 is a true 32-bit
+    # float (single precision), so f32 kernels vectorize to mulps/addps.
+    dtypes = {"f32": "float", "f64": "double", "i8": "char", "i16": "short",
+              "i32": "int", "i64": "long", "u8": "unsigned char",
+              "u32": "unsigned"}
     if text in simple:
         return simple[text]
-    head = text.split("[", 1)[0]
+    if text in dtypes:
+        return dtypes[text]
+    head = text.split("[", 1)[0].strip()
     if head in ("List", "list", "Dict", "dict", "Set", "set", "Tuple",
                 "tuple", "Optional", "Any", "object"):
         return OBJ
-    # pointer-to-scalar arrays, e.g. "int*", "float*", "double*" -- the rpython
-    # way to take a real C array (numpy-style) rather than a boxed list, so
-    # `a[i]` lowers to native indexing and the loop can be vectorized.
-    if text.endswith("*"):
-        base = text[:-1].strip()
+
+    def _scalar(base):
+        base = base.strip()
+        if base in dtypes:
+            return dtypes[base]
         if base in simple and simple[base] != "void":
-            return simple[base] + "*"
-        if base in ("char", "long", "short", "unsigned", "signed", "void"):
-            return base + "*"
+            return simple[base]
+        if base in ("char", "long", "short", "unsigned", "signed",
+                    "int", "float", "double"):
+            return base
+        return None
+
+    # fixed-size array  T[N] / f32[N] -> pointer to element (count via
+    # ann_array_size, used to infer SIMD-divisibility contracts).
+    m = re.match(r"^([A-Za-z_][\w ]*?)\s*\[\s*\d+\s*\]$", text)
+    if m:
+        s = _scalar(m.group(1))
+        if s:
+            return s + "*"
+    # pointer-to-scalar arrays, e.g. "int*", "float*", "f32*", "double*" -- the
+    # rpython way to take a real C array (numpy-style) rather than a boxed list,
+    # so `a[i]` lowers to native indexing and the loop can be vectorized.
+    if text.endswith("*"):
+        s = _scalar(text[:-1])
+        if s:
+            return s + "*"
+        if text[:-1].strip() in ("void",):
+            return "void*"
     if text and (text[0].isupper() or text[0] == "_") and text.isidentifier():
         return text + "*"
     return None
+
+
+def ann_array_size(ann):
+    """Element count N of a fixed-size array annotation `T[N]` / `f32[N]`, else
+    None. Lets py2c infer SIMD-divisibility contracts with no user assert."""
+    if ann is None:
+        return None
+    try:
+        text = ann.strip().strip("'\"") if isinstance(ann, str) \
+            else ast.unparse(ann).strip().strip("'\"")
+    except Exception:
+        return None
+    m = re.match(r"^[A-Za-z_][\w ]*?\s*\[\s*(\d+)\s*\]$", text)
+    return int(m.group(1)) if m else None
 
 
 def ann_elem_ctype(ann):
@@ -4410,6 +4450,30 @@ class Transpiler:
             return "assert %s %s %d" % (lenexpr(left), sym, right.value)
         return None
 
+    def _auto_contracts(self, node):
+        """Infer SIMD-divisibility contracts from fixed-size array parameters
+        (`x: "f32[256]"`) so the user need not write any assert. A 128-bit SSE
+        register holds 16/sizeof(elem) lanes; if the fixed element count is a
+        multiple of that lane count, emit the divisibility + minimum-length
+        contracts that license ShivyCX's vectorized kernel."""
+        bytesz = {"char": 1, "bool": 1, "short": 2, "int": 4, "unsigned": 4,
+                  "float": 4, "long": 8, "double": 8}
+        clauses = []
+        for a in node.args.args:
+            if a.annotation is None:
+                continue
+            ct = ann_to_ctype(a.annotation)
+            size = ann_array_size(a.annotation)
+            if size is None or not ct or not ct.endswith("*") \
+                    or ct[:-1] not in _SCALAR_CTYPES:
+                continue
+            lanes = 16 // bytesz.get(ct[:-1], 4)
+            if lanes >= 2 and size % lanes == 0:
+                nm = cname(a.arg)
+                clauses.append("assert not len(%s) %% %d" % (nm, lanes))
+                clauses.append("assert len(%s) >= %d" % (nm, lanes))
+        return clauses
+
     def func_def(self, node):
         self.enter_scope(node, skip_self=False)
         ret = ann_to_ctype(node.returns) or OBJ
@@ -4417,6 +4481,9 @@ class Transpiler:
         params = self.param_list(node, skip_self=False)
         plist = ", ".join(params) if params else "void"
         clauses, body = self._extract_contracts(node)
+        for c in self._auto_contracts(node):       # from fixed-size arrays
+            if c not in clauses:
+                clauses.append(c)
         sig = self.func_signature(node).rstrip(";")
         if clauses:
             self.emit(sig)
@@ -4648,11 +4715,15 @@ class Transpiler:
                 return "char*"
             lt = self.value_ctype(node.left)
             rt = self.value_ctype(node.right)
-            numeric = ("int", "bool", "double")
+            numeric = ("int", "bool", "double", "float")
             if lt in numeric and rt in numeric:
                 if isinstance(node.op, ast.Div):
                     return "double"          # Python `/` is always float
-                return "double" if "double" in (lt, rt) else "int"
+                if "double" in (lt, rt):
+                    return "double"
+                if "float" in (lt, rt):
+                    return "float"
+                return "int"
             return OBJ  # obj arithmetic yields a Tier-2 obj
         if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp,
                              ast.GeneratorExp)):
@@ -6859,7 +6930,7 @@ class Transpiler:
                                          self.as_str(node.right))
         lt = self.value_ctype(node.left)
         rt = self.value_ctype(node.right)
-        numeric = {"int", "bool", "double"}
+        numeric = {"int", "bool", "double", "float"}
         # both sides are concrete numbers -> plain C arithmetic
         if lt in numeric and rt in numeric:
             if isinstance(node.op, ast.Pow):     # C has no ** operator
