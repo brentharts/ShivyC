@@ -289,6 +289,8 @@ def process_py_file(file, args):
             prelude.append("int printf(const char *, ...);")
         if re.search(r"\bsqrt\b", code):
             prelude.append("double sqrt(double);")
+        if re.search(r"\batoi\b", code):
+            prelude.append("int atoi(const char *);")
         if prelude:
             code = "\n".join(prelude) + "\n" + code
         with open(out_c, "w", encoding="utf-8") as f:
