@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Benchmark harness: ShivyCX extended-C features vs gcc -O0.
+"""Benchmark harness: ShivyCX extended-C features vs gcc -O0 vs CCC.
 
 ShivyCX emits unoptimized, -O0-class code, so the fair external peer is
 **gcc -O0** (gcc -O2 would measure a different compiler class entirely). The
 primary comparison for each feature is still feature-ON vs feature-OFF on the
 same compiler, which holds codegen quality constant and isolates the feature;
 gcc -O0 is shown alongside as the honest "what an ordinary unoptimizing C
-compiler does" reference.
+compiler does" reference. CCC (Claude's C Compiler, another from-scratch
+unoptimizing compiler) is included as a third peer when built; see
+benchmarks/build_ccc.sh. It is auto-detected and omitted if absent.
 
 For every configuration the harness:
   * compiles the program,
@@ -42,6 +44,42 @@ def _gcc(src, out, opt="-O0"):
     p = subprocess.run(["gcc", opt, src, "-o", out],
                        capture_output=True, text=True)
     return p.returncode, p.stdout + p.stderr
+
+
+# CCC = Claude's C Compiler (https://github.com/anthropics/claudes-c-compiler),
+# another from-scratch unoptimizing C compiler -- a natural third peer next to
+# gcc -O0. Auto-detected; if it is not built, the CCC column is simply omitted
+# (build it with benchmarks/build_ccc.sh, or set $CCC to the binary).
+def _find_ccc():
+    import shutil
+    cand = os.environ.get("CCC") or shutil.which("ccc")
+    if cand and os.path.exists(cand):
+        return cand
+    guess = os.path.join(REPO, "..", "ccc", "target", "release", "ccc")
+    return guess if os.path.exists(guess) else None
+
+
+CCC_BIN = _find_ccc()
+
+
+def _ccc(src, out):
+    if not CCC_BIN:
+        return None, "ccc not available"
+    p = subprocess.run([CCC_BIN, "-o", out, src],
+                       capture_output=True, text=True)
+    return p.returncode, p.stdout + p.stderr
+
+
+def _add_ccc(cfgs, src, d, metric="external unoptimizing C compiler"):
+    """Append a CCC config built from the same plain-C source gcc -O0 uses, if
+    CCC is available and compiles it. No-op otherwise."""
+    if not CCC_BIN:
+        return
+    out = os.path.join(d, "bin_ccc")
+    rc, _ = _ccc(src, out)
+    if rc == 0 and os.path.exists(out):
+        cfgs.append({"name": "CCC", "binary": out, "baseline": False,
+                     "metric": metric, "metric_val": None})
 
 
 def _run_exit(binary):
@@ -139,6 +177,7 @@ def bench_nbit():
     _gcc(src, os.path.join(d, "bin_gcc0"))
     cfgs.append({"name": "gcc -O0", "binary": os.path.join(d, "bin_gcc0"),
                  "baseline": False, "metric": "5 mem-loads; never uses xmm15", "metric_val": None})
+    _add_ccc(cfgs, src, d)
 
     return {"benchmark": "nbit_globals", "configs": _finish(cfgs)}
 
@@ -167,6 +206,7 @@ def bench_contracts():
     _gcc(src_off, os.path.join(d, "bin_gcc0"))   # gcc can't parse `assert` clauses
     cfgs.append({"name": "gcc -O0", "binary": os.path.join(d, "bin_gcc0"),
                  "baseline": False, "metric": "scalar loop", "metric_val": None})
+    _add_ccc(cfgs, src_off, d)
 
     return {"benchmark": "contracts_simd", "configs": _finish(cfgs)}
 
@@ -196,6 +236,7 @@ def bench_stackless():
     _gcc(src, os.path.join(d, "bin_gcc0"))
     cfgs.append({"name": "gcc -O0", "binary": os.path.join(d, "bin_gcc0"),
                  "baseline": False, "metric": "full framed calls", "metric_val": None})
+    _add_ccc(cfgs, src, d)
 
     return {"benchmark": "stackless", "configs": _finish(cfgs)}
 
@@ -225,6 +266,7 @@ def bench_metamorphic():
     _gcc(src_off, os.path.join(d, "bin_gcc0"))   # gcc can't parse __metamorphic__
     cfgs.append({"name": "gcc -O0", "binary": os.path.join(d, "bin_gcc0"),
                  "baseline": False, "metric": "ordinary call/ret", "metric_val": None})
+    _add_ccc(cfgs, src_off, d)
 
     return {"benchmark": "metamorphic", "configs": _finish(cfgs)}
 

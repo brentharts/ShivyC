@@ -136,3 +136,11 @@ benchmarks/
   results/benchmarks.png                  runtime chart (4 features)
   results/benchmarks2.png                 capability chart (member-elim, threads, mem-safety)
 ```
+
+## Third peer: CCC
+
+[CCC](https://github.com/anthropics/claudes-c-compiler) (Claude's C Compiler) is
+included alongside gcc -O0 as a second from-scratch unoptimizing compiler. Build
+it with `./build_ccc.sh` (needs a Rust toolchain); the harness auto-detects
+`../ccc/target/release/ccc` or `$CCC`, and omits the CCC column if it is not
+built. CCC compiles the same plain-C source gcc -O0 uses.
