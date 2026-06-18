@@ -65,6 +65,28 @@ of the SSE2 width across the whole call graph, so it emits an SSE2 loop with
 ShivyCX's own scalar code**, and it beats gcc -O0 by ~26×. This is the paper's
 "guarantee gcc and clang cannot make without runtime checks" made concrete.
 
+## 3a — rpython `.py` SIMD vs **gcc -O2** (dynamic argv defeats folding)
+
+`simd_py/bench_evolve.py` raises the bar to gcc **-O2**. Two things stop -O2 from
+cheating: the loop count is read from `sys.argv` (rpython now supports it, so
+`main` becomes `int main(int argc, char** argv)` and `int(sys.argv[1])` lowers to
+`atoi`), and the kernel is an in-place recurrence `x[i] += y[i]` that is not
+loop-invariant, so -O2 cannot hoist it out. Both compilers must actually run and
+auto-vectorize the loop. ShivyCX vectorizes via the `len(x) % 4` contract with no
+alignment peeling and no scalar remainder:
+
+```
+ShivyCX .py (+contract SIMD)   0.488s  [addps, no peel/remainder]  (1.05x vs gcc -O2)
+gcc -O2                        0.510s  [auto-vectorized + peel/remainder]
+gcc -O0                       10.047s  [scalar loop]               (0.05x)
+```
+
+ShivyCX's contract SIMD **matches (edges out) gcc -O2** here and is ~20× faster
+than gcc -O0 — because the proven contract lets it skip the peel/remainder
+scaffolding -O2 must emit when it cannot know the length is a multiple of the
+vector width. Differential correctness holds (all configs return the same value,
+which depends on the runtime argument).
+
 ## 3 — rpython `.py` SIMD kernel vs gcc -O0
 
 `simd_py/bench_saxpy.py` is an *rpython* source (`out[i] = alpha*x[i] + y[i]`

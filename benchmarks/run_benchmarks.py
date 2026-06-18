@@ -82,15 +82,16 @@ def _add_ccc(cfgs, src, d, metric="external unoptimizing C compiler"):
                      "metric": metric, "metric_val": None})
 
 
-def _run_exit(binary):
-    return subprocess.run([binary]).returncode
+def _run_exit(binary, args=None):
+    return subprocess.run([binary] + list(args or [])).returncode
 
 
-def _time_best(binary, reps=REPS):
+def _time_best(binary, reps=REPS, args=None):
+    argv = [binary] + list(args or [])
     best = float("inf")
     for _ in range(reps):
         t0 = time.perf_counter()
-        subprocess.run([binary], stdout=subprocess.DEVNULL)
+        subprocess.run(argv, stdout=subprocess.DEVNULL)
         best = min(best, time.perf_counter() - t0)
     return best
 
@@ -143,8 +144,9 @@ def _count(asm, pat):
 
 def _finish(configs):
     for c in configs:
-        c["exit_code"] = _run_exit(c["binary"])
-        c["time_s"] = _time_best(c["binary"])
+        a = c.get("run_args")
+        c["exit_code"] = _run_exit(c["binary"], a)
+        c["time_s"] = _time_best(c["binary"], args=a)
     return configs
 
 
@@ -227,7 +229,7 @@ def _py2c(py_src, out_c):
         return None
     code = open(cpath).read()
     code = re.sub(r'#include "shivyc_rt\.h"\n', "", code)
-    code = "void *malloc(unsigned long);\n" + code
+    code = "void *malloc(unsigned long);\nint atoi(const char *);\n" + code
     with open(out_c, "w") as f:
         f.write(code)
     return out_c
@@ -267,6 +269,45 @@ def bench_simd_py():
     _add_ccc(cfgs, scal_c, d, metric="external unoptimizing C compiler")
 
     return {"benchmark": "simd_py_saxpy", "configs": _finish(cfgs)}
+
+
+def bench_simd_o2():
+    """rpython SIMD kernel (.py) vs gcc -O2. The loop count comes from argv, so
+    gcc -O2 cannot fold the program to a constant, and the in-place recurrence
+    x += y is not loop-invariant so it cannot be hoisted -- gcc must actually
+    run (and auto-vectorize) the loop. ShivyCX vectorizes via the len(x)%4
+    contract (no peeling, no remainder). This pits ShivyCX's contract SIMD
+    against a real optimizing compiler on equal, un-foldable work."""
+    d = os.path.join(HERE, "simd_py")
+    py_src = os.path.join(d, "bench_evolve.py")
+    simd_c = os.path.join(d, "bench_evolve_simd.c")
+    scal_c = os.path.join(d, "bench_evolve_scalar.c")
+    REP_ARG = ["400000"]
+    cfgs = []
+
+    if _py2c(py_src, simd_c) is None:
+        return {"benchmark": "simd_py_vs_gcc_O2", "configs": _finish(cfgs)}
+    _write_baseline(simd_c, scal_c, _strip_contract_clauses)
+
+    _shivyc(simd_c, os.path.join(d, "bin_evolve_simd"))
+    fn = _extract_function(_read_asm(simd_c), "vadd")
+    vec = "addps" in fn
+    cfgs.append({"name": "ShivyCX .py (+contract SIMD)",
+                 "binary": os.path.join(d, "bin_evolve_simd"), "baseline": False,
+                 "metric": "addps, no peel/remainder" if vec else "scalar",
+                 "metric_val": vec, "run_args": REP_ARG})
+
+    _gcc(scal_c, os.path.join(d, "bin_evolve_gcc2"), opt="-O2")
+    cfgs.append({"name": "gcc -O2", "binary": os.path.join(d, "bin_evolve_gcc2"),
+                 "baseline": True, "metric": "auto-vectorized + peel/remainder",
+                 "metric_val": None, "run_args": REP_ARG})
+
+    _gcc(scal_c, os.path.join(d, "bin_evolve_gcc0"), opt="-O0")
+    cfgs.append({"name": "gcc -O0", "binary": os.path.join(d, "bin_evolve_gcc0"),
+                 "baseline": False, "metric": "scalar loop",
+                 "metric_val": None, "run_args": REP_ARG})
+
+    return {"benchmark": "simd_py_vs_gcc_O2", "configs": _finish(cfgs)}
 
 
 # ===========================================================================
@@ -422,6 +463,7 @@ def main():
     for label, fn in [("_Nbit globals", bench_nbit),
                       ("contracts SIMD", bench_contracts),
                       ("SIMD .py vs gcc -O0", bench_simd_py),
+                      ("SIMD .py vs gcc -O2", bench_simd_o2),
                       ("stackless calls", bench_stackless),
                       ("metamorphic returns", bench_metamorphic)]:
         print("Running %s benchmark ..." % label)
@@ -439,7 +481,7 @@ def main():
     with open(os.path.join(RESULTS_DIR, "results.json"), "w") as f:
         json.dump(results, f, indent=2)
 
-    for bench in results[:5]:
+    for bench in results[:6]:
         print("\n=== %s ===" % bench["benchmark"])
         exits = {c["exit_code"] for c in bench["configs"]}
         print("  differential correctness: %s (exit codes: %s)"
