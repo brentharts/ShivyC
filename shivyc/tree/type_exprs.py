@@ -197,6 +197,11 @@ class Cast(Declaration, _RExprNode):
             raise CompilerError(err, self.node.decls[0].r)
 
         il_value = self.expr.make_il(il_code, symbol_table, c)
+        if ctype.is_void():
+            # `(void)expr` is the standard discard idiom: evaluate for any
+            # side effects and throw the value away. Valid for any source type
+            # (e.g. discarding an unused union-typed parameter).
+            return il_value
         if not il_value.ctype.is_scalar():
             err = "can only cast from scalar type"
             raise CompilerError(err, self.r)
