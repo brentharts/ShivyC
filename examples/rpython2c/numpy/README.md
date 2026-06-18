@@ -190,3 +190,37 @@ The synthesizer is now register-driven (System V assignment computed from the
 signature) rather than hardcoded to one shape, so 2-, 3- and 4-pointer kernels
 and an fp scalar all land in the right registers. `simd_kernels.py` exercises
 all three and returns 55 (= 30 + 4 + 21) as the proof of correctness.
+
+## simd_blas.py — scalar broadcast + dot product
+
+Two more contract-proven kinds in `shivyc/simd_contracts.py`:
+
+- **scalar broadcast** (`scale`): `out[i] = x[i] * s` (also `+`/`-`) where `s`
+  is an fp scalar argument. The scalar is splatted across the SSE lanes
+  (`shufps`/`unpcklpd`) once, then a single `mulps`/`addps`/`subps` per vector.
+- **dot product** (`dot`): `acc += a[i]*b[i]` over a loop returning the
+  accumulator. This is a *reduction* with no store: `mulps`/`mulpd` then
+  `addps`/`addpd` into a lane accumulator, followed by a horizontal sum, with
+  the scalar result returned in `xmm0`. The accumulator and array element type
+  must match (use `f64*` for a double accumulator).
+
+```
+python3 -m shivyc.main examples/rpython2c/numpy/simd_blas.py -o blas && ./blas
+echo $?      # 186   (scale -> 50, dot -> 136)
+```
+
+The classifier/synthesizer are register-driven, so the dot's 2-pointers+length
+layout (`a=rdi, b=rsi, n=edx`, result in `xmm0`) and the scale's
+scalar+2-pointers layout are assigned correctly without any per-kernel
+hardcoding. Both honor the same auto-contract path: annotate fixed sizes and the
+asserts disappear entirely.
+
+### Kernel shapes ShivyCX now vectorizes from contracts
+
+    reduce   sum += p[i]                 (int)        paddd + horizontal
+    dot      acc += a[i]*b[i]            (float)      mulps/pd + horizontal
+    binary   out[i] = a[i] {+,-,*} b[i]               addps/subps/mulps
+    scale    out[i] = x[i] {+,-,*} s                  broadcast + op
+    saxpy    out[i] = s*x[i] + y[i]                   broadcast + mul + add
+    fma      out[i] = a[i]*b[i] + c[i]                mul + add
+    map      out[i] = sqrt(x[i])                      sqrtps/pd
