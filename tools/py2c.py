@@ -3926,14 +3926,79 @@ class Transpiler:
                 return ann_elem_ctype(fn.returns)
         return None
 
+    def _float_locals(self, body):
+        """Locals that are real-valued, found by fixpoint: a local is double if
+        some assignment to it is a float literal, a `/` true-division, a
+        float()/known float-returning call, or arithmetic that involves another
+        float local -- and no assignment is clearly non-numeric. This breaks the
+        single-pass chicken-and-egg where `acc = acc + ...` looked like obj
+        because `acc` was not yet known to be double."""
+        assigns = {}
+        for stmt in body:
+            for sub in ast.walk(stmt):
+                tgt = None
+                if isinstance(sub, ast.Assign):
+                    for t in sub.targets:
+                        if isinstance(t, ast.Name):
+                            assigns.setdefault(t.id, []).append(sub.value)
+                elif isinstance(sub, ast.AugAssign) and \
+                        isinstance(sub.target, ast.Name):
+                    assigns.setdefault(sub.target.id, []).append(sub.value)
+
+        def non_numeric(node):
+            if isinstance(node, ast.Constant):
+                return not isinstance(node.value, (int, float, bool))
+            if isinstance(node, (ast.Str, ast.List, ast.Dict, ast.Set,
+                                 ast.Tuple, ast.ListComp, ast.DictComp,
+                                 ast.SetComp, ast.JoinedStr)):
+                return True
+            return False
+
+        floats = set()
+
+        def is_float(node):
+            if isinstance(node, ast.Constant):
+                return isinstance(node.value, float)
+            if isinstance(node, ast.Name):
+                return node.id in floats
+            if isinstance(node, ast.BinOp):
+                if isinstance(node.op, ast.Div):     # true division -> float
+                    return True
+                return is_float(node.left) or is_float(node.right)
+            if isinstance(node, ast.UnaryOp):
+                return is_float(node.operand)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                return node.func.id in ("float", "sqrt", "exp", "log", "sin",
+                                        "cos", "tan", "pow", "fabs")
+            return False
+
+        changed = True
+        while changed:
+            changed = False
+            for name, vals in assigns.items():
+                if name in floats or name in self.scope:
+                    continue
+                if any(non_numeric(v) for v in vals):
+                    continue                 # ever holds a non-number -> not double
+                if any(is_float(v) for v in vals):
+                    floats.add(name)
+                    changed = True
+        return floats
+
     def hoist_locals(self, body):
         """Find all assigned locals and their types, to declare at function top
         (Python has function scope; C blocks would otherwise lose them)."""
         order = []
         types = {}
+        float_locals = self._float_locals(body)
 
         def consider(name, ctype):
             if name in self.scope:
+                return
+            if name in float_locals:            # pinned real-valued
+                if name not in types:
+                    order.append(name)
+                types[name] = "double"
                 return
             if name not in types:
                 order.append(name)
@@ -4519,8 +4584,11 @@ class Transpiler:
                 return "char*"
             lt = self.value_ctype(node.left)
             rt = self.value_ctype(node.right)
-            if lt in ("int", "bool") and rt in ("int", "bool"):
-                return "int"
+            numeric = ("int", "bool", "double")
+            if lt in numeric and rt in numeric:
+                if isinstance(node.op, ast.Div):
+                    return "double"          # Python `/` is always float
+                return "double" if "double" in (lt, rt) else "int"
             return OBJ  # obj arithmetic yields a Tier-2 obj
         if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp,
                              ast.GeneratorExp)):
@@ -6730,6 +6798,9 @@ class Transpiler:
             if isinstance(node.op, ast.Pow):     # C has no ** operator
                 return "ipow(%s, %s)" % (self.expr(node.left),
                                          self.expr(node.right))
+            if isinstance(node.op, ast.Div):     # Python `/` is float division
+                return "((double)%s / (double)%s)" % (self.expr(node.left),
+                                                      self.expr(node.right))
             return "(%s %s %s)" % (self.expr(node.left),
                                    self.binop_sym(node.op),
                                    self.expr(node.right))
