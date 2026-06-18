@@ -2327,6 +2327,7 @@ class Transpiler:
                 break
         self.used_xmethods = {}     # (clsname, method) -> return ctype
         self.xstructs_needed = set()  # imported classes whose fields are read
+        self._io_used = set()       # libc I/O symbols referenced (fopen, ...)
         self.xvt_needed = set()     # imported modules needing a VT struct emitted
         self.xtype_externs = set()  # imported TypeInfo singletons (Cls_type)
         self.xvtable_impls = set()  # (clsname, method) imported vtable slot impls
@@ -2908,6 +2909,8 @@ class Transpiler:
     def ctype_csym(self, ft):
         """Rewrite a C type so a pointer to an ambiguous class uses that class's
         qualified symbol (e.g. 'Mult*' -> 'shivyc_..._Mult*')."""
+        if ft == "FILE*":           # rpython file handle -> opaque void*
+            return "void*"
         if ft.endswith("*") and ft[:-1] in self.ambiguous:
             return self.ccls(ft[:-1]) + "*"
         return ft
@@ -4046,6 +4049,7 @@ class Transpiler:
         (Python has function scope; C blocks would otherwise lose them)."""
         order = []
         types = {}
+        self._hoisting = types          # let value_ctype see earlier inferences
         float_locals = self._float_locals(body)
 
         def consider(name, ctype):
@@ -4114,7 +4118,9 @@ class Transpiler:
                         for el in sub.target.elts:
                             if isinstance(el, ast.Name) and el.id != "_":
                                 consider(el.id, OBJ)
-        return [(n, types[n]) for n in order]
+        result = [(n, types[n]) for n in order]
+        self._hoisting = None
+        return result
 
     def emit_hoisted_body(self, body):
         for name, ct in self.hoist_locals(body):
@@ -4793,9 +4799,26 @@ class Transpiler:
                     inner.value.value.id == "self" and self.cur_class and \
                     inner.value.attr in self.cur_class.const_dicts:
                 return "char*"
+        if self._std_stream(node) is not None:
+            return "FILE*"
         if isinstance(node, ast.Call):
             f = node.func
+            if isinstance(f, ast.Attribute):
+                if isinstance(f.value, ast.Name) and f.value.id == "os" \
+                        and f.attr == "system":
+                    return "int"
+                if self.value_ctype(f.value) == "FILE*":
+                    if f.attr in ("read", "readline"):
+                        return "char*"
+                    if f.attr == "write":
+                        return "int"
+                    if f.attr == "close":
+                        return "int"
             if isinstance(f, ast.Name):
+                if f.id == "open":
+                    return "FILE*"
+                if f.id == "input":
+                    return "char*"
                 if f.id == "isinstance":
                     return "bool"
                 if f.id in ("any", "all"):
@@ -5461,7 +5484,19 @@ class Transpiler:
             return "(%s*)AS_OBJ(%s)" % (cls, e)
         return "(%s*)(%s)" % (cls, e)
 
+    def _std_stream(self, node):
+        """`sys.stdin/stdout/stderr` -> the libc stream name, else None."""
+        if isinstance(node, ast.Attribute) and \
+                isinstance(node.value, ast.Name) and node.value.id == "sys" \
+                and node.attr in ("stdin", "stdout", "stderr"):
+            return node.attr
+        return None
+
     def ex_Attribute(self, node):
+        stream = self._std_stream(node)
+        if stream is not None:
+            self._io_used.add(stream)
+            return stream
         if node.attr == "__name__" and isinstance(node.value, ast.Attribute) \
                 and node.value.attr == "__class__":
             return "TYPE(%s)->name" % self.obj_ptr(node.value.value)
@@ -5719,7 +5754,52 @@ class Transpiler:
             "for (long _i=0;_i<_n;_i++) list_set(_lst,_i,_es[_i]); OBJ_NONE; })"
             % (lst, bind, keyobj, cmp_sign))
 
+    def _io_call(self, node):
+        """Lower simple I/O to C stdio (all handles are opaque void*):
+            open(path, mode)        -> fopen
+            f.write(s)              -> fputs
+            f.read()/f.readline()   -> fgets into a fresh buffer (line)
+            f.close()               -> fclose
+            input()                 -> read a line from stdin (newline stripped)
+            os.system(cmd)          -> system
+        """
+        f = node.func
+        if isinstance(f, ast.Attribute):
+            recv = f.value
+            if isinstance(recv, ast.Name) and recv.id == "os" \
+                    and f.attr == "system" and node.args:
+                self._io_used.add("system")
+                return "system(%s)" % self.as_str(node.args[0])
+            if self.value_ctype(recv) == "FILE*":
+                fe = self.expr(recv)
+                if f.attr == "write" and node.args:
+                    self._io_used.add("fputs")
+                    return "fputs(%s, %s)" % (self.as_str(node.args[0]), fe)
+                if f.attr == "close":
+                    self._io_used.add("fclose")
+                    return "fclose(%s)" % fe
+                if f.attr in ("read", "readline"):
+                    self._io_used.update(("malloc", "fgets"))
+                    return ("({ char* _b = malloc(4096); "
+                            "if (!fgets(_b, 4096, %s)) _b[0] = 0; _b; })" % fe)
+        if isinstance(f, ast.Name):
+            if f.id == "open" and node.args:
+                self._io_used.add("fopen")
+                mode = self.as_str(node.args[1]) if len(node.args) > 1 \
+                    else "\"r\""
+                return "fopen(%s, %s)" % (self.as_str(node.args[0]), mode)
+            if f.id == "input":
+                self._io_used.update(("malloc", "fgets", "stdin"))
+                return ("({ char* _b = malloc(4096); "
+                        "if (!fgets(_b, 4096, stdin)) _b[0] = 0; "
+                        "long _n = 0; while (_b[_n]) _n++; "
+                        "if (_n && _b[_n-1] == '\\n') _b[_n-1] = 0; _b; })")
+        return None
+
     def _ex_call_inner(self, node):
+        io = self._io_call(node)
+        if io is not None:
+            return io
         func = node.func
         argstrs = [self.expr(a) for a in node.args]
 
@@ -5792,8 +5872,15 @@ class Transpiler:
             if fn == "len" and len(node.args) == 1:
                 if self._is_sys_argv(node.args[0]):
                     return "argc"
+                if self.value_ctype(node.args[0]) == "char*":
+                    self._io_used.add("strlen")
+                    return "strlen(%s)" % self.expr(node.args[0])
                 return "pylen(%s)" % self.wrap_obj(node.args[0])
             if fn == "print":
+                if len(node.args) == 1 and \
+                        self.value_ctype(node.args[0]) == "char*":
+                    self._io_used.add("puts")
+                    return "puts(%s)" % self.expr(node.args[0])
                 if node.args:
                     return "pyprint(%s)" % self.wrap_obj(node.args[0])
                 return 'pyprint(OBJ_STR(""))'
@@ -6838,6 +6925,9 @@ class Transpiler:
                 return self.cur_class.name + "*"
             if node.id in self.scope:
                 return self.scope[node.id]
+            h = getattr(self, "_hoisting", None)
+            if h is not None and node.id in h:
+                return h[node.id]       # type inferred earlier in this hoist pass
             if node.id in self.func_nodes:   # function used as a value -> closure
                 return OBJ
             if node.id in self.classes:      # class used as a value -> ctor closure
