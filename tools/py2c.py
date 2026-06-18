@@ -2144,6 +2144,15 @@ _SOCK_CONSTS = {"AF_INET": "2", "AF_INET6": "10", "AF_UNIX": "1",
                 "SOCK_STREAM": "1", "SOCK_DGRAM": "2",
                 "SOL_SOCKET": "1", "SO_REUSEADDR": "2"}
 
+# libm unary/binary functions: numeric ufuncs that return double. Recognised so
+# `exp(x) + sin(x)` stays native double arithmetic instead of boxing.
+MATH_FUNCS = {
+    "sqrt", "cbrt", "exp", "exp2", "expm1", "log", "log2", "log10", "log1p",
+    "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh",
+    "asinh", "acosh", "atanh", "fabs", "floor", "ceil", "round", "trunc",
+    "pow", "fmod", "fmax", "fmin", "atan2", "hypot", "copysign",
+}
+
 # Bare names routed through mp_call_import("builtins", ...) in stdlib mode.
 STDLIB_BUILTINS = {
     "open", "next", "globals", "locals", "type", "__import__", "dir", "round",
@@ -4066,8 +4075,10 @@ class Transpiler:
             if isinstance(node, ast.UnaryOp):
                 return is_float(node.operand)
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-                return node.func.id in ("float", "sqrt", "exp", "log", "sin",
-                                        "cos", "tan", "pow", "fabs")
+                return node.func.id in MATH_FUNCS or node.func.id == "float"
+            if isinstance(node, ast.Call) and isinstance(node.func,
+                                                         ast.Attribute):
+                return node.func.attr in MATH_FUNCS    # math.sin / np.exp
             return False
 
         changed = True
@@ -4852,6 +4863,12 @@ class Transpiler:
             return "int"
         if isinstance(node, ast.Call):
             f = node.func
+            if isinstance(f, ast.Name) and f.id in MATH_FUNCS:
+                return "double"
+            if isinstance(f, ast.Attribute) and f.attr in MATH_FUNCS and \
+                    isinstance(f.value, ast.Name) and \
+                    f.value.id in ("math", "np", "numpy"):
+                return "double"
             if isinstance(f, ast.Attribute):
                 if isinstance(f.value, ast.Name) and f.value.id == "socket" \
                         and f.attr == "socket":
@@ -5942,6 +5959,14 @@ class Transpiler:
         return None
 
     def _ex_call_inner(self, node):
+        f0 = node.func
+        if isinstance(f0, ast.Attribute) and f0.attr in MATH_FUNCS and \
+                isinstance(f0.value, ast.Name) and \
+                f0.value.id in ("math", "np", "numpy"):
+            return "%s(%s)" % (f0.attr,
+                               ", ".join(self.coerce_to("double", a,
+                                                        self.expr(a))
+                                         for a in node.args))
         io = self._io_call(node)
         if io is not None:
             return io
