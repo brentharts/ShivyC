@@ -5234,9 +5234,20 @@ class Transpiler:
                     ct = self.value_ctype(t)
                 except Exception:
                     ct = None
+            # `del p` on a heap pointer reclaims its storage. A non-POD class
+            # instance lives in the runtime arena (aalloc) and is returned to
+            # the arena free list with afree; a POD instance or a typed array
+            # is libc-malloc'd, so it is released with free(). Borrowed/scalar
+            # values (char*, void*, obj, int, ...) keep the bulk-reclaim no-op.
             if ct and ct.endswith("*") and ct not in ("char*", "void*"):
                 expr = self.expr(t)
-                out.append("afree(%s, sizeof(*(%s)));" % (expr, expr))
+                cls = ct[:-1]
+                ci = self.classes.get(cls)
+                if ci is not None and \
+                        ci.csym not in getattr(self, "_pod_set", set()):
+                    out.append("afree(%s, sizeof(*(%s)));" % (expr, expr))
+                else:
+                    out.append("free(%s);" % expr)
                 continue
             # no-op (arena reclaims in bulk); use source text, never the
             # generated C, so inner /* */ can't break the comment
