@@ -79,10 +79,6 @@ def analyze(il_code, symbol_table, ext_info):
             reports.append(result)
             continue
         len_index = ints[0]["index"] if ints else None
-        if len_index is None:
-            result.reason = "no length argument"
-            reports.append(result)
-            continue
 
         contract = _merge_contracts(arg_contracts)
         sites = _find_call_sites(il_code, name_of, fname)
@@ -93,6 +89,7 @@ def analyze(il_code, symbol_table, ext_info):
             continue
 
         all_ok = True
+        counts = set()
         for caller, call in sites:
             count = _prove_one_call_multi(
                 il_code, name_of, caller, call, ptrs, len_index)
@@ -100,6 +97,7 @@ def analyze(il_code, symbol_table, ext_info):
                 all_ok = False
                 result.reason = "a call site could not be proven aligned"
                 break
+            counts.add(count)
         if not all_ok:
             reports.append(result)
             continue
@@ -108,13 +106,23 @@ def analyze(il_code, symbol_table, ext_info):
         if _is_sum_reduction(cmds):
             desc = {"kind": "reduce"}
         else:
-            desc = _classify_elementwise(cmds, ptrs)
-        if desc:
-            result.proven = True
-            proven[fname] = desc
-        else:
+            desc = _classify_elementwise(cmds, ptrs, layout, name_of)
+        if not desc:
             result.reason = "alignment proven but body is not a recognized kernel"
+            reports.append(result)
+            continue
 
+        # No length argument (fixed-size kernel like vadd256): the trip count is
+        # the proven element count, baked in as a literal. Requires all call
+        # sites to agree on that size.
+        if len_index is None:
+            if len(counts) != 1:
+                result.reason = "fixed-size kernel: call sites disagree on length"
+                reports.append(result)
+                continue
+            desc["fixed_count"] = next(iter(counts))
+        result.proven = True
+        proven[fname] = desc
         reports.append(result)
 
     return proven, reports
@@ -184,11 +192,8 @@ def _prove_one_call_multi(il_code, name_of, caller, call, ptrs, len_index):
     to a malloc whose element count is at least the literal length. Returns the
     proven element count (the length) or None."""
     cmds = il_code.commands[caller]
-    if len_index is None or len_index >= len(call.args):
-        return None
-    length = _trace_literal(il_code, cmds, call.args[len_index])
-    if length is None:
-        return None
+    # element count of each pointer's allocation (must all be consistent)
+    counts = []
     for p in ptrs:
         if p["index"] >= len(call.args):
             return None
@@ -196,22 +201,65 @@ def _prove_one_call_multi(il_code, name_of, caller, call, ptrs, len_index):
             il_code, name_of, cmds, call.args[p["index"]])
         if byte_size is None:
             return None
-        if length > byte_size // p["elem_size"]:
+        counts.append(byte_size // p["elem_size"])
+
+    if len_index is None:
+        # Fixed-size kernel with no length parameter: the processed count is the
+        # allocation itself, so every pointer must allocate the same count.
+        if len(set(counts)) != 1:
+            return None
+        return counts[0]
+
+    if len_index >= len(call.args):
+        return None
+    length = _trace_literal(il_code, cmds, call.args[len_index])
+    if length is None:
+        return None
+    for cnt in counts:
+        if length > cnt:
             return None                 # would read/write out of bounds
     return length
 
 
-def _classify_elementwise(cmds, ptrs):
-    """Recognize a float element-wise store kernel and return a descriptor:
+_INT_REGS64 = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
+_REG32 = {"rdi": "edi", "rsi": "esi", "rdx": "edx", "rcx": "ecx",
+          "r8": "r8d", "r9": "r9d"}
+_SSE_REGS = ["xmm" + str(i) for i in range(8)]
+_MAP_FUNCS = {"sqrt": "sqrt", "sqrtf": "sqrt"}
 
-        out[i] = a[i] + b[i]        -> {kind: binary, op: add}
-        out[i] = a[i] * b[i]        -> {kind: binary, op: mul}
-        out[i] = a[i] - b[i]        -> {kind: binary, op: sub}
-        out[i] = alpha*x[i] + y[i]  -> {kind: saxpy,  op: add}
 
-    Conservative: exactly three pointer args, one store, two loads, and a
-    floating element type. None if the body is not one of these shapes."""
-    if len(ptrs) != 3:
+def _sysv_regs(layout):
+    """System V AMD64 register for each argument (in declaration order):
+    integer/pointer args fill rdi,rsi,rdx,rcx,r8,r9; floating args fill
+    xmm0..7. Returns {arg_index: reg_name}."""
+    regs = {}
+    ii = si = 0
+    for a in layout:
+        if a["is_float"]:
+            if si < len(_SSE_REGS):
+                regs[a["index"]] = _SSE_REGS[si]
+            si += 1
+        else:                           # pointer or integer -> GPR
+            if ii < len(_INT_REGS64):
+                regs[a["index"]] = _INT_REGS64[ii]
+            ii += 1
+    return regs
+
+
+def _classify_elementwise(cmds, ptrs, layout, name_of=None):
+    """Recognize a float element-wise store kernel and return a descriptor with
+    the System V registers the synthesizer needs. Supported shapes:
+
+        out[i] = a[i] + b[i]        binary add        (3 ptr)
+        out[i] = a[i] - b[i]        binary sub        (3 ptr)
+        out[i] = a[i] * b[i]        binary mul        (3 ptr)
+        out[i] = a[i]*b[i] + c[i]   fma               (4 ptr)
+        out[i] = alpha*x[i] + y[i]  saxpy             (3 ptr + fp scalar)
+        out[i] = sqrt(x[i])         map (sqrtps)      (2 ptr)
+
+    Convention: the LAST pointer argument is the output, earlier pointers are
+    inputs. Float element type only. None if unrecognized."""
+    if not (2 <= len(ptrs) <= 4):
         return None
     defmap = {}
     for c in cmds:
@@ -219,7 +267,7 @@ def _classify_elementwise(cmds, ptrs):
             defmap[o] = c
     reads = [c for c in cmds if isinstance(c, value_cmds.ReadAt)]
     stores = [c for c in cmds if isinstance(c, value_cmds.SetAt)]
-    if len(stores) != 1 or len(reads) != 2:
+    if len(stores) != 1:
         return None
     store = stores[0]
     if not store.val.ctype.is_floating():
@@ -241,22 +289,59 @@ def _classify_elementwise(cmds, ptrs):
             d = defmap.get(v)
         return v in read_outs
 
+    regs = _sysv_regs(layout)
+    in_regs = [regs[p["index"]] for p in ptrs[:-1]]
+    out_reg = regs[ptrs[-1]["index"]]
+    floats = [a for a in layout if a["is_float"]]
+    scalar_reg = regs[floats[0]["index"]] if floats else None
+
+    def base(extra):
+        d = dict(extra)
+        d["elem_size"] = elem_size
+        d["in_regs"] = in_regs
+        d["out_reg"] = out_reg
+        d["scalar_reg"] = scalar_reg
+        return d
+
     d = origin(store.val)
-    if isinstance(d, math_cmds.Add):
+
+    # single-input map: out[i] = f(x[i])
+    if len(reads) == 1 and len(ptrs) == 2 and \
+            isinstance(d, control_cmds.Call):
+        target = getattr(d, "direct_name", None)
+        if target is None and name_of is not None:   # resolved via AddrOf
+            addr_of = {c.output: name_of.get(c.var)
+                       for c in cmds
+                       if isinstance(c, value_cmds.AddrOf)}
+            target = addr_of.get(d.func)
+        if target in _MAP_FUNCS and any(is_load(a) for a in d.inputs()):
+            return base({"kind": "map", "op": _MAP_FUNCS[target]})
+        return None
+
+    if len(reads) == 2 and isinstance(d, math_cmds.Add) and len(ptrs) == 3:
         a, b = d.arg1, d.arg2
         for x, y in ((a, b), (b, a)):       # saxpy: one side is scalar*load
             dx = origin(x)
             if isinstance(dx, math_cmds.Mult) and \
                     (is_load(dx.arg1) or is_load(dx.arg2)) and is_load(y):
-                return {"kind": "saxpy", "op": "add", "elem_size": elem_size}
+                return base({"kind": "saxpy", "op": "add"})
         if is_load(a) and is_load(b):
-            return {"kind": "binary", "op": "add", "elem_size": elem_size}
-    elif isinstance(d, math_cmds.Mult):
+            return base({"kind": "binary", "op": "add"})
+    elif len(reads) == 2 and isinstance(d, math_cmds.Mult) and len(ptrs) == 3:
         if is_load(d.arg1) and is_load(d.arg2):
-            return {"kind": "binary", "op": "mul", "elem_size": elem_size}
-    elif isinstance(d, math_cmds.Subtr):
+            return base({"kind": "binary", "op": "mul"})
+    elif len(reads) == 2 and isinstance(d, math_cmds.Subtr) and len(ptrs) == 3:
         if is_load(d.arg1) and is_load(d.arg2):
-            return {"kind": "binary", "op": "sub", "elem_size": elem_size}
+            return base({"kind": "binary", "op": "sub"})
+
+    # fused multiply-add: out[i] = a[i]*b[i] + c[i]   (4 pointers, 3 loads)
+    if len(reads) == 3 and isinstance(d, math_cmds.Add) and len(ptrs) == 4:
+        a, b = d.arg1, d.arg2
+        for x, y in ((a, b), (b, a)):
+            dx = origin(x)
+            if isinstance(dx, math_cmds.Mult) and \
+                    is_load(dx.arg1) and is_load(dx.arg2) and is_load(y):
+                return base({"kind": "fma", "op": "add"})
     return None
 
 
@@ -425,45 +510,66 @@ def synth_sse2_reduce(asm_code, func_ctype):
 
 
 def synth_sse_elementwise(asm_code, desc):
-    """Emit a fallback-free packed-SSE element-wise kernel.
+    """Emit a fallback-free packed-SSE element-wise kernel from a descriptor
+    carrying the System V registers, element size, kind and op.
 
-    Supported System V shapes (matching what tools/py2c.py emits):
-
-        binary: void f(T* a, T* b, T* out, int n)   a=rdi b=rsi out=rdx n=ecx
-                out[i] = a[i] {add,sub,mul} b[i]
-        saxpy : void f(T a, T* x, T* y, T* out, int n)  a=xmm0 x=rdi y=rsi
-                out[i] = a*x[i] + y[i]                   out=rdx n=ecx
-
-    T is float (4 lanes/128 bits) or double (2 lanes). The contract proof
-    guarantees n is a multiple of the lane count, so there is no scalar tail.
-    """
+    Kinds: binary (a op b), saxpy (s*a + b), fma (a*b + c), map (f(a)).
+    Element type is float (4 lanes / 128 bits) or double (2 lanes). The contract
+    proof guarantees the count is a multiple of the lane count, so there is no
+    scalar tail. A fixed-size kernel (no length argument) bakes the proven
+    element count in as a literal."""
     elem = desc["elem_size"]
     if elem == 4:
-        mov, suf, shift, bcast = "movups", "ps", 2, "shufps xmm0, xmm0, 0"
+        mov, suf, shift = "movups", "ps", 2
+        bcast = "shufps %s, %s, 0"
     else:
-        mov, suf, shift, bcast = "movupd", "pd", 1, "unpcklpd xmm0, xmm0"
+        mov, suf, shift = "movupd", "pd", 1
+        bcast = "unpcklpd %s, %s"
+    ins = desc["in_regs"]
+    out = desc["out_reg"]
+    scalar = desc.get("scalar_reg")
+    fixed = desc.get("fixed_count")
+    lanes = 16 // elem
     loop = asm_code.get_label()
+
     raw = ["push rbp", "mov rbp, rsp"]
-    if desc["kind"] == "saxpy":
-        raw.append(bcast)                       # xmm0 = broadcast scalar a
-    raw += ["mov r8d, ecx",                     # r8d = n
-            "shr r8d, %d" % shift,              # r8d = n / lanes
-            "xor rax, rax",                     # rax = byte offset
-            loop + ":"]
-    if desc["kind"] == "saxpy":
-        raw += [
-            "%s xmm1, [rdi + rax]" % mov,       # x[i..]
-            "mul%s xmm1, xmm0" % suf,           # a * x
-            "%s xmm2, [rsi + rax]" % mov,       # y[i..]
-            "add%s xmm1, xmm2" % suf,           # + y
-            "%s [rdx + rax], xmm1" % mov,       # -> out
-        ]
+    if desc["kind"] == "saxpy" and scalar:
+        raw.append(bcast % (scalar, scalar))    # broadcast the scalar lane-wise
+    if fixed is not None:
+        raw.append("mov r8d, %d" % (fixed // lanes))
     else:
+        # length is the integer argument right after the pointers
+        len_reg32 = _REG32[_INT_REGS64[len(ins) + 1]]
+        raw += ["mov r8d, %s" % len_reg32, "shr r8d, %d" % shift]
+    raw += ["xor rax, rax", loop + ":"]
+
+    if desc["kind"] == "map":
+        raw += ["%s xmm1, [%s + rax]" % (mov, ins[0]),
+                "sqrt%s xmm1, xmm1" % suf,
+                "%s [%s + rax], xmm1" % (mov, out)]
+    elif desc["kind"] == "saxpy":
         raw += [
-            "%s xmm1, [rdi + rax]" % mov,       # a[i..]
-            "%s xmm2, [rsi + rax]" % mov,       # b[i..]
+            "%s xmm1, [%s + rax]" % (mov, ins[0]),    # x
+            "mul%s xmm1, %s" % (suf, scalar),         # s * x
+            "%s xmm2, [%s + rax]" % (mov, ins[1]),    # y
+            "add%s xmm1, xmm2" % suf,                 # + y
+            "%s [%s + rax], xmm1" % (mov, out),
+        ]
+    elif desc["kind"] == "fma":
+        raw += [
+            "%s xmm1, [%s + rax]" % (mov, ins[0]),    # a
+            "%s xmm2, [%s + rax]" % (mov, ins[1]),    # b
+            "mul%s xmm1, xmm2" % suf,                 # a * b
+            "%s xmm2, [%s + rax]" % (mov, ins[2]),    # c
+            "add%s xmm1, xmm2" % suf,                 # + c
+            "%s [%s + rax], xmm1" % (mov, out),
+        ]
+    else:                                            # binary
+        raw += [
+            "%s xmm1, [%s + rax]" % (mov, ins[0]),
+            "%s xmm2, [%s + rax]" % (mov, ins[1]),
             "%s%s xmm1, xmm2" % (desc["op"], suf),
-            "%s [rdx + rax], xmm1" % mov,       # -> out
+            "%s [%s + rax], xmm1" % (mov, out),
         ]
     raw += ["add rax, 16", "dec r8d", "jnz " + loop,
             "mov rsp, rbp", "pop rbp", "ret"]

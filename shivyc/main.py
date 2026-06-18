@@ -180,8 +180,10 @@ def main():
                 print(f"eliminated from 'struct {tag}': {members}")
 
     objs = []
+    arguments._extra_objs = []
     for file in arguments.files:
         objs.append(process_file(file, arguments))
+    objs.extend(arguments._extra_objs)
 
     error_collector.show()
     if any(not obj for obj in objs):
@@ -215,12 +217,84 @@ def process_file(file, args):
     """Process single file into object file and return the object file name."""
     if file[-2:] == ".c":
         return process_c_file(file, args)
+    elif file[-3:] == ".py":
+        return process_py_file(file, args)
     elif file[-2:] == ".o":
         return file
     else:
         err = f"unknown file type: '{file}'"
         error_collector.add(CompilerError(err))
         return None
+
+
+def process_py_file(file, args):
+    """Transpile an rpython `.py` to C with tools/py2c.py, then compile it.
+
+    This lets ShivyCX consume rpython sources directly --
+    `shivyc.main kernels.py harness.c -o run` -- so the numpy examples no longer
+    need a hand-written .c copy or a transpile-then-compile shell script. Any
+    runtime support code py2c needs (shivyc_rt.c) is generated here and queued
+    for linking; pure kernels (the SIMD examples) reference no runtime, so the
+    runtime include is dropped and the kernel C compiles on its own.
+    """
+    import os
+    import sys
+    import re
+    import tempfile
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    tools_dir = os.path.join(repo_root, "tools")
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    try:
+        import py2c
+    except Exception as e:                       # pragma: no cover
+        error_collector.add(CompilerError(f"cannot import py2c: {e}"))
+        return None
+
+    out_dir = tempfile.mkdtemp(prefix="shivyc_py2c_")
+    try:
+        out_c, err = py2c.transpile_file(file, out_dir)
+    except Exception as e:
+        error_collector.add(CompilerError(f"py2c failed on '{file}': {e}"))
+        return None
+    if err or not out_c:
+        error_collector.add(
+            CompilerError(f"py2c could not translate '{file}': {err}"))
+        return None
+
+    code = open(out_c, encoding="utf-8").read()
+    uses_rt = re.search(
+        r"\b(obj_[a-z]|OBJ_[A-Z]|aalloc|afree|pystr|subscript|truthy|"
+        r"list_of|make_closure|pyconcat)", code)
+    if uses_rt:
+        # Module needs the runtime: emit and queue shivyc_rt.c for linking.
+        py2c.write_runtime(out_dir)
+        rt_c = os.path.join(out_dir, "shivyc_rt.c")
+        if os.path.exists(rt_c):
+            rt_obj = process_c_file(rt_c, args)
+            if rt_obj:
+                getattr(args, "_extra_objs", []).append(rt_obj)
+    else:
+        # Pure kernel/program: drop the (unused) runtime include so the
+        # C11-subset front end compiles it directly, but re-supply the handful
+        # of libc prototypes the dropped header would have provided.
+        code = re.sub(r'#include "shivyc_rt\.h"\n', "", code)
+        prelude = []
+        if re.search(r"\bmalloc\b", code):
+            prelude.append("void *malloc(unsigned long);")
+        if re.search(r"\bfree\b", code):
+            prelude.append("void free(void *);")
+        if re.search(r"\bprintf\b", code):
+            prelude.append("int printf(const char *, ...);")
+        if re.search(r"\bsqrt\b", code):
+            prelude.append("double sqrt(double);")
+        if prelude:
+            code = "\n".join(prelude) + "\n" + code
+        with open(out_c, "w", encoding="utf-8") as f:
+            f.write(code)
+
+    return process_c_file(out_c, args)
 
 
 def process_c_file(file, args):
