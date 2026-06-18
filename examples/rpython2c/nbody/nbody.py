@@ -1,31 +1,17 @@
-"""An N-body gravity simulation in rpython -- several POD class instances.
+"""An N-body gravity simulation in rpython -- class instances passed by pointer.
 
-Each `Body` is a plain data class (position, velocity, mass) lowered by ShivyCX
-to a bare C struct (no object header / vtable / runtime):
+`Body` is a plain data class, lowered by ShivyCX to a bare C struct:
 
     typedef struct Body { double x, y, vx, vy, mass; } Body;
 
-The per-body updates are methods (scalar params -> direct calls); the pairwise
-gravitational acceleration is computed by the free functions `gx`/`gy` reading
-struct fields directly. Plain Euler integration with softening. The exit code is
-a checksum of the final positions, so the trajectory is verifiable.
+Because POD classes pass by *pointer* (not the boxed object ABI), a function can
+take class instances directly: `add_gravity(p: "Body*", q: "Body*", dt)` becomes
+`void add_gravity(Body* p, Body* q, double dt)` and is called as
+`add_gravity(sun, p1, dt)` -- no boxing, no runtime. The exit code is a checksum
+of the final positions.
 
     python3 -m shivyc.main --no-cache nbody.py -o /tmp/nbody && /tmp/nbody
 """
-
-
-def gx(px: "f64", py: "f64", qx: "f64", qy: "f64", qm: "f64") -> float:
-    dx = qx - px
-    dy = qy - py
-    r2 = dx * dx + dy * dy + 0.05          # softening avoids the singularity
-    return qm * dx / (r2 * sqrt(r2))
-
-
-def gy(px: "f64", py: "f64", qx: "f64", qy: "f64", qm: "f64") -> float:
-    dx = qx - px
-    dy = qy - py
-    r2 = dx * dx + dy * dy + 0.05
-    return qm * dy / (r2 * sqrt(r2))
 
 
 class Body:
@@ -36,13 +22,19 @@ class Body:
         self.vy = vy
         self.mass = mass
 
-    def kick(self, ax: "f64", ay: "f64", dt: "f64") -> None:
-        self.vx = self.vx + ax * dt
-        self.vy = self.vy + ay * dt
-
     def drift(self, dt: "f64") -> None:
         self.x = self.x + self.vx * dt
         self.y = self.y + self.vy * dt
+
+
+def add_gravity(p: "Body*", q: "Body*", dt: "f64") -> None:
+    """Accelerate body p toward body q (softened) -- both passed by pointer."""
+    dx = q.x - p.x
+    dy = q.y - p.y
+    r2 = dx * dx + dy * dy + 0.05
+    f = q.mass * dt / (r2 * sqrt(r2))
+    p.vx = p.vx + f * dx
+    p.vy = p.vy + f * dy
 
 
 def main() -> int:
@@ -53,21 +45,12 @@ def main() -> int:
 
     steps = 0
     while steps < 4000:
-        sax = gx(sun.x, sun.y, p1.x, p1.y, p1.mass) + \
-            gx(sun.x, sun.y, p2.x, p2.y, p2.mass)
-        say = gy(sun.x, sun.y, p1.x, p1.y, p1.mass) + \
-            gy(sun.x, sun.y, p2.x, p2.y, p2.mass)
-        a1x = gx(p1.x, p1.y, sun.x, sun.y, sun.mass) + \
-            gx(p1.x, p1.y, p2.x, p2.y, p2.mass)
-        a1y = gy(p1.x, p1.y, sun.x, sun.y, sun.mass) + \
-            gy(p1.x, p1.y, p2.x, p2.y, p2.mass)
-        a2x = gx(p2.x, p2.y, sun.x, sun.y, sun.mass) + \
-            gx(p2.x, p2.y, p1.x, p1.y, p1.mass)
-        a2y = gy(p2.x, p2.y, sun.x, sun.y, sun.mass) + \
-            gy(p2.x, p2.y, p1.x, p1.y, p1.mass)
-        sun.kick(sax, say, dt)
-        p1.kick(a1x, a1y, dt)
-        p2.kick(a2x, a2y, dt)
+        add_gravity(sun, p1, dt)
+        add_gravity(sun, p2, dt)
+        add_gravity(p1, sun, dt)
+        add_gravity(p1, p2, dt)
+        add_gravity(p2, sun, dt)
+        add_gravity(p2, p1, dt)
         sun.drift(dt)
         p1.drift(dt)
         p2.drift(dt)

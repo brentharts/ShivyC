@@ -1,27 +1,36 @@
-# rpython N-body simulation — many structs interacting
+# rpython N-body simulation — passing class instances by pointer
 
 `nbody.py` integrates three gravitating bodies (a "sun" and two planets) with
-Euler steps. It shows several instances of a POD class working together: `Body`
-is a plain data class, so ShivyCX lowers it to a bare struct allocated with
-`malloc`, with methods compiled to direct calls and no runtime:
+Euler steps. It shows a POD class **passed directly to functions and methods**.
+
+`Body` is a plain data class, so ShivyCX lowers it to a bare struct, and since
+POD classes pass by *pointer* (not the boxed object ABI), a function can take
+class instances as arguments:
 
 ```c
 typedef struct Body { double x, y, vx, vy, mass; } Body;
-Body* Body_new(double x, double y, double vx, double vy, double mass);
-void  Body_kick(Body* self, double ax, double ay, double dt);   /* direct call */
-void  Body_drift(Body* self, double dt);
+
+void add_gravity(Body* p, Body* q, double dt) { ... }   /* p, q are pointers   */
+void Body_drift(Body* self, double dt) { ... }          /* method, direct call */
 ```
 
-Per-body updates are scalar-parameter methods; the pairwise gravitational
-acceleration is computed by the free functions `gx`/`gy`, which read body fields
-directly (`sqrt` lowers to native libm). The exit code is a checksum of the final
-positions:
+```python
+def add_gravity(p: "Body*", q: "Body*", dt: "f64") -> None:
+    dx = q.x - p.x
+    ...
+    p.vx = p.vx + f * dx
+
+add_gravity(sun, p1, dt)     # call -> add_gravity(sun, p1, dt), no boxing
+```
+
+The whole program is runtime-free (`sqrt` lowers to native libm). The exit code
+is a checksum of the final positions:
 
 ```
 python3 -m shivyc.main --no-cache nbody.py -o /tmp/nbody && /tmp/nbody
 echo $?      # 11
 ```
 
-Note: class instances aren't passed *as* arguments here — a class-typed
-parameter still uses ShivyCX's boxed-object ABI, so the simulation keeps inter-
-body math in free functions that take plain doubles.
+(Passing a class *by value* — `Body` rather than `Body*` — would still need the
+SysV two-eightbyte struct rule in the code generator; passing by pointer needs
+no such support, since a pointer is a single 8-byte register.)
