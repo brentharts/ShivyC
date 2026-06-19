@@ -5331,6 +5331,13 @@ class Transpiler:
         if ctype == OBJ and vt and vt != OBJ and vt.endswith("*") \
                 and vt[:-1] in self.classes:
             rhs = self.wrap_obj(node.value)
+        # An obj-valued RHS assigned to a concrete scalar annotation needs an
+        # unbox (e.g. `start_index: int = max(...)`, where max() is a Tier-2
+        # obj): coerce so the declared C type and the value agree.
+        elif isinstance(ctype, str) and \
+                ctype in ("int", "long", "bool", "double", "char*") and \
+                (vt == OBJ or self.is_obj_word(node.value)):
+            rhs = self.coerce_to(ctype, node.value, rhs)
         return ["%s%s = %s;" % (decl, tgt, rhs)]
 
     AUG_OP_CHAR = {ast.Add: '+', ast.Sub: '-', ast.Mult: '*', ast.Div: '/',
