@@ -7061,6 +7061,25 @@ class Transpiler:
                                                          len(node.args)):
                 return self.xvcall(self.hierarchy_method[func.attr],
                                    func.value, func.attr, node.args)
+            # A static method invoked on the class itself
+            # (`ASMCode.get_label()`) is a direct call, never a vtable dispatch
+            # -- even when that method name is virtual on some *other* class.
+            if isinstance(func.value, ast.Name) and \
+                    func.value.id not in self.scope:
+                _scls = func.value.id
+                _sci = self.classes.get(_scls) or \
+                    (self.xclasses[_scls][0] if _scls in self.xclasses else None)
+                if _sci is not None and \
+                        func.attr in getattr(_sci, "static_methods", set()):
+                    m = _sci.methods.get(func.attr)
+                    cargs = self.coerce_args(
+                        [arg_ctype(m, a) for a in m.args.args] if m else [],
+                        node.args)
+                    if _scls not in self.classes:    # imported: needs an extern
+                        self.used_xmethods[(_sci.name, func.attr)] = \
+                            self._c_ret(m) if m else OBJ
+                    return "%s_%s(%s)" % (_sci.csym, func.attr,
+                                          ", ".join(cargs))
             if func.attr in VTABLE_METHODS:
                 return self.vcall(func.value, func.attr, node.args)
             # concrete class. Safe to devirtualize only for a leaf class, so no
