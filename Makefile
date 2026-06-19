@@ -118,6 +118,12 @@ rpython:
 	  else timeout 20 $$out >/dev/null 2>&1; fi; rc=$$?; \
 	  if [ "$$rc" = "$$exp" ]; then echo "  ok    $$src (exit $$rc)"; \
 	  else echo "  FAIL  $$src (exit $$rc, expected $$exp)"; fail=1; fi; }; \
+	runm() { exp=$$1; shift; out=$(RPYBIN)/multi_`basename $$1 .py`; \
+	  if ! python3 -m shivyc.main --no-cache "$$@" -o $$out >/dev/null 2>&1; then \
+	    echo "  FAIL(compile) $$*"; fail=1; return; fi; \
+	  timeout 20 $$out >/dev/null 2>&1; rc=$$?; \
+	  if [ "$$rc" = "$$exp" ]; then echo "  ok    [multi] $$* (exit $$rc)"; \
+	  else echo "  FAIL  [multi] $$* (exit $$rc, expected $$exp)"; fail=1; fi; }; \
 	run $(RPY)/numpy/simd_kernels.py 55 ""; \
 	run $(RPY)/numpy/simd_blas.py   186 ""; \
 	run $(RPY)/numpy/ufuncs.py       49 ""; \
@@ -135,6 +141,7 @@ rpython:
 	run $(RPY)/net/socket_echo.py     5 ""; \
 	run $(RPY)/mandelbrot/mandelbrot.py 70 ""; \
 	run $(RPY)/sysinfo/sysinfo.py        7 ""; \
+	runm 38 $(RPY)/multifile/app.py $(RPY)/multifile/geom.py; \
 	if [ $$fail = 0 ]; then echo "rpython examples: all passed"; \
 	else echo "rpython examples: FAILURES"; fi; exit $$fail
 
