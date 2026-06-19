@@ -60,26 +60,54 @@ Details and guards:
 from address arithmetic and generic code. Implemented as IL rewrites to `Set`,
 so the register coalescer usually removes them entirely.
 
+## 4. Loop-invariant code motion (`shivyc/peephole.py`)
+
+A computation whose operands do not change across a loop is hoisted into a
+preheader so it runs once instead of every iteration. In the lexer this removes
+the per-iteration reload of the loop-invariant global modulus `HMOD` (gcc does
+the same); the divisor is loaded once before the loop and kept in a register.
+
+The pass is deliberately conservative:
+
+- It only fires on a structured loop (a single backward edge, that edge being
+  the label's only jump-predecessor, no nested back-edges in range).
+- It refuses to hoist out of a loop containing a **call or a store**, so a hoisted
+  read cannot observe a stale value. Plain loads are permitted inside the loop
+  (they do not modify memory) but are never themselves hoisted.
+- It hoists only pure, non-trapping commands (`Set`, address arithmetic, integer
+  add/sub/mul, bitwise ops, shifts) whose operands are all defined outside the
+  loop and whose result is defined exactly once in the loop. `Div`/`Mod` are
+  excluded (they can trap), as are dereferencing loads (which could fault if the
+  loop runs zero times).
+
+Verified to leave nested loops, zero-trip loops, and loops that mutate the read
+value via a call or store unchanged.
+
+## Comparison codegen fix (literal-first operands)
+
+While adding fusion we found a latent bug in the base comparison codegen: when
+the first operand is a literal (e.g. `5 < x`), the operands are swapped so the
+immediate is not the `cmp` destination, but the conditional jump was not
+adjusted, inverting ordering comparisons. The comparison now reports whether the
+swap happened and selects the reversed-comparison jump accordingly (and the
+negated-reversed jump for the fused path). All six relations were verified for
+signed, unsigned, var-first and literal-first operands against gcc.
+
 ## Result (lexer kernel, 20000 reps)
 
-| backend  | speedup vs CPython |
-|----------|--------------------|
-| CPython  | 1.0x               |
-| ShivyCX  | ~18.6x  ->  ~20.9x |
-| gcc -O2  | ~52x               |
+| backend  | speedup vs CPython          |
+|----------|-----------------------------|
+| CPython  | 1.0x                        |
+| ShivyCX  | ~18.6x -> ~20.9x -> ~21.8x  |
+| gcc -O2  | ~52x                        |
 
 ## Remaining gap (future work)
 
-Inspecting the hottest loop (`word_hash`), the rest of the gap to `gcc -O2` is:
-
-- **Loop-invariant code motion.** ShivyCX reloads the loop-invariant global
-  `HMOD` from memory on every iteration; gcc loads it once before the loop.
-- **Induction-variable strength reduction.** ShivyCX recomputes `base + index`
-  (with a sign-extend) each iteration; gcc strength-reduces the index to a
-  pointer increment.
-
-Both compilers emit the same `idiv` for the modulo (the divisor is a runtime
-global, so neither strength-reduces it), so division is not the differentiator.
+The dominant remaining difference in the hottest loop is **induction-variable
+strength reduction**: ShivyCX recomputes `base + index` (with a sign-extend)
+each iteration, while gcc strength-reduces the index to a single pointer
+increment. Both compilers emit the same `idiv` for the modulo (the divisor is a
+runtime global), so division is not the differentiator.
 
 ### On SIMD / contracts for this kernel
 
