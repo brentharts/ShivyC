@@ -19,8 +19,6 @@ line numbers, which is what lets directives (which are line-oriented) be picked
 out of the flat token list.
 """
 
-import pathlib
-
 import shivyc.lexer as lexer
 import shivyc.token_kinds as token_kinds
 from shivyc.tokens import Token, parse_c_int
@@ -906,6 +904,39 @@ def set_include_dirs(dirs):
     _extra_include_dirs = list(dirs or [])
 
 
+def _dirname(p):
+    """Directory portion of a '/'-separated path (own impl, no os/pathlib so it
+    transpiles to C)."""
+    i = len(p) - 1
+    while i >= 0 and p[i] != '/':
+        i = i - 1
+    if i < 0:
+        return "."
+    return p[:i]
+
+
+def _pjoin(a, b):
+    """Join two path components with a single '/'."""
+    if a == "":
+        return b
+    if a[len(a) - 1] == '/':
+        return a + b
+    return a + "/" + b
+
+
+def _try_read(path):
+    """Return the contents of `path`, or None if it cannot be opened."""
+    try:
+        f = open(path, "r")
+    except Exception:
+        return None
+    if f is None:          # transpiled C: fopen returns NULL on failure
+        return None
+    data = f.read()
+    f.close()
+    return data
+
+
 def read_file(include_file, this_file):
     """Read the text of the given include file.
 
@@ -915,24 +946,25 @@ def read_file(include_file, this_file):
     locating quoted headers.
     """
     name = include_file[1:-1]
-    bundled = pathlib.Path(__file__).parent.joinpath("include").joinpath(name)
-    extra = [pathlib.Path(d).joinpath(name) for d in _extra_include_dirs]
+    bundled = _pjoin(_pjoin(_dirname(__file__), "include"), name)
     candidates = []
     if include_file[0] == '"':
         # Quoted: the including file's directory, then -I dirs, then ShivyC's
         # bundled fallback headers.
-        candidates.append(pathlib.Path(this_file).parent.joinpath(name))
-        candidates.extend(extra)
+        candidates.append(_pjoin(_dirname(this_file), name))
+        for d in _extra_include_dirs:
+            candidates.append(_pjoin(d, name))
         candidates.append(bundled)
     else:
         # Angle-bracket: -I dirs first, so a real libc's headers (provided via
         # -I, e.g. musl) take precedence over ShivyC's bundled fallback stubs.
-        candidates.extend(extra)
+        for d in _extra_include_dirs:
+            candidates.append(_pjoin(d, name))
         candidates.append(bundled)
 
     for path in candidates:
-        if path.exists():
-            with open(str(path)) as file:
-                return file.read(), str(path)
+        data = _try_read(path)
+        if data is not None:
+            return data, path
 
     raise IOError(f"could not find include file {include_file}")
