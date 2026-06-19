@@ -99,8 +99,127 @@ def simplify_arith(commands, il_code):
     return out
 
 
+# Pure, non-trapping IL command types: hoisting them out of a loop cannot
+# introduce a fault (no division, no pointer dereference) or a side effect (no
+# store, no call). Set copies an allocated value; arithmetic/bitwise/address
+# computations are pure register ops.
+def _hoistable_types():
+    return (
+        value_cmds.Set,
+        value_cmds.AddrOf,
+        math_cmds.Add, math_cmds.Subtr, math_cmds.Mult,
+        math_cmds.BitAnd, math_cmds.BitOr, math_cmds.BitXor,
+        math_cmds.Neg, math_cmds.Not,
+        math_cmds.RBitShift, math_cmds.LBitShift,
+    )
+
+
+# Commands that write memory or call out: their presence makes a loop "unclean"
+# because a store or call could change the memory a hoisted Set reads. Plain
+# loads (ReadAt/ReadRel) do not modify memory, so they are allowed in the loop;
+# they simply are not themselves hoisted (not in the hoistable set), which
+# avoids any fault/aliasing concern from moving a dereference.
+def _has_side_effects(c):
+    return isinstance(c, (
+        control_cmds.Call,
+        value_cmds.SetAt, value_cmds.SetRel,
+    ))
+
+
+def hoist_loop_invariants(commands, il_code):
+    """Hoist loop-invariant pure computations into a loop preheader.
+
+    Conservative: only fires on a structured loop whose body contains no calls,
+    stores, or loads (so all memory is provably invariant), and only hoists
+    pure non-trapping commands whose operands are all defined outside the loop.
+    This removes, e.g., a loop-invariant global reload from a tight numeric loop
+    without risking aliasing or fault-introduction.
+    """
+    hoistable = _hoistable_types()
+    changed = True
+    guard = 0
+    while changed and guard < 20:
+        changed = False
+        guard += 1
+        labels = {c.label_name(): i for i, c in enumerate(commands)
+                  if c.label_name()}
+        # Count how many commands jump to each label (to require a single,
+        # back-edge entry so the preheader is the only non-loop predecessor).
+        target_counts = {}
+        for c in commands:
+            for t in c.targets():
+                target_counts[t] = target_counts.get(t, 0) + 1
+
+        for back_idx, c in enumerate(commands):
+            tgts = c.targets()
+            back_labels = [t for t in tgts if labels.get(t, back_idx) < back_idx]
+            if not back_labels:
+                continue
+            start_idx = labels[back_labels[0]]
+            body = commands[start_idx:back_idx + 1]
+
+            # Require a clean loop and a single jump-entry (the back-edge).
+            if any(_has_side_effects(b) for b in body):
+                continue
+            if target_counts.get(back_labels[0], 0) != 1:
+                continue
+            # Don't touch loops with nested back-edges (keep it simple/safe).
+            nested = False
+            for j in range(start_idx, back_idx):
+                for t in commands[j].targets():
+                    ti = labels.get(t)
+                    if ti is not None and ti < j and not (j == back_idx):
+                        nested = True
+            if nested:
+                continue
+
+            defined_in_loop = set()
+            def_count = {}
+            for b in body:
+                for o in b.outputs():
+                    defined_in_loop.add(o)
+                    def_count[o] = def_count.get(o, 0) + 1
+
+            to_hoist = []
+            for j in range(start_idx + 1, back_idx):  # skip start label, back-jump
+                b = commands[j]
+                if not isinstance(b, hoistable):
+                    continue
+                outs = b.outputs()
+                ins = b.inputs()
+                if len(outs) != 1:
+                    continue
+                out = outs[0]
+                if def_count.get(out, 0) != 1:   # multiple defs -> not safe
+                    continue
+                if out in ins:                   # self-referential
+                    continue
+                if any(v in defined_in_loop for v in ins):
+                    continue                     # an operand varies in the loop
+                to_hoist.append(j)
+
+            if not to_hoist:
+                continue
+
+            hoisted = [commands[j] for j in to_hoist]
+            hoist_set = set(to_hoist)
+            new_commands = []
+            for i, cc in enumerate(commands):
+                if i == start_idx:
+                    new_commands.extend(hoisted)   # preheader (before the label)
+                if i in hoist_set:
+                    continue
+                new_commands.append(cc)
+            commands = new_commands
+            changed = True
+            break  # restart scan with updated indices
+
+    return commands
+
+
 def optimize(commands, il_code):
     """Run all IL peephole passes for one function."""
     commands = simplify_arith(commands, il_code)
+    commands = hoist_loop_invariants(commands, il_code)
     commands = fuse_compare_jumps(commands, il_code)
     return commands
