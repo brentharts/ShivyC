@@ -95,6 +95,9 @@ selfhost_bench:
 selfhost_coverage:
 	python3 tools/selfhost.py coverage
 
+selfhost_link:
+	python3 tools/selfhost.py link
+
 selfhost_coverage_musl:
 	python3 tools/selfhost.py coverage --musl
 
@@ -306,7 +309,7 @@ self:
 
 .PHONY: default test shim install clean baremetal baremetal-hello \
         selfhost selfhost_objcore selfhost_bench selfhost_coverage \
-        selfhost_coverage_musl \
+        selfhost_coverage_musl selfhost_link \
         rpython benchmarks \
         baremetal-kernel baremetal-irq minikraft run-irq \
         install_micropython clean_micropython test_micropython \
