@@ -134,6 +134,7 @@ rpython:
 	run $(RPY)/io/simple_io.py        5 world; \
 	run $(RPY)/net/socket_echo.py     5 ""; \
 	run $(RPY)/mandelbrot/mandelbrot.py 70 ""; \
+	run $(RPY)/sysinfo/sysinfo.py        7 ""; \
 	if [ $$fail = 0 ]; then echo "rpython examples: all passed"; \
 	else echo "rpython examples: FAILURES"; fi; exit $$fail
 
