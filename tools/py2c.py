@@ -5741,6 +5741,11 @@ class Transpiler:
             return "/* expr-error %s */ OBJ_NONE" % e
 
     def ex_Name(self, node):
+        if node.id == "__file__" and node.id not in self.scope:
+            # No meaningful runtime path in the transpiled binary; emit the
+            # module's source name so code that only inspects/joins it compiles.
+            return "OBJ_STR(%s)" % c_string(getattr(self, "modname", "module")
+                                            + ".py")
         if self.stdlib_root and node.id == "__name__" and node.id not in self.scope:
             return "OBJ_STR(%s)" % c_string(self.modname)
         if self.stdlib_root and node.id in EXCEPTION_NAMES and \
@@ -6427,7 +6432,7 @@ class Transpiler:
                 start = self.wrap_obj(node.args[1]) if len(node.args) > 1 \
                     else "OBJ_INT(0)"
                 return "pysum(%s, %s)" % (self.wrap_obj(node.args[0]), start)
-            if fn == "set":
+            if fn in ("set", "frozenset"):
                 return "pyset(%s)" % self.wrap_obj(node.args[0]) if node.args \
                     else "list_new() /* set() */"
             if fn == "list":
