@@ -5658,6 +5658,20 @@ class Transpiler:
             else:
                 lo, hi, stp = a[0], a[1], a[2]
             decl = "" if tgt.id in self.hoisted else "int "
+            if tgt.id in self.hoisted and self.scope.get(tgt.id) == OBJ:
+                # The loop variable is also used as a boxed obj elsewhere (e.g.
+                # reused across a range loop and an enumerate, or as a subscript
+                # passed to obj helpers), so it is declared `obj`. Drive the
+                # loop with a hidden int counter and box each value in, instead
+                # of assigning an int straight into the obj variable.
+                self.loop_n += 1
+                ii = "_ri%d" % self.loop_n
+                lines = ["for (long %s = %s; %s < %s; %s += %s) {" %
+                         (ii, lo, ii, hi, ii, stp)]
+                lines.append("    %s = OBJ_INT(%s);" % (v, ii))
+                lines += self.indent_lines(self.suite(node.body))
+                lines.append("}")
+                return lines
             lines = ["for (%s%s = %s; %s < %s; %s += %s) {" %
                      (decl, v, lo, v, hi, v, stp)]
             lines += self.indent_lines(self.suite(node.body))
@@ -5983,6 +5997,13 @@ class Transpiler:
             return c_string(v.decode("latin-1"))
         if isinstance(v, float):
             return repr(v)
+        if isinstance(v, int):
+            # ShivyCX's lexer parses a bare decimal literal as a signed long
+            # long; values above LLONG_MAX need an explicit unsigned suffix so
+            # they fit (e.g. ULONG_MAX = 18446744073709551615).
+            if 9223372036854775807 < v <= 18446744073709551615:
+                return "%dULL" % v
+            return str(v)
         return str(v)
 
     def _class_has_field(self, cls, field):
