@@ -5017,7 +5017,15 @@ class Transpiler:
                     ctype = OBJ
                 if not toplevel:
                     self.scope[tgt.id] = ctype
-                lines.append("%s %s = %s;" % (ctype, cname(tgt.id), rhs))
+                if toplevel and ctype == OBJ and rhs == "OBJ_NONE":
+                    # A file-scope `obj` is zero-initialized and T_NONE == 0, so
+                    # an omitted initializer already yields OBJ_NONE. Emit it
+                    # without the OBJ_NONE compound literal, which the ShivyCX C
+                    # front end rejects as a static-storage initializer (gcc
+                    # accepts it; this keeps the generated C self-hostable).
+                    lines.append("%s %s;" % (ctype, cname(tgt.id)))
+                else:
+                    lines.append("%s %s = %s;" % (ctype, cname(tgt.id), rhs))
             else:
                 if isinstance(tgt, ast.Attribute):
                     lines.append(self._emit_attr_assign(tgt, node.value))
