@@ -263,6 +263,11 @@ What makes it fast and small:
   `in`, and iteration. A negative integer literal index (`xs[-1]`) wraps to
   `data[len-1]` statically; dynamic indices are taken as-is. Lists of objects
   keep the tagged model.
+- **Native byte scanning + 64-bit ints.** `ord(s[i])` on a `char*` compiles to a
+  direct byte read (no per-character allocation), and an `"i64"` annotation gives
+  true 64-bit arithmetic. Together these let character- and table-driven compiler
+  passes (lexers, hashers) be written in rpython and run at native speed — see
+  [`examples/rpython2c/compiler/`](examples/rpython2c/compiler/).
 - **Auto-contracts → SIMD.** A leading `assert len(x) % 4 == 0` (or an inferred
   divisibility fact from a fixed-size array) is lowered to a ShivyCX contract;
   the compiler proves it at the call site and emits a packed-SSE body with no
@@ -292,6 +297,8 @@ classes→structs), `nbody/` (a gravity sim that passes class instances by
 pointer), `classes/` (inheritance + polymorphism via the object model, plus a
 POD-vs-object-model comparison), `lists/` and `dicts/` (typed `list[T]` /
 `dict[K,V]` lowered to unboxed C arrays — no boxing, no GC),
+`compiler/` (a C-subset lexer kernel — a ShivyCX hotspot rewritten in rpython,
+~18x faster through ShivyCX and ~50x through gcc, with a benchmark harness),
 `memory/` (`del`, compiler-inserted `free` via whole-program escape analysis,
 and the `--pdf` memory report), `io/`, `net/`, and `mandelbrot/`. Run them all
 with `make rpython`.

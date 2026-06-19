@@ -128,6 +128,7 @@ rpython:
 	run $(RPY)/classes/pod_vs_object.py  48 ""; \
 	run $(RPY)/lists/typed_list.py       65 ""; \
 	run $(RPY)/dicts/typed_dict.py       58 ""; \
+	run $(RPY)/compiler/lexer_kernel.py  13 ""; \
 	run $(RPY)/memory/del_demo.py    60 ""; \
 	run $(RPY)/memory/autofree.py   135 ""; \
 	run $(RPY)/io/simple_io.py        5 world; \
