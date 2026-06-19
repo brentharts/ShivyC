@@ -93,21 +93,61 @@ swap happened and selects the reversed-comparison jump accordingly (and the
 negated-reversed jump for the fused path). All six relations were verified for
 signed, unsigned, var-first and literal-first operands against gcc.
 
-## Result (lexer kernel, 20000 reps)
+## 5. Induction-variable strength reduction (`shivyc/peephole.py`)
 
-| backend  | speedup vs CPython          |
-|----------|-----------------------------|
-| CPython  | 1.0x                        |
-| ShivyCX  | ~18.6x -> ~20.9x -> ~21.8x  |
-| gcc -O2  | ~52x                        |
+An address recomputed from the loop counter every iteration
+(`addr = base + scale*i + off`) is replaced by a pointer that is computed once
+in a preheader and advanced by a constant stride each iteration. The index
+recompute, sign-extend, and add-base sequence collapses to a single `add`,
+matching what gcc does for array traversals:
 
-## Remaining gap (future work)
+```
+    ; before:                    ; after:
+    mov   %esi,%ecx              mov   (%rdi),%dl
+    add   %r9d,%ecx              ...
+    movslq %ecx,%rcx             add   $1,%rdi      ; advance pointer
+    add   %rdi,%rcx
+    mov   (%rcx),%dl
+```
 
-The dominant remaining difference in the hottest loop is **induction-variable
-strength reduction**: ShivyCX recomputes `base + index` (with a sign-extend)
-each iteration, while gcc strength-reduces the index to a single pointer
-increment. Both compilers emit the same `idiv` for the modulo (the divisor is a
-runtime global), so division is not the differentiator.
+The pass detects a basic induction variable (`t = i + c; i = t`, c literal),
+then traces each `ReadAt`/`SetAt` address back through `Set`/`Add`/`Subtr`/`Mult`
+to confirm it is an affine function of exactly one IV with a compile-time
+stride. It is gated for safety:
+
+- single-basic-block loop body (no internal labels or jumps other than early
+  exits and the back-edge), so the pointer advance executes once per iteration;
+- the address and the chain's intermediate temps are used only to compute that
+  one access (so the chain can be moved to the preheader);
+- the pointer is advanced through a temporary (`t = p + stride; p = t`) rather
+  than in place, because ShivyCX's liveness pass mishandles a read-and-write of
+  the same value and would let the allocator clobber the live pointer.
+
+Like gcc -O2, this assumes the affine index does not signed-overflow, so that
+sign-extension is linear. Verified against gcc on int/double/char arrays, an
+index with an invariant offset, a scaled index (`a[i*2]`), a reverse traversal
+(`a[n-1-i]`, negative stride), a store loop, two parallel pointers, nested
+loops, zero-trip loops, and a non-unit IV step.
+
+## Result
+
+| backend  | speedup vs CPython                   |
+|----------|--------------------------------------|
+| CPython  | 1.0x                                 |
+| ShivyCX  | ~18.6x -> ~20.9x -> ~21.8x           |
+| gcc -O2  | ~51x                                 |
+
+IV strength reduction does not move the lexer number further: `word_hash` is a
+serial `idiv`-bound recurrence (`h = (h*K + byte) % M`), and the address
+arithmetic it eliminates already overlapped with the division latency. On an
+address-bound loop where nothing else is the bottleneck the same pass is worth
+~1.7x and matches gcc -O2.
+
+## Remaining gap
+
+Both compilers emit the same `idiv` for the modulo (the divisor is a runtime
+global, so neither strength-reduces it); on this kernel that division latency,
+not codegen, is now the dominant term.
 
 ### On SIMD / contracts for this kernel
 
@@ -116,4 +156,4 @@ hot loop is not vectorizable, and no data-parallel divisibility contract (of the
 kind the SSE element-wise path uses) applies to a scanner. Realistic SIMD for
 lexing means simdjson-style character-class/boundary finding, which is an
 algorithmic rewrite rather than a codegen pass. The gap here is scalar codegen
-quality, addressed by the optimizations above and the LICM/IV work listed.
+quality, addressed by the optimizations above.
