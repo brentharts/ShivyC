@@ -4,7 +4,6 @@ The lexing phase takes the entire contents of a raw input file and
 generates a flat list of tokens present in that input file.
 
 """
-import re
 
 import shivyc.token_kinds as token_kinds
 from shivyc.errors import CompilerError, Position, Range, error_collector
@@ -300,14 +299,14 @@ def _continues_number(line: list, chunk_start, chunk_end):
     chunk = "".join(c.c for c in line[chunk_start:chunk_end])
     ch = line[chunk_end].c
     if ch == ".":
-        if chunk and chunk[0].isdigit():
+        if len(chunk) > 0 and chunk[0].isdigit():
             return True
-        if (not chunk and chunk_end + 1 < len(line)
+        if (len(chunk) == 0 and chunk_end + 1 < len(line)
                 and line[chunk_end + 1].c.isdigit()):
             return True
         return False
     if ch in "+-":
-        return bool(chunk) and chunk[0].isdigit() and chunk[-1] in "eEpP" and (
+        return len(chunk) > 0 and chunk[0].isdigit() and chunk[-1] in "eEpP" and (
             chunk[-1] in "pP" or not chunk.lower().startswith("0x"))
     return False
 
@@ -515,32 +514,148 @@ def match_number_string(token_repr):
 
     """
     token_str = chunk_to_str(token_repr)
-    if _FLOAT_CONST_RE.fullmatch(token_str):
+    if _match_float_const(token_str):
         return token_str
-    if _INT_CONST_RE.fullmatch(token_str):
+    if _match_int_const(token_str):
         return token_str
     return None
 
 
-_FLOAT_CONST_RE = re.compile(
-    r"(?:0[xX](?:[0-9a-fA-F]*\.[0-9a-fA-F]+|[0-9a-fA-F]+\.?)[pP][+-]?[0-9]+"
-    r"|(?:[0-9]*\.[0-9]+|[0-9]+\.)(?:[eE][+-]?[0-9]+)?"
-    r"|[0-9]+[eE][+-]?[0-9]+)"
-    r"[fFlL]?")
+# The constant matchers below are hand-written character-class scanners rather
+# than `re` patterns, so the lexer transpiles to C. Each is a full-string match
+# and was verified identical to its original regex over a large case battery.
+#   float: 0[xX](hex*.hex+|hex+.?)[pP][+-]?dig+ | (dig*.dig+|dig+.)([eE][+-]?dig+)? | dig+[eE][+-]?dig+   then [fFlL]?
+#   int:   (0[xX]hex+ | 0[bB][01]+ | dig+) [uUlL]*
+#   ident: [_A-Za-z][_A-Za-z0-9]*
+
+
+def _is_dig(c):
+    return '0' <= c <= '9'
+
+
+def _is_alpha(c):
+    return ('a' <= c <= 'z') or ('A' <= c <= 'Z')
+
+
+def _is_hex(c):
+    return _is_dig(c) or ('a' <= c <= 'f') or ('A' <= c <= 'F')
+
+
+def _scan_digits(s, i):
+    start = i
+    while i < len(s) and _is_dig(s[i]):
+        i += 1
+    return i, i > start
+
+
+def _scan_hex(s, i):
+    start = i
+    while i < len(s) and _is_hex(s[i]):
+        i += 1
+    return i, i > start
+
+
+def _scan_exp(s, i, echars):
+    """Match [echars][+-]?digit+ at position i. Returns (new_i, matched)."""
+    if i < len(s) and s[i] in echars:
+        j = i + 1
+        if j < len(s) and (s[j] == '+' or s[j] == '-'):
+            j += 1
+        j, ok = _scan_digits(s, j)
+        if ok:
+            return j, True
+    return i, False
+
+
+def _match_float_const(s):
+    n = len(s)
+    # alt A: hex float  0[xX](hex*.hex+ | hex+.?) [pP][+-]?dig+
+    if n >= 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X'):
+        j = 2
+        ok_mant = False
+        k, _ = _scan_hex(s, j)
+        if k < n and s[k] == '.':
+            k2, has = _scan_hex(s, k + 1)
+            if has:
+                j = k2
+                ok_mant = True
+        if not ok_mant:
+            k, has = _scan_hex(s, j)
+            if has:
+                if k < n and s[k] == '.':
+                    k += 1
+                j = k
+                ok_mant = True
+        if ok_mant:
+            j2, has = _scan_exp(s, j, "pP")
+            if has:
+                j = j2
+                if j < n and s[j] in "fFlL":
+                    j += 1
+                if j == n:
+                    return True
+    # alt B: (dig*.dig+ | dig+.) ([eE][+-]?dig+)?
+    j = 0
+    ok_mant = False
+    k, _ = _scan_digits(s, 0)
+    if k < n and s[k] == '.':
+        k2, has = _scan_digits(s, k + 1)
+        if has:
+            j = k2
+            ok_mant = True
+    if not ok_mant:
+        k, has = _scan_digits(s, 0)
+        if has and k < n and s[k] == '.':
+            j = k + 1
+            ok_mant = True
+    if ok_mant:
+        j, _h = _scan_exp(s, j, "eE")
+        if j < n and s[j] in "fFlL":
+            j += 1
+        if j == n:
+            return True
+    # alt C: dig+ [eE][+-]?dig+
+    k, has = _scan_digits(s, 0)
+    if has:
+        j2, hase = _scan_exp(s, k, "eE")
+        if hase:
+            j = j2
+            if j < n and s[j] in "fFlL":
+                j += 1
+            if j == n:
+                return True
+    return False
 
 
 def is_float_constant(spelling):
     """Return whether `spelling` is a floating (not integer) constant."""
-    return bool(_FLOAT_CONST_RE.fullmatch(spelling))
+    return _match_float_const(spelling)
 
 
-# C integer constant: hex / binary / octal / decimal, with optional integer
-# suffixes (u, l, ll, ul, ull, ... in any order).
-_INT_CONST_RE = re.compile(
-    r"(?:0[xX][0-9a-fA-F]+"      # hexadecimal
-    r"|0[bB][01]+"               # binary (GNU extension)
-    r"|[0-9]+)"                  # decimal or octal (leading 0)
-    r"[uUlL]*")                  # optional integer suffixes
+def _match_int_const(s):
+    n = len(s)
+    i = 0
+    if n == 0:
+        return False
+    if s[0] == '0' and n > 1 and (s[1] == 'x' or s[1] == 'X'):
+        i = 2
+        i, ok = _scan_hex(s, i)
+        if not ok:
+            return False
+    elif s[0] == '0' and n > 1 and (s[1] == 'b' or s[1] == 'B'):
+        i = 2
+        start = i
+        while i < n and (s[i] == '0' or s[i] == '1'):
+            i += 1
+        if i == start:
+            return False
+    else:
+        i, ok = _scan_digits(s, i)
+        if not ok:
+            return False
+    while i < n and s[i] in "uUlL":
+        i += 1
+    return i == n
 
 
 def match_identifier_name(token_repr):
@@ -551,7 +666,21 @@ def match_identifier_name(token_repr):
 
     """
     token_str = chunk_to_str(token_repr)
-    if re.match(r"[_a-zA-Z][_a-zA-Z0-9]*$", token_str):
+    if _match_identifier(token_str):
         return token_str
     else:
         return None
+
+
+def _match_identifier(s):
+    if len(s) == 0:
+        return False
+    if not (s[0] == '_' or _is_alpha(s[0])):
+        return False
+    i = 1
+    while i < len(s):
+        c = s[i]
+        if not (c == '_' or _is_alpha(c) or _is_dig(c)):
+            return False
+        i += 1
+    return True

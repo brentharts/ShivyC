@@ -19,7 +19,6 @@ The pass runs after inlining, so the call edges it sees already reflect the
 calls that inlining removed.
 """
 
-import re
 
 import shivyc.il_cmds.control as control_cmds
 import shivyc.il_cmds.value as value_cmds
@@ -76,8 +75,32 @@ def _asm_refs(il_code, defined):
     if not templates:
         return set()
     text = "\n".join(templates)
-    return {fn for fn in defined
-            if re.search(r"\b" + re.escape(fn) + r"\b", text)}
+    return {fn for fn in defined if _word_in(fn, text)}
+
+
+def _is_word_char(ch):
+    return (ch == '_' or ('a' <= ch <= 'z') or ('A' <= ch <= 'Z')
+            or ('0' <= ch <= '9'))
+
+
+def _word_in(needle, hay):
+    """True if `needle` occurs in `hay` as a whole token (word boundaries on
+    both sides). Plain-string implementation so it transpiles to C; replaces a
+    `re.search(r"\\b" + re.escape(fn) + r"\\b", ...)`."""
+    n = len(needle)
+    if n == 0:
+        return False
+    start = 0
+    while True:
+        idx = hay.find(needle, start)
+        if idx < 0:
+            return False
+        before_ok = idx == 0 or not _is_word_char(hay[idx - 1])
+        after = idx + n
+        after_ok = after >= len(hay) or not _is_word_char(hay[after])
+        if before_ok and after_ok:
+            return True
+        start = idx + 1
 
 
 def eliminate_dead_functions(il_code, symbol_table):
