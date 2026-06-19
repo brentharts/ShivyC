@@ -3201,6 +3201,17 @@ class Transpiler:
                         val = _const_value(n.value)
                         if val is not None:
                             reg["consts"][n.targets[0].id] = val
+                for n in t.body:        # module-level annotated globals
+                    # `tokens: "list | None" = None` and similar annotated
+                    # module state are referenced cross-module as `alias.name`;
+                    # register them so the read resolves to the bare exported
+                    # symbol (with a matching extern) instead of a bogus
+                    # `alias_name` identifier.
+                    if isinstance(n, ast.AnnAssign) \
+                            and isinstance(n.target, ast.Name) \
+                            and n.target.id not in reg["consts"]:
+                        reg["globals"].setdefault(
+                            n.target.id, ann_to_ctype(n.annotation) or OBJ)
                 imp_src = list(t.body)
                 for n in t.body:        # descend into `if TYPE_CHECKING:`
                     if isinstance(n, ast.If) and isinstance(n.test, ast.Name) \
@@ -4467,7 +4478,7 @@ class Transpiler:
         elif isinstance(node, ast.Assign):
             self.toplevel_assign(node)
         elif isinstance(node, ast.AnnAssign):
-            for ln in self.st_AnnAssign(node):
+            for ln in self.st_AnnAssign(node, toplevel=True):
                 self.emit(ln)
         elif isinstance(node, ast.AugAssign):
             for ln in self.stmt(node):
@@ -5388,7 +5399,7 @@ class Transpiler:
                 return OBJ
         return self.guess_from_value(node)
 
-    def st_AnnAssign(self, node):
+    def st_AnnAssign(self, node, toplevel=False):
         ctype = self._local_ann_ctype(
             getattr(node.target, "id", "x"), node.annotation)
         if isinstance(node.target, ast.Name):
@@ -5401,6 +5412,12 @@ class Transpiler:
                 self.elem_types[node.target.id] = et
         tgt = self.expr(node.target)
         if node.value is None:
+            return ["%s %s;" % (ctype, tgt)]
+        # A module-scope `obj` initialized to None is zero-initialized and
+        # T_NONE == 0, so drop the OBJ_NONE compound literal, which the ShivyCX
+        # C front end rejects as a static-storage initializer (gcc accepts it).
+        if toplevel and ctype == OBJ and isinstance(node.value, ast.Constant) \
+                and node.value.value is None:
             return ["%s %s;" % (ctype, tgt)]
         already = isinstance(node.target, ast.Name) and \
             node.target.id in self.scope
@@ -6777,15 +6794,21 @@ class Transpiler:
                 return "(void)0"
             bname = base.name
             if func.attr == "__init__":
-                init = base.methods.get("__init__")
-                pct = self.init_param_ctypes(base) if base else []
+                owner = base.find_method_owner("__init__")
+                if owner is None:
+                    # super().__init__() resolves to object.__init__ (no class
+                    # in the base chain defines one): a no-op. Emitting
+                    # Base___init__ here would be an undeclared/dangling call.
+                    return "(void)0"
+                init = owner.methods.get("__init__")
+                pct = self.init_param_ctypes(owner)
                 defs = self.defaults_for(init, True) if init else None
                 cargs = self.coerce_args(pct, node.args, defs)
-                if bname not in self.classes:       # imported base: extern decls
-                    self.xstructs_needed.add(bname)
-                    self.used_xmethods[(bname, "__init__")] = "void"
+                if owner.name not in self.classes:  # imported base: extern decls
+                    self.xstructs_needed.add(owner.name)
+                    self.used_xmethods[(owner.name, "__init__")] = "void"
                 return "%s___init__((%s*)self%s)" % (
-                    base.csym, base.csym,
+                    owner.csym, owner.csym,
                     (", " + ", ".join(cargs)) if cargs else "")
             if func.attr in VTABLE_METHODS:
                 return "%s_%s((Obj*)self%s)" % (
