@@ -3519,6 +3519,8 @@ class Transpiler:
             elif isinstance(node, ast.Expr):
                 self.mod_init_stmts.append(node)
             elif isinstance(node, (ast.If, ast.For, ast.While, ast.Try, ast.With)):
+                if _is_dunder_main_guard(node):
+                    continue        # script-entry guard; C has its own entry
                 self.mod_init_stmts.append(node)
 
     def prelude(self):
@@ -4766,6 +4768,41 @@ class Transpiler:
         return (isinstance(node, ast.Attribute) and node.attr == "argv"
                 and isinstance(node.value, ast.Name) and node.value.id == "sys")
 
+    # The translator identifies itself as this implementation so that source
+    # can guard host-CPython-only code with `if sys.implementation.name !=
+    # 'shivyc':` -- the dead branch is skipped at translation time and never
+    # reaches the C backend (see _static_cond / st_If).
+    IMPL_NAME = "shivyc"
+
+    def _is_sys_impl_name(self, node):
+        return (isinstance(node, ast.Attribute) and node.attr == "name"
+                and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "implementation"
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id == "sys")
+
+    def _static_cond(self, test):
+        """Compile-time truth value of a guard the translator can fold, or None.
+
+        Currently folds `sys.implementation.name` compared (==/!=) against a
+        string literal, in either operand order."""
+        if isinstance(test, ast.Compare) and len(test.ops) == 1 \
+                and len(test.comparators) == 1:
+            left, right = test.left, test.comparators[0]
+            impl = other = None
+            if self._is_sys_impl_name(left):
+                impl, other = left, right
+            elif self._is_sys_impl_name(right):
+                impl, other = right, left
+            if impl is not None and isinstance(other, ast.Constant) \
+                    and isinstance(other.value, str):
+                eq = (other.value == self.IMPL_NAME)
+                if isinstance(test.ops[0], ast.Eq):
+                    return eq
+                if isinstance(test.ops[0], ast.NotEq):
+                    return not eq
+        return None
+
     def func_def(self, node):
         self.enter_scope(node, skip_self=False)
         ret = self._ret_ctype(node.returns)
@@ -5491,6 +5528,14 @@ class Transpiler:
         # `if TYPE_CHECKING:` guards type-only imports; emit nothing for it
         if isinstance(node.test, ast.Name) and node.test.id == "TYPE_CHECKING":
             return []
+        # Translation-time guard (e.g. `sys.implementation.name != 'shivyc'`):
+        # transpile only the live branch so host-only code in the dead branch
+        # is never lowered to C.
+        sc = self._static_cond(node.test)
+        if sc is True:
+            return self.suite(node.body)
+        if sc is False:
+            return self.suite(node.orelse) if node.orelse else []
         lines = ["if (%s) {" % self.bool_expr(node.test)]
         narrows = self._narrowings(node.test)
         saved = {n: self.narrowed.get(n) for n, _ in narrows}
@@ -5914,6 +5959,8 @@ class Transpiler:
         if stream is not None:
             self._io_used.add(stream)
             return stream
+        if self._is_sys_impl_name(node):
+            return 'OBJ_STR("%s")' % self.IMPL_NAME
         if isinstance(node.value, ast.Name) and node.value.id == "socket" \
                 and node.attr in _SOCK_CONSTS:
             return _SOCK_CONSTS[node.attr]
@@ -7639,6 +7686,8 @@ class Transpiler:
 
     def bool_expr(self, node):
         """Render `node` as a C truth test, boxing obj values via truthy()."""
+        if self._is_sys_argv(node):         # `if sys.argv:` -> any args present
+            return "(argc > 0)"
         s = self.expr(node)
         if isinstance(node, (ast.Compare, ast.UnaryOp)):
             return s
