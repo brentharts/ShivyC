@@ -1343,6 +1343,26 @@ KNOWN_CLASSES = {}      # name -> ClassInfo
 VTABLE_METHODS = set()  # method names that are virtual somewhere in the module
 _XMOD_CACHE = {}        # dotted module name -> imported-symbol registry
 
+# Directories to search when resolving a co-compiled local module by its bare
+# (non-package) name, e.g. `import helper` / `from helper import f` where
+# `helper.py` is one of the sources given on the command line. Populated by the
+# CLI / multi-file driver from the input files' directories so that several
+# .py files compiled together form one translation unit with direct calls
+# between them (instead of dynamic mp_call_import).
+_LOCAL_MODULE_DIRS = []
+
+
+def set_local_module_dirs(paths):
+    """Register the directories of the input sources for local-module lookup."""
+    global _LOCAL_MODULE_DIRS
+    seen = []
+    for p in paths:
+        d = os.path.dirname(os.path.abspath(p)) if not os.path.isdir(p) \
+            else os.path.abspath(p)
+        if d and d not in seen:
+            seen.append(d)
+    _LOCAL_MODULE_DIRS = seen
+
 
 def ann_text_to_ctype(text):
     text = text.strip().strip("'\"")
@@ -3127,6 +3147,26 @@ class Transpiler:
             return ent[0].csym
         return class_csym(name, self.xclass_module.get(name), self.ambiguous)
 
+    def _find_local_module(self, modname):
+        """Path to a co-compiled local module `modname`, or None.
+
+        Searches the transpiled file's own directory plus every input
+        directory registered via set_local_module_dirs(), trying both
+        `modname.py` and `modname/__init__.py` (dotted names map to a path)."""
+        rel = os.path.join(*modname.split("."))
+        dirs = []
+        if self.base_dir:
+            dirs.append(self.base_dir)
+        for d in _LOCAL_MODULE_DIRS:
+            if d not in dirs:
+                dirs.append(d)
+        for d in dirs:
+            for cand in (os.path.join(d, rel + ".py"),
+                         os.path.join(d, rel, "__init__.py")):
+                if os.path.isfile(cand):
+                    return cand
+        return None
+
     def load_xmod(self, modname):
         """Parse an imported shivyc module and register its public symbols."""
         cache = _XMOD_CACHE
@@ -3140,6 +3180,11 @@ class Transpiler:
             path = os.path.join(self.base_dir, *modname.split(".")) + ".py"
         elif modname in self.stdlib_index:
             path = self.stdlib_index[modname]
+        else:
+            # A bare co-compiled module given on the command line (resolve its
+            # name against the input directories): treat it as local so calls
+            # into it become direct C calls, not dynamic mp_call_import.
+            path = self._find_local_module(modname)
         if path:
             try:
                 t = ast.parse(open(path, encoding="utf-8").read())
@@ -8498,6 +8543,7 @@ def main(argv):
             sys.exit(2)
 
     os.makedirs(out_dir, exist_ok=True)
+    set_local_module_dirs(files)
     _, _, stdlib_root = _stdlib_context(files[0] if len(files) == 1 else "", None)
     mp_bridge = bool(stdlib_dir) or any(
         "python-stdlib" in os.path.abspath(p) for p in files)
