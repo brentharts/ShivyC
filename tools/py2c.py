@@ -232,6 +232,7 @@ long pylen(obj v);                 /* len(list) or len(str)                   */
 obj  index_obj(obj container, long i);  /* container[i] for list/str          */
 bool obj_eq(obj a, obj b);         /* == on Tier-2 values                     */
 bool pycontains(obj container, obj v);  /* v in container                     */
+bool in_str(str needle, const str* hay, int n);  /* x in ("a","b",...)        */
 void pyprint(obj v);               /* print(x)                                */
 
 /* ---- dicts: insertion-ordered obj->obj map, tagged obj (T_DICT) ----------- */
@@ -297,6 +298,7 @@ obj  pyset(obj it);                     /* dedup iterable into a list-set      *
 obj  py_slice(obj seq, long lo, long hi);  /* str or list slice, Python rules  */
 str  char_at(str s, long i);            /* s[i] on a string -> 1-char string   */
 void set_add(obj s, obj v);             /* add to a list-set if absent         */
+void pyclear(obj c);                    /* list/set/dict .clear() (empty in place) */
 void list_remove(obj lst, obj v);       /* remove first matching element       */
 obj  list_index(obj lst, obj v);        /* position of first match (else abort) */
 obj  list_pop(obj lst);                 /* remove & return last element        */
@@ -1067,6 +1069,10 @@ obj pyset(obj it) {
     return r;
 }
 void set_add(obj s, obj v) { if (!pycontains(s, v)) list_append(s, v); }
+void pyclear(obj c) {
+    if (c.tag == T_LIST) ((List*)c.u.o)->len = 0;
+    else if (c.tag == T_DICT) ((Dict*)c.u.o)->len = 0;
+}
 void list_remove(obj lst, obj v) {
     if (lst.tag != T_LIST) return;
     List* l = (List*)lst.u.o;
@@ -6959,6 +6965,10 @@ class Transpiler:
                     func.attr not in self.xmethod_owners:
                 return "set_add(%s, %s)" % (self.wrap_obj(func.value),
                                             self.wrap_obj(node.args[0]))
+            if func.attr == "clear" and not node.args and \
+                    func.attr not in self.method_owners and \
+                    func.attr not in self.xmethod_owners:
+                return "pyclear(%s)" % self.wrap_obj(func.value)
             if func.attr == "remove" and len(node.args) == 1 and \
                     func.attr not in self.method_owners:
                 return "list_remove(%s, %s)" % (self.wrap_obj(func.value),
