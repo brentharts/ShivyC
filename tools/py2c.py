@@ -2387,6 +2387,50 @@ def class_csym(name, modname, ambiguous):
     return name
 
 
+_AMBIG_FUNC_CACHE = {}
+
+
+def ambiguous_function_names(base_dir):
+    """Top-level function names defined in more than one shivyc module. Like
+    ambiguous class names, such functions are cross-module API (e.g. every
+    optimizer pass exports `optimize`), so a bare C symbol would collide at
+    link time; they get module-qualified instead."""
+    if base_dir in _AMBIG_FUNC_CACHE:
+        return _AMBIG_FUNC_CACHE[base_dir]
+    name2mods = {}
+    pkg = os.path.join(base_dir or ".", "shivyc")
+    for dp, _dirs, fns in os.walk(pkg):
+        if "musl" in dp.split(os.sep):
+            continue
+        for fn in fns:
+            if not fn.endswith(".py"):
+                continue
+            p = os.path.join(dp, fn)
+            mod = os.path.relpath(p, base_dir or ".")[:-3].replace(os.sep, ".")
+            try:
+                t = ast.parse(open(p, encoding="utf-8").read())
+            except Exception:
+                continue
+            for n in t.body:
+                if isinstance(n, ast.FunctionDef):
+                    name2mods.setdefault(n.name, set()).add(mod)
+    amb = {n for n, mods in name2mods.items() if len(mods) > 1}
+    _AMBIG_FUNC_CACHE[base_dir] = amb
+    return amb
+
+
+def func_csym(name, modname, ambiguous_funcs):
+    """C symbol for module-level function `name` defined in `modname`: bare when
+    unique across the package, else module-qualified to avoid link collisions
+    (e.g. peephole.optimize vs stackless.optimize). The qualifier uses the
+    module's final component so the definition and every cross-module call agree
+    regardless of whether the module was named by basename or dotted path."""
+    if name in ambiguous_funcs and modname:
+        slug = c_mod_slug(modname.split(".")[-1])
+        return "%s__%s" % (slug, cname(name))
+    return cname(name)
+
+
 class Transpiler:
     def __init__(self, modname, base_dir=None, stdlib_root=None,
                  py_modname=None, pod_classes=True):
@@ -2442,6 +2486,10 @@ class Transpiler:
         """C symbol for a module-level function."""
         if self.stdlib_root and name in self.func_nodes:
             return "%s__%s" % (self.cmod, cname(name))
+        if name in self.ambiguous_funcs and name in self.func_nodes:
+            # Defined in several modules under the same name (cross-module API
+            # like `optimize`): module-qualify to avoid a link-time collision.
+            return func_csym(name, self.modname, self.ambiguous_funcs)
         return cname(name)
 
     def pname(self, name):
@@ -2469,6 +2517,7 @@ class Transpiler:
         self.closure_values_needed = set()
         self.classes, self.class_order, vt = collect_classes(tree)
         self.ambiguous = ambiguous_class_names(self.base_dir)
+        self.ambiguous_funcs = ambiguous_function_names(self.base_dir)
         for ci in self.class_order:     # qualify local colliding class symbols
             ci.csym = class_csym(ci.name, self.modname, self.ambiguous)
         self.class_typedef_names = {ci.csym for ci in self.class_order}
@@ -2725,7 +2774,8 @@ class Transpiler:
                 # name (e.g. a tree node `Return` plus il_cmds.control.Return).
                 classes.add(name)
             elif kind == "func" and name not in self.func_params:
-                funcs[name] = ann_to_ctype(info.returns) or OBJ
+                funcs[func_csym(name, mod, self.ambiguous_funcs)] = \
+                    ann_to_ctype(info.returns) or OBJ
             elif kind == "singleton":
                 singles[name] = info
                 if info not in self.classes:
@@ -6781,7 +6831,10 @@ class Transpiler:
                                                       node.keywords) \
                         if node.keywords else node.args
                     cargs = self.coerce_args(pct, merged, defs)
-                    return "%s(%s)" % (fn, ", ".join(cargs))
+                    return "%s(%s)" % (
+                        func_csym(fn, self.from_imports[fn],
+                                  self.ambiguous_funcs),
+                        ", ".join(cargs))
                 if self.stdlib_root:
                     return self._mp_import_call(self.from_imports[fn], fn, node)
             if fn in self.mod_global_types and self.mod_global_types[fn] == OBJ \
@@ -6978,7 +7031,9 @@ class Transpiler:
                                                       node.keywords) \
                         if node.keywords else node.args
                     cargs = self.coerce_args(pct, merged, defs)
-                    return "%s(%s)" % (cname(func.attr), ", ".join(cargs))
+                    return "%s(%s)" % (
+                        func_csym(func.attr, modname, self.ambiguous_funcs),
+                        ", ".join(cargs))
                 if self.stdlib_root:
                     return self._mp_import_call(modname, func.attr, node)
                 if not modname.startswith("shivyc"):
