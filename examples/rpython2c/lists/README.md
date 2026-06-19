@@ -21,6 +21,12 @@ Backed by `malloc`/`realloc`. No tagged `obj`, no boxing, no GC.
 Arithmetic on elements is native (`xs[0] + xs[1]` is an `int` add, not `obj_add`).
 Only scalar element types are unboxed; lists of objects keep the tagged model.
 
+A negative integer **literal** index wraps Python-style at compile time:
+`xs[-1]` becomes `xs->data[xs->len + (-1)]` (no runtime branch), and the same on
+the left of an assignment (`xs[-1] = v`). Dynamic indices (`xs[i]`) are taken
+as-is — direct C indexing, like the numpy-style typed arrays — so hot loops pay
+no bounds/wrap cost.
+
 ```
 python3 -m shivyc.main --no-cache typed_list.py -o /tmp/tl && /tmp/tl   # exit 58
 ```
