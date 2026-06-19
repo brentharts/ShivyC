@@ -7111,6 +7111,11 @@ class Transpiler:
 
     def _format_direct_method_call(self, owner, m, recv_node, arg_nodes):
         """Direct call to a concrete (non-vtable) class method."""
+        # A local class can inherit from an imported base; a method that
+        # resolves to that base is emitted as a direct call to the imported
+        # symbol, which needs an extern prototype (else gcc assumes int).
+        if owner.name not in self.classes:
+            self.used_xmethods.setdefault((owner.name, m.name), self._c_ret(m))
         recv = self._class_ptr_expr(recv_node, owner.csym)
         pct = [arg_ctype(m, a) for a in m.args.args[1:]]
         n_named = len(pct)
