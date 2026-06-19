@@ -803,6 +803,11 @@ def get_arguments():
                         help="with --check-memory, also report (and where safe, "
                              "insert) automatic frees for non-escaping allocations")
 
+    parser.add_argument("--no-peephole", dest="no_peephole",
+                        action="store_true",
+                        help="disable the IL peephole optimizer "
+                             "(compare-and-branch fusion, arithmetic identities)")
+
     # Micro-slicing: productive spin-waiting analysis.
     parser.add_argument("--microslice", dest="microslice", action="store_true",
                         help="analyze the inputs for pure, independent fragments "

@@ -462,7 +462,12 @@ class ASMGen:
                     self.simd_pack.active and simd_pack.is_hot_function(func))
                 self._cur_func_is_main = (func == "main")
                 self._cur_func_name = func
-                self._make_asm(self.il_code.commands[func], global_spotmap)
+                cmds = self.il_code.commands[func]
+                if not getattr(self.arguments, "no_peephole", False):
+                    import shivyc.peephole as peephole
+                    cmds = peephole.optimize(cmds, self.il_code)
+                    self.il_code.commands[func] = cmds
+                self._make_asm(cmds, global_spotmap)
 
             if is_meta:
                 self.asm_code.add(asm_cmds.Raw(".section .text"))
