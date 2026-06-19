@@ -467,6 +467,13 @@ class ASMGen:
                     import shivyc.peephole as peephole
                     cmds = peephole.optimize(cmds, self.il_code)
                     self.il_code.commands[func] = cmds
+                    # The peephole may introduce new literals (e.g. an IV
+                    # stride); ensure each gets a LiteralSpot, since the global
+                    # spotmap was built before this pass ran.
+                    for v in self.il_code.literals:
+                        if v not in global_spotmap:
+                            global_spotmap[v] = LiteralSpot(
+                                self.il_code.literals[v])
                 self._make_asm(cmds, global_spotmap)
 
             if is_meta:

@@ -18,6 +18,8 @@ import shivyc.il_cmds.compare as compare_cmds
 import shivyc.il_cmds.control as control_cmds
 import shivyc.il_cmds.math as math_cmds
 import shivyc.il_cmds.value as value_cmds
+import shivyc.ctypes as ctypes
+from shivyc.il_gen import ILValue
 
 
 def _input_use_counts(commands):
@@ -217,9 +219,236 @@ def hoist_loop_invariants(commands, il_code):
     return commands
 
 
+# --- Induction-variable strength reduction --------------------------------
+#
+# In a loop, an address recomputed from the loop counter every iteration
+# (`addr = base + scale*i + off`) is replaced by a pointer computed once in a
+# preheader and advanced by a constant stride each iteration -- turning the
+# index recompute + sign-extend + add-base sequence into a single `add`. This
+# matches what gcc does for array traversals. Like gcc -O2, this assumes the
+# affine index does not signed-overflow (so sign-extension is linear).
+
+def _single_block_loop_range(commands, start_idx, back_idx, labels):
+    """True if (start_idx, back_idx) is a straight-line loop body: no internal
+    labels and no internal jumps except early exits (targets outside the loop)
+    and the single back-edge at back_idx."""
+    for j in range(start_idx + 1, back_idx + 1):
+        c = commands[j]
+        if c.label_name() is not None:
+            return False
+        if j == back_idx:
+            continue
+        for t in c.targets():
+            ti = labels.get(t)
+            if ti is not None and start_idx <= ti <= back_idx:
+                return False  # internal jump back into the loop body
+    return True
+
+
+def _trace_stride(addr, def_of, commands, basic_ivs, defined, il_code,
+                  chain, depth=0):
+    """Trace `addr` back toward a single basic IV, accumulating the scale.
+
+    Returns (iv, scale): addr changes by `scale` per unit of `iv`. scale 0 means
+    `addr` is loop-invariant. Returns None if `addr` is not an affine function
+    of at most one basic IV using only loop-invariant coefficients. Records the
+    indices (into `commands`) of visited defining commands in `chain`.
+    """
+    if depth > 12:
+        return None
+    if addr in basic_ivs:
+        return (addr, 1)
+    if addr not in defined:
+        return (addr, 0)
+    if addr not in def_of:
+        return None
+    idx = def_of[addr]
+    cmd = commands[idx]
+    chain.append(idx)
+
+    if isinstance(cmd, value_cmds.Set):
+        return _trace_stride(cmd.arg, def_of, commands, basic_ivs, defined,
+                             il_code, chain, depth + 1)
+    if isinstance(cmd, (math_cmds.Add, math_cmds.Subtr)):
+        a = _trace_stride(cmd.arg1, def_of, commands, basic_ivs, defined,
+                          il_code, chain, depth + 1)
+        b = _trace_stride(cmd.arg2, def_of, commands, basic_ivs, defined,
+                          il_code, chain, depth + 1)
+        if a is None or b is None:
+            return None
+        iv_a, s_a = a
+        iv_b, s_b = b
+        if s_a != 0 and s_b != 0:
+            return None  # two varying terms -> not single-IV affine
+        if isinstance(cmd, math_cmds.Subtr):
+            s_b = -s_b
+        if s_a != 0:
+            return (iv_a, s_a)
+        if s_b != 0:
+            return (iv_b, s_b)
+        return (iv_a, 0)
+    if isinstance(cmd, math_cmds.Mult):
+        la = _lit(il_code, cmd.arg1)
+        lb = _lit(il_code, cmd.arg2)
+        if lb is not None:
+            inner = _trace_stride(cmd.arg1, def_of, commands, basic_ivs,
+                                  defined, il_code, chain, depth + 1)
+            if inner is None or inner[1] == 0:
+                return None
+            return (inner[0], inner[1] * lb)
+        if la is not None:
+            inner = _trace_stride(cmd.arg2, def_of, commands, basic_ivs,
+                                  defined, il_code, chain, depth + 1)
+            if inner is None or inner[1] == 0:
+                return None
+            return (inner[0], inner[1] * la)
+        return None
+    return None
+
+
+def strength_reduce_ivs(commands, il_code):
+    guard = 0
+    changed = True
+    while changed and guard < 20:
+        changed = False
+        guard += 1
+        labels = {c.label_name(): i for i, c in enumerate(commands)
+                  if c.label_name()}
+        target_counts = {}
+        for c in commands:
+            for t in c.targets():
+                target_counts[t] = target_counts.get(t, 0) + 1
+
+        for back_idx, c in enumerate(commands):
+            back_labels = [t for t in c.targets()
+                           if labels.get(t, back_idx) < back_idx]
+            if not back_labels:
+                continue
+            start_idx = labels[back_labels[0]]
+            if target_counts.get(back_labels[0], 0) != 1:
+                continue
+            if not _single_block_loop_range(commands, start_idx, back_idx,
+                                            labels):
+                continue
+
+            body = commands[start_idx + 1:back_idx]
+            defined = set()
+            def_count = {}
+            def_of = {}
+            for off, b in enumerate(body):
+                bi = start_idx + 1 + off
+                for o in b.outputs():
+                    defined.add(o)
+                    def_count[o] = def_count.get(o, 0) + 1
+                    def_of[o] = bi
+
+            # Basic IVs: iv updated by `t = iv + c; iv = t` (c literal), which
+            # ShivyCX emits as Add(t, iv, c) then Set(iv, t). iv must be defined
+            # exactly once in the loop (by that Set).
+            basic_ivs = {}
+            for b in body:
+                if not isinstance(b, value_cmds.Set):
+                    continue
+                iv = b.output
+                if def_count.get(iv) != 1:
+                    continue
+                if b.arg not in def_of:
+                    continue
+                add = commands[def_of[b.arg]]
+                if not isinstance(add, math_cmds.Add):
+                    continue
+                inc = None
+                if add.arg1 is iv and _lit(il_code, add.arg2) is not None:
+                    inc = _lit(il_code, add.arg2)
+                elif add.arg2 is iv and _lit(il_code, add.arg1) is not None:
+                    inc = _lit(il_code, add.arg1)
+                if inc is not None:
+                    basic_ivs[iv] = inc
+            if not basic_ivs:
+                continue
+
+            uses = _input_use_counts(commands)
+
+            target = None
+            for b in body:
+                addr = None
+                if isinstance(b, value_cmds.ReadAt):
+                    addr = b.addr
+                elif isinstance(b, value_cmds.SetAt):
+                    addr = b.addr
+                if addr is None or addr not in defined:
+                    continue
+                if def_count.get(addr) != 1:
+                    continue
+                chain = []
+                res = _trace_stride(addr, def_of, commands, basic_ivs,
+                                    defined, il_code, chain)
+                if res is None or res[1] == 0:
+                    continue
+                iv, scale = res
+                stride = scale * basic_ivs[iv]
+
+                # Unique chain indices in program order.
+                chain_idxs = sorted(set(chain))
+                chain_outputs = set()
+                for ci in chain_idxs:
+                    for o in commands[ci].outputs():
+                        chain_outputs.add(o)
+                # Each chain intermediate (except addr) must feed only the next
+                # chain command (used exactly once), so the chain can be moved.
+                ok = True
+                for o in chain_outputs:
+                    if o is addr:
+                        continue
+                    if uses.get(o, 0) != 1:
+                        ok = False
+                        break
+                if not ok:
+                    continue
+                if uses.get(addr, 0) != 1:  # addr used only by this mem op
+                    continue
+                target = (addr, iv, stride, chain_idxs)
+                break
+
+            if target is None:
+                continue
+
+            addr, iv, stride, chain_idxs = target
+            chain_id_set = set(chain_idxs)
+
+            stride_val = ILValue(ctypes.longint)
+            il_code.register_literal_var(stride_val, str(stride))
+            # Advance via a temporary (t = addr + stride; addr = t) rather than
+            # an in-place Add(addr, addr, stride): ShivyCX's liveness pass adds
+            # inputs then removes outputs, so an in-place update looks like addr
+            # is not live-in, and the allocator would clobber the pointer.
+            adv_tmp = ILValue(addr.ctype)
+            advance = [math_cmds.Add(adv_tmp, addr, stride_val),
+                       value_cmds.Set(addr, adv_tmp)]
+            chain_cmds = [commands[ci] for ci in chain_idxs]  # program order
+
+            new_commands = []
+            for i, cc in enumerate(commands):
+                if i == start_idx:
+                    new_commands.extend(chain_cmds)  # preheader
+                    new_commands.append(cc)          # loop label
+                    continue
+                if i in chain_id_set:
+                    continue  # remove chain from loop body
+                if i == back_idx:
+                    new_commands.extend(advance)     # advance before back-jump
+                new_commands.append(cc)
+            commands = new_commands
+            changed = True
+            break
+
+    return commands
+
+
 def optimize(commands, il_code):
     """Run all IL peephole passes for one function."""
     commands = simplify_arith(commands, il_code)
     commands = hoist_loop_invariants(commands, il_code)
+    commands = strength_reduce_ivs(commands, il_code)
     commands = fuse_compare_jumps(commands, il_code)
     return commands
