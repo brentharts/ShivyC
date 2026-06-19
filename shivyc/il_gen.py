@@ -1,6 +1,5 @@
 """Objects used for the AST -> IL phase of the compiler."""
 
-from collections import namedtuple
 from copy import copy
 
 from shivyc.ctypes import CType
@@ -201,14 +200,25 @@ class StringLiteral(_Literal):
         super().__init__(str(val))
 
 
+class Tables:
+    """One scope's symbol-table namespaces (vars, structs, enums).
+
+    A plain class rather than a namedtuple so the compiler can self-host
+    (no dynamic namedtuple machinery); the fields are accessed by name.
+    """
+
+    def __init__(self, vars, structs, enums):
+        self.vars = vars
+        self.structs = structs
+        self.enums = enums
+
+
 class SymbolTable:
     """Symbol table for the IL -> AST phase.
 
     This object stores variable names, types, typedefs, and maintains
     information on the variable linkages and storage durations.
     """
-    Tables = namedtuple('Tables', ['vars', 'structs', 'enums'])
-
     # Definition statuses
     UNDEFINED = 1
     TENTATIVE = 2
@@ -261,7 +271,7 @@ class SymbolTable:
 
     def new_scope(self):
         """Initialize a new scope for the symbol table."""
-        self.tables.append(self.Tables(dict(), dict(), dict()))
+        self.tables.append(Tables(dict(), dict(), dict()))
 
     def end_scope(self):
         """End the most recently started scope."""
@@ -274,9 +284,10 @@ class SymbolTable:
 
         name (str) - Identifier name to search for.
         """
-        for table, _, _ in self.tables[::-1]:
-            if name in table:
-                return table[name]
+        for _t in self.tables[::-1]:
+            t: "Tables" = _t
+            if name in t.vars:
+                return t.vars[name]
 
     def lookup_variable(self, identifier):
         """Look up the given identifier.
@@ -373,9 +384,10 @@ class SymbolTable:
 
     def lookup_enum_const(self, name):
         """Return the integer value of an enum constant, or None."""
-        for _, _, enums in self.tables[::-1]:
-            if name in enums:
-                return enums[name]
+        for _t in self.tables[::-1]:
+            t: "Tables" = _t
+            if name in t.enums:
+                return t.enums[name]
         return None
 
     def add_enum_const(self, identifier, value):
@@ -392,8 +404,10 @@ class SymbolTable:
 
         If not found, returns None.
         """
-        for _, structs, _ in self.tables[::-1]:
-            if tag in structs: return structs[tag]
+        for _t in self.tables[::-1]:
+            t: "Tables" = _t
+            if tag in t.structs:
+                return t.structs[tag]
 
     def add_struct_union(self, tag, ctype):
         """Add struct or union to the symbol table and return it.
