@@ -5445,6 +5445,14 @@ class Transpiler:
                 ctype in ("int", "long", "bool", "double", "char*") and \
                 (vt == OBJ or self.is_obj_word(node.value)):
             rhs = self.coerce_to(ctype, node.value, rhs)
+        # An obj-valued RHS assigned to a concrete class-pointer annotation is a
+        # checked downcast (e.g. `node_typed: "Node" = node`, where `node` came
+        # back from a closure as a Tier-2 obj). Insert the unbox so `.attr`
+        # stores become real struct-field writes instead of dynamic setattr.
+        elif isinstance(ctype, str) and ctype.endswith("*") and ctype != OBJ \
+                and (ctype[:-1] in self.classes or ctype[:-1] in self.xclasses) \
+                and (vt == OBJ or self.is_obj_word(node.value)):
+            rhs = self.coerce_to(ctype, node.value, rhs)
         return ["%s%s = %s;" % (decl, tgt, rhs)]
 
     AUG_OP_CHAR = {ast.Add: '+', ast.Sub: '-', ast.Mult: '*', ast.Div: '/',
