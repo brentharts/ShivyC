@@ -1233,6 +1233,112 @@ OBJ = "obj"
 _SCALAR_CTYPES = {"int", "double", "float", "char", "long", "short",
                   "bool", "unsigned"}
 
+
+def _tlist_name(et):
+    """C struct name for a typed list of element ctype `et` (a scalar)."""
+    return "_tlist_" + et.replace(" ", "_").replace("*", "p")
+
+
+def _mangle_ct(ct):
+    return ct.replace(" ", "_").replace("*", "p")
+
+
+def ann_dict_kv(ann):
+    """(key_ctype, val_ctype) for a `dict[K, V]`/`Dict[K, V]` annotation, or
+    None if `ann` is not a typed-dict annotation."""
+    try:
+        text = ast.unparse(ann).strip().strip("'\"")
+    except Exception:
+        return None
+    for pfx in ("dict[", "Dict["):
+        if text.startswith(pfx) and text.endswith("]"):
+            inner = text[len(pfx):-1]
+            depth = 0
+            for i, c in enumerate(inner):
+                if c == "[":
+                    depth += 1
+                elif c == "]":
+                    depth -= 1
+                elif c == "," and depth == 0:
+                    k = ann_text_to_ctype(inner[:i].strip())
+                    v = ann_text_to_ctype(inner[i + 1:].strip())
+                    if k and v:
+                        return (k, v)
+                    return None
+    return None
+
+
+def _tdict_name(kct, vct):
+    return "_tdict_%s_%s" % (_mangle_ct(kct), _mangle_ct(vct))
+
+
+def _tdict_prelude(kct, vct):
+    """A small, runtime-free dict for scalar/string keys and scalar values:
+    parallel key/value arrays with linear probe. String keys compare by
+    strcmp; everything else by ==. O(n) lookup, fine for the small dicts
+    rpython programs use; no tagged obj, no hashing runtime."""
+    td = _tdict_name(kct, vct)
+    keyeq = ("(strcmp(d->keys[i], k) == 0)" if kct == "char*"
+             else "(d->keys[i] == k)")
+    return (
+        "typedef struct %s { %s* keys; %s* vals; long len; long cap; } %s;\n"
+        "static %s* %s_new(long cap) {\n"
+        "    %s* d = malloc(sizeof *d);\n"
+        "    d->len = 0; d->cap = cap > 0 ? cap : 4;\n"
+        "    d->keys = malloc((unsigned long)d->cap * sizeof(%s));\n"
+        "    d->vals = malloc((unsigned long)d->cap * sizeof(%s));\n"
+        "    return d;\n"
+        "}\n"
+        "static long %s_find(%s* d, %s k) {\n"
+        "    for (long i = 0; i < d->len; i++) if %s return i;\n"
+        "    return -1;\n"
+        "}\n"
+        "static void %s_set(%s* d, %s k, %s v) {\n"
+        "    long i = %s_find(d, k);\n"
+        "    if (i >= 0) { d->vals[i] = v; return; }\n"
+        "    if (d->len >= d->cap) {\n"
+        "        d->cap = d->cap * 2;\n"
+        "        d->keys = realloc(d->keys, (unsigned long)d->cap * sizeof(%s));\n"
+        "        d->vals = realloc(d->vals, (unsigned long)d->cap * sizeof(%s));\n"
+        "    }\n"
+        "    d->keys[d->len] = k; d->vals[d->len] = v; d->len++;\n"
+        "}\n"
+        "static %s %s_get(%s* d, %s k) {\n"
+        "    long i = %s_find(d, k);\n"
+        "    return i >= 0 ? d->vals[i] : (%s)0;\n"
+        "}\n"
+        "static int %s_has(%s* d, %s k) { return %s_find(d, k) >= 0; }\n"
+        % (td, kct, vct, td,
+           td, td, td, kct, vct,
+           td, td, kct, keyeq,
+           td, td, kct, vct, td, kct, vct,
+           vct, td, td, kct, td, vct,
+           td, td, kct, td))
+
+
+def _tlist_prelude(et):
+    """A small, runtime-free growable-array type for a scalar element `et`:
+    `{ et* data; long len, cap; }` with new/push helpers (get/len are inline
+    field accesses). Used to lower rpython `list[T]` for scalar T."""
+    tl = _tlist_name(et)
+    return (
+        "typedef struct %s { %s* data; long len; long cap; } %s;\n"
+        "static %s* %s_new(long cap) {\n"
+        "    %s* l = malloc(sizeof *l);\n"
+        "    l->len = 0; l->cap = cap > 0 ? cap : 4;\n"
+        "    l->data = malloc((unsigned long)l->cap * sizeof(%s));\n"
+        "    return l;\n"
+        "}\n"
+        "static void %s_push(%s* l, %s v) {\n"
+        "    if (l->len >= l->cap) {\n"
+        "        l->cap = l->cap * 2;\n"
+        "        l->data = realloc(l->data, (unsigned long)l->cap * sizeof(%s));\n"
+        "    }\n"
+        "    l->data[l->len++] = v;\n"
+        "}\n"
+        % (tl, et, tl, tl, tl, tl, et, tl, tl, et, et))
+
+
 KNOWN_CLASSES = {}      # name -> ClassInfo
 VTABLE_METHODS = set()  # method names that are virtual somewhere in the module
 _XMOD_CACHE = {}        # dotted module name -> imported-symbol registry
@@ -2270,6 +2376,9 @@ class Transpiler:
         self.base_dir = base_dir    # repo dir containing the shivyc/ package
         self.stdlib_root = os.fspath(stdlib_root) if stdlib_root else None
         self._pod_enabled = pod_classes   # POD class lowering (rpython only)
+        self._typed_lists = set()         # scalar element ctypes needing a list type
+        self._typed_dicts = set()         # (key_ct, val_ct) needing a dict type
+        self._tdict_by_name = {}          # _tdict_K_V -> (key_ct, val_ct)
         self.stdlib_index = build_stdlib_index(self.stdlib_root) \
             if self.stdlib_root else {}
         self.lines = []
@@ -2516,6 +2625,13 @@ class Transpiler:
                         {ci.csym for ci in self.class_order})
                        - self._pod_set)]
         self.lines[self.extern_idx:self.extern_idx] = externs + tramps
+        if self._typed_lists or self._typed_dicts:
+            pre = []
+            for et in sorted(self._typed_lists):
+                pre.extend(_tlist_prelude(et).splitlines())
+            for (kct, vct) in sorted(self._typed_dicts):
+                pre.extend(_tdict_prelude(kct, vct).splitlines())
+            self.lines[self.extern_idx:self.extern_idx] = pre
         if self._sock_used:
             self.lines[self.extern_idx:self.extern_idx] = \
                 SOCKET_PRELUDE.splitlines()
@@ -2771,7 +2887,7 @@ class Transpiler:
             self.emit()
 
     def func_signature(self, node):
-        ret = ann_to_ctype(node.returns) or OBJ
+        ret = self._ret_ctype(node.returns)
         if self._uses_argv(node):
             return "%s %s(int argc, char** argv)" % (ret, self.fnsym(node.name))
         params = self.param_list(node, skip_self=False)
@@ -2840,6 +2956,21 @@ class Transpiler:
         bind to the wrong same-named class."""
         if ann is None:
             return None
+        # rpython typed list of a scalar element (`list[int]`, `list[float]`,
+        # ...) -> a runtime-free unboxed growable array. Checked before
+        # ann_to_ctype, which would otherwise collapse `list[T]` to obj.
+        # Self-host's `List[ILValue]` etc. have non-scalar elements and stay obj.
+        if getattr(self, "_pod_enabled", False):
+            _el = ann_elem_ctype(ann)
+            if _el is not None and _el in _SCALAR_CTYPES:
+                self._typed_lists.add(_el)
+                return _tlist_name(_el) + "*"
+            _kv = ann_dict_kv(ann)
+            if _kv is not None and _kv[1] in _SCALAR_CTYPES and \
+                    (_kv[0] in _SCALAR_CTYPES or _kv[0] == "char*"):
+                self._typed_dicts.add(_kv)
+                self._tdict_by_name[_tdict_name(_kv[0], _kv[1])] = _kv
+                return _tdict_name(_kv[0], _kv[1]) + "*"
         base = ann_to_ctype(ann)
         if base is not None:
             return base
@@ -3359,7 +3490,8 @@ class Transpiler:
                                                           stmt.value)
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
-                self.func_returns[node.name] = ann_to_ctype(node.returns) or OBJ
+                self.func_returns[node.name] = \
+                    self._ret_ctype(node.returns)
                 self.func_params[node.name] = [self.arg_ctype_q(node, a)
                                                for a in node.args.args]
                 self.func_nodes[node.name] = node
@@ -4232,8 +4364,16 @@ class Transpiler:
                                     consider(el.id, OBJ)
                 elif isinstance(sub, ast.AnnAssign) and \
                         isinstance(sub.target, ast.Name):
+                    _et = ann_elem_ctype(sub.annotation)
+                    if not _et:
+                        _kv = ann_dict_kv(sub.annotation)
+                        if _kv:
+                            _et = _kv[0]      # iterating a dict yields keys
+                    if _et:
+                        self.elem_types.setdefault(sub.target.id, _et)
                     consider(sub.target.id,
-                             infer_type(sub.target.id, sub.annotation))
+                             self._local_ann_ctype(sub.target.id,
+                                                    sub.annotation))
                 elif isinstance(sub, ast.For):
                     if isinstance(sub.target, ast.Name):
                         is_range = isinstance(sub.iter, ast.Call) and \
@@ -4397,7 +4537,7 @@ class Transpiler:
         # caller-supplied params from `args` (filling defaults when short).
         for mangled in sorted(self.closure_values_needed):
             node, n_caps, real_defs = self.closure_specs[mangled]
-            ret = ann_to_ctype(node.returns) or OBJ
+            ret = self._ret_ctype(node.returns)
             parts = []
             for i in range(n_caps):
                 pct_i = arg_ctype(node, node.args.args[i])
@@ -4628,7 +4768,7 @@ class Transpiler:
 
     def func_def(self, node):
         self.enter_scope(node, skip_self=False)
-        ret = ann_to_ctype(node.returns) or OBJ
+        ret = self._ret_ctype(node.returns)
         self.cur_ret = ret
         if self._uses_argv(node):
             self.scope["argc"] = "int"
@@ -4749,6 +4889,17 @@ class Transpiler:
                         self.expr(tgt.value)
                     lines.append("list_set_slice(%s, %s, %s, %s);" % (
                         self.expr(tgt.value), lo, hi, self.wrap_obj(node.value)))
+                    continue
+                # rpython typed dict: d[k] = v -> _tdict_K_V_set(d, k, v)
+                tdct = self._typed_dict_ct(tgt.value)
+                if tdct is not None and not isinstance(tgt.slice, ast.Slice):
+                    name = tdct[:-1]
+                    kct, vct = self._tdict_by_name[name]
+                    lines.append("%s_set(%s, %s, %s);" % (
+                        name, self.expr(tgt.value),
+                        self.coerce_to(kct, tgt.slice, self.expr(tgt.slice)),
+                        self.coerce_to(vct, node.value,
+                                       self.expr(node.value))))
                     continue
                 if self._subscript_container_is_obj(tgt.value) or \
                         isinstance(tgt.value, ast.Call):
@@ -4912,6 +5063,12 @@ class Transpiler:
             if self.value_ctype(node.value) == "char*":
                 return "char*"
             vc = self.value_ctype(node.value)
+            if vc and vc.startswith("_tlist_") and vc.endswith("*"):
+                return vc[len("_tlist_"):-1]   # xs[i] of a typed list -> elem
+            if vc and vc.startswith("_tdict_") and vc.endswith("*"):
+                kv = self._tdict_by_name.get(vc[:-1])
+                if kv:
+                    return kv[1]               # d[k] of a typed dict -> value
             if vc and vc.endswith("*") and vc[:-1] in _SCALAR_CTYPES:
                 return vc[:-1]          # a[i] of a scalar pointer -> element type
         if isinstance(node, ast.UnaryOp):
@@ -5128,9 +5285,14 @@ class Transpiler:
         return self.guess_from_value(node)
 
     def st_AnnAssign(self, node):
-        ctype = infer_type(getattr(node.target, "id", "x"), node.annotation)
+        ctype = self._local_ann_ctype(
+            getattr(node.target, "id", "x"), node.annotation)
         if isinstance(node.target, ast.Name):
             et = ann_elem_ctype(node.annotation)
+            if not et:
+                kv = ann_dict_kv(node.annotation)
+                if kv:
+                    et = kv[0]                # iterating a dict yields keys
             if et:
                 self.elem_types[node.target.id] = et
         tgt = self.expr(node.target)
@@ -5141,6 +5303,13 @@ class Transpiler:
         decl = "" if (already or not isinstance(node.target, ast.Name)) \
             else (ctype + " ")
         rhs = self.expr(node.value)
+        # rpython typed list: `xs: "list[int]" = [..]` builds an unboxed array.
+        if isinstance(ctype, str) and ctype.startswith("_tlist_") and \
+                isinstance(node.value, ast.List):
+            rhs = self._typed_list_literal(ctype, node.value)
+        if isinstance(ctype, str) and ctype.startswith("_tdict_") and \
+                isinstance(node.value, ast.Dict):
+            rhs = self._typed_dict_literal(ctype, node.value)
         # A class instance assigned to an obj-typed target (e.g. a non-leaf
         # base annotation `base: "Shape*"`, which is typed obj for sound
         # dynamic dispatch) must be boxed into the tagged union.
@@ -5347,6 +5516,52 @@ class Transpiler:
             lines.append("}")
             return lines
         lines = ["/* for %s in %s: */" % (self.src1(tgt), self.src1(it))]
+        # rpython typed list: iterate the unboxed array directly.
+        tlct = self._typed_list_ct(it)
+        if tlct is not None and isinstance(tgt, ast.Name):
+            et = tlct[len("_tlist_"):-1]
+            self.loop_n += 1
+            itv = "_it%d" % self.loop_n
+            idx = "_k%d" % self.loop_n
+            saved = self.scope.get(tgt.id)
+            self.scope[tgt.id] = et
+            decl = "" if tgt.id in self.hoisted else (et + " ")
+            lines.append("{ %s %s = %s;" % (tlct, itv, self.expr(it)))
+            lines.append("  for (long %s = 0; %s < %s->len; %s++) {" %
+                         (idx, idx, itv, idx))
+            lines.append("    %s%s = %s->data[%s];" %
+                         (decl, self.lid(tgt.id), itv, idx))
+            lines += self.indent_lines(self.indent_lines(self.suite(node.body)))
+            lines.append("  }")
+            lines.append("}")
+            if saved is None:
+                self.scope.pop(tgt.id, None)
+            else:
+                self.scope[tgt.id] = saved
+            return lines
+        # rpython typed dict: `for k in d` iterates the keys.
+        tdct = self._typed_dict_ct(it)
+        if tdct is not None and isinstance(tgt, ast.Name):
+            kct = self._tdict_by_name[tdct[:-1]][0]
+            self.loop_n += 1
+            itv = "_it%d" % self.loop_n
+            idx = "_k%d" % self.loop_n
+            saved = self.scope.get(tgt.id)
+            self.scope[tgt.id] = kct
+            decl = "" if tgt.id in self.hoisted else (kct + " ")
+            lines.append("{ %s %s = %s;" % (tdct, itv, self.expr(it)))
+            lines.append("  for (long %s = 0; %s < %s->len; %s++) {" %
+                         (idx, idx, itv, idx))
+            lines.append("    %s%s = %s->keys[%s];" %
+                         (decl, self.lid(tgt.id), itv, idx))
+            lines += self.indent_lines(self.indent_lines(self.suite(node.body)))
+            lines.append("  }")
+            lines.append("}")
+            if saved is None:
+                self.scope.pop(tgt.id, None)
+            else:
+                self.scope[tgt.id] = saved
+            return lines
         if isinstance(tgt, (ast.Name, ast.Tuple, ast.List)):
             self.loop_n += 1
             itv = "_it%d" % self.loop_n
@@ -6143,6 +6358,9 @@ class Transpiler:
             if fn == "len" and len(node.args) == 1:
                 if self._is_sys_argv(node.args[0]):
                     return "argc"
+                if self._typed_list_ct(node.args[0]) is not None or \
+                        self._typed_dict_ct(node.args[0]) is not None:
+                    return "%s->len" % self.expr(node.args[0])
                 if self.value_ctype(node.args[0]) == "char*":
                     self._io_used.add("strlen")
                     return "strlen(%s)" % self.expr(node.args[0])
@@ -6443,6 +6661,12 @@ class Transpiler:
                 return rcv
             # list methods on an obj/list receiver
             if func.attr == "append" and len(node.args) == 1:
+                tlct = self._typed_list_ct(func.value)
+                if tlct is not None:
+                    return "%s_push(%s, %s)" % (
+                        tlct[:-1], self.expr(func.value),
+                        self.coerce_to(tlct[len("_tlist_"):-1], node.args[0],
+                                       self.expr(node.args[0])))
                 return "list_append(%s, %s)" % (self.expr(func.value),
                                                 self.wrap_obj(node.args[0]))
             if func.attr == "extend" and len(node.args) == 1 and \
@@ -7536,6 +7760,13 @@ class Transpiler:
     def cmp(self, left, op, right):
         ls, rs = self.expr(left), self.expr(right)
         if isinstance(op, (ast.In, ast.NotIn)):
+            tdct = self._typed_dict_ct(right)
+            if tdct is not None:
+                kct = self._tdict_by_name[tdct[:-1]][0]
+                inner = "%s_has(%s, %s)" % (
+                    tdct[:-1], self.expr(right),
+                    self.coerce_to(kct, left, self.expr(left)))
+                return ("(!%s)" % inner) if isinstance(op, ast.NotIn) else inner
             if isinstance(right, ast.Name) and right.id in self.str_sets:
                 elems = self.str_sets[right.id]
                 arr = "(const str[]){%s}" % ", ".join(c_string(e)
@@ -7684,6 +7915,16 @@ class Transpiler:
                                           self.wrap_obj(sl))
         if self.value_ctype(node.value) == "char*":   # s[i] -> 1-char string
             return "char_at(%s, %s)" % (self.expr(node.value), self.as_long(sl))
+        # rpython typed list: xs[i] -> xs->data[i] (unboxed)
+        tlct = self._typed_list_ct(node.value)
+        if tlct is not None and not isinstance(sl, ast.Slice):
+            return "%s->data[%s]" % (self.expr(node.value), self.as_long(sl))
+        # rpython typed dict: d[k] -> _tdict_K_V_get(d, k)
+        tdct = self._typed_dict_ct(node.value)
+        if tdct is not None and not isinstance(sl, ast.Slice):
+            kct = self._tdict_by_name[tdct[:-1]][0]
+            return "%s_get(%s, %s)" % (tdct[:-1], self.expr(node.value),
+                                       self.coerce_to(kct, sl, self.expr(sl)))
         # scalar-pointer array (int*/double*/float*/...): native C indexing for
         # ANY index (a numpy-style array), not just literal indices.
         if vct and vct.endswith("*") and vct[:-1] in _SCALAR_CTYPES:
@@ -7712,6 +7953,72 @@ class Transpiler:
         return "(%s ? %s : %s)" % (self.bool_expr(node.test),
                                    self.expr(node.body),
                                    self.expr(node.orelse))
+
+    def _ret_ctype(self, returns):
+        """Return ctype of a function, preferring rpython typed containers
+        (`list[T]`/`dict[K,V]`) over the obj fallback."""
+        if returns is not None and getattr(self, "_pod_enabled", False):
+            r = self.ann_ctype(returns)
+            if r is not None and (r.startswith("_tlist_") or
+                                  r.startswith("_tdict_")):
+                return r
+        return ann_to_ctype(returns) or OBJ
+
+    def _local_ann_ctype(self, name, annotation):
+        """C type of an annotated local, preferring rpython typed lists over the
+        name-based infer_type fallback (which doesn't know `list[T]`)."""
+        if annotation is not None and getattr(self, "_pod_enabled", False):
+            r = self.ann_ctype(annotation)
+            if r is not None and (r.startswith("_tlist_") or
+                                  r.startswith("_tdict_")):
+                return r
+        return infer_type(name, annotation)
+
+    def _typed_dict_ct(self, node):
+        """Return the typed-dict ctype (e.g. '_tdict_charp_int*') of an
+        expression, or None if it is not a typed dict."""
+        try:
+            ct = self.value_ctype(node)
+        except Exception:
+            return None
+        if isinstance(ct, str) and ct.startswith("_tdict_") and ct.endswith("*"):
+            return ct
+        return None
+
+    def _typed_dict_literal(self, ct, dictnode):
+        name = ct[:-1]
+        kct, vct = self._tdict_by_name[name]
+        pairs = [(k, v) for k, v in zip(dictnode.keys, dictnode.values)
+                 if k is not None]
+        parts = ["%s* _td = %s_new(%d);" % (name, name, len(pairs) or 4)]
+        for k, v in pairs:
+            parts.append("%s_set(_td, %s, %s);" % (
+                name, self.coerce_to(kct, k, self.expr(k)),
+                self.coerce_to(vct, v, self.expr(v))))
+        parts.append("_td;")
+        return "({ " + " ".join(parts) + " })"
+
+    def _typed_list_ct(self, node):
+        """Return the typed-list ctype (e.g. '_tlist_int*') of an expression,
+        or None if it is not a typed list."""
+        try:
+            ct = self.value_ctype(node)
+        except Exception:
+            return None
+        if isinstance(ct, str) and ct.startswith("_tlist_") and ct.endswith("*"):
+            return ct
+        return None
+
+    def _typed_list_literal(self, ct, listnode):
+        """Build a typed list from a list literal as a statement-expression:
+        ({ _tlist_T* _t = _tlist_T_new(n); _tlist_T_push(_t, e0); ...; _t; })."""
+        name = ct[:-1]                       # _tlist_T  (drop the '*')
+        n = len(listnode.elts)
+        parts = ["%s* _tl = %s_new(%d);" % (name, name, n if n else 4)]
+        for e in listnode.elts:
+            parts.append("%s_push(_tl, %s);" % (name, self.expr(e)))
+        parts.append("_tl;")
+        return "({ " + " ".join(parts) + " })"
 
     def ex_List(self, node):
         if not node.elts:
