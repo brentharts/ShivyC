@@ -6919,6 +6919,22 @@ class Transpiler:
                         cargs = self.coerce_args(pct, merged, defs)
                         cargs = self._pad_ctor_kwargs(init, cargs)
                         return "%s_new(%s)" % (info.csym, ", ".join(cargs))
+            # `self.attr(...)` where `attr` is a class-valued attribute (an
+            # instance field holding a constructor/closure, e.g. the
+            # polymorphic `default_il_cmd = math_cmds.Add` idiom) is a call of
+            # the stored closure, not a method named `attr`.
+            recv_ct = self.value_ctype(func.value)
+            if isinstance(recv_ct, str) and recv_ct.endswith("*") \
+                    and recv_ct != OBJ:
+                rci = self.classes.get(recv_ct[:-1])
+                if rci is not None \
+                        and rci.find_method_owner(func.attr) is None \
+                        and any(f == func.attr for f, _ in rci.own_fields):
+                    fld = self.expr(func)
+                    wargs = [self.wrap_obj(a) for a in node.args]
+                    return "call_obj(%s, %d%s)" % (
+                        fld, len(wargs),
+                        (", " + ", ".join(wargs)) if wargs else "")
             if self.stdlib_root:
                 return self._mp_method_call(func.value, func.attr, node)
             recv = self.expr(func.value)
