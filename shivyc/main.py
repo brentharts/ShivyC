@@ -209,6 +209,10 @@ def main():
     if any(not obj for obj in objs):
         return 1
 
+    # -S: assembly already written by process_c_file; nothing to assemble/link.
+    if getattr(arguments, "asm_only", False):
+        return 0
+
     # -c: compile and assemble only, leaving the .o files; do not link.
     if getattr(arguments, "compile_only", False):
         if (arguments.output_name and len(arguments.output_name) == 1
@@ -739,6 +743,16 @@ def process_c_file(file, args):
     if not error_collector.ok():
         return None
 
+    # -S: stop after emitting assembly. If a single -o name was given, publish
+    # the .s there (gcc-style); otherwise leave it next to the source.
+    if getattr(args, "asm_only", False):
+        out_names = getattr(args, "output_name", None)
+        if out_names and len(out_names) == 1 and out_names[0] != asm_file:
+            import shutil
+            shutil.copyfile(asm_file, out_names[0])
+            return out_names[0]
+        return asm_file
+
     assemble(asm_file, obj_file)
     if not error_collector.ok():
         return None
@@ -798,6 +812,11 @@ def get_arguments():
     parser.add_argument("-c",
                         help="compile and assemble to .o, but do not link",
                         dest="compile_only", action="store_true")
+
+    parser.add_argument("-S",
+                        help="emit assembly (.s) and stop; do not assemble or "
+                             "link",
+                        dest="asm_only", action="store_true")
 
     parser.add_argument(
         "-f-eliminate-unused-members",
