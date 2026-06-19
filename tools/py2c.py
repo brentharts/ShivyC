@@ -6472,6 +6472,15 @@ class Transpiler:
                 return "0"
             if fn == "abs" and node.args:
                 return "pyabs(%s)" % self.as_long(node.args[0])
+            if fn == "bool":
+                if not node.args:
+                    return "0"
+                vt = self.value_ctype(node.args[0])
+                if vt in ("int", "bool", "long", "short", "char",
+                          "double", "float"):
+                    return "(%s != 0)" % self.expr(node.args[0])
+                # obj / char* / other: Python truthiness, yielding a C bool.
+                return "truthy(%s)" % self.wrap_obj(node.args[0])
             if fn == "float" and node.args:
                 vt = self.value_ctype(node.args[0])
                 if vt in ("int", "bool", "double", "float", "long",
@@ -6702,7 +6711,8 @@ class Transpiler:
                 return "list_extend(%s, %s)" % (self.wrap_obj(func.value),
                                                 self.wrap_obj(node.args[0]))
             if func.attr == "add" and len(node.args) == 1 and \
-                    func.attr not in self.method_owners:
+                    func.attr not in self.method_owners and \
+                    func.attr not in self.xmethod_owners:
                 return "set_add(%s, %s)" % (self.wrap_obj(func.value),
                                             self.wrap_obj(node.args[0]))
             if func.attr == "remove" and len(node.args) == 1 and \
