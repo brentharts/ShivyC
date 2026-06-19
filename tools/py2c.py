@@ -6342,6 +6342,11 @@ class Transpiler:
         if isinstance(func, ast.Call):
             inner = self.expr(func)
             args = [self.wrap_obj(a) for a in node.args]
+            if not self.stdlib_root:        # rpython runtime: call_obj varargs
+                if args:
+                    return "call_obj(%s, %d, %s)" % (
+                        inner, len(args), ", ".join(args))
+                return "call_obj(%s, 0)" % inner
             if args:
                 return "mp_call_obj(%s, list_of(%d, %s), dict_new())" % (
                     inner, len(args), ", ".join(args))
@@ -6472,6 +6477,10 @@ class Transpiler:
                 return "0"
             if fn == "abs" and node.args:
                 return "pyabs(%s)" % self.as_long(node.args[0])
+            if fn == "iter" and len(node.args) == 1:
+                # Iterables are materialized lists in this runtime, so iter() is
+                # the identity (the list is directly indexable).
+                return self.wrap_obj(node.args[0])
             if fn == "id" and len(node.args) == 1:
                 # Object identity: the heap pointer as an integer (matches
                 # CPython's id() being the address). Used for set-based dedup.
@@ -6675,6 +6684,11 @@ class Transpiler:
                 return "%s_%s((Obj*)self%s)" % (
                     base.csym, func.attr,
                     (", " + ", ".join(argstrs)) if argstrs else "")
+            if bname not in self.classes:       # imported base: extern decl
+                self.xstructs_needed.add(bname)
+                self.used_xmethods.setdefault(
+                    (bname, func.attr),
+                    self._c_ret(base.methods.get(func.attr)))
             return "%s_%s((%s*)self%s)" % (
                 base.csym, func.attr, base.csym,
                 (", " + ", ".join(argstrs)) if argstrs else "")
@@ -7049,6 +7063,9 @@ class Transpiler:
         elif prefix:
             star = "obj_add(list_of(%d, %s), %s)" % (
                 len(prefix), ", ".join(prefix), star)
+        if not self.stdlib_root and not node.keywords:
+            # rpython runtime: call a dynamic callable with a runtime arg list.
+            return "call_closure(%s, %s)" % (func_expr, star)
         kw = self._lower_call_kwargs(node)
         return "mp_call_obj(%s, %s, %s)" % (func_expr, star, kw)
 
