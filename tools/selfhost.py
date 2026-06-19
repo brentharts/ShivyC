@@ -518,9 +518,86 @@ def cmd_coverage(build_root, args):
     return 0
 
 
+def cmd_link(build_root, args):
+    """Fast self-host LINK check (gcc, not ShivyCX).
+
+    Transpiles every module as ONE translation unit, gcc-compiles each, then
+    links them together to surface cross-module *linker* errors -- undefined
+    references and multiple definitions -- which is what most self-host bugs
+    reduce to. Much faster than driving each module through the ShivyCX backend
+    (use that, or `make rpython`, for codegen correctness)."""
+    import glob
+    out = os.path.join(build_root, "link")
+    os.makedirs(out, exist_ok=True)
+    mods = []
+    for g in COVERAGE_GLOBS:
+        mods += glob.glob(os.path.join(REPO, g))
+    r = run([sys.executable, PY2C, *mods, "--out", out], cwd=REPO)
+    if r.returncode != 0:
+        print("transpile failed:\n" + r.stderr)
+        return 1
+    sys.path.insert(0, os.path.join(REPO, "tools"))
+    import py2c as _p
+    _p.write_runtime(out)
+
+    # Compile the runtime and every module (-O0 for speed; we only need
+    # symbols, not optimized code).
+    objs = []
+    compile_fails = []
+    rt_o = os.path.join(out, "shivyc_rt.o")
+    compile_c(os.path.join(out, "shivyc_rt.c"), rt_o, inc_dirs=[out],
+              extra=["-O0"])
+    objs.append(rt_o)
+    cfiles = sorted(f for f in os.listdir(out)
+                    if f.endswith(".c") and f != "shivyc_rt.c")
+    for c in cfiles:
+        oo = os.path.join(out, c[:-2] + ".o")
+        res = compile_c(os.path.join(out, c), oo, inc_dirs=[out], extra=["-O0"])
+        if res.returncode == 0:
+            objs.append(oo)
+        else:
+            compile_fails.append(c[:-2])
+
+    # (1) Partial link to surface multiple-definition clashes between modules.
+    combined = os.path.join(out, "combined.o")
+    lr = run(["ld", "-r", "-o", combined] + objs)
+    dup = sorted({ln.split("`")[1].split("'")[0]
+                  for ln in lr.stderr.splitlines()
+                  if "multiple definition" in ln and "`" in ln})
+
+    # (2) Final link (allowing dups) to surface undefined references. A tiny
+    # stub provides main() so a missing entry point isn't reported as an error.
+    stub_c = os.path.join(out, "_linkstub.c")
+    with open(stub_c, "w") as f:
+        f.write("int main(void){return 0;}\n")
+    stub_o = os.path.join(out, "_linkstub.o")
+    compile_c(stub_c, stub_o, extra=["-O0"])
+    exe = os.path.join(out, "_all")
+    fl = run(["gcc"] + objs + [stub_o, "-o", exe, "-lm",
+              "-Wl,--allow-multiple-definition"])
+    undef = sorted({ln.split("`")[1].split("'")[0]
+                    for ln in fl.stderr.splitlines()
+                    if "undefined reference" in ln and "`" in ln
+                    and "`main'" not in ln})
+
+    print("self-host link check (gcc): %d/%d modules compiled, "
+          "%d dup symbols, %d undefined refs"
+          % (len(objs) - 1, len(cfiles), len(dup), len(undef)))
+    if not args.quiet:
+        if compile_fails:
+            print("  compile fails (%d): %s"
+                  % (len(compile_fails), ", ".join(compile_fails[:20])))
+        for d in dup[:20]:
+            print("  DUP    " + d)
+        for u in undef[:25]:
+            print("  UNDEF  " + u)
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="ShivyCX self-host build/test")
-    ap.add_argument("cmd", choices=["list", "test", "bench", "coverage"])
+    ap.add_argument("cmd", choices=["list", "test", "bench", "coverage",
+                                    "link"])
     ap.add_argument("names", nargs="*", help="target name(s)")
     ap.add_argument("--musl", action="store_true",
                     help="compile transpiled C against packaged musl headers")
@@ -548,6 +625,8 @@ def main():
             rc = cmd_bench(args.names, build_root, args) or 0
         elif args.cmd == "coverage":
             rc = cmd_coverage(build_root, args)
+        elif args.cmd == "link":
+            rc = cmd_link(build_root, args)
     finally:
         if args.keep:
             print("build dir:", build_root)
