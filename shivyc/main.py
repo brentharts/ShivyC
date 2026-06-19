@@ -273,6 +273,7 @@ def process_py_unit(py_files, args):
     out_dir = tempfile.mkdtemp(prefix="shivyc_py2c_unit_")
     mp_bridge = any("python-stdlib" in os.path.abspath(p) for p in py_files)
     try:
+        py2c.set_local_module_dirs(py_files)
         py2c.write_runtime(out_dir, mp_bridge=mp_bridge)
     except Exception as e:                       # pragma: no cover
         error_collector.add(CompilerError(f"py2c runtime emit failed: {e}"))
