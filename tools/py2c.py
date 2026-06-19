@@ -2779,6 +2779,13 @@ class Transpiler:
                 # so it must be emitted even when a local class shares the bare
                 # name (e.g. a tree node `Return` plus il_cmds.control.Return).
                 classes.add(name)
+                # A re-export (`pkg.Name` -> defining submodule) qualifies the
+                # csym by the *defining* module; keep the xclasses registry in
+                # step so the extern's csym matches the (already qualified) call
+                # site rather than a stale bare entry.
+                if name not in self.classes and info is not None and \
+                        self.xclasses.get(name, (None,))[0] is not info:
+                    self.xclasses[name] = (info, mod)
             elif kind == "func" and name not in self.func_params:
                 funcs[func_csym(name, mod, self.ambiguous_funcs)] = \
                     ann_to_ctype(info.returns) or OBJ
@@ -3238,6 +3245,13 @@ class Transpiler:
         path = None
         if self.base_dir and modname.startswith("shivyc"):
             path = os.path.join(self.base_dir, *modname.split(".")) + ".py"
+            if not os.path.exists(path):
+                # a package (e.g. `shivyc.tree`) lives in its __init__.py, which
+                # re-exports the submodules' public classes.
+                pkg_init = os.path.join(self.base_dir, *modname.split("."),
+                                        "__init__.py")
+                if os.path.exists(pkg_init):
+                    path = pkg_init
         elif modname in self.stdlib_index:
             path = self.stdlib_index[modname]
         else:
@@ -3313,7 +3327,7 @@ class Transpiler:
         cache[modname] = reg
         return reg
 
-    def resolve_import(self, name, modname):
+    def resolve_import(self, name, modname, _seen=None):
         """('class'|'func'|'singleton'|None, info) for `name` in `modname`."""
         reg = self.load_xmod(modname)
         if not reg:
@@ -3328,6 +3342,15 @@ class Transpiler:
             return ("global", reg["globals"][name])
         if name in reg["consts"]:
             return ("const", reg["consts"][name])
+        # Re-export through a package __init__ (`from .submod import Name`):
+        # follow the alias to the module that actually defines the symbol, so
+        # `pkg.Name` resolves even when `Name` is only re-exported by `pkg`.
+        src = reg.get("imports", {}).get(name)
+        if src and src != modname:
+            seen = _seen if _seen is not None else set()
+            if modname not in seen:
+                seen.add(modname)
+                return self.resolve_import(name, src, seen)
         return (None, None)
 
     def xref(self, name, modname):
@@ -6158,6 +6181,25 @@ class Transpiler:
                 self.wrap_obj(node.value), c_string(node.attr))
         if isinstance(node.value, ast.Name):
             base = node.value.id
+            # `ClassName.CONST` where CONST is a class-level scalar constant
+            # (e.g. `ParserError.AFTER`): resolve to the literal rather than
+            # instantiating the class and reading a struct member. Works for a
+            # local class, a from-imported class, or a module-aliased one.
+            if base not in self.scope:
+                _cci = self.classes.get(base)
+                if _cci is None and base in self.from_imports:
+                    _ck, _ci = self.xref(base, self.from_imports[base])
+                    _cci = _ci if _ck == "class" else None
+                if _cci is None and base in self.import_alias:
+                    _ck, _ci = self.xref(node.attr, self.import_alias[base])
+                    # handled by the class-as-value path below; skip here
+                    _cci = None
+                if _cci is not None:
+                    _ca = getattr(_cci, "class_attrs", {})
+                    _cv = _ca.get(node.attr)
+                    if isinstance(_cv, ast.Constant) and \
+                            isinstance(_cv.value, (int, bool, str, float)):
+                        return self.wrap_obj(_cv)
             if base in self.import_alias:
                 modname = self.import_alias[base]
                 consts = self.load_xmod(modname).get("consts", {})
@@ -7666,6 +7708,15 @@ class Transpiler:
                     return "AS_STR(%s)" % rendered
                 return rendered
             if is_objval:
+                if target.endswith("*"):
+                    _tc = target[:-1]
+                    if _tc not in self.classes:
+                        # a `(Cls*)AS_OBJ(...)` cast needs Cls's forward typedef
+                        # so ShivyCX's C parser recognizes it as a type; make
+                        # sure Cls is loaded and queued for that typedef.
+                        self._load_xclass_anywhere(_tc)
+                        if _tc in self.xclasses:
+                            self.xstructs_needed.add(_tc)
                 return "(%s)AS_OBJ(%s)" % (target, rendered)
             if vt and vt.endswith("*") and vt != OBJ:
                 return "(%s)(%s)" % (target, rendered)   # base/derived cast
