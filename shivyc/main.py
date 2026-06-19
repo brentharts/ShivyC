@@ -289,6 +289,8 @@ def process_py_file(file, args):
             prelude.append("void *malloc(unsigned long);")
         if re.search(r"\bfree\b", code):
             prelude.append("void free(void *);")
+        if re.search(r"\brealloc\b", code):
+            prelude.append("void *realloc(void *, unsigned long);")
         if re.search(r"\bprintf\b", code):
             prelude.append("int printf(const char *, ...);")
         if re.search(r"\bsqrt\b", code):
@@ -314,6 +316,7 @@ def process_py_file(file, args):
                 ("system", "int system(const char *);"),
                 ("puts", "int puts(const char *);"),
                 ("strlen", "unsigned long strlen(const char *);"),
+                ("strcmp", "int strcmp(const char *, const char *);"),
                 ("fork", "int fork(void);"),
                 ("_exit", "void _exit(int);"),
                 ("waitpid", "int waitpid(int, int *, int);")]:
