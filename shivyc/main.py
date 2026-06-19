@@ -185,8 +185,24 @@ def main():
 
     objs = []
     arguments._extra_objs = []
-    for file in arguments.files:
-        objs.append(process_file(file, arguments))
+    py_files = [f for f in arguments.files if f.endswith(".py")]
+    if len(py_files) > 1:
+        # Several rpython sources: translate them together as one unit so the
+        # runtime is emitted and compiled exactly once (no duplicate-symbol
+        # link errors) and cross-module calls between them resolve against a
+        # single output directory -- the whole program in one translation unit,
+        # no on-disk AST cache required.
+        unit_objs = process_py_unit(py_files, arguments)
+        if unit_objs is None:
+            error_collector.show()
+            return 1
+        objs.extend(unit_objs)
+        for file in arguments.files:
+            if not file.endswith(".py"):
+                objs.append(process_file(file, arguments))
+    else:
+        for file in arguments.files:
+            objs.append(process_file(file, arguments))
     objs.extend(arguments._extra_objs)
 
     error_collector.show()
@@ -229,6 +245,66 @@ def process_file(file, args):
         err = f"unknown file type: '{file}'"
         error_collector.add(CompilerError(err))
         return None
+
+
+def process_py_unit(py_files, args):
+    """Translate several rpython `.py` sources as one translation unit.
+
+    Every source is transpiled into a single shared output directory, so the
+    py2c runtime (shivyc_rt.c) is emitted and compiled exactly once and the
+    modules link together without duplicate-symbol errors. Cross-module
+    references between the sources resolve against that shared output. Returns
+    the list of object files (runtime first), or None on any failure.
+    """
+    import os
+    import sys
+    import tempfile
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    tools_dir = os.path.join(repo_root, "tools")
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    try:
+        import py2c
+    except Exception as e:                       # pragma: no cover
+        error_collector.add(CompilerError(f"cannot import py2c: {e}"))
+        return None
+
+    out_dir = tempfile.mkdtemp(prefix="shivyc_py2c_unit_")
+    mp_bridge = any("python-stdlib" in os.path.abspath(p) for p in py_files)
+    try:
+        py2c.write_runtime(out_dir, mp_bridge=mp_bridge)
+    except Exception as e:                       # pragma: no cover
+        error_collector.add(CompilerError(f"py2c runtime emit failed: {e}"))
+        return None
+
+    generated = []
+    for f in py_files:
+        try:
+            out_c, err = py2c.transpile_file(f, out_dir)
+        except Exception as e:
+            error_collector.add(CompilerError(f"py2c failed on '{f}': {e}"))
+            return None
+        if err or not out_c:
+            error_collector.add(
+                CompilerError(f"py2c could not translate '{f}': {err}"))
+            return None
+        generated.append(out_c)
+
+    # The shared runtime backs every module in the unit; compile it once.
+    objs = []
+    rt_c = os.path.join(out_dir, "shivyc_rt.c")
+    if os.path.exists(rt_c):
+        rt_obj = process_c_file(rt_c, args)
+        if not rt_obj:
+            return None
+        objs.append(rt_obj)
+    for out_c in generated:
+        obj = process_c_file(out_c, args)
+        if not obj:
+            return None
+        objs.append(obj)
+    return objs
 
 
 def process_py_file(file, args):

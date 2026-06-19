@@ -10,13 +10,24 @@ preprocessor). Cache entries are pickled ASTs under a directory in /tmp.
 The cache is best-effort: any failure to read, write, or unpickle simply falls
 back to parsing from scratch, so a stale or corrupt entry can never produce a
 wrong result -- at worst it is ignored.
+
+The pickle/filesystem machinery exists only to make repeated *host* (CPython)
+runs fast. It is host-only: under the ShivyCX translator
+(`sys.implementation.name == 'shivyc'`) the whole cache compiles down to a
+no-op -- `load_ast` always misses and `store_ast` does nothing -- because the
+translated compiler sees the entire program in one invocation (multiple .c/.py
+files on the command line) and so never needs a cross-run AST cache. Fencing
+the pickle/os use behind that guard also keeps this module free of constructs
+the C backend does not model.
 """
 
-import hashlib
-import os
-import pickle
+import sys
 
-_CACHE_DIR = os.environ.get("SHIVYC_CACHE_DIR", "/tmp/shivyc-cache")
+if sys.implementation.name != 'shivyc':
+    import hashlib
+    import os
+    import pickle
+    _CACHE_DIR = os.environ.get("SHIVYC_CACHE_DIR", "/tmp/shivyc-cache")
 
 # Bump when the AST representation or parser changes in a way that would make
 # previously-cached trees invalid.
@@ -24,51 +35,65 @@ _CACHE_VERSION = "1"
 
 
 def _ensure_dir():
-    try:
-        os.makedirs(_CACHE_DIR, exist_ok=True)
-        return True
-    except OSError:
-        return False
+    if sys.implementation.name != 'shivyc':
+        try:
+            os.makedirs(_CACHE_DIR, exist_ok=True)
+            return True
+        except OSError:
+            return False
+    return False
 
 
 def token_key(tokens):
-    """Return a stable hex digest for a post-preprocessing token stream."""
-    h = hashlib.sha256()
-    h.update(_CACHE_VERSION.encode())
-    for t in tokens:
-        # kind is identified by its text_repr; content/rep capture the spelling.
-        h.update(b"\x00")
-        h.update(str(getattr(t.kind, "text_repr", t.kind)).encode())
-        h.update(b"\x01")
-        h.update(str(getattr(t, "content", "")).encode())
-    return h.hexdigest()
+    """Return a stable hex digest for a post-preprocessing token stream.
+
+    Under translation the cache is disabled, so the key is unused; return an
+    empty string (a falsy key the callers treat as "do not cache")."""
+    if sys.implementation.name != 'shivyc':
+        h = hashlib.sha256()
+        h.update(_CACHE_VERSION.encode())
+        for t in tokens:
+            # kind is identified by its text_repr; content captures the spelling.
+            h.update(b"\x00")
+            h.update(str(getattr(t.kind, "text_repr", t.kind)).encode())
+            h.update(b"\x01")
+            h.update(str(getattr(t, "content", "")).encode())
+        return h.hexdigest()
+    return ""
 
 
 def _path_for(key):
-    return os.path.join(_CACHE_DIR, key + ".ast.pkl")
+    if sys.implementation.name != 'shivyc':
+        return os.path.join(_CACHE_DIR, key + ".ast.pkl")
+    return ""
 
 
 def load_ast(key):
     """Return the cached AST for `key`, or None on any miss/error."""
-    try:
-        with open(_path_for(key), "rb") as f:
-            return pickle.load(f)
-    except (OSError, pickle.UnpicklingError, EOFError, AttributeError,
-            ImportError, ValueError):
-        return None
+    if sys.implementation.name != 'shivyc':
+        try:
+            with open(_path_for(key), "rb") as f:
+                return pickle.load(f)
+        except (OSError, pickle.UnpicklingError, EOFError, AttributeError,
+                ImportError, ValueError):
+            return None
+    return None
 
 
 def store_ast(key, ast):
-    """Pickle `ast` under `key`. Best-effort; failures are ignored."""
-    if not _ensure_dir():
-        return
-    tmp = _path_for(key) + ".tmp.%d" % os.getpid()
-    try:
-        with open(tmp, "wb") as f:
-            pickle.dump(ast, f, protocol=pickle.HIGHEST_PROTOCOL)
-        os.replace(tmp, _path_for(key))  # atomic publish
-    except (OSError, pickle.PicklingError, TypeError):
+    """Pickle `ast` under `key`. Best-effort; failures are ignored.
+
+    A no-op under translation (the translated compiler does not pickle)."""
+    if sys.implementation.name != 'shivyc':
+        if not _ensure_dir():
+            return
+        tmp = _path_for(key) + ".tmp.%d" % os.getpid()
         try:
-            os.remove(tmp)
-        except OSError:
-            pass
+            with open(tmp, "wb") as f:
+                pickle.dump(ast, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp, _path_for(key))  # atomic publish
+        except (OSError, pickle.PicklingError, TypeError):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
