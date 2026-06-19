@@ -20,12 +20,33 @@ class _GeneralCmp(ILCommand):
         self.output = output
         self.arg1 = arg1
         self.arg2 = arg2
+        # Set by the compare-and-branch peephole (shivyc/peephole.py) to
+        # (label, negate): emit `cmp; jcc label` directly instead of
+        # materializing a 0/1 boolean. negate=True jumps when the comparison
+        # is false (the JumpZero case). Only used for integer comparisons.
+        self.fuse = None
+
+    # Negated conditional-jump for the fused (jump-if-false) case.
+    _neg_jump = None
+
+    def neg_cmp_command(self):
+        """The conditional jump for the *negated* comparison (used by the fused
+        jump-if-false path)."""
+        ctype = self.arg1.ctype
+        if ctype.is_pointer() or (ctype.is_integral() and not ctype.signed):
+            return self.unsigned_neg_cmd
+        return self.signed_neg_cmd
 
     def inputs(self): # noqa D102
         return [self.arg1, self.arg2]
 
     def outputs(self): # noqa D102
-        return [self.output]
+        return [] if self.fuse else [self.output]
+
+    def targets(self): # noqa D102
+        # When fused, this command performs a conditional branch to the fused
+        # label, so the CFG/liveness analysis must see that edge.
+        return [self.fuse[0]] if self.fuse else []
 
     def rel_spot_conf(self):  # noqa D102
         return {self.output: [self.arg1, self.arg2]}
@@ -83,6 +104,23 @@ class _GeneralCmp(ILCommand):
         if self.arg1.ctype.is_floating() or self.arg2.ctype.is_floating():
             return self._make_float_asm(spotmap, get_reg, asm_code)
         regs = []
+
+        # Fused compare-and-branch: emit `cmp; jcc label` and skip the 0/1
+        # boolean. negate=True (the JumpZero case) branches when the comparison
+        # is false. The output boolean is dead (outputs() is empty when fused).
+        if self.fuse:
+            label, negate = self.fuse
+            arg1_spot, arg2_spot = self._fix_both_literal_or_mem(
+                spotmap[self.arg1], spotmap[self.arg2], regs, get_reg, asm_code)
+            arg1_spot, arg2_spot = self._fix_either_literal64(
+                arg1_spot, arg2_spot, regs, get_reg, asm_code)
+            arg1_spot, arg2_spot = self._fix_literal_wrong_order(
+                arg1_spot, arg2_spot)
+            arg_size = self.arg1.ctype.size
+            asm_code.add(asm_cmds.Cmp(arg1_spot, arg2_spot, arg_size))
+            jmp = self.neg_cmp_command() if negate else self.cmp_command()
+            asm_code.add(jmp(label))
+            return
 
         result = get_reg([spotmap[self.output]],
                          [spotmap[self.arg1], spotmap[self.arg2]])
@@ -173,6 +211,8 @@ class NotEqualCmp(_GeneralCmp):
     """
     signed_cmp_cmd = asm_cmds.Jne
     unsigned_cmp_cmd = asm_cmds.Jne
+    signed_neg_cmd = asm_cmds.Je
+    unsigned_neg_cmd = asm_cmds.Je
     f_neq = True
 
 
@@ -185,12 +225,16 @@ class EqualCmp(_GeneralCmp):
     """
     signed_cmp_cmd = asm_cmds.Je
     unsigned_cmp_cmd = asm_cmds.Je
+    signed_neg_cmd = asm_cmds.Jne
+    unsigned_neg_cmd = asm_cmds.Jne
     f_eq = True
 
 
 class LessCmp(_GeneralCmp):
     signed_cmp_cmd = asm_cmds.Jl
     unsigned_cmp_cmd = asm_cmds.Jb
+    signed_neg_cmd = asm_cmds.Jge
+    unsigned_neg_cmd = asm_cmds.Jae
     f_swap = True
     f_jump = asm_cmds.Ja
 
@@ -198,12 +242,16 @@ class LessCmp(_GeneralCmp):
 class GreaterCmp(_GeneralCmp):
     signed_cmp_cmd = asm_cmds.Jg
     unsigned_cmp_cmd = asm_cmds.Ja
+    signed_neg_cmd = asm_cmds.Jle
+    unsigned_neg_cmd = asm_cmds.Jbe
     f_jump = asm_cmds.Ja
 
 
 class LessOrEqCmp(_GeneralCmp):
     signed_cmp_cmd = asm_cmds.Jle
     unsigned_cmp_cmd = asm_cmds.Jbe
+    signed_neg_cmd = asm_cmds.Jg
+    unsigned_neg_cmd = asm_cmds.Ja
     f_swap = True
     f_jump = asm_cmds.Jae
 
@@ -211,4 +259,6 @@ class LessOrEqCmp(_GeneralCmp):
 class GreaterOrEqCmp(_GeneralCmp):
     signed_cmp_cmd = asm_cmds.Jge
     unsigned_cmp_cmd = asm_cmds.Jae
+    signed_neg_cmd = asm_cmds.Jl
+    unsigned_neg_cmd = asm_cmds.Jb
     f_jump = asm_cmds.Jae
