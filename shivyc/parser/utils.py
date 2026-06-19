@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 
 from shivyc.errors import CompilerError, Range
+from shivyc.tree.base_nodes import Node
 
 
 # This is a little bit messy, but worth the repetition it saves. In the
@@ -228,7 +229,13 @@ def add_range(parse_func):
     def parse_with_range(index: int, *args):
         start_index: int = index
         node, end_index = parse_func(index, *args)
-        node.r = token_range(start_index, end_index)
+        # `node` is a parse node that carries a range field. The annotated
+        # alias lets the transpiler lower the write below as a struct-field
+        # store rather than a dynamic setattr (which it cannot self-host).
+        # Under CPython `from __future__ import annotations` makes the
+        # annotation an inert string, so this is exactly `node.r = ...`.
+        ranged: "Node" = node
+        ranged.r = token_range(start_index, end_index)
 
         return node, end_index
 
