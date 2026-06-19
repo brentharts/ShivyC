@@ -2718,7 +2718,11 @@ class Transpiler:
         classes, funcs, singles, globs = set(), {}, {}, {}
         for (mod, name) in sorted(self.used_imports):
             kind, info = self.resolve_import(name, mod)
-            if kind == "class" and name not in self.classes:
+            if kind == "class" and (name not in self.classes
+                                    or name in self.xclasses):
+                # An imported class is externed via its module-qualified csym,
+                # so it must be emitted even when a local class shares the bare
+                # name (e.g. a tree node `Return` plus il_cmds.control.Return).
                 classes.add(name)
             elif kind == "func" and name not in self.func_params:
                 funcs[name] = ann_to_ctype(info.returns) or OBJ
