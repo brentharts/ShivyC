@@ -6472,6 +6472,20 @@ class Transpiler:
                 return "0"
             if fn == "abs" and node.args:
                 return "pyabs(%s)" % self.as_long(node.args[0])
+            if fn == "id" and len(node.args) == 1:
+                # Object identity: the heap pointer as an integer (matches
+                # CPython's id() being the address). Used for set-based dedup.
+                return "OBJ_INT((long)AS_OBJ(%s))" % \
+                    self.wrap_obj(node.args[0])
+            if fn == "next" and node.args:
+                # The iterable is materialized (generator exprs are lowered to
+                # list comprehensions), so next() is the first element, or the
+                # default (2-arg form) when empty.
+                it = self.wrap_obj(node.args[0])
+                dflt = self.wrap_obj(node.args[1]) if len(node.args) > 1 \
+                    else "OBJ_NONE"
+                return ("({ obj _nx = %s; pylen(_nx) > 0 ? "
+                        "index_obj(_nx, 0) : %s; })" % (it, dflt))
             if fn == "bool":
                 if not node.args:
                     return "0"
