@@ -5027,7 +5027,8 @@ class Transpiler:
                 return "char*"
             lt = self.value_ctype(node.left)
             rt = self.value_ctype(node.right)
-            numeric = ("int", "bool", "double", "float")
+            numeric = ("int", "bool", "double", "float", "long",
+                       "short", "unsigned", "char")
             if lt in numeric and rt in numeric:
                 if isinstance(node.op, ast.Div):
                     return "double"          # Python `/` is always float
@@ -5035,6 +5036,8 @@ class Transpiler:
                     return "double"
                 if "float" in (lt, rt):
                     return "float"
+                if "long" in (lt, rt):       # long widens int/short/char
+                    return "long"
                 return "int"
             return OBJ  # obj arithmetic yields a Tier-2 obj
         if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp,
@@ -6437,6 +6440,15 @@ class Transpiler:
                     return self._mp_import_call("builtins", "dict", node)
                 return "dict_new() /* dict(arg) unsupported */"
             if fn == "ord" and node.args:
+                a0 = node.args[0]
+                # ord(s[i]) on a char* -> direct byte read, no per-char string
+                # allocation. Makes char-scanning kernels (lexers, parsers)
+                # compile to tight C.
+                if isinstance(a0, ast.Subscript) and \
+                        not isinstance(a0.slice, ast.Slice) and \
+                        self.value_ctype(a0.value) == "char*":
+                    return "((long)(unsigned char)%s[%s])" % (
+                        self.expr(a0.value), self.as_long(a0.slice))
                 return "pyord(%s)" % self.wrap_obj(node.args[0])
             if fn == "chr" and node.args:
                 return "pychr(%s)" % self.as_long(node.args[0])
@@ -7576,7 +7588,8 @@ class Transpiler:
                                          self.as_str(node.right))
         lt = self.value_ctype(node.left)
         rt = self.value_ctype(node.right)
-        numeric = {"int", "bool", "double", "float"}
+        numeric = {"int", "bool", "double", "float", "long",
+                   "short", "unsigned", "char"}
         # both sides are concrete numbers -> plain C arithmetic
         if lt in numeric and rt in numeric:
             if isinstance(node.op, ast.Pow):     # C has no ** operator
