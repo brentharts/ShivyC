@@ -256,6 +256,13 @@ What makes it fast and small:
   numeric loops, which lower to plain C with zero boxing.
 - **numpy-style typed arrays.** `"f32*"`, `"f64*"`, `"i32*"` (and fixed-size
   `"f32[256]"`) are real C arrays with native indexing — not boxed lists.
+- **Typed containers.** `"list[int]"` / `"list[float]"` lower to a growable
+  `{T* data; long len, cap;}` array (malloc/realloc), and `"dict[str,int]"` /
+  `"dict[int,int]"` to parallel key/value arrays with linear-probe lookup — both
+  unboxed and runtime-free, supporting literals, indexing, `append`, `len`,
+  `in`, and iteration. A negative integer literal index (`xs[-1]`) wraps to
+  `data[len-1]` statically; dynamic indices are taken as-is. Lists of objects
+  keep the tagged model.
 - **Auto-contracts → SIMD.** A leading `assert len(x) % 4 == 0` (or an inferred
   divisibility fact from a fixed-size array) is lowered to a ShivyCX contract;
   the compiler proves it at the call site and emits a packed-SSE body with no
@@ -282,7 +289,9 @@ What makes it fast and small:
 Worked examples live in [`examples/rpython2c/`](examples/rpython2c/): `numpy/`
 (SIMD kernels, BLAS, ufuncs, matmul), `nn/` (a feed-forward neural net showing
 classes→structs), `nbody/` (a gravity sim that passes class instances by
-pointer), `classes/` (inheritance + polymorphism via the object model),
+pointer), `classes/` (inheritance + polymorphism via the object model, plus a
+POD-vs-object-model comparison), `lists/` and `dicts/` (typed `list[T]` /
+`dict[K,V]` lowered to unboxed C arrays — no boxing, no GC),
 `memory/` (`del`, compiler-inserted `free` via whole-program escape analysis,
 and the `--pdf` memory report), `io/`, `net/`, and `mandelbrot/`. Run them all
 with `make rpython`.
