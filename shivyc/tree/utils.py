@@ -435,6 +435,11 @@ def get_size(ctype, num, il_code):
     """
 
     long_num = set_type(num, ctypes.longint, il_code)
+    if ctype.size == 1:
+        # Byte-sized elements need no scaling: `p[i]` is `p + i`. Skipping the
+        # `* 1` removes an imul from every char/byte index (hot in lexers and
+        # all string code).
+        return long_num
     total = ILValue(ctypes.longint)
     size = ILValue(ctypes.longint)
     il_code.register_literal_var(size, str(ctype.size))
