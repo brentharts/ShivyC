@@ -94,11 +94,34 @@ class _GeneralCmp(ILCommand):
             return arg1_spot, arg2_spot
 
     def _fix_literal_wrong_order(self, arg1_spot, arg2_spot):
-        """If the first operand is a literal, swap the operands."""
+        """If the first operand is a literal, swap the operands.
+
+        Returns (arg1_spot, arg2_spot, swapped). When swapped, the comparison
+        operands are reversed, so callers must use the reversed-comparison jump
+        (see _select_jump) to keep the relation correct.
+        """
         if self._is_imm(arg1_spot):
-            return arg2_spot, arg1_spot
-        else:
-            return arg1_spot, arg2_spot
+            return arg2_spot, arg1_spot, True
+        return arg1_spot, arg2_spot, False
+
+    def _select_jump(self, swapped, negate):
+        """Pick the conditional-jump asm command for this comparison.
+
+        swapped - operands were reversed by _fix_literal_wrong_order, so the
+                  relation is mirrored (e.g. `<` becomes `>`).
+        negate  - branch when the comparison is *false* (the fused JumpZero
+                  case) rather than when it is true.
+        """
+        ctype = self.arg1.ctype
+        unsigned = ctype.is_pointer() or (ctype.is_integral()
+                                          and not ctype.signed)
+        if swapped and negate:
+            return self.unsigned_negswap_cmd if unsigned else self.signed_negswap_cmd
+        if swapped:
+            return self.unsigned_swap_cmd if unsigned else self.signed_swap_cmd
+        if negate:
+            return self.unsigned_neg_cmd if unsigned else self.signed_neg_cmd
+        return self.unsigned_cmp_cmd if unsigned else self.signed_cmp_cmd
 
     def make_asm(self, spotmap, home_spots, get_reg, asm_code):  # noqa D102
         if self.arg1.ctype.is_floating() or self.arg2.ctype.is_floating():
@@ -114,12 +137,11 @@ class _GeneralCmp(ILCommand):
                 spotmap[self.arg1], spotmap[self.arg2], regs, get_reg, asm_code)
             arg1_spot, arg2_spot = self._fix_either_literal64(
                 arg1_spot, arg2_spot, regs, get_reg, asm_code)
-            arg1_spot, arg2_spot = self._fix_literal_wrong_order(
+            arg1_spot, arg2_spot, swapped = self._fix_literal_wrong_order(
                 arg1_spot, arg2_spot)
             arg_size = self.arg1.ctype.size
             asm_code.add(asm_cmds.Cmp(arg1_spot, arg2_spot, arg_size))
-            jmp = self.neg_cmp_command() if negate else self.cmp_command()
-            asm_code.add(jmp(label))
+            asm_code.add(self._select_jump(swapped, negate)(label))
             return
 
         result = get_reg([spotmap[self.output]],
@@ -134,7 +156,7 @@ class _GeneralCmp(ILCommand):
             spotmap[self.arg1], spotmap[self.arg2], regs, get_reg, asm_code)
         arg1_spot, arg2_spot = self._fix_either_literal64(
             arg1_spot, arg2_spot, regs, get_reg, asm_code)
-        arg1_spot, arg2_spot = self._fix_literal_wrong_order(
+        arg1_spot, arg2_spot, swapped = self._fix_literal_wrong_order(
             arg1_spot, arg2_spot)
 
         arg_size = self.arg1.ctype.size
@@ -142,7 +164,7 @@ class _GeneralCmp(ILCommand):
         label = asm_code.get_label()
 
         asm_code.add(asm_cmds.Cmp(arg1_spot, arg2_spot, arg_size))
-        asm_code.add(self.cmp_command()(label))
+        asm_code.add(self._select_jump(swapped, False)(label))
         asm_code.add(asm_cmds.Mov(result, neq_val_spot, out_size))
         asm_code.add(asm_cmds.AsmLabel(label))
 
@@ -213,6 +235,10 @@ class NotEqualCmp(_GeneralCmp):
     unsigned_cmp_cmd = asm_cmds.Jne
     signed_neg_cmd = asm_cmds.Je
     unsigned_neg_cmd = asm_cmds.Je
+    signed_swap_cmd = asm_cmds.Jne
+    unsigned_swap_cmd = asm_cmds.Jne
+    signed_negswap_cmd = asm_cmds.Je
+    unsigned_negswap_cmd = asm_cmds.Je
     f_neq = True
 
 
@@ -227,6 +253,10 @@ class EqualCmp(_GeneralCmp):
     unsigned_cmp_cmd = asm_cmds.Je
     signed_neg_cmd = asm_cmds.Jne
     unsigned_neg_cmd = asm_cmds.Jne
+    signed_swap_cmd = asm_cmds.Je
+    unsigned_swap_cmd = asm_cmds.Je
+    signed_negswap_cmd = asm_cmds.Jne
+    unsigned_negswap_cmd = asm_cmds.Jne
     f_eq = True
 
 
@@ -235,6 +265,10 @@ class LessCmp(_GeneralCmp):
     unsigned_cmp_cmd = asm_cmds.Jb
     signed_neg_cmd = asm_cmds.Jge
     unsigned_neg_cmd = asm_cmds.Jae
+    signed_swap_cmd = asm_cmds.Jg
+    unsigned_swap_cmd = asm_cmds.Ja
+    signed_negswap_cmd = asm_cmds.Jle
+    unsigned_negswap_cmd = asm_cmds.Jbe
     f_swap = True
     f_jump = asm_cmds.Ja
 
@@ -244,6 +278,10 @@ class GreaterCmp(_GeneralCmp):
     unsigned_cmp_cmd = asm_cmds.Ja
     signed_neg_cmd = asm_cmds.Jle
     unsigned_neg_cmd = asm_cmds.Jbe
+    signed_swap_cmd = asm_cmds.Jl
+    unsigned_swap_cmd = asm_cmds.Jb
+    signed_negswap_cmd = asm_cmds.Jge
+    unsigned_negswap_cmd = asm_cmds.Jae
     f_jump = asm_cmds.Ja
 
 
@@ -252,6 +290,10 @@ class LessOrEqCmp(_GeneralCmp):
     unsigned_cmp_cmd = asm_cmds.Jbe
     signed_neg_cmd = asm_cmds.Jg
     unsigned_neg_cmd = asm_cmds.Ja
+    signed_swap_cmd = asm_cmds.Jge
+    unsigned_swap_cmd = asm_cmds.Jae
+    signed_negswap_cmd = asm_cmds.Jl
+    unsigned_negswap_cmd = asm_cmds.Jb
     f_swap = True
     f_jump = asm_cmds.Jae
 
@@ -261,4 +303,8 @@ class GreaterOrEqCmp(_GeneralCmp):
     unsigned_cmp_cmd = asm_cmds.Jae
     signed_neg_cmd = asm_cmds.Jl
     unsigned_neg_cmd = asm_cmds.Jb
+    signed_swap_cmd = asm_cmds.Jle
+    unsigned_swap_cmd = asm_cmds.Jbe
+    signed_negswap_cmd = asm_cmds.Jg
+    unsigned_negswap_cmd = asm_cmds.Ja
     f_jump = asm_cmds.Jae
