@@ -5052,6 +5052,17 @@ class Transpiler:
                 return "char*"
             if isinstance(node.slice, ast.Slice):
                 return OBJ
+            # Typed list/dict element type, resolved via static_type so it works
+            # mid-hoist (before the receiver is in scope): an unannotated
+            # `x = xs[i]` then infers the element type instead of boxing to obj.
+            _st = self.static_type(node.value)
+            if _st and _st.endswith("*"):
+                if _st.startswith("_tlist_"):
+                    return _st[len("_tlist_"):-1]
+                if _st.startswith("_tdict_"):
+                    _kv = self._tdict_by_name.get(_st[:-1])
+                    if _kv:
+                        return _kv[1]
             if isinstance(node.value, ast.Subscript):
                 inner = node.value
                 if isinstance(inner.value, ast.Attribute) and \
@@ -7915,10 +7926,18 @@ class Transpiler:
                                           self.wrap_obj(sl))
         if self.value_ctype(node.value) == "char*":   # s[i] -> 1-char string
             return "char_at(%s, %s)" % (self.expr(node.value), self.as_long(sl))
-        # rpython typed list: xs[i] -> xs->data[i] (unboxed)
+        # rpython typed list: xs[i] -> xs->data[i] (unboxed). A negative integer
+        # *literal* (xs[-1]) wraps to xs->data[xs->len + (-1)] statically -- no
+        # runtime branch, so hot numeric loops with non-negative indices keep
+        # plain direct indexing. (Dynamic indices are taken as-is, numpy-style.)
         tlct = self._typed_list_ct(node.value)
         if tlct is not None and not isinstance(sl, ast.Slice):
-            return "%s->data[%s]" % (self.expr(node.value), self.as_long(sl))
+            recv = self.expr(node.value)
+            neg = self._neg_int_literal(sl)
+            if neg is not None and isinstance(node.value,
+                                              (ast.Name, ast.Attribute)):
+                return "%s->data[%s->len + (%d)]" % (recv, recv, neg)
+            return "%s->data[%s]" % (recv, self.as_long(sl))
         # rpython typed dict: d[k] -> _tdict_K_V_get(d, k)
         tdct = self._typed_dict_ct(node.value)
         if tdct is not None and not isinstance(sl, ast.Slice):
@@ -7997,6 +8016,16 @@ class Transpiler:
                 self.coerce_to(vct, v, self.expr(v))))
         parts.append("_td;")
         return "({ " + " ".join(parts) + " })"
+
+    def _neg_int_literal(self, sl):
+        """The integer value of a negative integer literal subscript (e.g. -1
+        from xs[-1]), or None if `sl` is not a negative integer literal."""
+        if isinstance(sl, ast.UnaryOp) and isinstance(sl.op, ast.USub) \
+                and isinstance(sl.operand, ast.Constant) \
+                and isinstance(sl.operand.value, int) \
+                and not isinstance(sl.operand.value, bool):
+            return -sl.operand.value
+        return None
 
     def _typed_list_ct(self, node):
         """Return the typed-list ctype (e.g. '_tlist_int*') of an expression,
