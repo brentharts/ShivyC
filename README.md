@@ -283,6 +283,17 @@ What makes it fast and small:
   classes (inheritance, `isinstance`, virtual dispatch) use the tagged-object
   model, which ShivyCX now compiles end to end — including its own object-model
   runtime — so polymorphism works in self-compiled code, not just under gcc.
+- **Multi-file programs.** Pass several `.py` files at once
+  (`shivyc.main app.py lib.py -o app`) and they compile as one translation unit:
+  `import lib` resolves against the input directory, so functions call directly,
+  classes construct and dispatch across the boundary, and fields read/write
+  directly (boxing into `obj` fields as needed). A POD class stays POD when used
+  from another module — its decision is propagated so layout and dispatch agree.
+  Two modules may even define classes with the *same* bare name; the translator
+  module-qualifies the colliding symbols and emits a distinct struct for each
+  (plus a separate `TypeInfo` for object-model classes, so `isinstance` still
+  distinguishes them). A field assigned only `None` in its
+  module is typed `obj` (nullable), so another module can store an object in it.
 - **System glue.** File I/O (`open`/`read`/`write`/`close`), `input()`,
   `os.system`, `os.fork`, BSD **sockets** (`socket`/`bind`/`connect`/`accept`/
   `send`/`recv`), and `sys.argv` all lower to plain C — enough to write real
@@ -300,8 +311,10 @@ POD-vs-object-model comparison), `lists/` and `dicts/` (typed `list[T]` /
 `compiler/` (a C-subset lexer kernel — a ShivyCX hotspot rewritten in rpython,
 ~18x faster through ShivyCX and ~50x through gcc, with a benchmark harness),
 `memory/` (`del`, compiler-inserted `free` via whole-program escape analysis,
-and the `--pdf` memory report), `io/`, `net/`, and `mandelbrot/`. Run them all
-with `make rpython`.
+and the `--pdf` memory report), `multifile/`, `ambig/`, and `fieldwrite/`
+(multi-file programs: cross-module calls, same-named classes module-qualified
+into distinct structs, and cross-module writes into None-initialised `obj`
+fields), `io/`, `net/`, and `mandelbrot/`. Run them all with `make rpython`.
 
 ---
 
