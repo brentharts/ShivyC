@@ -6,7 +6,7 @@ import shivyc.tree.decl_nodes as decl_nodes
 from shivyc.errors import CompilerError
 from shivyc.il_gen import ILValue
 from shivyc.tree.expr_base import _RExprNode, _LExprNode
-from shivyc.tree.general_nodes import Declaration
+from shivyc.tree.general_nodes import Declaration, DeclInfo
 from shivyc.tree.utils import set_type, DirectLValue
 from shivyc.tokens import Token
 
@@ -231,7 +231,7 @@ class CompoundLiteral(_LExprNode):
         helper.set_self_vars(il_code, symbol_table, c)
 
         root = decl_nodes.Root(self.node.specs, self.node.decls, [self.init])
-        info = helper.get_decl_infos(root)[0]
+        info: "DeclInfo" = helper.get_decl_infos(root)[0]
 
         # The object is anonymous; give it a unique synthetic name.
         CompoundLiteral._counter += 1
