@@ -147,6 +147,7 @@ rpython:
 	run $(RPY)/collections/containers.py 10 ""; \
 	runm 38 $(RPY)/multifile/app.py $(RPY)/multifile/geom.py; \
 	runm 45 $(RPY)/ambig/app.py $(RPY)/ambig/node_a.py $(RPY)/ambig/node_b.py; \
+	runm 55 $(RPY)/fieldwrite/app.py $(RPY)/fieldwrite/lib.py; \
 	if [ $$fail = 0 ]; then echo "rpython examples: all passed"; \
 	else echo "rpython examples: FAILURES"; fi; exit $$fail
 
