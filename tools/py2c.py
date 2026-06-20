@@ -2589,6 +2589,9 @@ class Transpiler:
                 break
         self.used_xmethods = {}     # (clsname, method) -> return ctype
         self.xstructs_needed = set()  # imported classes whose fields are read
+        self.xshadow_td = {}        # csym -> ClassInfo: forward typedef for an
+        self.xshadow_body = {}      # ambiguous same-named class that is *not*
+        self.xshadow_type = {}      # the bare-keyed registry entry (a "shadow")
         self._io_used = set()       # libc I/O symbols referenced (fopen, ...)
         self._sock_used = set()     # socket symbols referenced (-> prelude)
         self.xvt_needed = set()     # imported modules needing a VT struct emitted
@@ -2861,22 +2864,57 @@ class Transpiler:
                     base = ct.rstrip("*")
                     if base in self.xclasses and base not in self.classes:
                         vt_fwd.add(base)
+        # field-type dependencies of *shadow* struct bodies (an ambiguous
+        # same-named class whose body we emit by exact csym): their pointer
+        # fields may name classes not otherwise referenced here.
+        for ci in list(self.xshadow_body.values()):
+            cmod = getattr(ci, "defmod", None)
+            for _, ft in ci.full_fields():
+                if not ft.endswith("*"):
+                    continue
+                base = ft[:-1]
+                if base in self.classes or base in self.xclasses:
+                    if base in self.xclasses and base not in self.classes:
+                        classes.add(base)
+                    continue
+                if cmod and self._load_missing_xclass(base, cmod):
+                    classes.add(base)
         if not (classes or funcs or singles or globs or self.used_xmethods or
                 self.xvt_needed or self.xtype_externs or self.xvtable_impls or
-                self.xconstdict_externs):
+                self.xconstdict_externs or self.xshadow_td):
             return []
         out = ["/* ---- cross-module imports (extern declarations) ---- */"]
+        emitted_td = set()
         for c in sorted(classes | (vt_fwd - classes)):  # forward typedefs first
             cs = self.xcsym(c)
+            emitted_td.add(cs)
             out.append("typedef struct %s %s;" % (cs, cs))
+        for cs in sorted(self.xshadow_td):     # shadows of ambiguous names
+            if cs not in emitted_td:
+                emitted_td.add(cs)
+                out.append("typedef struct %s %s;" % (cs, cs))
+        emitted_body = set()
         for c in sorted(needed):            # full layout for accessed classes
-            out += self.struct_body_lines(self.xclasses[c][0])
+            ci = self.xclasses[c][0]
+            emitted_body.add(ci.csym)
+            out += self.struct_body_lines(ci)
+        for cs in sorted(self.xshadow_body):
+            if cs not in emitted_body:
+                emitted_body.add(cs)
+                out += self.struct_body_lines(self.xshadow_body[cs])
+        emitted_type = set()
+        for cs in sorted(self.xshadow_type):   # TypeInfo for shadow isinstance
+            emitted_type.add(cs)
+            out.append("extern const TypeInfoHdr %s_type;" % cs)
+        for cs in sorted(self.xshadow_td):     # ctor for a constructed shadow
+            out.append("extern %s* %s_new();" % (cs, cs))
         for c in sorted(classes):
             # a class that is also a cross-module hierarchy base gets a full
             # `extern const TypeInfo c_type;` below; emitting a TypeInfoHdr one
             # here too would conflict, so emit only the constructor for it.
             cs = self.xcsym(c)
-            if c not in self.xtype_externs:
+            if c not in self.xtype_externs and cs not in emitted_type:
+                emitted_type.add(cs)
                 out.append("extern const TypeInfoHdr %s_type;" % cs)
             out.append("extern %s* %s_new();" % (cs, cs))
         for n in sorted(funcs):
@@ -3242,6 +3280,21 @@ class Transpiler:
         if ent is not None:
             return ent[0].csym
         return class_csym(name, self.xclass_module.get(name), self.ambiguous)
+
+    def _ref_xclass(self, ci, body=False, typeinfo=False):
+        """Register an imported class referenced by its *exact* csym so its
+        forward typedef (plus struct body / TypeInfo extern, as requested) is
+        always emitted -- even when the bare-name registry entry is a
+        *different*, same-named class, or flips between two such classes by
+        load order (the ambiguous-collision case). Emission dedups by csym, so
+        registering the common (non-ambiguous) case here is harmless."""
+        if ci is None or ci.name in self.classes:
+            return
+        self.xshadow_td[ci.csym] = ci
+        if body:
+            self.xshadow_body[ci.csym] = ci
+        if typeinfo:
+            self.xshadow_type[ci.csym] = ci
 
     def _find_local_module(self, modname):
         """Path to a co-compiled local module `modname`, or None.
@@ -6349,6 +6402,7 @@ class Transpiler:
                 if owner.name in self.xclasses and \
                         owner.name not in self.classes:
                     self.xstructs_needed.add(owner.name)
+                self._ref_xclass(owner, body=True)
                 return "((%s*)AS_OBJ(%s))->%s" % (
                     owner.csym, self.expr(node.value), cname(node.attr))
             if self.stdlib_root:
@@ -7678,10 +7732,13 @@ class Transpiler:
             self.xref(clsname, self.import_alias[cls_node.value.id])
         if clsname:
             if clsname in self.classes or clsname in self.xclasses:
+                ci = self.classes.get(clsname) or self.xclasses[clsname][0]
+                self._ref_xclass(ci, body=True, typeinfo=True)
                 return "&%s_type" % self.ccls(clsname)
             if clsname in self.from_imports:
-                kind, _ = self.xref(clsname, self.from_imports[clsname])
+                kind, info = self.xref(clsname, self.from_imports[clsname])
                 if kind == "class":
+                    self._ref_xclass(info, body=True, typeinfo=True)
                     return "&%s_type" % self.ccls(clsname)
         return "NULL"
 
