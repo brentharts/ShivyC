@@ -318,6 +318,17 @@ long pyint(obj v);
 long py_int_base(str s, long base);     /* int(s, base) incl 0x/0b/0o prefix   */
 long pyabs(long x);
 
+/* Dynamic-dispatch bridge: emitted in stdlib mode for setattr/getattr and
+   other genuinely dynamic operations. Defined by the micropython core
+   (mp_stdlib_bridge) in a full stdlib link; declared here so a module that
+   falls back to one of them still compiles on its own. */
+obj  mp_call_import(const char* mod, const char* attr, int n, ...);
+obj  mp_call_method(obj recv, const char* attr, int n, ...);
+obj  mp_call_obj(obj fun, obj args, obj kwargs);
+bool mp_hasattr(obj recv, const char* attr);
+obj  mp_getattr(obj recv, const char* attr, obj dflt);
+obj  mp_getattr_obj(obj recv, obj attr, obj dflt);
+
 #endif /* SHIVYC_RT_H */
 '''
 
@@ -2799,11 +2810,16 @@ class Transpiler:
                   for fn in sorted(self.func_values_needed)]
         tramps += ["static obj %s__tramp(obj, obj);" % cname(m)
                    for m in sorted(self.closure_values_needed)]
-        tramps += ["static obj %s__ctortramp(obj, obj);" % cls
-                   for cls in sorted(
-                       (set(self.class_values_needed) |
-                        {ci.csym for ci in self.class_order})
-                       - self._pod_set)]
+        def _tramp_sym(c):
+            cci = self.classes.get(c) or (self.xclasses[c][0]
+                                          if c in self.xclasses else None) \
+                or self._ci_by_csym(c)
+            return cci.csym if cci is not None else c
+        tramps += ["static obj %s__ctortramp(obj, obj);" % s
+                   for s in sorted({_tramp_sym(cls) for cls in
+                                    (set(self.class_values_needed) |
+                                     {ci.csym for ci in self.class_order})
+                                    - self._pod_set})]
         self.lines[self.extern_idx:self.extern_idx] = externs + tramps
         if self._typed_lists or self._typed_dicts:
             pre = []
@@ -4819,11 +4835,15 @@ class Transpiler:
 
     def _emit_ctortramp(self, cls, ci, init):
         """Emit static obj Class__ctortramp(obj env, obj args)."""
+        # The trampoline symbol must match make_closure(&<csym>__ctortramp) and
+        # the emitted ctor extern; for an ambiguous class the bare name and the
+        # module-qualified csym differ, so always key off the resolved csym.
+        sym = ci.csym if ci is not None else cls
         if init is None:
-            self.emit("static obj %s__ctortramp(obj env, obj args) {" % cls)
+            self.emit("static obj %s__ctortramp(obj env, obj args) {" % sym)
             self.indent += 1
             self.emit("(void)env; (void)args;")
-            self.emit("return OBJ_OBJ(%s_new());" % cls)
+            self.emit("return OBJ_OBJ(%s_new());" % sym)
             self.indent -= 1
             self.emit("}")
             self.emit()
@@ -4831,7 +4851,7 @@ class Transpiler:
         if init.args.vararg and len(init.args.args) == 1:
             prev = self.cur_class
             self.cur_class = ci
-            self.emit("static obj %s__ctortramp(obj env, obj args) {" % cls)
+            self.emit("static obj %s__ctortramp(obj env, obj args) {" % sym)
             self.indent += 1
             self.emit("(void)env;")
             self.emit("%s* self = aalloc(sizeof *self);" % ci.csym)
@@ -4846,7 +4866,7 @@ class Transpiler:
             self.cur_class = prev
             return
         nargs = self._ctortramp_new_args(init)
-        self.emit("static obj %s__ctortramp(obj env, obj args) {" % cls)
+        self.emit("static obj %s__ctortramp(obj env, obj args) {" % sym)
         self.indent += 1
         self.emit("(void)env; (void)args;")
         self.emit("return OBJ_OBJ(%s_new(%s));" % (ci.csym, ", ".join(nargs)))
@@ -5588,7 +5608,8 @@ class Transpiler:
                     cls = self.narrowed[f.value.id][:-1]
                     ci = self.classes.get(cls) or (self.xclasses[cls][0]
                                                    if cls in self.xclasses
-                                                   else None)
+                                                   else None) \
+                        or self._ci_by_csym(cls)
                     if ci is not None and self._class_is_leaf(cls):
                         owner = ci.find_method_owner(f.attr)
                         if owner is None and f.attr in ci.methods:
@@ -5849,13 +5870,15 @@ class Transpiler:
 
     def _isinstance_class(self, ref):
         """Resolve an isinstance() 2nd-arg class reference to a known class
-        name (local or imported), or None for tuples / unknown types."""
-        if isinstance(ref, ast.Name):
-            n = ref.id
-        elif isinstance(ref, ast.Attribute):
-            n = ref.attr                # e.g. value_cmds.AddrOf -> AddrOf
-        else:
+        *csym* (local or imported), or None for tuples / unknown types. Uses
+        the same resolution as the isinstance check itself so the narrowed cast
+        targets the same same-named class the check tested against."""
+        if not isinstance(ref, (ast.Name, ast.Attribute)):
             return None                 # tuple-of-types: ambiguous, don't narrow
+        ci = self._resolve_class_ref(ref)
+        if ci is not None:
+            return ci.csym
+        n = ref.id if isinstance(ref, ast.Name) else ref.attr
         if n in self.classes or n in self.xclasses:
             return n
         return None
@@ -6175,8 +6198,9 @@ class Transpiler:
             return "make_closure(&%s__tramp, OBJ_NONE)" % self.fnsym(node.id)
         # a class used as a *value* becomes a constructor closure
         if node.id in self.classes and node.id not in self.scope:
-            self.class_values_needed.add(node.id)
-            return "make_closure(&%s__ctortramp, OBJ_NONE)" % node.id
+            self.class_values_needed.add(self.classes[node.id].csym)
+            return "make_closure(&%s__ctortramp, OBJ_NONE)" % \
+                self.classes[node.id].csym
         # an imported module global / singleton referenced by bare name: make
         # sure it gets an extern declaration emitted by build_externs
         if node.id in self.from_imports and node.id not in self.scope:
@@ -6194,8 +6218,8 @@ class Transpiler:
             if kind in ("singleton", "func", "class"):
                 self.used_imports.add((mod, node.id))
                 if kind == "class":
-                    self.class_values_needed.add(node.id)
-                    return "make_closure(&%s__ctortramp, OBJ_NONE)" % node.id
+                    self.class_values_needed.add(info.csym)
+                    return "make_closure(&%s__ctortramp, OBJ_NONE)" % info.csym
                 if kind == "func" and self.stdlib_root:
                     return "mp_call_import(%s, %s, 0)" % (
                         c_string(mod), c_string(node.id))
@@ -6430,8 +6454,8 @@ class Transpiler:
                 if kind in ("singleton", "func", "global"):
                     return cname(node.attr)      # bare exported symbol
                 if kind == "class":
-                    self.class_values_needed.add(node.attr)
-                    return "make_closure(&%s__ctortramp, OBJ_NONE)" % node.attr
+                    self.class_values_needed.add(info.csym)
+                    return "make_closure(&%s__ctortramp, OBJ_NONE)" % info.csym
                 if base in self.modules:
                     mod = self.import_alias.get(base, base)
                     if self.stdlib_root:
@@ -7388,7 +7412,8 @@ class Transpiler:
                     func.value.id in self.narrowed:
                 cls = self.narrowed[func.value.id][:-1]
                 ci = self.classes.get(cls) or (self.xclasses[cls][0]
-                                               if cls in self.xclasses else None)
+                                               if cls in self.xclasses else None) \
+                    or self._ci_by_csym(cls)
                 if ci is not None and self._class_is_leaf(cls):
                     owner = ci.find_method_owner(func.attr)
                     if owner is None and func.attr in ci.methods:
@@ -7850,32 +7875,37 @@ class Transpiler:
         return "isinstance_of((Obj*)(%s), %s)" % (self.expr(val_node),
                                                   type_sym)
 
-    def _type_symbol(self, cls_node):
-        """`&Cls_type` for a class reference (local, alias.Cls, or imported)."""
+    def _resolve_class_ref(self, ref):
+        """Resolve a class reference (`Name`, `alias.Cls`, or a from-imported
+        name) to its ClassInfo, preferring the exact alias/re-export resolution
+        over the ambiguous bare-name registry (which can pick the wrong
+        same-named class). Returns None if `ref` is not a known class."""
         clsname = None
-        resolved = None          # ClassInfo resolved through an alias/from-import
-        if isinstance(cls_node, ast.Name):
-            clsname = cls_node.id
+        resolved = None
+        if isinstance(ref, ast.Name):
+            clsname = ref.id
             if clsname not in self.classes and clsname in self.from_imports:
                 kind, info = self.xref(clsname, self.from_imports[clsname])
                 if kind == "class":
                     resolved = info
-        elif isinstance(cls_node, ast.Attribute) and \
-                isinstance(cls_node.value, ast.Name) and \
-                cls_node.value.id in self.import_alias:
-            clsname = cls_node.attr
-            kind, info = self.xref(clsname, self.import_alias[cls_node.value.id])
+        elif isinstance(ref, ast.Attribute) and \
+                isinstance(ref.value, ast.Name) and \
+                ref.value.id in self.import_alias:
+            clsname = ref.attr
+            kind, info = self.xref(clsname, self.import_alias[ref.value.id])
             if kind == "class":
                 resolved = info
         if clsname:
-            # A bare-name registry hit can resolve to the *wrong* same-named
-            # class when the name is ambiguous; prefer a local class, then the
-            # exact alias/from-import resolution, and only then the registry.
-            ci = self.classes.get(clsname) or resolved or \
+            return self.classes.get(clsname) or resolved or \
                 (self.xclasses[clsname][0] if clsname in self.xclasses else None)
-            if ci is not None:
-                self._ref_xclass(ci, body=True, typeinfo=True)
-                return "&%s_type" % ci.csym
+        return None
+
+    def _type_symbol(self, cls_node):
+        """`&Cls_type` for a class reference (local, alias.Cls, or imported)."""
+        ci = self._resolve_class_ref(cls_node)
+        if ci is not None:
+            self._ref_xclass(ci, body=True, typeinfo=True)
+            return "&%s_type" % ci.csym
         return "NULL"
 
     def lower_any_all(self, fn, arg):
@@ -8158,7 +8188,7 @@ class Transpiler:
                     node.value.id in self.narrowed:
                 cls = self.narrowed[node.value.id][:-1]
                 if self._class_has_field(cls, node.attr):
-                    ci = self.classes.get(cls) or self.xclasses[cls][0]
+                    ci = self.classes.get(cls) or self._ci_by_csym(cls)
                     return ci.field_ctype(node.attr)
             if self.is_obj_word(node.value) or \
                     self.value_ctype(node.value) == OBJ:
