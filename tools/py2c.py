@@ -6165,6 +6165,13 @@ class Transpiler:
         if v is False:
             return "0"
         if isinstance(v, int):
+            # -(2**63) can't be written as a literal (the 2**63 operand
+            # overflows a signed long before negation); build it instead.
+            if v == -9223372036854775808:
+                return "(-9223372036854775807LL - 1)"
+            # values above INT64_MAX need an unsigned-long-long literal.
+            if v > 9223372036854775807:
+                return "%dULL" % v
             return str(v)
         if isinstance(v, str):
             return c_string(v)
