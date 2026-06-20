@@ -2608,9 +2608,10 @@ class Transpiler:
         return cname(name)
 
     def pname(self, name):
-        """C parameter name: avoid typedef / keyword collisions."""
+        """C parameter name: avoid typedef / keyword / imported-global collisions."""
         if name in C_KEYWORDS or name in RUNTIME_API_NAMES \
-                or name in self.class_typedef_names:
+                or name in self.class_typedef_names \
+                or name in getattr(self, "_shadow_names", ()):
             return name + "_"
         return name
 
@@ -2643,10 +2644,16 @@ class Transpiler:
         self.collect_imports(tree)
         # cross-module class registry: clsname -> (ClassInfo, modname)
         self.xclasses = {}
+        # names of imported module-level singletons/globals: a local of the
+        # same name would shadow the bare extern in C (and break an inlined
+        # default arg that references the global, e.g. token_kinds.open_paren).
+        self._shadow_names = set()
         for modname in set(self.import_alias.values()) | \
                 set(self.from_imports.values()):
             reg = self.load_xmod(modname)
             if reg:
+                self._shadow_names |= set(reg.get("singletons", {})) | \
+                    set(reg.get("globals", {}))
                 for cn, ci in reg["classes"].items():
                     ci.csym = class_csym(cn, modname, self.ambiguous)
                     self.xclasses.setdefault(cn, (ci, modname))
@@ -4735,7 +4742,7 @@ class Transpiler:
         for name, ct in self.hoist_locals(body):
             self.scope[name] = ct
             self.hoisted.add(name)
-            self.emit("%s %s;" % (self.ctype_csym(ct), cname(name)))
+            self.emit("%s %s;" % (self.ctype_csym(ct), self.pname(name)))
         self.emit_body(body)
 
     # ---- top level (non-class) -------------------------------------------
