@@ -3322,6 +3322,16 @@ class Transpiler:
                         # registers = caller_saved + callee_saved), emitted
                         # unprefixed in its module as `obj <name>;`
                         reg["globals"][n.targets[0].id] = OBJ
+                    elif isinstance(n, ast.Assign) and len(n.targets) == 1 \
+                            and isinstance(n.targets[0], ast.Name) \
+                            and isinstance(n.value, ast.Constant) \
+                            and n.value.value is None \
+                            and n.targets[0].id not in reg["consts"]:
+                        # a mutable module global initialised to None (e.g.
+                        # `current_function = None`); it is emitted as a real
+                        # `obj <name>;` in its module and referenced elsewhere
+                        # as `alias.name`, so register it for the extern.
+                        reg["globals"].setdefault(n.targets[0].id, OBJ)
             except (OSError, SyntaxError):
                 pass
         cache[modname] = reg
@@ -7132,6 +7142,30 @@ class Transpiler:
                             self._c_ret(m) if m else OBJ
                     return "%s_%s(%s)" % (_sci.csym, func.attr,
                                           ", ".join(cargs))
+            # Explicit base-class init by class name: `Node.__init__(self)` ->
+            # Node___init__((Node*)self). (super().__init__() is handled
+            # separately; this is the spelled-out form.)
+            if isinstance(func.value, ast.Name) and \
+                    func.value.id not in self.scope and \
+                    func.attr == "__init__" and node.args:
+                _bcls = func.value.id
+                _bci = self.classes.get(_bcls) or \
+                    (self.xclasses[_bcls][0] if _bcls in self.xclasses else None)
+                if _bci is not None:
+                    owner = _bci.find_method_owner("__init__")
+                    recv0 = node.args[0]
+                    if owner is None:        # object.__init__: nothing to do
+                        return "(void)(%s)" % \
+                            self._class_ptr_expr(recv0, _bci.csym)
+                    rest = self.coerce_args(
+                        self.init_param_ctypes(owner), node.args[1:],
+                        self.defaults_for(owner.methods.get("__init__"), True))
+                    if owner.name not in self.classes:
+                        self.xstructs_needed.add(owner.name)
+                        self.used_xmethods[(owner.name, "__init__")] = "void"
+                    return "%s___init__(%s%s)" % (
+                        owner.csym, self._class_ptr_expr(recv0, owner.csym),
+                        (", " + ", ".join(rest)) if rest else "")
             if func.attr in VTABLE_METHODS:
                 return self.vcall(func.value, func.attr, node.args)
             # concrete class. Safe to devirtualize only for a leaf class, so no
