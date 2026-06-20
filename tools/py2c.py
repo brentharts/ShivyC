@@ -2398,10 +2398,12 @@ def ambiguous_class_names(base_dir):
     Mult), so they are module-qualified. Computed once over the whole package so
     that every separately-compiled module agrees, even ones that import neither
     side of a collision."""
-    if base_dir in _AMBIG_CACHE:
-        return _AMBIG_CACHE[base_dir]
+    ckey = (base_dir, tuple(sorted(_LOCAL_MODULE_DIRS)))
+    if ckey in _AMBIG_CACHE:
+        return _AMBIG_CACHE[ckey]
     name2mods = {}
     pkg = os.path.join(base_dir or ".", "shivyc")
+    pkg_abs = os.path.abspath(pkg)
     for dp, _dirs, fns in os.walk(pkg):
         if "musl" in dp.split(os.sep):
             continue
@@ -2417,8 +2419,30 @@ def ambiguous_class_names(base_dir):
             for n in t.body:
                 if isinstance(n, ast.ClassDef):
                     name2mods.setdefault(n.name, set()).add(mod)
+    # Also scan the input program's own module directories (set via
+    # set_local_module_dirs) so same-named classes in *any* multi-file rpython
+    # program are detected -- not just the shivyc package. Dirs already inside
+    # the shivyc package are skipped: the walk above covers them under their
+    # dotted module name, and re-adding them under their basename would make a
+    # genuinely unique class look ambiguous.
+    for d in _LOCAL_MODULE_DIRS:
+        da = os.path.abspath(d)
+        if not os.path.isdir(d) or da == pkg_abs \
+                or da.startswith(pkg_abs + os.sep):
+            continue
+        for fn in sorted(os.listdir(d)):
+            if not fn.endswith(".py"):
+                continue
+            try:
+                t = ast.parse(open(os.path.join(d, fn),
+                                   encoding="utf-8").read())
+            except Exception:
+                continue
+            for n in t.body:
+                if isinstance(n, ast.ClassDef):
+                    name2mods.setdefault(n.name, set()).add(fn[:-3])
     amb = {n for n, mods in name2mods.items() if len(mods) > 1}
-    _AMBIG_CACHE[base_dir] = amb
+    _AMBIG_CACHE[ckey] = amb
     return amb
 
 
@@ -6200,11 +6224,29 @@ class Transpiler:
             return str(v)
         return str(v)
 
+    def _ci_by_csym(self, csym):
+        """Find the ClassInfo (local or imported) whose C symbol is exactly
+        `csym`. The xclasses registry is keyed by *bare* name, which is
+        ambiguous when two modules share a class name; the csym (then
+        module-qualified) identifies the intended one precisely. The ambiguous
+        "loser" (not the bare-keyed entry) lives only in the shadow maps."""
+        for ci in self.classes.values():
+            if ci.csym == csym:
+                return ci
+        for ci, _mod in self.xclasses.values():
+            if ci.csym == csym:
+                return ci
+        for m in (self.xshadow_body, self.xshadow_td, self.xshadow_type):
+            if csym in m:
+                return m[csym]
+        return None
+
     def _class_has_field(self, cls, field):
         """True if class `cls` (local or imported), including bases, declares
         `field` as a real struct member."""
         ci = self.classes.get(cls) or (self.xclasses[cls][0]
-                                       if cls in self.xclasses else None)
+                                       if cls in self.xclasses else None) \
+            or self._ci_by_csym(cls)
         if ci is None:
             return False
         try:
@@ -6984,6 +7026,7 @@ class Transpiler:
             if fn in self.from_imports:
                 kind, info = self.xref(fn, self.from_imports[fn])
                 if kind == "class":
+                    self._ref_xclass(info, body=True)
                     init = info.methods.get("__init__")
                     pct = [arg_ctype(init, a) for a in init.args.args[1:]] \
                         if init else []
@@ -7188,6 +7231,7 @@ class Transpiler:
                 modname = self.import_alias[func.value.id]
                 kind, info = self.xref(func.attr, modname)
                 if kind == "class":
+                    self._ref_xclass(info, body=True)
                     init = info.methods.get("__init__")
                     pct = [arg_ctype(init, a) for a in init.args.args[1:]] \
                         if init else []
@@ -7372,6 +7416,7 @@ class Transpiler:
                 if func.attr == sym:
                     kind, info = self.xref(sym, self.from_imports[sym])
                     if kind == "class":
+                        self._ref_xclass(info, body=True)
                         init = info.methods.get("__init__")
                         pct = [arg_ctype(init, a) for a in init.args.args[1:]] \
                             if init else []
@@ -7694,8 +7739,12 @@ class Transpiler:
             if m is not None:
                 return self._format_direct_method_call(
                     owner, m, func.value, node.args)
-        if cls in self.xclasses:
-            ci, modname = self.xclasses[cls]
+        if cls in self.xclasses or self._ci_by_csym(cls) is not None:
+            if cls in self.xclasses:
+                ci, modname = self.xclasses[cls]
+            else:
+                ci = self._ci_by_csym(cls)
+                modname = getattr(ci, "defmod", None)
             owner = ci.find_method_owner(func.attr)
             if owner is None:
                 return None
@@ -7743,25 +7792,29 @@ class Transpiler:
     def _type_symbol(self, cls_node):
         """`&Cls_type` for a class reference (local, alias.Cls, or imported)."""
         clsname = None
+        resolved = None          # ClassInfo resolved through an alias/from-import
         if isinstance(cls_node, ast.Name):
             clsname = cls_node.id
             if clsname not in self.classes and clsname in self.from_imports:
-                self.xref(clsname, self.from_imports[clsname])
+                kind, info = self.xref(clsname, self.from_imports[clsname])
+                if kind == "class":
+                    resolved = info
         elif isinstance(cls_node, ast.Attribute) and \
                 isinstance(cls_node.value, ast.Name) and \
                 cls_node.value.id in self.import_alias:
             clsname = cls_node.attr
-            self.xref(clsname, self.import_alias[cls_node.value.id])
+            kind, info = self.xref(clsname, self.import_alias[cls_node.value.id])
+            if kind == "class":
+                resolved = info
         if clsname:
-            if clsname in self.classes or clsname in self.xclasses:
-                ci = self.classes.get(clsname) or self.xclasses[clsname][0]
+            # A bare-name registry hit can resolve to the *wrong* same-named
+            # class when the name is ambiguous; prefer a local class, then the
+            # exact alias/from-import resolution, and only then the registry.
+            ci = self.classes.get(clsname) or resolved or \
+                (self.xclasses[clsname][0] if clsname in self.xclasses else None)
+            if ci is not None:
                 self._ref_xclass(ci, body=True, typeinfo=True)
-                return "&%s_type" % self.ccls(clsname)
-            if clsname in self.from_imports:
-                kind, info = self.xref(clsname, self.from_imports[clsname])
-                if kind == "class":
-                    self._ref_xclass(info, body=True, typeinfo=True)
-                    return "&%s_type" % self.ccls(clsname)
+                return "&%s_type" % ci.csym
         return "NULL"
 
     def lower_any_all(self, fn, arg):
@@ -8058,7 +8111,8 @@ class Transpiler:
             if bt and bt.endswith("*") and bt != OBJ:
                 cls = bt[:-1]
                 ci = self.classes.get(cls) or (self.xclasses[cls][0]
-                                               if cls in self.xclasses else None)
+                                               if cls in self.xclasses else None) \
+                    or self._ci_by_csym(cls)
                 if ci is not None and self._class_has_field(cls, node.attr):
                     return ci.field_ctype(node.attr)
                 if ci is not None:
