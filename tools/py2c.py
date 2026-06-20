@@ -287,6 +287,8 @@ str  pyjoin(str sep, obj it);
 /* ---- common builtins ---- */
 obj  pyenumerate(obj it, long start);   /* list of [i, x]                     */
 obj  pyzip(obj a, obj b);               /* list of [x, y] (shortest)          */
+obj  pyzip3(obj a, obj b, obj c);       /* list of [x, y, z] (shortest)       */
+obj  pyzip4(obj a, obj b, obj c, obj d); /* list of [w, x, y, z] (shortest)   */
 obj  pysorted(obj it);                  /* natural-order sort (obj_cmp)        */
 void list_sort(obj lst);                /* in-place natural sort               */
 obj  pymax(obj it, obj dflt, bool has_dflt);
@@ -1022,6 +1024,33 @@ obj pyzip(obj a, obj b) {
     long n = pylen(a), m = pylen(b); if (m < n) n = m;
     for (long i = 0; i < n; i++)
         list_append(r, list_of(2, index_obj(a, i), index_obj(b, i)));
+    return r;
+}
+obj pyzip3(obj a, obj b, obj c) {
+    obj r = list_new();
+    long n = pylen(a), m = pylen(b), k = pylen(c);
+    if (m < n) n = m; if (k < n) n = k;
+    for (long i = 0; i < n; i++) {
+        obj t = list_new();
+        list_append(t, index_obj(a, i));
+        list_append(t, index_obj(b, i));
+        list_append(t, index_obj(c, i));
+        list_append(r, t);
+    }
+    return r;
+}
+obj pyzip4(obj a, obj b, obj c, obj d) {
+    obj r = list_new();
+    long n = pylen(a), m = pylen(b), k = pylen(c), j = pylen(d);
+    if (m < n) n = m; if (k < n) n = k; if (j < n) n = j;
+    for (long i = 0; i < n; i++) {
+        obj t = list_new();
+        list_append(t, index_obj(a, i));
+        list_append(t, index_obj(b, i));
+        list_append(t, index_obj(c, i));
+        list_append(t, index_obj(d, i));
+        list_append(r, t);
+    }
     return r;
 }
 static int cmp_obj_qsort(const void* a, const void* b) {
@@ -2785,7 +2814,7 @@ class Transpiler:
                 # site rather than a stale bare entry.
                 if name not in self.classes and info is not None and \
                         self.xclasses.get(name, (None,))[0] is not info:
-                    self.xclasses[name] = (info, mod)
+                    self.xclasses[name] = (info, getattr(info, "defmod", mod))
             elif kind == "func" and name not in self.func_params:
                 funcs[func_csym(name, mod, self.ambiguous_funcs)] = \
                     ann_to_ctype(info.returns) or OBJ
@@ -3266,6 +3295,7 @@ class Transpiler:
                 amb = ambiguous_class_names(self.base_dir)
                 for cn, ci in classes.items():
                     ci.csym = class_csym(cn, modname, amb)
+                    ci.defmod = modname     # module that actually defines it
                 reg["classes"] = classes
                 reg["order"] = order
                 reg["vt"] = vt
@@ -6678,6 +6708,12 @@ class Transpiler:
             if fn == "zip" and len(node.args) == 2:
                 return "pyzip(%s, %s)" % (self.wrap_obj(node.args[0]),
                                           self.wrap_obj(node.args[1]))
+            if fn == "zip" and len(node.args) == 3:
+                return "pyzip3(%s, %s, %s)" % tuple(
+                    self.wrap_obj(a) for a in node.args)
+            if fn == "zip" and len(node.args) == 4:
+                return "pyzip4(%s, %s, %s, %s)" % tuple(
+                    self.wrap_obj(a) for a in node.args)
             if fn == "enumerate" and node.args:
                 start = self.expr(node.args[1]) if len(node.args) > 1 else "0"
                 return "pyenumerate(%s, %s)" % (self.wrap_obj(node.args[0]),
