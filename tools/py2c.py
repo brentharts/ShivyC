@@ -2446,6 +2446,40 @@ def ambiguous_class_names(base_dir):
     return amb
 
 
+def pod_csyms(tree, order, pod_enabled):
+    """Csyms of classes in `order` (parsed from `tree`) that qualify for the
+    POD lowering (bare struct, no Obj header / vtable). Mirrors the core of
+    Transpiler._compute_pod_set, but as a free function so an *importing*
+    module can replicate a defining module's POD decision and keep struct
+    layout and dispatch in agreement across the module boundary."""
+    if not pod_enabled:
+        return set()
+    has_subclass = set()
+    for ci in order:
+        if getattr(ci, "base_name", None):
+            has_subclass.add(ci.base_name)
+    class_names = {ci.name for ci in order}
+    value_used = set()
+    for parent in ast.walk(tree):
+        for _f, child in ast.iter_fields(parent):
+            kids = child if isinstance(child, list) else [child]
+            for c in kids:
+                if isinstance(c, ast.Name) and c.id in class_names:
+                    if isinstance(parent, ast.Call) and parent.func is c:
+                        continue            # construction X(...) is fine
+                    value_used.add(c.id)
+    pod = set()
+    for ci in order:
+        if (not getattr(ci, "base_name", None)
+                and ci.name not in has_subclass
+                and ci.name not in value_used
+                and not getattr(ci, "const_dicts", None)
+                and not getattr(ci, "class_statics", None)
+                and not getattr(ci, "class_attrs", None)):
+            pod.add(ci.csym)
+    return pod
+
+
 def class_csym(name, modname, ambiguous):
     """C base symbol for class `name` defined in `modname`: bare when unique
     across the package, else module-qualified so collisions get distinct
@@ -2621,6 +2655,10 @@ class Transpiler:
             if not added:
                 break
         self.used_xmethods = {}     # (clsname, method) -> return ctype
+        self.used_xmethods_csym = {}  # (csym, method) -> ret: same, but keyed
+                                    # by exact csym for *ambiguous* classes whose
+                                    # bare name can't pick the right same-named
+                                    # class at extern-emission time.
         self.xstructs_needed = set()  # imported classes whose fields are read
         self.xshadow_td = {}        # csym -> ClassInfo: forward typedef for an
         self.xshadow_body = {}      # ambiguous same-named class that is *not*
@@ -2780,7 +2818,9 @@ class Transpiler:
     def struct_body_lines(self, ci):
         """Tag definition `struct C { ... };` for an imported class whose
         fields are accessed (the typedef is forward-declared separately)."""
-        out = ["struct %s {" % ci.csym, "    Obj _hdr;"]
+        out = ["struct %s {" % ci.csym]
+        if not getattr(ci, "pod", False):
+            out.append("    Obj _hdr;")  # non-POD: boxed obj header for vtable
         ff = ci.full_fields()
         if not ff:
             out.append("    char _empty;")
@@ -2968,6 +3008,9 @@ class Transpiler:
             else:
                 out.append("extern %s %s_%s();" % (
                     self.used_xmethods[(cls, meth)], self.xcsym(cls), meth))
+        for (cs, meth) in sorted(self.used_xmethods_csym):  # ambiguous classes
+            out.append("extern %s %s_%s();" % (
+                self.used_xmethods_csym[(cs, meth)], cs, meth))
         for (cls, meth) in sorted(self.xvtable_impls):  # imported vtable slots
             if (cls, meth) not in self.used_xmethods:
                 out.append("extern %s %s_%s();" % (
@@ -3382,6 +3425,19 @@ class Transpiler:
                 for cn, ci in classes.items():
                     ci.csym = class_csym(cn, modname, amb)
                     ci.defmod = modname     # module that actually defines it
+                # Replicate this module's POD decision so a POD class's methods
+                # are not advertised as virtual: a POD class has no vtable, so
+                # importers must dispatch its methods directly (and not read a
+                # nonexistent Obj `type` header). Keep a method in vt only if
+                # some *non-POD* class in the module defines it.
+                pods = pod_csyms(t, order, self._pod_enabled)
+                for ci in order:
+                    ci.pod = ci.csym in pods
+                non_pod_methods = set()
+                for ci in order:
+                    if ci.csym not in pods:
+                        non_pod_methods.update(ci.methods)
+                vt = {m for m in vt if m in non_pod_methods}
                 reg["classes"] = classes
                 reg["order"] = order
                 reg["vt"] = vt
@@ -7612,7 +7668,10 @@ class Transpiler:
         # resolves to that base is emitted as a direct call to the imported
         # symbol, which needs an extern prototype (else gcc assumes int).
         if owner.name not in self.classes:
-            self.used_xmethods.setdefault((owner.name, m.name), self._c_ret(m))
+            if owner.name in self.ambiguous:
+                self.used_xmethods_csym[(owner.csym, m.name)] = self._c_ret(m)
+            else:
+                self.used_xmethods.setdefault((owner.name, m.name), self._c_ret(m))
         recv = self._class_ptr_expr(recv_node, owner.csym)
         pct = [arg_ctype(m, a) for a in m.args.args[1:]]
         n_named = len(pct)
