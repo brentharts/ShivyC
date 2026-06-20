@@ -5466,6 +5466,9 @@ class Transpiler:
                     kind, info = self.resolve_import(f.id,
                                                      self.from_imports[f.id])
                     if kind == "class":
+                        cs = getattr(info, "csym", None)
+                        if cs and f.id in self.ambiguous:
+                            return cs + "*"
                         return cname(f.id) + "*"
                     if kind == "func":
                         return ann_to_ctype(info.returns) or OBJ
@@ -5507,6 +5510,9 @@ class Transpiler:
                     kind, info = self.resolve_import(
                         f.attr, self.import_alias[f.value.id])
                     if kind == "class":
+                        cs = getattr(info, "csym", None)
+                        if cs and f.attr in self.ambiguous:
+                            return cs + "*"
                         return cname(f.attr) + "*"
                     if kind == "func":
                         return ann_to_ctype(info.returns) or OBJ
