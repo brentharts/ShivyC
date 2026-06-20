@@ -2242,6 +2242,15 @@ def discover_fields(classnode, method_names=None):
                                 sub.value.id in param_ann:
                             add(st.attr, infer_type(st.attr,
                                                     param_ann[sub.value.id]))
+                        # self.x = None  ->  a field a numeric-name heuristic
+                        # would call int/double/bool is actually nullable, so it
+                        # must be obj (it provably holds None at least once).
+                        elif ann is None and isinstance(sub, ast.Assign) and \
+                                isinstance(sub.value, ast.Constant) and \
+                                sub.value.value is None and \
+                                infer_type(st.attr, None) in (
+                                    "int", "double", "bool"):
+                            add(st.attr, OBJ)
                         else:
                             add(st.attr, infer_type(st.attr, ann))
     return fields
