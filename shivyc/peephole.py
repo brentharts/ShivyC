@@ -245,7 +245,7 @@ def _single_block_loop_range(commands, start_idx, back_idx, labels):
     return True
 
 
-def _trace_stride(addr, def_of, commands, basic_ivs, defined, il_code,
+def _trace_stride(addr: "ILValue", def_of, commands, basic_ivs, defined, il_code,
                   chain, depth=0):
     """Trace `addr` back toward a single basic IV, accumulating the scale.
 
