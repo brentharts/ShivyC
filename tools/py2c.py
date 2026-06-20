@@ -6551,10 +6551,12 @@ class Transpiler:
                 self._ref_xclass(owner, body=True)
                 return "((%s*)AS_OBJ(%s))->%s" % (
                     owner.csym, self.expr(node.value), cname(node.attr))
-            if self.stdlib_root:
-                return "mp_getattr(%s, %s, OBJ_NONE)" % (
-                    self.wrap_obj(node.value), c_string(node.attr))
-            return "OBJ_NONE /* %s.%s */" % (self.src1(node.value), node.attr)
+            # No statically-resolvable owner: do a real runtime attribute
+            # lookup. (Previously this discarded the access as OBJ_NONE, which
+            # silently produced wrong values; mp_getattr is declared in the
+            # runtime header and defined by the stdlib bridge.)
+            return "mp_getattr(%s, %s, OBJ_NONE)" % (
+                self.wrap_obj(node.value), c_string(node.attr))
         return "%s.%s" % (self.expr(node.value), cname(node.attr))
 
     def ex_Call(self, node):
