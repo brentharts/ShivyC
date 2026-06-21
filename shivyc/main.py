@@ -354,6 +354,17 @@ def _libm_protos(code):
     for fn in ("pow", "fmod", "fmax", "fmin", "atan2", "hypot", "copysign"):
         if re.search(r"\b" + fn + r"\b", code):
             protos.append("double %s(double, double);" % fn)
+    # single-precision variants (expf/sqrtf/...) for f32 kernels
+    for fn in ("sqrtf", "cbrtf", "expf", "exp2f", "expm1f", "logf", "log2f",
+               "log10f", "log1pf", "sinf", "cosf", "tanf", "asinf", "acosf",
+               "atanf", "sinhf", "coshf", "tanhf", "asinhf", "acoshf",
+               "atanhf", "fabsf", "floorf", "ceilf", "roundf", "truncf"):
+        if re.search(r"\b" + fn + r"\b", code):
+            protos.append("float %s(float);" % fn)
+    for fn in ("powf", "fmodf", "fmaxf", "fminf", "atan2f", "hypotf",
+               "copysignf"):
+        if re.search(r"\b" + fn + r"\b", code):
+            protos.append("float %s(float, float);" % fn)
     return protos
 
 
