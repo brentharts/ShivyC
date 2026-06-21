@@ -94,6 +94,17 @@ no-op). Slices take a step, including negative (`xs[::-1]`, `xs[::2]`,
 negative operands the sign differs from Python's floored result (e.g. `-7 % 3` is
 `-1`, not `2`). Avoid relying on it in rpython sources.
 
+**`dict` has two forms.** A general dict is a first-class runtime value
+(`T_DICT`): an insertion-ordered array of boxed key/value `obj`s with linear
+`obj_eq` lookup, so keys/values may mix scalar types. It supports literals and
+`{k: v for ...}` comprehensions, `d[k]` read/write and `d[k] += …`, `get`,
+`setdefault`, `pop`, `update`, `clear`, `copy`, `del d[k]`, `in`, `len`,
+`keys`/`values`/`items`, direct key iteration, `|` merge (right wins), and
+order-independent `==`. For hot paths, annotating `d: "dict[K, V]"` with scalar
+`K`/`V` lowers to unboxed parallel arrays (`{K* keys; V* vals; long len, cap;}`)
+with no boxing or hashing runtime -- a missing key reads as 0. See the `dictops`,
+`wordfreq`, and `dicts/typed_dict` examples.
+
 **`set` is a real type.** Sets carry their own runtime tag (`T_SET`) — a `List`
 whose tag marks it as a set — rather than sharing the list representation. `|`
 `&` `-` `^` are union / intersection / difference / symmetric-difference,
