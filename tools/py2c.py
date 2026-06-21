@@ -238,6 +238,7 @@ str  pyfmt(int n, const char* fmt, ...); /* f-strings: "{}..." + obj args     */
 str  pyfmt_a(const char* fmt, obj* args, int n);  /* varargs-free f-strings    */
 str  pyconcat(str a, str b);       /* "x" + y                                 */
 bool truthy(obj v);                /* Python truthiness of a Tier-2 value     */
+double as_dbl(obj v);              /* obj -> double (int/bool widen, else .d) */
 
 /* ---- lists: growable obj vector, represented as a tagged obj (T_LIST) ----- */
 typedef struct { obj* data; int len; int cap; } List;
@@ -941,6 +942,7 @@ void subscript_set(obj container, obj key, obj v) {
 
 /* ---- arithmetic / comparison on Tier-2 values ---- */
 static long as_num(obj v) { return (v.tag == T_INT || v.tag == T_BOOL) ? v.u.i : 0; }
+double as_dbl(obj v) { return v.tag == T_FLOAT ? v.u.d : (double)as_num(v); }
 
 obj obj_add(obj a, obj b) {
     if (a.tag == T_STR && b.tag == T_STR) return OBJ_STR(pyconcat(a.u.s, b.u.s));
@@ -5062,6 +5064,8 @@ class Transpiler:
                 raw = "AS_INT(%s)" % raw
             elif ct == "bool":
                 raw = "truthy(%s)" % raw
+            elif ct in ("double", "float"):
+                raw = "as_dbl(%s)" % raw
             elif ct == "char*":
                 raw = "AS_STR(%s)" % raw
             elif ct.endswith("*") and ct != OBJ:
