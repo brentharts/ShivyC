@@ -2232,8 +2232,22 @@ def _ctor_class_name(val, classes):
     return None
 
 
+def _ann_class_name(ann, classes):
+    """Local class named by a param annotation (`x: Cls` or `x: "Cls"`)."""
+    if isinstance(ann, ast.Name) and ann.id in classes:
+        return ann.id
+    if isinstance(ann, ast.Constant) and isinstance(ann.value, str) \
+            and ann.value in classes:
+        return ann.value
+    return None
+
+
 def discover_fields_from_ctor_locals(tree, classes):
-    """Discover instance fields from `var = Cls(); var.attr = ...` patterns."""
+    """Discover instance fields written through a *typed* receiver other than
+    `self` -- `var.attr = ...` / `setattr(var, "attr", ...)` where `var`'s class
+    is known from a `var = Cls()` binding or a parameter annotation. These
+    cross-class dynamic attributes otherwise have no struct slot, so rt_setattr
+    would silently drop the write; giving them a slot makes the write persist."""
 
     def add_field(clsname, attr):
         ci = classes.get(clsname)
@@ -2242,30 +2256,48 @@ def discover_fields_from_ctor_locals(tree, classes):
         if not any(f == attr for f, _ in ci.own_fields):
             ci.own_fields.append((attr, OBJ))
 
-    def scan_scope(body):
-        locals_types = {}
-        for sub in ast.walk(ast.Module(body=body, type_ignores=[])):
+    def scan_scope(body, seed=None):
+        locals_types = dict(seed) if seed else {}
+        mod = ast.Module(body=list(body), type_ignores=[])
+        for sub in ast.walk(mod):
             if isinstance(sub, ast.Assign) and len(sub.targets) == 1 and \
                     isinstance(sub.targets[0], ast.Name):
                 cls = _ctor_class_name(sub.value, classes)
                 if cls:
                     locals_types[sub.targets[0].id] = cls
-        for sub in ast.walk(ast.Module(body=body, type_ignores=[])):
-            if not isinstance(sub, ast.Assign):
-                continue
-            for tgt in sub.targets:
-                if isinstance(tgt, ast.Attribute) and \
-                        isinstance(tgt.value, ast.Name):
-                    vn = tgt.value.id
-                    if vn == "self":
-                        continue
-                    if vn in locals_types:
-                        add_field(locals_types[vn], tgt.attr)
+        for sub in ast.walk(mod):
+            if isinstance(sub, ast.Assign):
+                for tgt in sub.targets:
+                    if isinstance(tgt, ast.Attribute) and \
+                            isinstance(tgt.value, ast.Name) and \
+                            tgt.value.id != "self" and \
+                            tgt.value.id in locals_types:
+                        add_field(locals_types[tgt.value.id], tgt.attr)
+            elif isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) \
+                    and sub.func.id == "setattr" and len(sub.args) == 3 \
+                    and isinstance(sub.args[0], ast.Name) \
+                    and sub.args[0].id != "self" \
+                    and sub.args[0].id in locals_types \
+                    and isinstance(sub.args[1], ast.Constant) \
+                    and isinstance(sub.args[1].value, str):
+                add_field(locals_types[sub.args[0].id], sub.args[1].value)
+
+    def params_seed(fn):
+        seed = {}
+        for a in (list(fn.args.posonlyargs) + list(fn.args.args) +
+                  list(fn.args.kwonlyargs)):
+            cls = _ann_class_name(a.annotation, classes) if a.annotation else None
+            if cls:
+                seed[a.arg] = cls
+        return seed
 
     scan_scope(tree.body)
     for node in tree.body:
         if isinstance(node, ast.FunctionDef):
-            scan_scope(node.body)
+            scan_scope(node.body, params_seed(node))
+    for ci in classes.values():
+        for fn in ci.methods.values():
+            scan_scope(fn.body, params_seed(fn))
 
 
 def discover_fields(classnode, method_names=None):
