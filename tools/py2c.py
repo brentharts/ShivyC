@@ -1213,6 +1213,7 @@ long pyord(obj c) { return (c.tag == T_STR && c.u.s) ? (unsigned char)c.u.s[0] :
 str pychr(long i) { char* o = aalloc(2); o[0] = (char)i; o[1] = 0; return o; }
 long pyint(obj v) {
     if (v.tag == T_INT || v.tag == T_BOOL) return v.u.i;
+    if (v.tag == T_FLOAT) return (long)v.u.d;
     if (v.tag == T_STR) return strtol(v.u.s, NULL, 0);
     return 0;
 }
@@ -7042,6 +7043,24 @@ class Transpiler:
                         self.wrap_obj(node.args[0]),
                         c_string(node.args[1].value))
                 return "0 /* hasattr: dynamic attr, unsupported */"
+            if fn == "getattr" and len(node.args) >= 2 and \
+                    not (isinstance(node.args[1], ast.Constant) and
+                         isinstance(node.args[1].value, str)):
+                # runtime key on a statically-typed struct -> compiled switch
+                ci = self._dyn_struct_ci(node.args[0])
+                if ci is not None:
+                    dflt = self.wrap_obj(node.args[2]) if len(node.args) > 2 \
+                        else "OBJ_NONE"
+                    return self._emit_dynget(node.args[0], ci,
+                                             node.args[1], dflt)
+            if fn == "setattr" and len(node.args) == 3:
+                ci = self._dyn_struct_ci(node.args[0])
+                if ci is not None and not (
+                        isinstance(node.args[1], ast.Constant) and
+                        isinstance(node.args[1].value, str) and
+                        ci.field_ctype(node.args[1].value) is None):
+                    return self._emit_dynset(node.args[0], ci,
+                                             node.args[1], node.args[2])
             if fn == "hasattr" and len(node.args) == 2 and self.stdlib_root \
                     and isinstance(node.args[1], ast.Constant) \
                     and isinstance(node.args[1].value, str):
@@ -8311,6 +8330,70 @@ class Transpiler:
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             return self.expr(node)
         return "pystr(%s)" % self.wrap_obj(node)
+
+    # ---- compiled dynamic getattr/setattr on a typed struct ---------------
+    # When the receiver's static type is a known struct, getattr/setattr with a
+    # *runtime* key lower to an inline switch on the key's first character (the
+    # rpython type-encoding convention: a field's initial letter selects its C
+    # type), then a strcmp picks the exact field for direct, typed member
+    # access. No hash table and no micropython bridge -- a compiled jump table.
+    _DYN_BOX = {"int": "OBJ_INT", "long": "OBJ_INT", "short": "OBJ_INT",
+                "char": "OBJ_INT", "bool": "OBJ_BOOL", "double": "OBJ_FLOAT",
+                "float": "OBJ_FLOAT", "char*": "OBJ_STR"}
+    _DYN_UNBOX = {"int": "AS_INT", "long": "AS_INT", "short": "AS_INT",
+                  "char": "AS_INT", "bool": "AS_INT", "double": "AS_FLOAT",
+                  "float": "AS_FLOAT", "char*": "AS_STR"}
+
+    def _dyn_struct_ci(self, recv_node):
+        """ClassInfo if `recv_node`'s static type is a known local struct
+        pointer, else None."""
+        ct = self.value_ctype(recv_node)
+        if ct and ct.endswith("*"):
+            return self.classes.get(ct[:-1])
+        return None
+
+    def _dyn_box(self, t, e):
+        if t in self._DYN_BOX:
+            return "%s(%s)" % (self._DYN_BOX[t], e)
+        if t.endswith("*"):
+            return "OBJ_OBJ(%s)" % e
+        return e                    # already an obj field
+
+    def _dyn_unbox(self, t, v):
+        if t in self._DYN_UNBOX:
+            return "%s(%s)" % (self._DYN_UNBOX[t], v)
+        if t.endswith("*"):
+            return "(%s)AS_OBJ(%s)" % (t, v)
+        return v
+
+    def _dyn_switch(self, ci, arm):
+        """`switch(_dk[0]){...}` over ci's fields grouped by name initial.
+        `arm(name, ctype)` returns the matched-field C statement."""
+        groups = {}
+        for n, t in ci.full_fields():
+            groups.setdefault(n[0], []).append((n, t))
+        cases = []
+        for c in sorted(groups):
+            arms = " else ".join('if (!strcmp(_dk, "%s")) %s' % (n, arm(n, t))
+                                 for (n, t) in groups[c])
+            cases.append("case '%s': %s break;" % (c, arms))
+        return "switch (_dk[0]) { %s }" % " ".join(cases)
+
+    def _emit_dynget(self, recv_node, ci, key_node, dflt):
+        sw = self._dyn_switch(
+            ci, lambda n, t: "_dr = %s;" % self._dyn_box(t, "_ds->%s" % cname(n)))
+        return ("({ %s* _ds = %s; const char* _dk = %s; obj _dr = %s; %s _dr; })"
+                % (ci.csym, self.expr(recv_node), self.as_str(key_node),
+                   dflt, sw))
+
+    def _emit_dynset(self, recv_node, ci, key_node, val_node):
+        sw = self._dyn_switch(
+            ci, lambda n, t: "{ _ds->%s = %s; }" % (
+                cname(n), self._dyn_unbox(t, "_dv")))
+        return ("({ %s* _ds = %s; const char* _dk = %s; obj _dv = %s; %s "
+                "OBJ_NONE; })" % (ci.csym, self.expr(recv_node),
+                                  self.as_str(key_node),
+                                  self.wrap_obj(val_node), sw))
 
     def as_long(self, node):
         """Render `node` as a long/int expression."""
