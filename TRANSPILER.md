@@ -104,7 +104,7 @@ observed types to JSON, then rewrites the original source with concrete
 analysis as static promotion) for py2c to lower. Triggered by the
 `-fprofile-generate` flag or `RPY_PROFILE_GENERATE=1` (which also flows through
 the ShivyCX front end); best-effort, so any profiling failure falls back to the
-unchanged source. `make testpgo` checks boxed == profile-guided. See the `pgo`
+unchanged source. `make testpgo` checks boxed == profile-guided. Three refinements: it **merges** evidence -- a container the run actually populated is typed from the observed types (which also *veto* a statically-clean-looking but at-runtime-mixed container), while a container on a cold path the run never reached falls back to static inference; it profiles **multi-file** programs as a set (one run instruments every module via a shared probe, so cross-module containers are typed); and `-fprofile-use[=PATH]` replays a cached profile written by `-fprofile-generate[=PATH]` without re-running. See the `pgo`
 example.
 
 **Opt-in promotion to the unboxed form.** With `PY2C_PROMOTE_CONTAINERS=1`,

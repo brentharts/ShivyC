@@ -158,6 +158,7 @@ rpython:
 	run $(RPY)/promote/app.py 70 ""; \
 	run $(RPY)/pgo/app.py 70 ""; \
 	runm 38 $(RPY)/multifile/app.py $(RPY)/multifile/geom.py; \
+	runm 44 $(RPY)/pgo_multi/app.py $(RPY)/pgo_multi/hist.py; \
 	runm 45 $(RPY)/ambig/app.py $(RPY)/ambig/node_a.py $(RPY)/ambig/node_b.py; \
 	runm 55 $(RPY)/fieldwrite/app.py $(RPY)/fieldwrite/lib.py; \
 	if [ $$fail = 0 ]; then echo "rpython examples: all passed"; \
@@ -241,15 +242,30 @@ testpgo:
 	  if ! gcc -std=c99 -I$$d $$d/*.c -o $$d/bin 2>/dev/null; then echo ERR; return; fi; \
 	  timeout 40 $$d/bin >/dev/null 2>&1; echo $$?; }; \
 	chk() { src=$$1; b=`build $$src "" box`; a=`build $$src -fprofile-generate at`; \
-	  n=`python3 tools/py2c.py $$src -fprofile-generate --out $(FASTBIN)/pgo_at 2>/dev/null | grep -o 'auto-typed [0-9]*' | grep -o '[0-9]*'`; \
-	  if [ "$$b" = "$$a" ] && [ "$$b" != "ERR" ]; then echo "  ok    $$src (boxed==pgo==$$b, $${n:-0} auto-typed)"; \
+	  n=`python3 tools/py2c.py $$src -fprofile-generate --out $(FASTBIN)/pgo_at 2>/dev/null | grep -oE '[0-9]+ profiled \+ [0-9]+ static' | head -1`; \
+	  if [ "$$b" = "$$a" ] && [ "$$b" != "ERR" ]; then echo "  ok    $$src (boxed==pgo==$$b; $${n:-no} type(s))"; \
 	  else echo "  FAIL  $$src (boxed=$$b pgo=$$a)"; fail=1; fi; }; \
+	buildm() { flag=$$1; tag=$$2; shift 2; d=$(FASTBIN)/pgom_$$tag; rm -rf $$d; mkdir -p $$d; \
+	  if ! python3 tools/py2c.py "$$@" $$flag --out $$d >/dev/null 2>&1; then echo ERR; return; fi; \
+	  python3 -c "import sys;sys.path.insert(0,'tools');import py2c;py2c.write_runtime('$$d')" >/dev/null 2>&1; \
+	  if ! gcc -std=c99 -I$$d $$d/*.c -o $$d/bin 2>/dev/null; then echo ERR; return; fi; \
+	  timeout 40 $$d/bin >/dev/null 2>&1; echo $$?; }; \
+	chkm() { exp=$$1; shift; b=`buildm "" box "$$@"`; a=`buildm -fprofile-generate at "$$@"`; \
+	  if [ "$$b" = "$$a" ] && [ "$$b" != "ERR" ]; then echo "  ok    [multi] $$1 ... (boxed==pgo==$$b)"; \
+	  else echo "  FAIL  [multi] $$1 ... (boxed=$$b pgo=$$a)"; fail=1; fi; }; \
+	chku() { src=$$1; rm -f $(FASTBIN)/prof.json; \
+	  g=`build $$src "-fprofile-generate=$(FASTBIN)/prof.json" gen`; \
+	  u=`build $$src "-fprofile-use=$(FASTBIN)/prof.json" use`; \
+	  if [ "$$g" = "$$u" ] && [ "$$g" != "ERR" ]; then echo "  ok    [use] $$src (generate==use==$$g)"; \
+	  else echo "  FAIL  [use] $$src (generate=$$g use=$$u)"; fail=1; fi; }; \
 	chk $(RPY)/pgo/app.py; \
 	chk $(RPY)/promote/app.py; \
 	chk $(RPY)/dictops/app.py; \
 	chk $(RPY)/wordfreq/app.py; \
 	chk $(RPY)/untyped/app.py; \
 	chk $(FAST)/syntax_core.py; \
+	chkm 44 $(RPY)/pgo_multi/app.py $(RPY)/pgo_multi/hist.py; \
+	chku $(RPY)/pgo/app.py; \
 	if [ $$fail = 0 ]; then echo "testpgo: PASS"; \
 	else echo "testpgo: FAIL"; fi; exit $$fail
 
