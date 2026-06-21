@@ -151,6 +151,7 @@ rpython:
 	run $(RPY)/aggregates/app.py 84 ""; \
 	run $(RPY)/formatting/app.py 33 ""; \
 	run $(RPY)/ctorval/app.py 23 ""; \
+	run $(RPY)/sets/app.py 35 ""; \
 	runm 38 $(RPY)/multifile/app.py $(RPY)/multifile/geom.py; \
 	runm 45 $(RPY)/ambig/app.py $(RPY)/ambig/node_a.py $(RPY)/ambig/node_b.py; \
 	runm 55 $(RPY)/fieldwrite/app.py $(RPY)/fieldwrite/lib.py; \

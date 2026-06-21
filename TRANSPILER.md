@@ -90,11 +90,18 @@ just a truthy-in-context expression); `[x]*n` / `n*[x]` repeat a list; `divmod`,
 no-op). Slices take a step, including negative (`xs[::-1]`, `xs[::2]`,
 `xs[a:b:c]`), via `py_slice_step`.
 
-*Known divergences from CPython:* integer `//` and `%` use C truncation, so for
+*Known divergence from CPython:* integer `//` and `%` use C truncation, so for
 negative operands the sign differs from Python's floored result (e.g. `-7 % 3` is
-`-1`, not `2`); and `|` / `&` on sets are not set union/intersection (sets share
-the list representation, so those operators stay bitwise). Avoid relying on
-either in rpython sources.
+`-1`, not `2`). Avoid relying on it in rpython sources.
+
+**`set` is a real type.** Sets carry their own runtime tag (`T_SET`) — a `List`
+whose tag marks it as a set — rather than sharing the list representation. `|`
+`&` `-` `^` are union / intersection / difference / symmetric-difference,
+dispatched on the tag inside `obj_bin`/`obj_sub` (so they stay bitwise on
+integers); set literals, `set(iterable)`, and set comprehensions de-duplicate;
+equality is order-independent; `{...}` prints with braces and the empty set as
+`set()`; `in`, `add`, `discard`, `remove`, `clear`, and iteration all work. See
+the `sets` example.
 
 **Set literals de-duplicate.** A `{a, b, ...}` literal lowers to `set_from`,
 which is `list_from` minus elements already present (by `obj_eq`), so
