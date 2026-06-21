@@ -156,6 +156,7 @@ rpython:
 	run $(RPY)/wordfreq/app.py 93 ""; \
 	run $(RPY)/untyped/app.py 41 ""; \
 	run $(RPY)/promote/app.py 70 ""; \
+	run $(RPY)/pgo/app.py 70 ""; \
 	runm 38 $(RPY)/multifile/app.py $(RPY)/multifile/geom.py; \
 	runm 45 $(RPY)/ambig/app.py $(RPY)/ambig/node_a.py $(RPY)/ambig/node_b.py; \
 	runm 55 $(RPY)/fieldwrite/app.py $(RPY)/fieldwrite/lib.py; \
@@ -224,6 +225,33 @@ testpromote:
 	chk $(RPY)/untyped/app.py; \
 	if [ $$fail = 0 ]; then echo "testpromote: PASS"; \
 	else echo "testpromote: FAIL"; fi; exit $$fail
+
+# ---------------------------------------------------------------------------
+# Profile-guided auto-typing behavior-preservation check: compile each program
+# both boxed (default) and with -fprofile-generate (profile the run, auto-type
+# inferred containers), and require the two binaries to agree. Guards that PGO
+# auto-typing never changes observable behavior relative to the boxed build.
+#     make testpgo
+testpgo:
+	@mkdir -p $(FASTBIN)
+	@fail=0; \
+	build() { src=$$1; flag=$$2; tag=$$3; d=$(FASTBIN)/pgo_$$tag; rm -rf $$d; mkdir -p $$d; \
+	  if ! python3 tools/py2c.py $$src $$flag --out $$d >/dev/null 2>&1; then echo ERR; return; fi; \
+	  python3 -c "import sys;sys.path.insert(0,'tools');import py2c;py2c.write_runtime('$$d')" >/dev/null 2>&1; \
+	  if ! gcc -std=c99 -I$$d $$d/*.c -o $$d/bin 2>/dev/null; then echo ERR; return; fi; \
+	  timeout 40 $$d/bin >/dev/null 2>&1; echo $$?; }; \
+	chk() { src=$$1; b=`build $$src "" box`; a=`build $$src -fprofile-generate at`; \
+	  n=`python3 tools/py2c.py $$src -fprofile-generate --out $(FASTBIN)/pgo_at 2>/dev/null | grep -o 'auto-typed [0-9]*' | grep -o '[0-9]*'`; \
+	  if [ "$$b" = "$$a" ] && [ "$$b" != "ERR" ]; then echo "  ok    $$src (boxed==pgo==$$b, $${n:-0} auto-typed)"; \
+	  else echo "  FAIL  $$src (boxed=$$b pgo=$$a)"; fail=1; fi; }; \
+	chk $(RPY)/pgo/app.py; \
+	chk $(RPY)/promote/app.py; \
+	chk $(RPY)/dictops/app.py; \
+	chk $(RPY)/wordfreq/app.py; \
+	chk $(RPY)/untyped/app.py; \
+	chk $(FAST)/syntax_core.py; \
+	if [ $$fail = 0 ]; then echo "testpgo: PASS"; \
+	else echo "testpgo: FAIL"; fi; exit $$fail
 
 # ---------------------------------------------------------------------------
 # Benchmarks: whole-program SIMD vs gcc -O0/-O2, memory-safety table, etc.
@@ -384,7 +412,7 @@ run-irq: baremetal-irq
 self:
 	cd tools && pypy3 py2c.py
 
-.PHONY: default test testfast testpromote shim install clean baremetal baremetal-hello \
+.PHONY: default test testfast testpromote testpgo shim install clean baremetal baremetal-hello \
         selfhost selfhost_objcore selfhost_bench selfhost_coverage \
         selfhost_coverage_musl selfhost_link \
         rpython benchmarks \

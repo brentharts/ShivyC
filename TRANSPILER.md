@@ -94,6 +94,19 @@ no-op). Slices take a step, including negative (`xs[::-1]`, `xs[::2]`,
 negative operands the sign differs from Python's floored result (e.g. `-7 % 3` is
 `-1`, not `2`). Avoid relying on it in rpython sources.
 
+**Profile-guided auto-typing (`-fprofile-generate`).** Where static
+inference can't see a container's element type (e.g. it is filled from a function
+call), `tools/rpy_pgo.py` profiles the running script to discover the real types.
+It instruments the source with per-mutation type probes, bounds every loop to a
+small iteration budget so profiling is fast, runs it in a subprocess that dumps
+observed types to JSON, then rewrites the original source with concrete
+`name: "list[int]"` / `dict[str,int]` annotations (gated by the same escape/usage
+analysis as static promotion) for py2c to lower. Triggered by the
+`-fprofile-generate` flag or `RPY_PROFILE_GENERATE=1` (which also flows through
+the ShivyCX front end); best-effort, so any profiling failure falls back to the
+unchanged source. `make testpgo` checks boxed == profile-guided. See the `pgo`
+example.
+
 **Opt-in promotion to the unboxed form.** With `PY2C_PROMOTE_CONTAINERS=1`,
 an unannotated empty `list`/`dict` whose element (or key/value) types infer to a
 single scalar, and whose every use is supported by the typed form, is rewritten
