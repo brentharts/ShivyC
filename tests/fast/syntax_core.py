@@ -150,6 +150,29 @@ def sets() -> int:
     return total                      # 19
 
 
+def dicts() -> int:
+    d = {"a": 1, "b": 2}
+    total = 0
+    total += d["a"] + d["b"]          # 3
+    total += d.get("z", 5)            # missing -> default 5          (8)
+    d["c"] = 3
+    total += len(d)                   # 3 keys                       (11)
+    e = d.copy()
+    e["a"] = 9                        # copy is independent
+    total += d["a"] * 10 + e["a"]     # 10 + 9                       (30)
+    m = d | {"x": 7}                  # merge
+    total += len(m)                   # 4 keys                       (34)
+    if {"p": 1, "q": 2} == {"q": 2, "p": 1}:   # order-independent ==
+        total += 1                    # (35)
+    sq = {i: i * i for i in range(4)}  # dict comprehension
+    total += sq[3]                    # 9                            (44)
+    acc = 0
+    for k, v in d.items():            # items iteration
+        acc += v
+    total += acc                      # 1+2+3 = 6                    (50)
+    return total                      # 50
+
+
 def main() -> int:
     total = 0
     total += fib(10)                  # 55
@@ -171,6 +194,7 @@ def main() -> int:
     total += strings()                # 16
     total += builtins_and_slices()    # 70
     total += sets()                   # 19
+    total += dicts()                  # 50
     return total % 200                # keep < 256
 
 
