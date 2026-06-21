@@ -94,6 +94,17 @@ no-op). Slices take a step, including negative (`xs[::-1]`, `xs[::2]`,
 negative operands the sign differs from Python's floored result (e.g. `-7 % 3` is
 `-1`, not `2`). Avoid relying on it in rpython sources.
 
+**Untyped containers are inferred and advised.** An unannotated empty
+container (`x = {}` / `[]` / `set()`) compiles to a boxed container and works as
+written. The transpiler also infers its element (or key/value) type from use --
+literals, arithmetic, `len`/`int`/`str`/... calls, `d.get(k, default)`,
+constructors, and `for` variables over `range`/strings/homogeneous literals --
+and prints a stderr advisory: a suggested `name: "list[int]"`-style annotation
+for the unboxed fast path, a note that it stays boxed (e.g. `dict[str, obj]`), or
+a warning when element types are mixed (rpython containers should be
+homogeneous). Advisories never change codegen; silence them with
+`PY2C_NO_CONTAINER_WARN=1`. See the `untyped` example.
+
 **`dict` has two forms.** A general dict is a first-class runtime value
 (`T_DICT`): an insertion-ordered array of boxed key/value `obj`s with linear
 `obj_eq` lookup, so keys/values may mix scalar types. It supports literals and

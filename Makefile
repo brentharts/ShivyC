@@ -154,6 +154,7 @@ rpython:
 	run $(RPY)/sets/app.py 35 ""; \
 	run $(RPY)/dictops/app.py 186 ""; \
 	run $(RPY)/wordfreq/app.py 93 ""; \
+	run $(RPY)/untyped/app.py 41 ""; \
 	runm 38 $(RPY)/multifile/app.py $(RPY)/multifile/geom.py; \
 	runm 45 $(RPY)/ambig/app.py $(RPY)/ambig/node_a.py $(RPY)/ambig/node_b.py; \
 	runm 55 $(RPY)/fieldwrite/app.py $(RPY)/fieldwrite/lib.py; \
