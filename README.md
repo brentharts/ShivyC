@@ -318,8 +318,10 @@ fields), `dynattr/` (compiled `getattr`/`setattr` on a struct by runtime key —
 an inline first-character type switch, no dict and no bridge), `rtattr/`
 (`getattr`/`setattr` by runtime key on a *polymorphic* object held as a tagged
 `obj`, dispatched through a per-type field table by the `rt_getattr`/`rt_setattr`
-runtime helpers — again no micropython bridge), `io/`, `net/`,
-and `mandelbrot/`. Run them all with `make rpython`.
+runtime helpers — again no micropython bridge), `crossattr/` (cross-class field
+discovery: attributes a configurator stamps onto another class via
+`obj.attr =`/`setattr` are promoted to real slots so the writes persist),
+`io/`, `net/`, and `mandelbrot/`. Run them all with `make rpython`.
 
 ---
 

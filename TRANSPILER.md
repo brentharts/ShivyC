@@ -215,10 +215,22 @@ references (`getattr(some_imported_module, attr)`) are excluded — a module is 
 an object value — and fall back to the default.
 
 The table is built from a class's *declared* fields (those assigned on `self`).
-An attribute only ever added from outside the class has no slot, so `rt_getattr`
-returns the default and `rt_setattr` is a no-op for it; giving such cross-class
-dynamic attributes real storage would require discovering them at their (often
-untyped) assignment sites and promoting them to declared fields.
+An attribute that is instead written through a *different* receiver — a
+configurator doing `target.attr = …` or `setattr(target, "attr", …)` — is also
+captured, **provided the receiver's class is statically known**: from a
+`var = Cls()` binding or a parameter annotation (`target: "Widget"`). A pre-pass
+(`discover_fields_from_ctor_locals`) walks top-level functions and method bodies,
+and promotes each such `attr` to an `obj` field on the receiver's class, which
+its subclasses then inherit. This is what lets a cross-class dynamic write land
+in a real slot instead of being dropped by `rt_setattr` — see the `crossattr`
+example.
+
+Two cases remain out of reach. A receiver that stays an untyped `obj` at the
+write site gives no class to attribute the field to. And a discovered field is
+typed as the generic `obj` word, which is correct for scalars and dynamic values
+but conflicts if that same attribute is elsewhere read as a *typed object
+pointer*; giving it a concrete type would require inferring the assigned value's
+type at the discovery site.
 
 
 ## 5. `isinstance` narrowing — blocks and `and`-chains
