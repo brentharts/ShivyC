@@ -84,6 +84,18 @@ the constructor's C parameter type: `int`->`AS_INT`, `bool`->`truthy`,
 `switch` is now integer-promoted, so `switch` on a one-byte tag -- e.g. inside
 `truthy` -- compares correctly.)
 
+**More container/number builtins.** `bool(x)` yields a normalized 0/1 value (not
+just a truthy-in-context expression); `[x]*n` / `n*[x]` repeat a list; `divmod`,
+`list.count`, and `list.reverse` are supported (reverse was previously a silent
+no-op). Slices take a step, including negative (`xs[::-1]`, `xs[::2]`,
+`xs[a:b:c]`), via `py_slice_step`.
+
+*Known divergences from CPython:* integer `//` and `%` use C truncation, so for
+negative operands the sign differs from Python's floored result (e.g. `-7 % 3` is
+`-1`, not `2`); and `|` / `&` on sets are not set union/intersection (sets share
+the list representation, so those operators stay bitwise). Avoid relying on
+either in rpython sources.
+
 **Set literals de-duplicate.** A `{a, b, ...}` literal lowers to `set_from`,
 which is `list_from` minus elements already present (by `obj_eq`), so
 `len({1, 1, 2})` is 2. (Sets are still backed by the list representation.)
