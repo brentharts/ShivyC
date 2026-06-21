@@ -315,7 +315,10 @@ and the `--pdf` memory report), `multifile/`, `ambig/`, and `fieldwrite/`
 (multi-file programs: cross-module calls, same-named classes module-qualified
 into distinct structs, and cross-module writes into None-initialised `obj`
 fields), `dynattr/` (compiled `getattr`/`setattr` on a struct by runtime key —
-an inline first-character type switch, no dict and no bridge), `io/`, `net/`,
+an inline first-character type switch, no dict and no bridge), `rtattr/`
+(`getattr`/`setattr` by runtime key on a *polymorphic* object held as a tagged
+`obj`, dispatched through a per-type field table by the `rt_getattr`/`rt_setattr`
+runtime helpers — again no micropython bridge), `io/`, `net/`,
 and `mandelbrot/`. Run them all with `make rpython`.
 
 ---

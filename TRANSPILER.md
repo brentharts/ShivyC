@@ -174,6 +174,53 @@ the field is mangled to `signed_` by `cname`, which rewrites C keywords and
 runtime type names.)
 
 
+### Bridge-free dynamic attribute access — `rt_getattr` / `rt_setattr`
+
+The downcast above resolves an attribute *statically*, when the field's owner can
+be proven. When it cannot — a `getattr(obj, key, default)` / `setattr(obj, key,
+val)` whose key is computed at runtime, or whose receiver is a tagged Tier-2
+`obj` of unknown concrete type — the access is dispatched at runtime through a
+**per-type field table**, with no micropython core involved.
+
+Every object-model class already carries a `TypeInfo` (reached via the `Obj`
+header's `type` pointer). Each `TypeInfo` additionally points at a `FieldDesc`
+array describing the class's fields — a name, a byte offset, and a 1-char storage
+code:
+
+```c
+typedef struct FieldDesc { const char* name; long off; char tc; } FieldDesc;
+/*  i=int  l=long  b=bool  d=double  f=float  s=char*  o=obj  p=Obj*  */
+
+static const FieldDesc ILValue__fields[] = {
+    { "ctype",   offsetof(ILValue, ctype),   'p' },
+    { "literal", offsetof(ILValue, literal), 'o' },
+    { NULL, 0, 0 }
+};
+```
+
+`rt_getattr(recv, name, dflt)` casts `recv`'s `TypeInfo` to the shared
+`TypeInfoHdr` (whose first three members — `name`, `base`, `fields` — are common
+to every module's `TypeInfo`), walks the field table and the base chain, and on a
+name match reads the field directly at its offset and boxes it per the storage
+code; an absent field yields `dflt`. `rt_setattr` is the mirror: unbox and store.
+Both live in `shivyc_rt.c`, so a program that uses only object-model dynamic
+attributes **links without the micropython bridge** (`mp_getattr` lives in the
+separate bridge translation unit and is only emitted for stdlib-porting mode).
+
+The two lowerings are complementary: when the receiver's *static* struct type is
+known the transpiler inlines the field-selection `switch` at the call site (see
+the `dynattr` example); when it is a boxed `obj` it emits an `rt_getattr` /
+`rt_setattr` call against the runtime field table (the `rtattr` example). Module
+references (`getattr(some_imported_module, attr)`) are excluded — a module is not
+an object value — and fall back to the default.
+
+The table is built from a class's *declared* fields (those assigned on `self`).
+An attribute only ever added from outside the class has no slot, so `rt_getattr`
+returns the default and `rt_setattr` is a no-op for it; giving such cross-class
+dynamic attributes real storage would require discovering them at their (often
+untyped) assignment sites and promoting them to declared fields.
+
+
 ## 5. `isinstance` narrowing — blocks and `and`-chains
 
 `isinstance` is the front end's main type discriminator, so narrowing it well
