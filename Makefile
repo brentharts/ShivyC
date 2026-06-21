@@ -155,6 +155,7 @@ rpython:
 	run $(RPY)/dictops/app.py 186 ""; \
 	run $(RPY)/wordfreq/app.py 93 ""; \
 	run $(RPY)/untyped/app.py 41 ""; \
+	run $(RPY)/promote/app.py 70 ""; \
 	runm 38 $(RPY)/multifile/app.py $(RPY)/multifile/geom.py; \
 	runm 45 $(RPY)/ambig/app.py $(RPY)/ambig/node_a.py $(RPY)/ambig/node_b.py; \
 	runm 55 $(RPY)/fieldwrite/app.py $(RPY)/fieldwrite/lib.py; \
@@ -195,6 +196,34 @@ testfast:
 	report "multi (cross-module)" $$orc $$sx $$cc; \
 	if [ $$fail = 0 ]; then echo "testfast: PASS"; \
 	else echo "testfast: FAIL"; fi; exit $$fail
+
+# ---------------------------------------------------------------------------
+# Promotion behavior-preservation check: compile a set of container-heavy
+# programs with PY2C_PROMOTE_CONTAINERS=1 (auto-promote inferred containers to
+# the unboxed typed form) and require the result to still match CPython. This
+# guards that promotion never changes observable behavior.
+#     make testpromote
+testpromote:
+	@mkdir -p $(FASTBIN)
+	@fail=0; \
+	chk() { src=$$1; cpy=`python3 $$src >/dev/null 2>&1; echo $$?`; \
+	  d=$(FASTBIN)/promo_`basename $$src .py`; rm -rf $$d; mkdir -p $$d; \
+	  if ! PY2C_PROMOTE_CONTAINERS=1 python3 tools/py2c.py $$src --out $$d >/dev/null 2>&1; then \
+	    echo "  FAIL(transpile) $$src"; fail=1; return; fi; \
+	  python3 -c "import sys;sys.path.insert(0,'tools');import py2c;py2c.write_runtime('$$d')" >/dev/null 2>&1; \
+	  if ! gcc -std=c99 -I$$d $$d/*.c -o $$d/bin 2>/dev/null; then \
+	    echo "  FAIL(gcc) $$src"; fail=1; return; fi; \
+	  got=`timeout 30 $$d/bin >/dev/null 2>&1; echo $$?`; \
+	  n=`PY2C_PROMOTE_CONTAINERS=1 python3 tools/py2c.py $$src --out $$d 2>&1 >/dev/null | grep -c promoted`; \
+	  if [ "$$got" = "$$cpy" ]; then echo "  ok    $$src (==$$cpy, $$n promoted)"; \
+	  else echo "  FAIL  $$src (promoted=$$got, cpython=$$cpy)"; fail=1; fi; }; \
+	chk $(FAST)/syntax_core.py; \
+	chk $(RPY)/promote/app.py; \
+	chk $(RPY)/dictops/app.py; \
+	chk $(RPY)/wordfreq/app.py; \
+	chk $(RPY)/untyped/app.py; \
+	if [ $$fail = 0 ]; then echo "testpromote: PASS"; \
+	else echo "testpromote: FAIL"; fi; exit $$fail
 
 # ---------------------------------------------------------------------------
 # Benchmarks: whole-program SIMD vs gcc -O0/-O2, memory-safety table, etc.
@@ -355,7 +384,7 @@ run-irq: baremetal-irq
 self:
 	cd tools && pypy3 py2c.py
 
-.PHONY: default test testfast shim install clean baremetal baremetal-hello \
+.PHONY: default test testfast testpromote shim install clean baremetal baremetal-hello \
         selfhost selfhost_objcore selfhost_bench selfhost_coverage \
         selfhost_coverage_musl selfhost_link \
         rpython benchmarks \

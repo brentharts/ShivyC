@@ -94,6 +94,17 @@ no-op). Slices take a step, including negative (`xs[::-1]`, `xs[::2]`,
 negative operands the sign differs from Python's floored result (e.g. `-7 % 3` is
 `-1`, not `2`). Avoid relying on it in rpython sources.
 
+**Opt-in promotion to the unboxed form.** With `PY2C_PROMOTE_CONTAINERS=1`,
+an unannotated empty `list`/`dict` whose element (or key/value) types infer to a
+single scalar, and whose every use is supported by the typed form, is rewritten
+to the unboxed `list[int]` / `dict[str,int]` representation automatically (the
+inference even sees through the self-referential read in the `d[k] = d[k] + 1`
+counter idiom). It is conservative: any escape (return, pass as arg, alias,
+store-in-container), unsupported method, slice, or negative index leaves the
+container boxed, and promotion never changes observable behavior. Off by default;
+`make testpromote` checks behavior-preservation against CPython. See the
+`promote` example.
+
 **Untyped containers are inferred and advised.** An unannotated empty
 container (`x = {}` / `[]` / `set()`) compiles to a boxed container and works as
 written. The transpiler also infers its element (or key/value) type from use --
