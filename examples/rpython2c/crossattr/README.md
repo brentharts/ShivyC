@@ -1,4 +1,4 @@
-# crossattr — cross-class field discovery
+# crossattr — cross-class field discovery (with type inference)
 
 A configurator class often stamps attributes onto instances of *another* class
 that the other class never declares on `self`. In Python the attribute simply
@@ -12,44 +12,39 @@ and `attr` is not already declared, `attr` is promoted to a field on that class
 (and is therefore inherited by its subclasses). The pass walks top-level
 functions and method bodies alike.
 
+## Inferring the slot's type
+
+A discovered field defaults to the generic `obj` word, which safely holds a
+scalar or any dynamic value. But when **every** write to that field assigns a
+direct constructor result of one local class, the field takes that concrete
+pointer type instead:
+
 ```python
-class Widget:
-    def __init__(self, width: int):
-        self.width = width                  # the only declared field
-
-class Button(Widget):                       # inherits discovered fields too
-    ...
-
-def configure(target: "Widget"):            # annotation pins the receiver type
-    setattr(target, "margin", 8)            # -> 'margin' promoted onto Widget
-    target.padding = 4                      # -> 'padding' promoted onto Widget
-    target.visible = 1
+def configure(target: "Widget"):
+    setattr(target, "margin", 8)        # scalar -> `obj margin;`
+    target.visible = 1                  # scalar -> `obj visible;`
+    target.style = Style(3)             # ctor   -> `Style* style;`
 ```
 
-After the pass, `Widget` (and `Button`) carry `margin`, `padding`, and `visible`
-as real fields, complete with `FieldDesc` table entries — so the writes land in
-slots and a later `getattr(b, "margin", -1)` reads them back through
-`rt_getattr`. CPython, `gcc`, and ShivyCX-self-compiled all exit **112**.
-
-This closes the correctness gap left by the field-table mechanism on its own: a
-cross-class dynamic *write* to an undeclared attribute would otherwise be lost
-(`rt_setattr` is a no-op for a name with no slot), and on a *typed* receiver it
-would not even compile (there is no slot and no micropython bridge to absorb it).
+So `Widget` (and `Button`) gain `margin`/`visible` as `obj` fields and `style`
+as a real `Style*`. The typed slot can then be used as a pointer —
+`b.style.inset()` compiles to a **direct** `Style_inset(b->style)` call, not a
+dynamic dispatch — while the `obj` slots round-trip through `rt_getattr`. Any
+disagreement between write sites, or any non-constructor value, falls back to
+`obj`. CPython, `gcc`, and ShivyCX-self-compiled all exit **114**.
 
 ## Run
 
 ```
-python3 examples/rpython2c/crossattr/app.py ; echo $?                       # 112
+python3 examples/rpython2c/crossattr/app.py ; echo $?                       # 114
 python3 -m shivyc.main --no-cache examples/rpython2c/crossattr/app.py -o /tmp/ca
-/tmp/ca ; echo $?                                                           # 112
+/tmp/ca ; echo $?                                                           # 114
 ```
 
 ## Limitation
 
-Discovered fields are typed as the generic `obj` word, which is right for scalars
-and dynamically-typed values but conflicts if the same attribute is elsewhere
-accessed as a *typed object pointer* (e.g. a field holding a specific class
-instance that is then used for member access). Giving those their concrete type
-requires inferring the assigned value's type at the discovery site, which this
-pass does not yet attempt. Receivers that stay untyped (`obj`) at the write site
-are also out of reach — the class to attribute the field to is unknown there.
+Two cases stay out of reach. A receiver that remains an untyped `obj` at the
+write site gives no class to attribute the field to. And the type inference only
+fires for a *direct local-class constructor* on the right-hand side — a value
+reached indirectly (e.g. `target.layout = self.layout`, where `self.layout`'s
+own type is not itself a known class pointer) still lands as `obj`.
