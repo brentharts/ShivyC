@@ -111,6 +111,24 @@ def strings() -> int:
     return len(greet) + len(pct) + len(fs)   # 5 + 5 + 6 = 16
 
 
+def builtins_and_slices() -> int:
+    total = 0
+    xs = [1, 2, 3, 4, 5]
+    total += xs[::-1][0]               # reverse slice -> 5
+    total += len(xs[::2])             # step slice [1,3,5] -> 3  (8)
+    total += sum(xs[1:4])             # [2,3,4] -> 9            (17)
+    buf = [0] * 4                     # list repetition
+    total += len(buf)                 # 4                       (21)
+    ys = [3, 1, 2, 1, 3]
+    total += ys.count(1)              # 2                       (23)
+    ys.reverse()
+    total += ys[0]                    # 3                       (26)
+    q, r = divmod(23, 5)              # (4, 3)
+    total += q * 10 + r               # 43                      (69)
+    total += int(bool(7)) + int(bool(0))   # 1 + 0             (70)
+    return total                      # 70
+
+
 def main() -> int:
     total = 0
     total += fib(10)                  # 55
@@ -130,6 +148,7 @@ def main() -> int:
     total += control_flow()           # 10
     total += containers()             # 67
     total += strings()                # 16
+    total += builtins_and_slices()    # 70
     return total % 200                # keep < 256
 
 
