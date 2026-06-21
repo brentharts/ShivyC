@@ -47,6 +47,28 @@ def m_fill(o: "f64*", n) -> None:
         i = i + 1
 
 
+def f_sigmoid(x: "f64*", o: "f64*", n) -> None:
+    o[:n] = 1.0 / (1.0 + exp(-x))     # transcendental fusion (libm)
+
+
+def m_sigmoid(x: "f64*", o: "f64*", n) -> None:
+    i = 0
+    while i < n:
+        o[i] = 1.0 / (1.0 + exp(-x[i]))
+        i = i + 1
+
+
+def f_rms(x: "f64*", y: "f64*", o: "f64*", n) -> None:
+    o[:n] = sqrt(x * x + y * y)       # libm sqrt fused with arithmetic
+
+
+def m_rms(x: "f64*", y: "f64*", o: "f64*", n) -> None:
+    i = 0
+    while i < n:
+        o[i] = sqrt(x[i] * x[i] + y[i] * y[i])
+        i = i + 1
+
+
 def diffcount(a: "f64*", b: "f64*", n) -> int:
     d = 0
     i = 0
@@ -76,6 +98,10 @@ def main() -> int:
     f_mask(x, fo, N); m_mask(x, mo, N)
     bad = bad + diffcount(fo, mo, N)
     f_fill(fo, N); m_fill(mo, N)
+    bad = bad + diffcount(fo, mo, N)
+    f_sigmoid(x, fo, N); m_sigmoid(x, mo, N)
+    bad = bad + diffcount(fo, mo, N)
+    f_rms(x, y, fo, N); m_rms(x, y, mo, N)
     bad = bad + diffcount(fo, mo, N)
     return bad                         # 0 iff all fused kernels match manual
 
