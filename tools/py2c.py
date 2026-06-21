@@ -5549,6 +5549,10 @@ class Transpiler:
 
     def func_def(self, node):
         self.enter_scope(node, skip_self=False)
+        try:
+            self._analyze_untyped_containers(node)
+        except Exception:
+            pass        # advisory only: never let analysis break compilation
         ret = self._ret_ctype(node.returns)
         self.cur_ret = ret
         if self._uses_argv(node):
@@ -5573,6 +5577,214 @@ class Transpiler:
         self.emit_hoisted_body(body)
         self.indent -= 1
         self.emit("}")
+
+    # ---- untyped-container inference + rpython-rule warnings -------------
+
+    def _warn(self, line, msg):
+        """Emit an rpython advisory to stderr (never affects generated code)."""
+        if getattr(self, "_no_warn", False) or \
+                os.environ.get("PY2C_NO_CONTAINER_WARN"):
+            return
+        where = "%s:%s" % (getattr(self, "src_name", "?"), line)
+        sys.stderr.write("rpython: %s: %s\n" % (where, msg))
+
+    def _empty_container_kind(self, node):
+        """'dict'/'list'/'set' if node is an empty container constructor."""
+        if isinstance(node, ast.Dict) and not node.keys:
+            return "dict"
+        if isinstance(node, ast.List) and not node.elts:
+            return "list"
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id == "dict" and not node.args:
+                return "dict"
+            if node.func.id == "list" and not node.args:
+                return "list"
+            if node.func.id in ("set", "frozenset") and not node.args:
+                return "set"
+        return None
+
+    def _lit_type(self, node):
+        """Coarse element-type inference for a value expression: one of
+        'int'/'float'/'bool'/'str'/'None'/'obj' ('obj' == unknown/boxed)."""
+        if isinstance(node, ast.Constant):
+            v = node.value
+            if isinstance(v, bool):
+                return "bool"
+            if isinstance(v, int):
+                return "int"
+            if isinstance(v, float):
+                return "float"
+            if isinstance(v, str):
+                return "str"
+            if v is None:
+                return "None"
+            return "obj"
+        if isinstance(node, ast.Name):
+            t = getattr(self, "_infer_locals", {}).get(node.id)
+            if t:
+                return t
+            ct = self.scope.get(node.id)
+            return {"int": "int", "long": "int", "bool": "bool",
+                    "double": "float", "float": "float",
+                    "char*": "str"}.get(ct, "obj")
+        if isinstance(node, (ast.Compare, ast.BoolOp)):
+            return "bool"
+        if isinstance(node, ast.BinOp):
+            lt, rt = self._lit_type(node.left), self._lit_type(node.right)
+            if "str" in (lt, rt):
+                return "str"
+            if "float" in (lt, rt):
+                return "float"
+            if lt == "int" and rt == "int":
+                return "int"
+            return "obj"
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            fn = node.func.id
+            if fn in ("int", "len", "ord", "abs", "hash"):
+                return "int"
+            if fn in ("str", "chr", "repr", "input"):
+                return "str"
+            if fn == "float":
+                return "float"
+            if fn == "bool":
+                return "bool"
+            if fn in self.classes or fn in self.xclasses:
+                return "obj"      # a class instance
+        if isinstance(node, ast.Call) and \
+                isinstance(node.func, ast.Attribute) and \
+                node.func.attr == "get" and len(node.args) == 2:
+            return self._lit_type(node.args[1])     # d.get(k, default)
+        return "obj"
+
+    @staticmethod
+    def _ann_for(kind, key, val):
+        """Suggested rpython annotation string for an inferred container."""
+        if kind == "dict":
+            return "dict[%s, %s]" % (key, val)
+        return "%s[%s]" % (kind, val)
+
+    def _analyze_untyped_containers(self, fndef):
+        """Infer key/value (element) types of *unannotated* empty containers
+        from their use, and warn so the user can adapt to the rpython rules.
+        Purely advisory: the generated code is unchanged (boxed containers)."""
+        annotated = set()
+        for n in ast.walk(fndef):
+            if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name):
+                annotated.add(n.target.id)
+        decls = {}     # name -> (kind, lineno)
+        for stmt in fndef.body:
+            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 \
+                    and isinstance(stmt.targets[0], ast.Name):
+                kind = self._empty_container_kind(stmt.value)
+                if kind and stmt.targets[0].id not in annotated:
+                    decls.setdefault(stmt.targets[0].id, (kind, stmt.lineno))
+        if not decls:
+            return
+        # Lightweight local typing: for-loop variables over range()/strings/
+        # homogeneous literals, and simple scalar assignments. Used to infer
+        # element types from loop bodies (e.g. `for i in range(n): xs.append(i)`).
+        locals_t = {}
+        for n in ast.walk(fndef):
+            if isinstance(n, ast.For) and isinstance(n.target, ast.Name):
+                et = self._iter_elem_type(n.iter)
+                if et != "obj":
+                    locals_t[n.target.id] = et
+        self._infer_locals = locals_t
+        for n in ast.walk(fndef):
+            if isinstance(n, ast.Assign) and len(n.targets) == 1 and \
+                    isinstance(n.targets[0], ast.Name):
+                t = self._lit_type(n.value)
+                if t not in ("obj", "None"):
+                    locals_t.setdefault(n.targets[0].id, t)
+        info = {nm: {"kind": k, "line": ln, "keys": set(), "vals": set()}
+                for nm, (k, ln) in decls.items()}
+        for n in ast.walk(fndef):
+            if isinstance(n, ast.Assign):
+                for tgt in n.targets:
+                    if isinstance(tgt, ast.Subscript) and \
+                            isinstance(tgt.value, ast.Name) and \
+                            tgt.value.id in info:
+                        d = info[tgt.value.id]
+                        if d["kind"] == "dict":
+                            d["keys"].add(self._lit_type(tgt.slice))
+                        d["vals"].add(self._lit_type(n.value))
+            elif isinstance(n, ast.Call) and \
+                    isinstance(n.func, ast.Attribute) and \
+                    isinstance(n.func.value, ast.Name) and \
+                    n.func.value.id in info and n.args:
+                d = info[n.func.value.id]
+                if n.func.attr in ("append", "add"):
+                    d["vals"].add(self._lit_type(n.args[0]))
+        for nm, d in info.items():
+            self._warn_container(nm, d)
+        self._infer_locals = {}
+
+    def _iter_elem_type(self, node):
+        """Coarse element type of an iterable used in `for x in <node>`."""
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id == "range":
+            return "int"
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return "str"
+        if isinstance(node, (ast.List, ast.Set, ast.Tuple)) and node.elts:
+            ts = {self._lit_type(e) for e in node.elts}
+            ts.discard("None")
+            if len(ts) == 1:
+                return next(iter(ts))
+        return "obj"
+
+    def _warn_container(self, nm, d):
+        kind, line = d["kind"], d["line"]
+        vals = d["vals"] - {"None"}        # None alone doesn't pin a type
+        keys = d.get("keys", set()) - {"None"}
+        had_none = "None" in d["vals"]
+        if not vals:
+            vt = "obj" if had_none else None
+        elif len(vals) == 1:
+            vt = next(iter(vals))
+        else:
+            vt = "MIXED"
+        kt = None
+        if kind == "dict":
+            if not keys:
+                kt = None
+            elif len(keys) == 1:
+                kt = next(iter(keys))
+            else:
+                kt = "MIXED"
+
+        if vt is None and kt is None:
+            self._warn(line, "untyped %s '%s' has no observed use; it stays a "
+                       "boxed container. Annotate it (e.g. %s: \"%s\") for the "
+                       "unboxed fast path." % (
+                           kind, nm, nm, self._ann_for(kind, "str", "int")))
+            return
+        if vt == "MIXED" or kt == "MIXED":
+            parts = []
+            if kt == "MIXED":
+                parts.append("key types " + ", ".join(sorted(keys)))
+            if vt == "MIXED":
+                parts.append("value types " + ", ".join(sorted(vals)))
+            self._warn(line, "%s '%s' mixes %s; rpython containers should be "
+                       "homogeneous, so it stays boxed (obj). Use one element "
+                       "type, or keep it boxed intentionally." % (
+                           kind, nm, " and ".join(parts)))
+            return
+        vt = vt or "obj"
+        if kind == "dict":
+            kt = kt or "obj"
+            ann = self._ann_for("dict", kt, vt)
+        else:
+            ann = self._ann_for(kind, None, vt)
+        extra = " (value is None/object)" if had_none and vt == "obj" else ""
+        if vt == "obj" or (kind == "dict" and kt == "obj"):
+            self._warn(line, "%s '%s' looks like %s%s and stays boxed; that is "
+                       "fine, but a scalar element type would compile to an "
+                       "unboxed %s." % (kind, nm, ann, extra, kind))
+        else:
+            self._warn(line, "%s '%s' looks like %s; annotate it as %s: \"%s\" "
+                       "to get the unboxed fast path." % (
+                           kind, nm, ann, nm, ann))
 
     def emit_body(self, body):
         if not body:
@@ -9545,8 +9757,10 @@ def transpile_file(path, out_dir, stdlib_dir=None):
     try:
         pod_ok = stdlib_root is None and \
             "shivyc" not in os.path.abspath(path).split(os.sep)
-        out = Transpiler(modname, base_dir, stdlib_root=stdlib_root,
-                         py_modname=py_mod, pod_classes=pod_ok).run(tree)
+        _t = Transpiler(modname, base_dir, stdlib_root=stdlib_root,
+                        py_modname=py_mod, pod_classes=pod_ok)
+        _t.src_name = os.path.basename(path)
+        out = _t.run(tree)
     except Unsupported as e:
         print("  FAIL %s: %s" % (path, e))
         return None, str(e)
