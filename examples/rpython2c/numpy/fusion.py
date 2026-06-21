@@ -14,7 +14,8 @@ No language changes are needed (unlike Codon's `@par` / `@gpu.kernel`): `out[:] 
 expr` and `out[:n] = expr` are ordinary NumPy in-place stores. Supported leaves
 are native scalar arrays (`f64*`, `f32*`, `i32*`, fixed-size `T[N]`) and scalars;
 supported ops are `+ - * / **`, comparisons, unary `-`, and the libm ufuncs
-(`sqrt`, `exp`, `sin`, ...). Set `PY2C_NPFUSE_VERBOSE=1` to print each fused
+(`sqrt`, `exp`, `sin`, ...), which now resolve under the ShivyCX self-backend
+as well as gcc. Set `PY2C_NPFUSE_VERBOSE=1` to print each fused
 expression and its cost (mirroring Codon's `-npfuse-verbose`).
 
 This program builds a grid, computes the unit-circle membership mask two ways --
@@ -33,6 +34,17 @@ def manual_mask(x: "f64*", y: "f64*", out: "f64*", n) -> None:
         dx = x[i] - 1.0
         dy = y[i] - 1.0
         out[i] = float(dx * dx + dy * dy < 1.0)
+        i = i + 1
+
+
+def fused_dist(x: "f64*", y: "f64*", out: "f64*", n) -> None:
+    out[:n] = sqrt(x * x + y * y)                        # libm sqrt, fused
+
+
+def manual_dist(x: "f64*", y: "f64*", out: "f64*", n) -> None:
+    i = 0
+    while i < n:
+        out[i] = sqrt(x[i] * x[i] + y[i] * y[i])
         i = i + 1
 
 
@@ -55,6 +67,14 @@ def main() -> int:
     while i < N:
         inside = inside + int(mf[i])
         if int(mf[i]) != int(mm[i]):
+            mism = mism + 1
+        i = i + 1
+    # transcendental fusion (sqrt) -- now resolves under the ShivyCX backend too
+    fused_dist(x, y, mf, N)
+    manual_dist(x, y, mm, N)
+    i = 0
+    while i < N:
+        if int(mf[i] * 1e6) != int(mm[i] * 1e6):
             mism = mism + 1
         i = i + 1
     if mism != 0:

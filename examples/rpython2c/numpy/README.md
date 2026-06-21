@@ -252,6 +252,15 @@ are `+ - * / % **`, the comparisons, bitwise ops, unary `-`, and the libm ufuncs
 expanded to repeated multiplies (so they vectorize and need no `ipow`); other
 powers use `pow`. A pure-scalar right-hand side broadcasts (`out[:n] = 7.0`).
 
+The libm ufuncs resolve under **both** gcc and the ShivyCX self-backend. ShivyCX
+has no system headers and `shivyc_rt.h` does not pull in `<math.h>`, so a bare
+`exp`/`sqrt`/... was previously an *undeclared identifier* in any function that
+also touched the runtime (the prototype was only re-supplied for pure kernels
+that dropped the runtime header). `shivyc/main.py` now injects the needed libm
+prototypes (`_libm_protos`, used by both the runtime and pure-kernel paths)
+whenever a math function is referenced, so transcendental fused kernels -- and
+ordinary hand-written `exp`/`sqrt` loops -- compile under the self-backend too.
+
 Set `PY2C_NPFUSE_VERBOSE=1` to print each fused expression with the cost the
 analysis assigned it (mirroring Codon's `-npfuse-verbose`); the per-op weights
 match Codon's model (`+ - *` = 1, `/ % **` = 8, `sqrt` = 2, `exp/log` = 5,
@@ -265,6 +274,6 @@ echo $?      # 97  (unit-circle membership count; fused result == manual loop)
 ```
 
 `make testfuse` builds `fusion.py` and `tests/fast/fuse_kernels.py` (saxpy,
-polynomial, mask and broadcast-fill kernels, each checked against an explicit
-manual loop) through both gcc and the ShivyCX self-backend and requires every
-fused result to match its manual twin.
+polynomial, mask, broadcast-fill, plus the `sigmoid`/`sqrt` transcendental
+kernels, each checked against an explicit manual loop) through both gcc and the
+ShivyCX self-backend and requires every fused result to match its manual twin.
