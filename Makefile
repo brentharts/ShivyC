@@ -130,6 +130,7 @@ rpython:
 	run $(RPY)/numpy/simd_kernels.py 55 ""; \
 	run $(RPY)/numpy/simd_blas.py   186 ""; \
 	run $(RPY)/numpy/ufuncs.py       49 ""; \
+	run $(RPY)/numpy/fusion.py       97 ""; \
 	run $(RPY)/numpy/matmul.py      239 ""; \
 	run $(RPY)/nn/neural_net.py     199 ""; \
 	run $(RPY)/nbody/nbody.py        11 ""; \
@@ -268,6 +269,31 @@ testpgo:
 	chku $(RPY)/pgo/app.py; \
 	if [ $$fail = 0 ]; then echo "testpgo: PASS"; \
 	else echo "testpgo: FAIL"; fi; exit $$fail
+
+# ---------------------------------------------------------------------------
+# NumPy operator-fusion check: a whole-array `out[:]=expr` store lowers to ONE
+# loop with no array temporaries. Each fused kernel is checked against an
+# explicit manual loop (self-validating sources return 0 on agreement), built
+# through both gcc and the ShivyCX self-backend.
+#     make testfuse
+testfuse:
+	@mkdir -p $(FASTBIN)
+	@fail=0; \
+	gccbuild() { src=$$1; d=$(FASTBIN)/fuse_`basename $$src .py`; rm -rf $$d; mkdir -p $$d; \
+	  if ! python3 tools/py2c.py $$src --out $$d >/dev/null 2>&1; then echo ERR; return; fi; \
+	  python3 -c "import sys;sys.path.insert(0,'tools');import py2c;py2c.write_runtime('$$d')" >/dev/null 2>&1; \
+	  if ! gcc -std=c99 -I$$d $$d/*.c -o $$d/bin -lm 2>/dev/null; then echo ERR; return; fi; \
+	  timeout 30 $$d/bin >/dev/null 2>&1; echo $$?; }; \
+	sxbuild() { src=$$1; out=$(FASTBIN)/fusesx_`basename $$src .py`; \
+	  if ! python3 -m shivyc.main --no-cache $$src -o $$out >/dev/null 2>&1; then echo ERR; return; fi; \
+	  timeout 30 $$out >/dev/null 2>&1; echo $$?; }; \
+	chk() { src=$$1; exp=$$2; g=`gccbuild $$src`; s=`sxbuild $$src`; \
+	  if [ "$$g" = "$$exp" ] && [ "$$s" = "$$exp" ]; then echo "  ok    $$src (gcc==shivycx==$$exp)"; \
+	  else echo "  FAIL  $$src (gcc=$$g shivycx=$$s, expected $$exp)"; fail=1; fi; }; \
+	chk $(FAST)/fuse_kernels.py 0; \
+	chk $(RPY)/numpy/fusion.py 97; \
+	if [ $$fail = 0 ]; then echo "testfuse: PASS"; \
+	else echo "testfuse: FAIL"; fi; exit $$fail
 
 # ---------------------------------------------------------------------------
 # Benchmarks: whole-program SIMD vs gcc -O0/-O2, memory-safety table, etc.
@@ -428,7 +454,7 @@ run-irq: baremetal-irq
 self:
 	cd tools && pypy3 py2c.py
 
-.PHONY: default test testfast testpromote testpgo shim install clean baremetal baremetal-hello \
+.PHONY: default test testfast testpromote testpgo testfuse shim install clean baremetal baremetal-hello \
         selfhost selfhost_objcore selfhost_bench selfhost_coverage \
         selfhost_coverage_musl selfhost_link \
         rpython benchmarks \
