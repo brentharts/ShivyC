@@ -224,3 +224,47 @@ asserts disappear entirely.
     saxpy    out[i] = s*x[i] + y[i]                   broadcast + mul + add
     fma      out[i] = a[i]*b[i] + c[i]                mul + add
     map      out[i] = sqrt(x[i])                      sqrtps/pd
+
+## Operator fusion (`fusion.py`)
+
+Ported from the good part of Codon's `core-numpy-fusion` pass (minus the C++/LLVM
+machinery and the `@par`/`@gpu.kernel` language changes, which rpython rejects). A
+whole-array elementwise store
+
+```python
+out[:n] = (x - 1.0)**2 + (y - 1.0)**2 < 1.0
+```
+
+lowers to a **single** C loop with **no intermediate array temporaries** --
+operator fusion and memory-allocation elision together. A naive evaluator would
+allocate and traverse a temporary array for each of `x-1`, `(x-1)**2`, `y-1`,
+`(y-1)**2`, the sum and the comparison (six passes, six allocations); the fused
+form makes one pass and allocates nothing. ShivyCX then vectorizes the resulting
+scalar loop.
+
+No language change is involved -- `out[:] = expr` / `out[:n] = expr` are ordinary
+NumPy in-place stores. The fused form is detected when the target is a native
+scalar array (`f64*`, `f32*`, `i32*`, fixed-size `T[N]`) sliced as `out[:]`
+(trip count from a `T[N]` annotation) or `out[:n]` (explicit count, works for raw
+pointers). Supported leaves are native arrays and scalars; supported operators
+are `+ - * / % **`, the comparisons, bitwise ops, unary `-`, and the libm ufuncs
+(`sqrt`, `exp`, `log`, `sin`, `cos`, ...). Small integer powers (`**2`..`**4`) are
+expanded to repeated multiplies (so they vectorize and need no `ipow`); other
+powers use `pow`. A pure-scalar right-hand side broadcasts (`out[:n] = 7.0`).
+
+Set `PY2C_NPFUSE_VERBOSE=1` to print each fused expression with the cost the
+analysis assigned it (mirroring Codon's `-npfuse-verbose`); the per-op weights
+match Codon's model (`+ - *` = 1, `/ % **` = 8, `sqrt` = 2, `exp/log` = 5,
+`sin/cos` = 10, ...). Because py2c emits the fused loop directly rather than going
+through a temp-array runtime, fusion is always a win here, so the cost is
+reported for transparency rather than used to fall back to sequential evaluation.
+
+```
+python3 -m shivyc.main examples/rpython2c/numpy/fusion.py -o fusion && ./fusion
+echo $?      # 97  (unit-circle membership count; fused result == manual loop)
+```
+
+`make testfuse` builds `fusion.py` and `tests/fast/fuse_kernels.py` (saxpy,
+polynomial, mask and broadcast-fill kernels, each checked against an explicit
+manual loop) through both gcc and the ShivyCX self-backend and requires every
+fused result to match its manual twin.
