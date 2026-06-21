@@ -145,6 +145,7 @@ rpython:
 	run $(RPY)/mandelbrot/mandelbrot.py 70 ""; \
 	run $(RPY)/sysinfo/sysinfo.py        7 ""; \
 	run $(RPY)/collections/containers.py 10 ""; \
+	run $(RPY)/dynattr/app.py 126 ""; \
 	runm 38 $(RPY)/multifile/app.py $(RPY)/multifile/geom.py; \
 	runm 45 $(RPY)/ambig/app.py $(RPY)/ambig/node_a.py $(RPY)/ambig/node_b.py; \
 	runm 55 $(RPY)/fieldwrite/app.py $(RPY)/fieldwrite/lib.py; \

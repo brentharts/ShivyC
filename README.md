@@ -314,7 +314,9 @@ POD-vs-object-model comparison), `lists/` and `dicts/` (typed `list[T]` /
 and the `--pdf` memory report), `multifile/`, `ambig/`, and `fieldwrite/`
 (multi-file programs: cross-module calls, same-named classes module-qualified
 into distinct structs, and cross-module writes into None-initialised `obj`
-fields), `io/`, `net/`, and `mandelbrot/`. Run them all with `make rpython`.
+fields), `dynattr/` (compiled `getattr`/`setattr` on a struct by runtime key —
+an inline first-character type switch, no dict and no bridge), `io/`, `net/`,
+and `mandelbrot/`. Run them all with `make rpython`.
 
 ---
 
