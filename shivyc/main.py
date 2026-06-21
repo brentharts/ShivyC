@@ -312,6 +312,30 @@ def process_py_unit(py_files, args):
     return objs
 
 
+def _libm_protos(code):
+    """libm prototypes for the math functions actually referenced in `code`.
+
+    ShivyCX's C11-subset front end has no system headers, and shivyc_rt.h does
+    not pull in <math.h>, so a bare `exp`/`sqrt`/... call is otherwise an
+    undeclared identifier. We re-supply just the prototypes that are used, with
+    the standard signatures (so they are compatible whether or not the runtime
+    header is present)."""
+    protos = []
+    import re
+    if re.search(r"\bsqrt\b", code):
+        protos.append("double sqrt(double);")
+    for fn in ("cbrt", "exp", "exp2", "expm1", "log", "log2", "log10",
+               "log1p", "sin", "cos", "tan", "asin", "acos", "atan",
+               "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "fabs",
+               "floor", "ceil", "round", "trunc"):
+        if re.search(r"\b" + fn + r"\b", code):
+            protos.append("double %s(double);" % fn)
+    for fn in ("pow", "fmod", "fmax", "fmin", "atan2", "hypot", "copysign"):
+        if re.search(r"\b" + fn + r"\b", code):
+            protos.append("double %s(double, double);" % fn)
+    return protos
+
+
 def process_py_file(file, args):
     """Transpile an rpython `.py` to C with tools/py2c.py, then compile it.
 
@@ -360,6 +384,14 @@ def process_py_file(file, args):
             rt_obj = process_c_file(rt_c, args)
             if rt_obj:
                 getattr(args, "_extra_objs", []).append(rt_obj)
+        # shivyc_rt.h supplies the libc prototypes (malloc/printf/...) but not
+        # <math.h>; re-supply any libm prototypes the kernel actually uses so
+        # bare exp/sqrt/... resolve in functions that also touch the runtime.
+        mprotos = _libm_protos(code)
+        if mprotos:
+            code = "\n".join(mprotos) + "\n" + code
+            with open(out_c, "w", encoding="utf-8") as f:
+                f.write(code)
     else:
         # Pure kernel/program: drop the (unused) runtime include so the
         # C11-subset front end compiles it directly, but re-supply the handful
@@ -374,18 +406,7 @@ def process_py_file(file, args):
             prelude.append("void *realloc(void *, unsigned long);")
         if re.search(r"\bprintf\b", code):
             prelude.append("int printf(const char *, ...);")
-        if re.search(r"\bsqrt\b", code):
-            prelude.append("double sqrt(double);")
-        for fn in ("cbrt", "exp", "exp2", "expm1", "log", "log2", "log10",
-                   "log1p", "sin", "cos", "tan", "asin", "acos", "atan",
-                   "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "fabs",
-                   "floor", "ceil", "round", "trunc"):
-            if re.search(r"\b" + fn + r"\b", code):
-                prelude.append("double %s(double);" % fn)
-        for fn in ("pow", "fmod", "fmax", "fmin", "atan2", "hypot",
-                   "copysign"):
-            if re.search(r"\b" + fn + r"\b", code):
-                prelude.append("double %s(double, double);" % fn)
+        prelude.extend(_libm_protos(code))
         if re.search(r"\batoi\b", code):
             prelude.append("int atoi(const char *);")
         for sym, proto in [
