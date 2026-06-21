@@ -5556,6 +5556,10 @@ class Transpiler:
                 if f.id == "getattr" and len(node.args) >= 2 and \
                         isinstance(node.args[1], ast.Constant) and \
                         isinstance(node.args[1].value, str):
+                    ci = self._dyn_struct_ci(node.args[0])
+                    if ci is not None and \
+                            ci.field_ctype(node.args[1].value) is not None:
+                        return ci.field_ctype(node.args[1].value)
                     owner = self.resolve_attr_owner(node.args[1].value)
                     return owner.field_ctype(node.args[1].value) if owner \
                         else OBJ
@@ -7061,6 +7065,18 @@ class Transpiler:
                         ci.field_ctype(node.args[1].value) is None):
                     return self._emit_dynset(node.args[0], ci,
                                              node.args[1], node.args[2])
+            if fn == "getattr" and len(node.args) >= 2 and \
+                    isinstance(node.args[1], ast.Constant) and \
+                    isinstance(node.args[1].value, str):
+                # const key on a statically-typed struct with a declared field:
+                # a direct, unboxed member read (normal coercion boxes it on
+                # demand, matching value_ctype). Absent fields fall through.
+                ci = self._dyn_struct_ci(node.args[0])
+                if ci is not None and \
+                        ci.field_ctype(node.args[1].value) is not None:
+                    return "(%s)->%s" % (
+                        self._class_ptr_expr(node.args[0], ci.name),
+                        cname(node.args[1].value))
             if fn == "hasattr" and len(node.args) == 2 and self.stdlib_root \
                     and isinstance(node.args[1], ast.Constant) \
                     and isinstance(node.args[1].value, str):
@@ -8383,15 +8399,16 @@ class Transpiler:
         sw = self._dyn_switch(
             ci, lambda n, t: "_dr = %s;" % self._dyn_box(t, "_ds->%s" % cname(n)))
         return ("({ %s* _ds = %s; const char* _dk = %s; obj _dr = %s; %s _dr; })"
-                % (ci.csym, self.expr(recv_node), self.as_str(key_node),
-                   dflt, sw))
+                % (ci.csym, self._class_ptr_expr(recv_node, ci.name),
+                   self.as_str(key_node), dflt, sw))
 
     def _emit_dynset(self, recv_node, ci, key_node, val_node):
         sw = self._dyn_switch(
             ci, lambda n, t: "{ _ds->%s = %s; }" % (
                 cname(n), self._dyn_unbox(t, "_dv")))
         return ("({ %s* _ds = %s; const char* _dk = %s; obj _dv = %s; %s "
-                "OBJ_NONE; })" % (ci.csym, self.expr(recv_node),
+                "OBJ_NONE; })" % (ci.csym,
+                                  self._class_ptr_expr(recv_node, ci.name),
                                   self.as_str(key_node),
                                   self.wrap_obj(val_node), sw))
 
