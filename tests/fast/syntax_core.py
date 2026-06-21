@@ -129,6 +129,27 @@ def builtins_and_slices() -> int:
     return total                      # 70
 
 
+def sets() -> int:
+    a = {1, 2, 3, 4}
+    b = {3, 4, 5, 6}
+    total = 0
+    total += len(a | b)               # union {1..6}      -> 6
+    total += len(a & b)               # intersection {3,4} -> 2   (8)
+    total += len(a - b)               # difference {1,2}   -> 2   (10)
+    total += len(a ^ b)               # symdiff {1,2,5,6}  -> 4   (14)
+    if 3 in a:
+        total += 1                    # 15
+    if 9 not in a:
+        total += 1                    # 16
+    s = {7, 7, 8}                     # dedup -> {7,8}
+    s.add(9)                          # {7,8,9}
+    s.discard(8)                      # {7,9}
+    total += len(s)                   # +2                 -> 18
+    if {1, 2} == {2, 1}:              # order-independent equality
+        total += 1                    # 19
+    return total                      # 19
+
+
 def main() -> int:
     total = 0
     total += fib(10)                  # 55
@@ -149,6 +170,7 @@ def main() -> int:
     total += containers()             # 67
     total += strings()                # 16
     total += builtins_and_slices()    # 70
+    total += sets()                   # 19
     return total % 200                # keep < 256
 
 
