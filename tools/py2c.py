@@ -272,6 +272,7 @@ bool dict_contains(obj d, obj k);
 obj  dict_pop(obj d, obj k, obj dflt);
 obj  dict_setdefault(obj d, obj k, obj dflt);
 void dict_update(obj d, obj other);
+obj  pycopy(obj c);                /* shallow copy of a dict / list / set      */
 obj  dict_keys(obj d);
 obj  dict_values(obj d);
 obj  dict_items(obj d);            /* list of [k, v] pairs                     */
@@ -886,6 +887,20 @@ bool obj_eq(obj a, obj b) {
             }
             return true;
         }
+        case T_DICT: {                /* order-independent: same key->value map */
+            Dict* da = (Dict*)a.u.o; Dict* db = (Dict*)b.u.o;
+            if (da->len != db->len) return false;
+            for (int i = 0; i < da->len; i++) {
+                bool found = false;
+                for (int j = 0; j < db->len; j++)
+                    if (obj_eq(da->e[i].key, db->e[j].key)) {
+                        if (!obj_eq(da->e[i].val, db->e[j].val)) return false;
+                        found = true; break;
+                    }
+                if (!found) return false;
+            }
+            return true;
+        }
         default:     return a.u.o == b.u.o;
     }
 }
@@ -958,6 +973,16 @@ void dict_update(obj dd, obj other) {
     if (other.tag != T_DICT) return;
     Dict* o = (Dict*)other.u.o;
     for (int i = 0; i < o->len; i++) dict_set(dd, o->e[i].key, o->e[i].val);
+}
+obj pycopy(obj c) {                 /* shallow copy: dict / list / set */
+    if (c.tag == T_DICT) { obj r = dict_new(); dict_update(r, c); return r; }
+    if (c.tag == T_LIST || c.tag == T_SET) {
+        obj r = list_new(); List* l = (List*)c.u.o;
+        for (int i = 0; i < l->len; i++) list_append(r, l->data[i]);
+        r.tag = c.tag;             /* preserve set-ness */
+        return r;
+    }
+    return c;
 }
 obj dict_keys(obj dd) {
     Dict* d = (Dict*)dd.u.o; obj r = list_new();
@@ -1081,6 +1106,9 @@ obj obj_bin(char op, obj a, obj b) {
         if (op == '|') return set_union(a, b);
         if (op == '&') return set_inter(a, b);
         if (op == '^') return set_symdiff(a, b);
+    }
+    if (a.tag == T_DICT && b.tag == T_DICT && op == '|') {   /* dict merge */
+        obj r = dict_new(); dict_update(r, a); dict_update(r, b); return r;
     }
     long x = as_num(a), y = as_num(b), r = 0;
     switch (op) {
@@ -7688,6 +7716,14 @@ class Transpiler:
                     func.attr not in self.method_owners and \
                     func.attr not in self.xmethod_owners:
                 return "pyclear(%s)" % self.wrap_obj(func.value)
+            if func.attr == "copy" and not node.args and \
+                    func.attr not in self.method_owners and \
+                    func.attr not in self.xmethod_owners and \
+                    not (isinstance(func.value, ast.Name) and
+                         (func.value.id in self.import_alias or
+                          func.value.id == "copy")):
+                # dict/list/set .copy() -> shallow copy (runtime-dispatched).
+                return "pycopy(%s)" % self.wrap_obj(func.value)
             if func.attr == "remove" and len(node.args) == 1 and \
                     func.attr not in self.method_owners:
                 return "list_remove(%s, %s)" % (self.wrap_obj(func.value),
