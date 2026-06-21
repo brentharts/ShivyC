@@ -173,9 +173,21 @@ typedef struct { unsigned char tag; union { long i; str s; Obj* o; double d; } u
    module's TypeInfo as long as {name; base;} are the first two members. */
 struct Obj { const void* type; };
 
+/* Per-type field table for bridge-free dynamic attribute access. Each entry is
+   a field name -> byte offset within the struct + a 1-char storage code:
+     i=int  l=long  b=bool  d=double  f=float  s=char*  o=obj(16B)  p=Obj*
+   The array is terminated by a {NULL,...} sentinel. rt_getattr/rt_setattr walk
+   it (plus the base chain) instead of routing through the micropython core. */
+typedef struct FieldDesc {
+    const char* name;
+    long off;
+    char tc;
+} FieldDesc;
+
 typedef struct TypeInfoHdr {
     const char* name;
     const struct TypeInfoHdr* base;
+    const FieldDesc* fields;
 } TypeInfoHdr;
 
 static inline bool isinstance_of(Obj* o, const void* t) {
@@ -189,6 +201,13 @@ static inline bool isinstance_of(Obj* o, const void* t) {
 
 /* fetch a transpiled value's TypeInfo (cast to the module's TypeInfo type) */
 #define TYPEINFO(T, o) ((const T*)((Obj*)(o))->type)
+
+/* Bridge-free dynamic attribute access on an object-model instance. Walks the
+   receiver type's field table (and base chain); a declared field is read/
+   written directly at its offset. rt_getattr returns `dflt` for an absent
+   field; rt_setattr is a no-op for an absent one. No micropython core. */
+obj  rt_getattr(obj recv, const char* name, obj dflt);
+void rt_setattr(obj recv, const char* name, obj val);
 
 /* ---- first-class functions: a callable obj (T_FUNC) is a closure: a uniform
    function pointer plus a captured-environment obj. All transpiled functions
@@ -1218,6 +1237,56 @@ long pyint(obj v) {
     return 0;
 }
 long pyabs(long x) { return x < 0 ? -x : x; }
+
+/* Bridge-free dynamic attribute access via the per-type FieldDesc tables. */
+obj rt_getattr(obj recv, const char* name, obj dflt) {
+    if (recv.tag != T_OBJ || !recv.u.o) return dflt;
+    const TypeInfoHdr* ti = (const TypeInfoHdr*)recv.u.o->type;
+    char* p = (char*)recv.u.o;
+    for (; ti; ti = ti->base) {
+        const FieldDesc* f = ti->fields;
+        for (; f && f->name; f++) {
+            if (strcmp(f->name, name) != 0) continue;
+            char* a = p + f->off;
+            switch (f->tc) {
+                case 'i': return OBJ_INT(*(int*)a);
+                case 'l': return OBJ_INT(*(long*)a);
+                case 'b': return OBJ_BOOL(*(unsigned char*)a);
+                case 'd': return OBJ_FLOAT(*(double*)a);
+                case 'f': return OBJ_FLOAT(*(float*)a);
+                case 's': return OBJ_STR(*(str*)a);
+                case 'o': return *(obj*)a;
+                case 'p': return OBJ_OBJ(*(void**)a);
+                default:  return dflt;
+            }
+        }
+    }
+    return dflt;
+}
+
+void rt_setattr(obj recv, const char* name, obj val) {
+    if (recv.tag != T_OBJ || !recv.u.o) return;
+    const TypeInfoHdr* ti = (const TypeInfoHdr*)recv.u.o->type;
+    char* p = (char*)recv.u.o;
+    for (; ti; ti = ti->base) {
+        const FieldDesc* f = ti->fields;
+        for (; f && f->name; f++) {
+            if (strcmp(f->name, name) != 0) continue;
+            char* a = p + f->off;
+            switch (f->tc) {
+                case 'i': *(int*)a = (int)AS_INT(val); return;
+                case 'l': *(long*)a = AS_INT(val); return;
+                case 'b': *(unsigned char*)a = (unsigned char)(AS_INT(val) != 0); return;
+                case 'd': *(double*)a = AS_FLOAT(val); return;
+                case 'f': *(float*)a = (float)AS_FLOAT(val); return;
+                case 's': *(str*)a = AS_STR(val); return;
+                case 'o': *(obj*)a = val; return;
+                case 'p': *(void**)a = AS_OBJ(val); return;
+                default:  return;
+            }
+        }
+    }
+}
 long py_int_base(str s, long base) {
     const char* p = s ? s : "";
     while (isspace((unsigned char)*p)) p++;
@@ -3941,6 +4010,7 @@ class Transpiler:
         self.indent += 1
         self.emit("const char* name;")
         self.emit("const struct TypeInfo* base;")
+        self.emit("const FieldDesc* fields;")
         for m in sorted(VTABLE_METHODS):
             self.emit(self.vslot_signature(m) + ";")
         self.indent -= 1
@@ -4111,6 +4181,16 @@ class Transpiler:
                 for fn in ci.methods.values():
                     self._pod_method_nodes.add(id(fn))
 
+    _FIELD_TC = {"int": "i", "long": "l", "short": "i", "char": "i",
+                 "bool": "b", "double": "d", "float": "f", "char*": "s",
+                 "str": "s", "obj": "o"}
+
+    def _field_tc(self, ctype):
+        """1-char storage code for a field's C type (see FieldDesc in runtime)."""
+        if ctype in self._FIELD_TC:
+            return self._FIELD_TC[ctype]
+        return "p" if ctype.endswith("*") else "o"
+
     def emit_struct(self, ci):
         bn = (" : " + ci.base_name) if ci.base_name else ""
         self.emit("/* class %s%s */" % (ci.name, bn))
@@ -4125,7 +4205,20 @@ class Transpiler:
             self.emit("%s %s;" % (self.ctype_csym(ft), self.fnsym(fn)))
         self.indent -= 1
         self.emit("} %s;" % ci.csym)
+        # Per-type field table for bridge-free rt_getattr/rt_setattr. Only
+        # object-model classes (those carrying a TypeInfo) get one; POD structs
+        # have no type pointer to reach it from.
+        if ci.csym not in self._pod_set:
+            self.emit_field_table(ci)
         self.emit()
+
+    def emit_field_table(self, ci):
+        rows = ["{ %s, offsetof(%s, %s), '%s' }" % (
+            c_string(fn), ci.csym, self.fnsym(fn), self._field_tc(ft))
+            for fn, ft in ci.full_fields()]
+        rows.append("{ NULL, 0, 0 }")
+        self.emit("static const FieldDesc %s__fields[] = { %s };" % (
+            ci.csym, ", ".join(rows)))
 
     # ---- class implementation -------------------------------------------
 
@@ -4467,7 +4560,8 @@ class Transpiler:
             slots.append(".%s = %s" % (vslot_name(m), ("%s_%s" % (owner.csym, method_cname(m)))
                                        if owner else "NULL"))
         init = ", ".join([".name = %s" % c_string(ci.name),
-                          ".base = (const struct TypeInfo*)%s" % base] + slots)
+                          ".base = (const struct TypeInfo*)%s" % base,
+                          ".fields = %s__fields" % ci.csym] + slots)
         self.emit("const TypeInfo %s_type = { %s };" % (ci.csym, init))
         self.emit()
 
@@ -7065,6 +7159,12 @@ class Transpiler:
                         ci.field_ctype(node.args[1].value) is None):
                     return self._emit_dynset(node.args[0], ci,
                                              node.args[1], node.args[2])
+                if ci is None and not self._is_module_ref(node.args[0]):
+                    # object-model receiver: bridge-free runtime setattr
+                    return "({ rt_setattr(%s, %s, %s); OBJ_NONE; })" % (
+                        self.wrap_obj(node.args[0]),
+                        self._key_charp(node.args[1]),
+                        self.wrap_obj(node.args[2]))
             if fn == "getattr" and len(node.args) >= 2 and \
                     isinstance(node.args[1], ast.Constant) and \
                     isinstance(node.args[1].value, str):
@@ -7098,7 +7198,10 @@ class Transpiler:
                 if self.stdlib_root:
                     return "mp_getattr(%s, %s, %s)" % (
                         self.wrap_obj(node.args[0]), c_string(attr), dflt)
-                return dflt
+                if self._is_module_ref(node.args[0]):
+                    return dflt
+                return "rt_getattr(%s, %s, %s)" % (
+                    self.wrap_obj(node.args[0]), c_string(attr), dflt)
             if fn == "getattr" and len(node.args) >= 2:
                 if self.stdlib_root and isinstance(node.args[1], ast.Constant) \
                         and isinstance(node.args[1].value, str):
@@ -7113,8 +7216,13 @@ class Transpiler:
                     return "mp_getattr_obj(%s, %s, %s)" % (
                         self.wrap_obj(node.args[0]),
                         self.wrap_obj(node.args[1]), dflt)
-                return self.wrap_obj(node.args[2]) if len(node.args) > 2 \
-                    else "OBJ_NONE /* getattr: dynamic attr, unsupported */"
+                dflt = self.wrap_obj(node.args[2]) if len(node.args) > 2 \
+                    else "OBJ_NONE"
+                if self._is_module_ref(node.args[0]):
+                    return dflt
+                return "rt_getattr(%s, %s, %s)" % (
+                    self.wrap_obj(node.args[0]),
+                    self._key_charp(node.args[1]), dflt)
             if fn in self.classes:
                 ci = self.classes[fn]
                 init = ci.methods.get("__init__")
@@ -8359,6 +8467,17 @@ class Transpiler:
     _DYN_UNBOX = {"int": "AS_INT", "long": "AS_INT", "short": "AS_INT",
                   "char": "AS_INT", "bool": "AS_INT", "double": "AS_FLOAT",
                   "float": "AS_FLOAT", "char*": "AS_STR"}
+
+    def _is_module_ref(self, node):
+        """True if `node` names an imported module (not an obj value), so
+        dynamic attribute access can't go through rt_getattr/rt_setattr."""
+        return isinstance(node, ast.Name) and node.id in self.import_alias
+
+    def _key_charp(self, node):
+        """Render an attribute-key node as a `const char*`."""
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return c_string(node.value)
+        return self.as_str(node)
 
     def _dyn_struct_ci(self, recv_node):
         """ClassInfo if `recv_node`'s static type is a known local struct
