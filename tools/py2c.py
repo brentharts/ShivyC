@@ -245,6 +245,7 @@ typedef struct { obj* data; int len; int cap; } List;
 obj  list_new(void);
 obj  list_of(int n, ...);          /* [a, b, c] literal                       */
 obj  list_from(obj* a, int n);     /* varargs-free list build (stack array)    */
+obj  set_from(obj* a, int n);      /* like list_from, de-duplicated (sets)     */
 obj  varg_list(int n, va_list ap); /* collect C varargs (obj) into a list     */
 void list_append(obj lst, obj v);
 void list_insert(obj lst, long i, obj v);
@@ -788,6 +789,17 @@ obj list_from(obj* a, int n) {     /* like list_of, but no varargs (a 16-byte
                                       backends); the caller fills a stack array */
     obj r = list_new();
     for (int i = 0; i < n; i++) list_append(r, a[i]);
+    return r;
+}
+obj set_from(obj* a, int n) {      /* set literal: list_from, minus duplicates */
+    obj r = list_new();
+    for (int i = 0; i < n; i++) {
+        List* l = (List*)r.u.o;
+        bool seen = false;
+        for (int j = 0; j < l->len; j++)
+            if (obj_eq(l->data[j], a[i])) { seen = true; break; }
+        if (!seen) list_append(r, a[i]);
+    }
     return r;
 }
 obj varg_list(int n, va_list ap) {
@@ -9130,11 +9142,12 @@ class Transpiler:
         return "({ obj %s[%d]; %s dict_of_a(%s, %d); })" % (
             v, len(flat_exprs), stores, v, npairs)
 
-    def _list_literal(self, elem_exprs):
+    def _list_literal(self, elem_exprs, builder="list_from"):
         """Build a list from rendered element exprs without C varargs: store
-        them into a stack array and hand list_from a pointer. A 16-byte obj
+        them into a stack array and hand the builder a pointer. A 16-byte obj
         passed through `...` mis-lowers on some backends (only the first arg
-        survives), so list literals avoid varargs entirely."""
+        survives), so list/set literals avoid varargs entirely. `builder` is
+        the runtime function (list_from, or set_from for de-duplicated sets)."""
         n = len(elem_exprs)
         if n == 0:
             return "list_new()"
@@ -9142,7 +9155,7 @@ class Transpiler:
         v = "_lt%d" % self._list_tmp
         stores = " ".join("%s[%d] = %s;" % (v, i, e)
                           for i, e in enumerate(elem_exprs))
-        return "({ obj %s[%d]; %s list_from(%s, %d); })" % (v, n, stores, v, n)
+        return "({ obj %s[%d]; %s %s(%s, %d); })" % (v, n, stores, builder, v, n)
 
     def ex_List(self, node):
         return self._list_literal([self.wrap_obj(e) for e in node.elts])
@@ -9156,7 +9169,8 @@ class Transpiler:
         if not node.elts:
             return "list_new() /* set */"
         return self._list_literal(
-            [self.wrap_obj(e) for e in node.elts]) + " /* set */"
+            [self.wrap_obj(e) for e in node.elts],
+            builder="set_from") + " /* set */"
 
     def ex_Dict(self, node):
         pairs = [(k, v) for k, v in zip(node.keys, node.values)
