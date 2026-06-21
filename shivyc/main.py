@@ -186,6 +186,20 @@ def main():
     objs = []
     arguments._extra_objs = []
     py_files = [f for f in arguments.files if f.endswith(".py")]
+    # Auto-bundle the rpy_torch mini-library when a source imports it, so a
+    # single `shivyc.main model.py` still co-compiles the library it needs.
+    if py_files:
+        try:
+            import os as _os
+            import sys as _sys
+            _td = _os.path.join(_os.path.dirname(_os.path.dirname(
+                _os.path.abspath(__file__))), "tools")
+            if _td not in _sys.path:
+                _sys.path.insert(0, _td)
+            import rpy_torch as _rpy_torch
+            py_files = _rpy_torch.bundle(py_files)
+        except Exception:
+            pass
     if len(py_files) > 1:
         # Several rpython sources: translate them together as one unit so the
         # runtime is emitted and compiled exactly once (no duplicate-symbol
@@ -305,6 +319,13 @@ def process_py_unit(py_files, args):
             return None
         objs.append(rt_obj)
     for out_c in generated:
+        # shivyc_rt.h doesn't pull in <math.h>; re-supply any libm prototypes
+        # this module references so bare exp/sqrt/... resolve (see _libm_protos).
+        code = open(out_c, encoding="utf-8").read()
+        mprotos = _libm_protos(code)
+        if mprotos:
+            with open(out_c, "w", encoding="utf-8") as f:
+                f.write("\n".join(mprotos) + "\n" + code)
         obj = process_c_file(out_c, args)
         if not obj:
             return None
