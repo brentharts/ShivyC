@@ -142,6 +142,44 @@ translator can emit a **performance warning** pointing at the construct, so you
 can decide whether to make it static. The goal is "your Python runs", then
 "here is where it is paying for dynamism".
 
+### Compiled `getattr`/`setattr` on a typed struct (no bridge)
+
+There is a faster path that needs no object core at all. When the receiver's
+*static* type is a known struct, `getattr(obj, key)` and `setattr(obj, key, val)`
+with a **runtime** string key lower to an inline `switch` on the key's first
+character, then a `strcmp` selects the exact field for direct, typed member
+access. It compiles to a jump table — no dict, no hash, no micropython bridge.
+
+This relies on one naming convention: **a field's first letter encodes its C
+type**, so the result type is decidable from `key[0]` alone (uniformly across
+every struct):
+
+| Initial | Type | Initial | Type |
+|---|---|---|---|
+| `i…` | int | `d…` / `f…` | double / float |
+| `b…` | bool | `s…` | str (`char*`) |
+| `<Upper>…` | object | | |
+
+```python
+class Particle:
+    def __init__(self, ix: int, dmass: float, sname: "char*"):
+        self.ix = ix          # 'i' -> int
+        self.dmass = dmass    # 'd' -> double
+        self.sname = sname    # 's' -> char*
+
+f = "ix"
+n = int(getattr(p, f))        # compiled switch -> OBJ_INT(p->ix)
+setattr(p, f, n + 1)          # compiled switch -> p->ix = AS_INT(...)
+```
+
+The convention is restrictive on purpose: looking only at the first character
+keeps the generated switch tiny, and it lines up with how code is normally
+written — types start lowercase, classes start uppercase. A `getattr` result is
+returned as a tagged value (so it flows into ordinary rpython), while `setattr`
+stores the unboxed value directly. This is the mechanism a minimal ctypes/FFI
+layer builds on — poking a C struct field, or reading a `c_int`'s `.value`, by
+name and without dynamic-dispatch cost. See `dynattr/`.
+
 ## 5. Memory: no reference cycles, and `del` is a hint
 
 rpython assumes object graphs are acyclic. Under that rule the translator can
