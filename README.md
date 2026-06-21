@@ -321,7 +321,7 @@ an inline first-character type switch, no dict and no bridge), `rtattr/`
 runtime helpers — again no micropython bridge), `crossattr/` (cross-class field
 discovery: attributes a configurator stamps onto another class via
 `obj.attr =`/`setattr` are promoted to real slots so the writes persist),
-`aggregates/` (varargs-free list/dict/call construction — a 16-byte `obj` mis-lowers through C `...` on the self-compiled backend, so literals and calls build via a stack array instead), `formatting/` (`%` string formatting and f-strings — `fmt % args` is real printf-style formatting, not arithmetic modulo, lowered to a varargs-free `str_mod`), `io/`, `net/`, and `mandelbrot/`. Run them all with `make rpython`.
+`aggregates/` (varargs-free list/dict/call construction — a 16-byte `obj` mis-lowers through C `...` on the self-compiled backend, so literals and calls build via a stack array instead), `formatting/` (`%` string formatting and f-strings — `fmt % args` is real printf-style formatting, not arithmetic modulo, lowered to a varargs-free `str_mod`), `ctorval/` (constructors used as values: trampoline unboxing of int/float/bool arguments, plus the switch-on-narrow-type integer-promotion fix that makes boolean truthiness correct), `io/`, `net/`, and `mandelbrot/`. Run them all with `make rpython`.
 
 ---
 

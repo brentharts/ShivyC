@@ -76,6 +76,14 @@ a string lowers to `str_mod` (a printf-style formatter), not the arithmetic
 lower to `pyfmt_a`. Both take arguments through a pointer (see below) and size
 their output to the arguments. See the `formatting` example.
 
+**Constructors used as values unbox every argument.** A class used as a value
+emits a `Cls__ctortramp` that unpacks a runtime arg list and unboxes each entry to
+the constructor's C parameter type: `int`->`AS_INT`, `bool`->`truthy`,
+`double`/`float`->`as_dbl`, `char*`->`AS_STR`, pointer->`(T)AS_OBJ`. See the
+`ctorval` example. (A backend fix rides along: the controlling expression of a C
+`switch` is now integer-promoted, so `switch` on a one-byte tag -- e.g. inside
+`truthy` -- compares correctly.)
+
 **No obj through C varargs.** The tagged `obj` is a 16-byte struct, and passing
 a 16-byte struct by value through a `...` parameter mis-lowers on the
 self-compiled backend (only the first variadic argument survives). So aggregate
