@@ -134,6 +134,7 @@ rpython:
 	run $(RPY)/numpy/matmul.py      239 ""; \
 	run $(RPY)/nn/neural_net.py     199 ""; \
 	run $(RPY)/nn/torch_mlp.py        4 ""; \
+	run $(RPY)/nn/torch_mlp_f32.py    4 ""; \
 	run $(RPY)/nbody/nbody.py        11 ""; \
 	run $(RPY)/classes/polymorphism.py 22 ""; \
 	run $(RPY)/classes/pod_vs_object.py  48 ""; \
@@ -317,6 +318,7 @@ testtorch:
 	  if [ "$$g" = "$$exp" ] && [ "$$s" = "$$exp" ]; then echo "  ok    $$src (gcc==shivycx==$$exp)"; \
 	  else echo "  FAIL  $$src (gcc=$$g shivycx=$$s, expected $$exp)"; fail=1; fi; }; \
 	chk $(RPY)/nn/torch_mlp.py 4; \
+	chk $(RPY)/nn/torch_mlp_f32.py 4; \
 	if [ $$fail = 0 ]; then echo "testtorch: PASS"; \
 	else echo "testtorch: FAIL"; fi; exit $$fail
 
