@@ -102,3 +102,99 @@ is a real training signal, not just a checksum.
 > `n` as `int`, but `n_in` / `n_out` would default to a boxed object — so the
 > library annotates them `n_in: "int"`. (A scalar read from a native array, like
 > `diff = pred[i] - target[i]`, now infers `double` automatically.)
+
+---
+
+## `torch_mlp_f32.py` — single precision + SIMD
+
+`torch_mlp_f32.py` is the same XOR MLP in **float32**. It exercises three
+features that speed up the mini-PyTorch when the dtype is `f32` and layer widths
+are known.
+
+### 1. Dtype-aware fusion (`expf` / `sqrtf` / `1.0f`)
+
+A fused store into an `f32*` now lowers to true single precision instead of
+computing in `double` and casting at the end:
+
+```python
+def sigmoid_f32(x: "f32*", out: "f32*", n) -> None:
+    out[:n] = 1.0 / (1.0 + exp(-x))
+```
+
+```c
+/* f64 path:  out[i] = (float)((1.0  / (1.0  + exp (-x[i])))); */
+/* f32 path:  out[i] = (float)((1.0f / (1.0f + expf(-x[i])))); */
+```
+
+Float literals get an `f` suffix, libm calls pick the single-precision variant
+(`expf`, `sqrtf`, `powf`, ...). Half the memory traffic of the `f64` path, and
+the elementwise loops auto-vectorize under gcc `-O2` and ShivyCX.
+
+### 2. Auto-generated SIMD contracts, guarded for gcc
+
+The compute kernels carry a divisibility contract so ShivyCX can prove the trip
+count is a multiple of the SSE lane count and drop the scalar remainder:
+
+```python
+def sgd_step_f32(w: "f32*", grad: "f32*", lr: "f32", n) -> None:
+    assert len(w) % 4 == 0          # SIMD contract
+    i = 0
+    while i < n:
+        w[i] = w[i] - lr * grad[i]
+        i = i + 1
+```
+
+The `assert` is not valid C, so py2c now emits it behind `#ifdef __SHIVYC__`
+(which ShivyCX's preprocessor always predefines):
+
+```c
+void sgd_step_f32(float* w, float* grad, float lr, int n)
+#ifdef __SHIVYC__
+assert not len(w) % 4
+#endif
+{ ... }
+```
+
+ShivyCX reads the contract and lowers proven kernels to packed SSE
+(`mulps` / `addps`); gcc skips the `#ifdef` block and compiles the plain loop.
+The numpy `simd_kernels.py` example now compiles under **both** backends for
+this reason.
+
+> **Two limits worth knowing.** A SIMD contract is only *proven* when the kernel
+> and its call sites share one translation unit (as in `simd_kernels.py`). When
+> `rpy_torch` is auto-bundled as a separate module, ShivyCX reports
+> "no call sites visible" and keeps the (correct) scalar code, so the f32 speedup
+> there comes from the smaller data and single-precision libm rather than packed
+> SSE. Also, a fused store (`out[:] = expr`) and a SIMD contract do not combine —
+> use explicit loops for the kernels you want vectorized.
+
+### 3. One source, two interpreters (the import switch)
+
+```python
+import sys
+if sys.implementation.name == 'shivyc':
+    import rpy_torch as torch
+else:
+    import torch
+```
+
+ShivyCX folds `sys.implementation.name == 'shivyc'` at translation time, takes
+the first branch, and auto-bundles `rpy_torch`; CPython takes the second. This
+lets the same file be checked against a reference `torch`. Two compiler fixes
+were needed to make the switch real:
+
+* the dead `else` branch no longer shadows the alias bound in the taken branch
+  (`import rpy_torch as torch`), so `torch.linear_f32(...)` resolves; and
+* cross-module functions are now declared with a **full prototype**
+  (`extern void sgd_step_f32(float*, float*, float, int);`) instead of a K&R
+  `sgd_step_f32()`. Without the prototype a `double` argument was passed where
+  the callee expected `float`, and an `f32` learning rate silently arrived as
+  `0.0` — so only the manually-updated bias learned.
+
+> **Compatibility scope.** The import-switch *mechanism* works today. `rpy_torch`
+> is still a low-level buffer API (`malloc`'d `f32*`, explicit dims), not a
+> drop-in for `torch.nn`'s tensor API, and `malloc` is a ShivyCX builtin — so the
+> CPython branch needs a tensor-API shim before the example runs unmodified under
+> real PyTorch. Validation here is against a pure-Python f32 reference, which the
+> compiled result matches exactly (all four XOR cases correct, exit `4` under both
+> gcc and ShivyCX; `make testtorch` checks both).
