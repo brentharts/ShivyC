@@ -6395,6 +6395,8 @@ class Transpiler:
                     _kv = self._tdict_by_name.get(_st[:-1])
                     if _kv:
                         return _kv[1]
+                if _st[:-1] in _SCALAR_CTYPES and _st != "char*":
+                    return _st[:-1]     # a[i] of a numeric scalar pointer (mid-hoist)
             if isinstance(node.value, ast.Subscript):
                 inner = node.value
                 if isinstance(inner.value, ast.Attribute) and \
@@ -10239,6 +10241,12 @@ def main(argv):
             sys.exit(2)
 
     os.makedirs(out_dir, exist_ok=True)
+    # Auto-bundle the rpy_torch mini-library when a source imports it.
+    try:
+        import rpy_torch as _rpy_torch
+        files = _rpy_torch.bundle(files)
+    except Exception:
+        pass
     # Profile-guided auto-typing. Single .py inputs go through transpile_file's
     # per-file hook (so the ShivyCX front end gets them too); multi-file programs
     # are profiled once here as a set (one run, module-qualified types) so cross
