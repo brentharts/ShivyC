@@ -5550,6 +5550,10 @@ class Transpiler:
     def func_def(self, node):
         self.enter_scope(node, skip_self=False)
         try:
+            self._promote_containers(node)
+        except Exception:
+            pass        # promotion is opt-in and best-effort; never break codegen
+        try:
             self._analyze_untyped_containers(node)
         except Exception:
             pass        # advisory only: never let analysis break compilation
@@ -5718,6 +5722,166 @@ class Transpiler:
         for nm, d in info.items():
             self._warn_container(nm, d)
         self._infer_locals = {}
+
+    # ---- auto-promotion of cleanly-inferred containers (opt-in) ---------
+
+    _SCALARS = {"int", "float", "bool", "str"}
+
+    def _promote_containers(self, fndef):
+        """When PY2C_PROMOTE_CONTAINERS is set, rewrite an unannotated empty
+        list/dict whose element/key/value types infer to a single scalar AND
+        whose every use is supported by the unboxed typed form, into an
+        annotated `name: "list[int]"`-style assignment -- so the existing typed
+        path lowers it to an unboxed array. Conservative by construction: any
+        escape (return, pass as arg, alias, store-in-container), unsupported
+        method, slice, or negative index leaves the container boxed."""
+        if not os.environ.get("PY2C_PROMOTE_CONTAINERS"):
+            return
+        annotated = {n.target.id for n in ast.walk(fndef)
+                     if isinstance(n, ast.AnnAssign)
+                     and isinstance(n.target, ast.Name)}
+        decls = {}            # name -> (kind, assign_stmt)
+        for stmt in fndef.body:
+            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 \
+                    and isinstance(stmt.targets[0], ast.Name):
+                kind = self._empty_container_kind(stmt.value)
+                if kind in ("list", "dict") and \
+                        stmt.targets[0].id not in annotated:
+                    decls.setdefault(stmt.targets[0].id, (kind, stmt))
+        if not decls:
+            return
+        # one assignment only (a reassignment may change the representation)
+        assigns = {}
+        for n in ast.walk(fndef):
+            if isinstance(n, ast.Assign):
+                for t in n.targets:
+                    if isinstance(t, ast.Name) and t.id in decls:
+                        assigns[t.id] = assigns.get(t.id, 0) + 1
+        locals_t = {}
+        for n in ast.walk(fndef):
+            if isinstance(n, ast.For) and isinstance(n.target, ast.Name):
+                et = self._iter_elem_type(n.iter)
+                if et != "obj":
+                    locals_t[n.target.id] = et
+        self._infer_locals = locals_t
+        info = {nm: {"kind": k, "keys": set(), "vals": set()}
+                for nm, (k, _) in decls.items()}
+        parent = {}
+        for n in ast.walk(fndef):
+            for c in ast.iter_child_nodes(n):
+                parent[c] = n
+        safe = {nm: True for nm in decls}
+        for n in ast.walk(fndef):
+            if isinstance(n, ast.Assign):
+                for tgt in n.targets:
+                    if isinstance(tgt, ast.Subscript) and \
+                            isinstance(tgt.value, ast.Name) and \
+                            tgt.value.id in info:
+                        d = info[tgt.value.id]
+                        if d["kind"] == "dict":
+                            d["keys"].add(self._lit_type(tgt.slice))
+                        vt = self._promo_val_type(tgt.value.id, n.value)
+                        if vt:
+                            d["vals"].add(vt)
+            elif isinstance(n, ast.Call) and \
+                    isinstance(n.func, ast.Attribute) and \
+                    isinstance(n.func.value, ast.Name) and \
+                    n.func.value.id in info and n.args:
+                if n.func.attr == "append":
+                    avt = self._promo_val_type(n.func.value.id, n.args[0])
+                    if avt:
+                        info[n.func.value.id]["vals"].add(avt)
+        for n in ast.walk(fndef):
+            if isinstance(n, ast.Name) and n.id in decls:
+                if not self._safe_container_use(n, parent, decls[n.id][0]):
+                    safe[n.id] = False
+        self._infer_locals = {}
+        for nm, (kind, stmt) in decls.items():
+            if not safe.get(nm) or assigns.get(nm, 0) != 1:
+                continue
+            d = info[nm]
+            vals = d["vals"] - {"None"}
+            if len(vals) != 1:
+                continue
+            vt = next(iter(vals))
+            if vt not in self._SCALARS:
+                continue
+            if kind == "dict":
+                keys = d["keys"] - {"None"}
+                if len(keys) != 1:
+                    continue
+                kt = next(iter(keys))
+                if kt not in self._SCALARS:
+                    continue
+                ann = "dict[%s, %s]" % (kt, vt)
+            else:
+                ann = "list[%s]" % vt
+            self._rewrite_to_annassign(fndef, stmt, ann)
+            self._warn(stmt.lineno, "promoted %s '%s' to unboxed %s." % (
+                kind, nm, ann))
+
+    def _promo_val_type(self, nm, node):
+        """Scalar type of a value assigned into container `nm`, treating a
+        self-reference `nm[...]` as transparent so the counter idiom
+        `d[k] = d[k] + 1` infers from the rest of the expression."""
+        if isinstance(node, ast.Subscript) and \
+                isinstance(node.value, ast.Name) and node.value.id == nm:
+            return None                              # self-ref: no new info
+        if isinstance(node, ast.BinOp):
+            cand = [t for t in (self._promo_val_type(nm, node.left),
+                                self._promo_val_type(nm, node.right)) if t]
+            if not cand:
+                return "obj"
+            if "str" in cand:
+                return "str"
+            if "float" in cand:
+                return "float"
+            return "int" if all(t == "int" for t in cand) else "obj"
+        return self._lit_type(node)
+
+    def _safe_container_use(self, nm_node, parent, kind):
+        """True if this occurrence of the container name is an operation the
+        unboxed typed form supports (so promotion preserves behavior)."""
+        p = parent.get(nm_node)
+        if p is None:
+            return False
+        if isinstance(p, ast.Assign) and nm_node in p.targets:
+            return True                              # `nm = ...`
+        if isinstance(p, ast.Subscript) and p.value is nm_node:
+            sl = p.slice
+            if isinstance(sl, ast.Slice):
+                return False                         # no typed slicing
+            if isinstance(sl, ast.UnaryOp) and isinstance(sl.op, ast.USub):
+                return False                         # no negative index
+            if isinstance(sl, ast.Constant) and \
+                    isinstance(sl.value, int) and sl.value < 0:
+                return False
+            return True
+        if isinstance(p, ast.Attribute) and p.value is nm_node:
+            gp = parent.get(p)
+            methods = {"append"} if kind == "list" else set()
+            return isinstance(gp, ast.Call) and gp.func is p and \
+                p.attr in methods
+        if isinstance(p, ast.For) and p.iter is nm_node:
+            return True
+        if isinstance(p, ast.Compare) and nm_node in p.comparators and \
+                any(isinstance(o, (ast.In, ast.NotIn)) for o in p.ops):
+            return True
+        if isinstance(p, ast.Call) and isinstance(p.func, ast.Name) and \
+                p.func.id == "len" and nm_node in p.args:
+            return True
+        return False
+
+    def _rewrite_to_annassign(self, fndef, assign_stmt, ann):
+        new = ast.AnnAssign(target=assign_stmt.targets[0],
+                            annotation=ast.Constant(value=ann),
+                            value=assign_stmt.value, simple=1)
+        ast.copy_location(new, assign_stmt)
+        ast.fix_missing_locations(new)
+        for i, s in enumerate(fndef.body):
+            if s is assign_stmt:
+                fndef.body[i] = new
+                return
 
     def _iter_elem_type(self, node):
         """Coarse element type of an iterable used in `for x in <node>`."""
