@@ -149,7 +149,7 @@ typedef char* str;
 
 /* ---- Tier 2: generic dynamic value (used only where the type is open) ---- */
 typedef struct Obj Obj;
-enum { T_NONE, T_INT, T_BOOL, T_STR, T_OBJ, T_LIST, T_DICT, T_FUNC, T_FLOAT };
+enum { T_NONE, T_INT, T_BOOL, T_STR, T_OBJ, T_LIST, T_DICT, T_FUNC, T_FLOAT, T_SET };
 typedef struct { unsigned char tag; union { long i; str s; Obj* o; double d; } u; } obj;
 
 #define OBJ_NONE    ((obj){T_NONE,{0}})
@@ -322,7 +322,11 @@ obj  pymax(obj it, obj dflt, bool has_dflt);
 obj  pymin(obj it, obj dflt, bool has_dflt);
 obj  pysum(obj it, obj start);
 obj  pyreversed(obj it);
-obj  pyset(obj it);                     /* dedup iterable into a list-set      */
+obj  pyset(obj it);                     /* dedup iterable into a set (T_SET)   */
+obj  set_union(obj a, obj b);           /* a | b   (all return a fresh T_SET)  */
+obj  set_inter(obj a, obj b);           /* a & b                               */
+obj  set_diff(obj a, obj b);            /* a - b                               */
+obj  set_symdiff(obj a, obj b);         /* a ^ b                               */
 #define PY_SLICE_END 0x7fffffffffffffffL
 obj  py_slice(obj seq, long lo, long hi);  /* str or list slice, Python rules  */
 obj  py_slice_step(obj seq, long lo, long hi, long step, int hl, int hh);
@@ -391,6 +395,7 @@ static mp_obj_t obj_to_mp(obj v) {
         case T_BOOL: return mp_obj_new_bool((bool)v.u.i);
         case T_STR: return mp_obj_new_str(v.u.s, v.u.s ? strlen(v.u.s) : 0);
         case T_FLOAT: return mp_obj_new_float(v.u.d);
+        case T_SET:
         case T_LIST: {
             List* l = (List*)v.u.o;
             mp_obj_t items[l->len];
@@ -608,6 +613,19 @@ str pystr(obj v) {
         case T_BOOL: return v.u.i ? "True" : "False";
         case T_STR:  return v.u.s ? v.u.s : "";
         case T_NONE: return "None";
+        case T_SET: {
+            List* l = (List*)v.u.o;
+            if (l->len == 0) return "set()";
+            size_t cap = 3;
+            for (int i = 0; i < l->len; i++) cap += strlen(pyrepr(l->data[i])) + 2;
+            b = aalloc(cap); char* p = b; *p++ = '{';
+            for (int i = 0; i < l->len; i++) {
+                if (i) { *p++ = ','; *p++ = ' '; }
+                str s = pyrepr(l->data[i]); size_t n = strlen(s);
+                memcpy(p, s, n); p += n;
+            }
+            *p++ = '}'; *p = 0; return b;
+        }
         case T_LIST: {
             List* l = (List*)v.u.o;
             size_t cap = 3;
@@ -707,6 +725,7 @@ bool truthy(obj v) {
         case T_INT:
         case T_BOOL: return v.u.i != 0;
         case T_STR:  return v.u.s && v.u.s[0];
+        case T_SET:
         case T_LIST: return ((List*)v.u.o)->len != 0;
         case T_DICT: return ((Dict*)v.u.o)->len != 0;
         default:     return v.u.o != NULL;
@@ -803,6 +822,7 @@ obj set_from(obj* a, int n) {      /* set literal: list_from, minus duplicates *
             if (obj_eq(l->data[j], a[i])) { seen = true; break; }
         if (!seen) list_append(r, a[i]);
     }
+    r.tag = T_SET;
     return r;
 }
 obj varg_list(int n, va_list ap) {
@@ -822,13 +842,13 @@ void list_set(obj lst, long i, obj v) {
     if (i >= 0 && i < l->len) l->data[i] = v;
 }
 long pylen(obj v) {
-    if (v.tag == T_LIST) return ((List*)v.u.o)->len;
+    if (v.tag == T_LIST || v.tag == T_SET) return ((List*)v.u.o)->len;
     if (v.tag == T_DICT) return ((Dict*)v.u.o)->len;
     if (v.tag == T_STR)  return v.u.s ? (long)strlen(v.u.s) : 0;
     return 0;
 }
 obj index_obj(obj container, long i) {
-    if (container.tag == T_LIST) return list_get(container, i);
+    if (container.tag == T_LIST || container.tag == T_SET) return list_get(container, i);
     if (container.tag == T_DICT) {   /* iterating a dict yields its keys */
         Dict* d = (Dict*)container.u.o;
         if (i < 0) i += d->len;
@@ -855,11 +875,22 @@ bool obj_eq(obj a, obj b) {
         case T_INT:
         case T_BOOL: return a.u.i == b.u.i;
         case T_STR:  return strcmp(a.u.s, b.u.s) == 0;
+        case T_SET: {                 /* order-independent: same elements */
+            List* la = (List*)a.u.o; List* lb = (List*)b.u.o;
+            if (la->len != lb->len) return false;
+            for (int i = 0; i < la->len; i++) {
+                bool found = false;
+                for (int j = 0; j < lb->len; j++)
+                    if (obj_eq(la->data[i], lb->data[j])) { found = true; break; }
+                if (!found) return false;
+            }
+            return true;
+        }
         default:     return a.u.o == b.u.o;
     }
 }
 bool pycontains(obj container, obj v) {
-    if (container.tag == T_LIST) {
+    if (container.tag == T_LIST || container.tag == T_SET) {
         List* l = (List*)container.u.o;
         for (int i = 0; i < l->len; i++) if (obj_eq(l->data[i], v)) return true;
         return false;
@@ -970,7 +1001,10 @@ obj obj_add(obj a, obj b) {
     }
     return OBJ_INT(as_num(a) + as_num(b));
 }
-obj obj_sub(obj a, obj b) { return OBJ_INT(as_num(a) - as_num(b)); }
+obj obj_sub(obj a, obj b) {
+    if (a.tag == T_SET && b.tag == T_SET) return set_diff(a, b);
+    return OBJ_INT(as_num(a) - as_num(b));
+}
 obj obj_mul(obj a, obj b) {
     if (a.tag == T_STR && b.tag == T_INT) {
         long n = b.u.i; size_t l = strlen(a.u.s);
@@ -1043,6 +1077,11 @@ long ipow(long base, long exp) {
 }
 obj obj_pow(obj a, obj b) { return OBJ_INT(ipow(as_num(a), as_num(b))); }
 obj obj_bin(char op, obj a, obj b) {
+    if (a.tag == T_SET && b.tag == T_SET) {      /* set algebra, not bitwise */
+        if (op == '|') return set_union(a, b);
+        if (op == '&') return set_inter(a, b);
+        if (op == '^') return set_symdiff(a, b);
+    }
     long x = as_num(a), y = as_num(b), r = 0;
     switch (op) {
         case '&': r = x & y; break; case '|': r = x | y; break;
@@ -1238,15 +1277,52 @@ obj pylist(obj it) {
 obj pyset(obj it) {
     obj r = list_new(); long n = pylen(it);
     for (long i = 0; i < n; i++) { obj v = index_obj(it, i); if (!pycontains(r, v)) list_append(r, v); }
+    r.tag = T_SET;
     return r;
 }
 void set_add(obj s, obj v) { if (!pycontains(s, v)) list_append(s, v); }
+/* ---- set algebra: all return a fresh T_SET ---- */
+obj set_union(obj a, obj b) {
+    obj r = list_new(); r.tag = T_SET;
+    long n = pylen(a);
+    for (long i = 0; i < n; i++) set_add(r, index_obj(a, i));
+    n = pylen(b);
+    for (long i = 0; i < n; i++) set_add(r, index_obj(b, i));
+    return r;
+}
+obj set_inter(obj a, obj b) {
+    obj r = list_new(); r.tag = T_SET;
+    long n = pylen(a);
+    for (long i = 0; i < n; i++) {
+        obj v = index_obj(a, i);
+        if (pycontains(b, v) && !pycontains(r, v)) list_append(r, v);
+    }
+    return r;
+}
+obj set_diff(obj a, obj b) {
+    obj r = list_new(); r.tag = T_SET;
+    long n = pylen(a);
+    for (long i = 0; i < n; i++) {
+        obj v = index_obj(a, i);
+        if (!pycontains(b, v) && !pycontains(r, v)) list_append(r, v);
+    }
+    return r;
+}
+obj set_symdiff(obj a, obj b) {     /* (a - b) U (b - a) */
+    obj r = set_diff(a, b);
+    long n = pylen(b);
+    for (long i = 0; i < n; i++) {
+        obj v = index_obj(b, i);
+        if (!pycontains(a, v)) set_add(r, v);
+    }
+    return r;
+}
 void pyclear(obj c) {
-    if (c.tag == T_LIST) ((List*)c.u.o)->len = 0;
+    if (c.tag == T_LIST || c.tag == T_SET) ((List*)c.u.o)->len = 0;
     else if (c.tag == T_DICT) ((Dict*)c.u.o)->len = 0;
 }
 void list_remove(obj lst, obj v) {
-    if (lst.tag != T_LIST) return;
+    if (lst.tag != T_LIST && lst.tag != T_SET) return;
     List* l = (List*)lst.u.o;
     for (long i = 0; i < l->len; i++) {
         if (obj_eq(l->data[i], v)) {
@@ -1257,7 +1333,7 @@ void list_remove(obj lst, obj v) {
     }
 }
 obj list_pop(obj lst) {
-    if (lst.tag != T_LIST) return OBJ_NONE;
+    if (lst.tag != T_LIST && lst.tag != T_SET) return OBJ_NONE;
     List* l = (List*)lst.u.o;
     if (l->len == 0) return OBJ_NONE;
     return l->data[--l->len];
@@ -1288,29 +1364,9 @@ obj list_reverse(obj lst) {        /* in-place reverse; returns None */
     return OBJ_NONE;
 }
 obj obj_augop(obj a, char op, obj b) {
-    int set_like = (a.tag == T_LIST || b.tag == T_LIST);
     if (op == '+') return obj_add(a, b);
-    if (set_like && op == '|') {                 /* set union */
-        obj r = pyset(a); long n = pylen(b);
-        for (long i = 0; i < n; i++) set_add(r, index_obj(b, i));
-        return r;
-    }
-    if (set_like && op == '&') {                 /* intersection */
-        obj r = list_new(); long n = pylen(a);
-        for (long i = 0; i < n; i++) {
-            obj v = index_obj(a, i);
-            if (pycontains(b, v) && !pycontains(r, v)) list_append(r, v);
-        }
-        return r;
-    }
-    if (set_like && op == '-') {                 /* difference */
-        obj r = list_new(); long n = pylen(a);
-        for (long i = 0; i < n; i++) {
-            obj v = index_obj(a, i);
-            if (!pycontains(b, v) && !pycontains(r, v)) list_append(r, v);
-        }
-        return r;
-    }
+    if (op == '-') return obj_sub(a, b);   /* set diff when both sets, else num */
+    /* |, &, ^ dispatch to set algebra inside obj_bin when both are sets. */
     return obj_bin(op, a, b);
 }
 void del_item(obj c, obj k) {
@@ -6413,6 +6469,8 @@ class Transpiler:
                 if kind == "dict":
                     return "dict_set(%s, %s, %s);" % (
                         acc, self.wrap_obj(node.key), self.wrap_obj(node.value))
+                if kind == "set":     # de-duplicate as we go
+                    return "set_add(%s, %s);" % (acc, self.wrap_obj(node.elt))
                 return "list_append(%s, %s);" % (acc, self.wrap_obj(node.elt))
             g = gens[i]
             self.loop_n += 1
@@ -6432,6 +6490,9 @@ class Transpiler:
 
         body = build(0)
         self.scope = saved
+        if kind == "set":
+            return "({ obj %s = %s; %s %s.tag = T_SET; %s; })" % (
+                acc, init, body, acc, acc)
         return "({ obj %s = %s; %s %s; })" % (acc, init, body, acc)
 
     def st_Try(self, node):
@@ -7263,7 +7324,7 @@ class Transpiler:
                 return "pysum(%s, %s)" % (self.wrap_obj(node.args[0]), start)
             if fn in ("set", "frozenset"):
                 return "pyset(%s)" % self.wrap_obj(node.args[0]) if node.args \
-                    else "list_new() /* set() */"
+                    else "({ obj _es = list_new(); _es.tag = T_SET; _es; })"
             if fn == "list":
                 return "pylist(%s)" % self.wrap_obj(node.args[0]) if node.args \
                     else "list_new()"
@@ -7629,6 +7690,13 @@ class Transpiler:
                 return "pyclear(%s)" % self.wrap_obj(func.value)
             if func.attr == "remove" and len(node.args) == 1 and \
                     func.attr not in self.method_owners:
+                return "list_remove(%s, %s)" % (self.wrap_obj(func.value),
+                                                self.wrap_obj(node.args[0]))
+            if func.attr == "discard" and len(node.args) == 1 and \
+                    func.attr not in self.method_owners and \
+                    func.attr not in self.xmethod_owners:
+                # set.discard: remove if present (list_remove is already a
+                # no-op when the value is absent, which is discard's contract).
                 return "list_remove(%s, %s)" % (self.wrap_obj(func.value),
                                                 self.wrap_obj(node.args[0]))
             if func.attr == "pop" and not node.args and \
@@ -9243,7 +9311,7 @@ class Transpiler:
 
     def ex_Set(self, node):
         if not node.elts:
-            return "list_new() /* set */"
+            return "({ obj _es = list_new(); _es.tag = T_SET; _es; })"
         return self._list_literal(
             [self.wrap_obj(e) for e in node.elts],
             builder="set_from") + " /* set */"
@@ -9263,7 +9331,7 @@ class Transpiler:
         return self.lower_comp(node, "list")
 
     def ex_SetComp(self, node):
-        return self.lower_comp(node, "list")
+        return self.lower_comp(node, "set")
 
     def ex_DictComp(self, node):
         return self.lower_comp(node, "dict")
