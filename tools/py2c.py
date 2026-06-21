@@ -3284,8 +3284,14 @@ class Transpiler:
                         self.xclasses.get(name, (None,))[0] is not info:
                     self.xclasses[name] = (info, getattr(info, "defmod", mod))
             elif kind == "func" and name not in self.func_params:
+                _pcts = []
+                try:
+                    _pcts = [arg_ctype(info, a) or OBJ
+                             for a in info.args.args]
+                except Exception:
+                    _pcts = []
                 funcs[func_csym(name, mod, self.ambiguous_funcs)] = \
-                    ann_to_ctype(info.returns) or OBJ
+                    (ann_to_ctype(info.returns) or OBJ, _pcts)
             elif kind == "singleton":
                 singles[name] = info
                 if info not in self.classes:
@@ -3383,7 +3389,13 @@ class Transpiler:
                 out.append("extern const TypeInfoHdr %s_type;" % cs)
             out.append("extern %s* %s_new();" % (cs, cs))
         for n in sorted(funcs):
-            out.append("extern %s %s();" % (funcs[n], n))
+            ret, pcts = funcs[n]
+            # Emit a full prototype (not K&R `name()`): without parameter types
+            # the C compiler applies default argument promotions at the call
+            # site, so a `float` parameter would receive a promoted `double` and
+            # read garbage. A real prototype makes the compiler coerce each arg.
+            plist = ", ".join(pcts) if pcts else "void"
+            out.append("extern %s %s(%s);" % (ret, n, plist))
         for n in sorted(singles):
             out.append("extern %s* %s;" % (singles[n], cname(n)))
         for n in sorted(globs):
@@ -3528,8 +3540,27 @@ class Transpiler:
             base.extend(node.module.split("."))
         return ".".join(base)
 
+    def _walk_live(self, node):
+        """Like ast.walk, but for an `if` whose test the translator can fold
+        (`sys.implementation.name == 'shivyc'`), descend only the live branch.
+        This keeps a dead `else: import torch` from shadowing the alias bound in
+        the taken branch (`import rpy_torch as torch`)."""
+        yield node
+        if isinstance(node, ast.If):
+            cond = self._static_cond(node.test)
+            if cond is True:
+                for c in node.body:
+                    yield from self._walk_live(c)
+                return
+            if cond is False:
+                for c in node.orelse:
+                    yield from self._walk_live(c)
+                return
+        for c in ast.iter_child_nodes(node):
+            yield from self._walk_live(c)
+
     def collect_imports(self, tree):
-        for node in ast.walk(tree):
+        for node in self._walk_live(tree):
             if isinstance(node, ast.Import):
                 for a in node.names:
                     alias = (a.asname or a.name).split(".")[0]
@@ -5574,9 +5605,15 @@ class Transpiler:
                 clauses.append(c)
         sig = self.func_signature(node).rstrip(";")
         if clauses:
+            # ShivyCX reads these contract clauses (between the parameter list
+            # and `{`) to prove SIMD-divisibility and vectorize the loop. They
+            # are not valid C, so guard them for gcc/clang with __SHIVYC__,
+            # which ShivyCX's preprocessor always predefines.
             self.emit(sig)
+            self.emit("#ifdef __SHIVYC__")
             for c in clauses:
                 self.emit(c)
+            self.emit("#endif")
             self.emit("{")
         else:
             self.emit("%s {" % sig)
@@ -6073,37 +6110,47 @@ class Transpiler:
             return (a[0], a[1] + self._FUSE_UFUNCS[node.func.id][1], a[2])
         return None
 
-    def _fuse_render(self, node, idx):
+    def _fuse_render(self, node, idx, dtype=None):
+        f32 = (dtype == "float")
         if isinstance(node, ast.Constant):
             v = node.value
-            return repr(float(v)) if isinstance(v, float) else str(int(v))
+            if isinstance(v, float):
+                return repr(float(v)) + ("f" if f32 else "")
+            return str(int(v))
         if isinstance(node, ast.Name):
             if self._array_elem_ct(node):
                 return "%s[%s]" % (self.lid(node.id), idx)
             return self.lid(node.id)
         if isinstance(node, ast.UnaryOp):
             if isinstance(node.op, ast.USub):
-                return "(-(%s))" % self._fuse_render(node.operand, idx)
-            return self._fuse_render(node.operand, idx)
+                return "(-(%s))" % self._fuse_render(node.operand, idx, dtype)
+            return self._fuse_render(node.operand, idx, dtype)
         if isinstance(node, ast.BinOp):
             if isinstance(node.op, ast.Pow):
-                base = self._fuse_render(node.left, idx)
+                base = self._fuse_render(node.left, idx, dtype)
                 e = node.right
                 if isinstance(e, ast.Constant) and isinstance(e.value, int) \
                         and 1 <= e.value <= 4:
                     return "(" + "*".join("(%s)" % base
                                           for _ in range(e.value)) + ")"
-                return "pow(%s, %s)" % (base, self._fuse_render(e, idx))
+                powfn = "powf" if f32 else "pow"
+                return "%s(%s, %s)" % (powfn, base,
+                                       self._fuse_render(e, idx, dtype))
             cop = self._FUSE_BINOP[type(node.op)][0]
-            return "(%s %s %s)" % (self._fuse_render(node.left, idx), cop,
-                                   self._fuse_render(node.right, idx))
+            return "(%s %s %s)" % (self._fuse_render(node.left, idx, dtype),
+                                   cop,
+                                   self._fuse_render(node.right, idx, dtype))
         if isinstance(node, ast.Compare):
             cop = self._FUSE_CMP[type(node.ops[0])]
-            return "(%s %s %s)" % (self._fuse_render(node.left, idx), cop,
-                                   self._fuse_render(node.comparators[0], idx))
+            return "(%s %s %s)" % (self._fuse_render(node.left, idx, dtype),
+                                   cop,
+                                   self._fuse_render(node.comparators[0], idx,
+                                                     dtype))
         if isinstance(node, ast.Call):
-            return "%s(%s)" % (self._FUSE_UFUNCS[node.func.id][0],
-                               self._fuse_render(node.args[0], idx))
+            fn = self._FUSE_UFUNCS[node.func.id][0]
+            if f32:
+                fn = fn + "f"           # single-precision libm (expf/sqrtf/...)
+            return "%s(%s)" % (fn, self._fuse_render(node.args[0], idx, dtype))
         return "0"
 
     def _try_fused_array_store(self, node):
@@ -6132,7 +6179,7 @@ class Transpiler:
             n = str(sz)
         self.loop_n += 1
         iv = "_fi%d" % self.loop_n
-        body = self._fuse_render(node.value, iv)
+        body = self._fuse_render(node.value, iv, elem)
         if os.environ.get("PY2C_NPFUSE_VERBOSE"):
             kind = "array" if is_arr else "scalar-fill"
             sys.stderr.write(
