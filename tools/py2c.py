@@ -9915,7 +9915,8 @@ def transpile_file(path, out_dir, stdlib_dir=None):
     # scripts only -- never stdlib or the compiler's own modules. Best-effort:
     # autotype() returns the original path on any failure, so a build is never
     # broken by profiling.
-    if os.environ.get("RPY_PROFILE_GENERATE") and stdlib_dir is None \
+    if (os.environ.get("RPY_PROFILE_GENERATE") or
+            os.environ.get("RPY_PROFILE_USE")) and stdlib_dir is None \
             and path.endswith(".py") \
             and "shivyc" not in os.path.abspath(path).split(os.sep):
         try:
@@ -9923,7 +9924,10 @@ def transpile_file(path, out_dir, stdlib_dir=None):
             if _here not in sys.path:
                 sys.path.insert(0, _here)
             import rpy_pgo
-            path = rpy_pgo.autotype(path)
+            path = rpy_pgo.autotype(
+                path,
+                profile_in=os.environ.get("RPY_PROFILE_USE") or None,
+                profile_out=os.environ.get("RPY_PROFILE_OUT") or None)
         except Exception as e:
             print("  pgo: skipped (%s)" % e)
     src = open(path, encoding="utf-8").read()
@@ -10006,6 +10010,9 @@ def main(argv):
     stdlib_dir = None
     report_path = None
     profile_gen = bool(os.environ.get("RPY_PROFILE_GENERATE"))
+    profile_use = os.environ.get("RPY_PROFILE_USE") or None
+    profile_out = os.environ.get("RPY_PROFILE_OUT") or None
+    default_profile = "/tmp/rpy_profile.json"
     files = []
     i = 0
     while i < len(argv):
@@ -10016,6 +10023,20 @@ def main(argv):
             continue
         if a in ("-fprofile-generate", "--fprofile-generate"):
             profile_gen = True
+            i += 1
+            continue
+        if a.startswith("-fprofile-generate=") or \
+                a.startswith("--fprofile-generate="):
+            profile_gen = True
+            profile_out = a.split("=", 1)[1]
+            i += 1
+            continue
+        if a in ("-fprofile-use", "--fprofile-use"):
+            profile_use = default_profile
+            i += 1
+            continue
+        if a.startswith("-fprofile-use=") or a.startswith("--fprofile-use="):
+            profile_use = a.split("=", 1)[1]
             i += 1
             continue
         if a == "--stdlib-dir":
@@ -10053,14 +10074,38 @@ def main(argv):
             sys.exit(2)
 
     os.makedirs(out_dir, exist_ok=True)
-    # Profile-guided auto-typing (-fprofile-generate): the actual work happens
-    # in transpile_file (so the ShivyCX front end, which calls transpile_file
-    # directly, gets it too). The flag just turns the env switch on.
-    if profile_gen:
-        if len(files) == 1 and files[0].endswith(".py"):
-            os.environ["RPY_PROFILE_GENERATE"] = "1"
+    # Profile-guided auto-typing. Single .py inputs go through transpile_file's
+    # per-file hook (so the ShivyCX front end gets them too); multi-file programs
+    # are profiled once here as a set (one run, module-qualified types) so cross
+    # -module containers can be typed. -fprofile-use replays a cached profile.
+    if profile_gen or profile_use:
+        py_files = [f for f in files if f.endswith(".py")]
+        if profile_gen and not profile_use and not profile_out:
+            profile_out = default_profile     # cache so -fprofile-use can replay
+        if len(py_files) == len(files) and len(files) >= 2:
+            try:
+                _here = os.path.dirname(os.path.abspath(__file__))
+                if _here not in sys.path:
+                    sys.path.insert(0, _here)
+                import rpy_pgo
+                mapping = rpy_pgo.autotype_set(
+                    files, profile_in=profile_use, profile_out=profile_out)
+                files = [mapping.get(f, f) for f in files]
+            except Exception as e:
+                print("  pgo: skipped (%s)" % e)
+            # consumed here -- don't let the per-file hook re-profile.
+            for k in ("RPY_PROFILE_GENERATE", "RPY_PROFILE_USE",
+                      "RPY_PROFILE_OUT"):
+                os.environ.pop(k, None)
+        elif len(files) == 1 and files[0].endswith(".py"):
+            if profile_gen:
+                os.environ["RPY_PROFILE_GENERATE"] = "1"
+            if profile_use:
+                os.environ["RPY_PROFILE_USE"] = profile_use
+            if profile_out:
+                os.environ["RPY_PROFILE_OUT"] = profile_out
         else:
-            print("  pgo: skipped (profile-generate needs a single .py input)")
+            print("  pgo: skipped (need .py input(s))")
     set_local_module_dirs(files)
     _, _, stdlib_root = _stdlib_context(files[0] if len(files) == 1 else "", None)
     mp_bridge = bool(stdlib_dir) or any(
