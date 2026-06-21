@@ -218,6 +218,7 @@ obj  make_closure(ClosureFn fn, obj env);
 obj  call_closure(obj f, obj args);
 obj  identity__tramp(obj env, obj args);
 obj  call_obj(obj f, int n, ...);              /* convenience: builds arg list  */
+obj  call_obj_a(obj f, obj* a, int n);         /* varargs-free call_obj         */
 
 /* ---- arena: bump-allocate; free the whole compile at once (no refcount) -- */
 void* aalloc(size_t n);
@@ -241,6 +242,7 @@ bool truthy(obj v);                /* Python truthiness of a Tier-2 value     */
 typedef struct { obj* data; int len; int cap; } List;
 obj  list_new(void);
 obj  list_of(int n, ...);          /* [a, b, c] literal                       */
+obj  list_from(obj* a, int n);     /* varargs-free list build (stack array)    */
 obj  varg_list(int n, va_list ap); /* collect C varargs (obj) into a list     */
 void list_append(obj lst, obj v);
 void list_insert(obj lst, long i, obj v);
@@ -259,6 +261,8 @@ typedef struct { obj key; obj val; } DEnt;
 typedef struct { DEnt* e; int len; int cap; } Dict;
 obj  dict_new(void);
 obj  dict_of(int n, ...);          /* {k1:v1, k2:v2, ...} (2n varargs)         */
+obj  dict_of_a(obj* a, int n);     /* varargs-free dict_of (a = n key,val pairs) */
+obj  list_pair(obj a, obj b);      /* 2-element list, no varargs               */
 void dict_set(obj d, obj k, obj v);
 obj  dict_get(obj d, obj k, obj dflt);
 bool dict_contains(obj d, obj k);
@@ -555,6 +559,11 @@ obj call_obj(obj f, int n, ...) {
     va_end(ap);
     return call_closure(f, args);
 }
+obj call_obj_a(obj f, obj* a, int n) {    /* varargs-free call_obj */
+    obj args = list_new();
+    for (int i = 0; i < n; i++) list_append(args, a[i]);
+    return call_closure(f, args);
+}
 
 
 obj float_to_bits(obj val, long size) {
@@ -754,6 +763,13 @@ obj list_of(int n, ...) {
     va_end(ap);
     return r;
 }
+obj list_from(obj* a, int n) {     /* like list_of, but no varargs (a 16-byte
+                                      obj passed through `...` mis-lowers on some
+                                      backends); the caller fills a stack array */
+    obj r = list_new();
+    for (int i = 0; i < n; i++) list_append(r, a[i]);
+    return r;
+}
 obj varg_list(int n, va_list ap) {
     obj r = list_new();
     for (int i = 0; i < n; i++) list_append(r, va_arg(ap, obj));
@@ -846,6 +862,15 @@ obj dict_of(int n, ...) {
     for (int i = 0; i < n; i++) { obj k = va_arg(ap, obj); obj v = va_arg(ap, obj); dict_set(r, k, v); }
     va_end(ap); return r;
 }
+obj dict_of_a(obj* a, int n) {            /* varargs-free dict_of; a holds n
+                                             key,value pairs back to back */
+    obj r = dict_new();
+    for (int i = 0; i < n; i++) dict_set(r, a[2 * i], a[2 * i + 1]);
+    return r;
+}
+obj list_pair(obj a, obj b) {             /* 2-element list without varargs */
+    obj r = list_new(); list_append(r, a); list_append(r, b); return r;
+}
 obj dict_get(obj dd, obj k, obj dflt) {
     Dict* d = (Dict*)dd.u.o; int i = dict_find(d, k);
     return i >= 0 ? d->e[i].val : dflt;
@@ -881,7 +906,7 @@ obj dict_values(obj dd) {
 obj dict_items(obj dd) {
     Dict* d = (Dict*)dd.u.o; obj r = list_new();
     for (int i = 0; i < d->len; i++)
-        list_append(r, list_of(2, d->e[i].key, d->e[i].val));
+        list_append(r, list_pair(d->e[i].key, d->e[i].val));
     return r;
 }
 obj subscript(obj container, obj key) {
@@ -1046,14 +1071,14 @@ str pyjoin(str sep, obj it) {
 /* ---- builtins ---- */
 obj pyenumerate(obj it, long start) {
     obj r = list_new(); long n = pylen(it);
-    for (long i = 0; i < n; i++) list_append(r, list_of(2, OBJ_INT(start + i), index_obj(it, i)));
+    for (long i = 0; i < n; i++) list_append(r, list_pair(OBJ_INT(start + i), index_obj(it, i)));
     return r;
 }
 obj pyzip(obj a, obj b) {
     obj r = list_new();
     long n = pylen(a), m = pylen(b); if (m < n) n = m;
     for (long i = 0; i < n; i++)
-        list_append(r, list_of(2, index_obj(a, i), index_obj(b, i)));
+        list_append(r, list_pair(index_obj(a, i), index_obj(b, i)));
     return r;
 }
 obj pyzip3(obj a, obj b, obj c) {
@@ -6976,10 +7001,7 @@ class Transpiler:
         if isinstance(func, ast.Lambda):
             clo = self.expr(func)
             wargs = [self.wrap_obj(a) for a in node.args]
-            if wargs:
-                return "call_obj(%s, %d, %s)" % (clo, len(wargs),
-                                                 ", ".join(wargs))
-            return "call_closure(%s, list_new())" % clo
+            return self._emit_call_obj(clo, wargs)
 
         if isinstance(func, ast.Call) and isinstance(func.func, ast.Name) and \
                 func.func.id == "type" and len(func.args) == 1:
@@ -7008,10 +7030,7 @@ class Transpiler:
             inner = self.expr(func)
             args = [self.wrap_obj(a) for a in node.args]
             if not self.stdlib_root:        # rpython runtime: call_obj varargs
-                if args:
-                    return "call_obj(%s, %d, %s)" % (
-                        inner, len(args), ", ".join(args))
-                return "call_obj(%s, 0)" % inner
+                return self._emit_call_obj(inner, args)
             if args:
                 return "mp_call_obj(%s, list_of(%d, %s), dict_new())" % (
                     inner, len(args), ", ".join(args))
@@ -7025,9 +7044,8 @@ class Transpiler:
                 mangled = node.args[0].value
                 self.closure_values_needed.add(mangled)
                 caps = node.args[1:]
-                env = "list_of(%d, %s)" % (
-                    len(caps), ", ".join(self.wrap_obj(c) for c in caps)) \
-                    if caps else "list_new()"
+                env = self._list_literal(
+                    [self.wrap_obj(c) for c in caps])
                 return "make_closure(&%s__tramp, %s)" % (cname(mangled), env)
             if fn == "const" and node.args:
                 return self.expr(node.args[0])
@@ -7101,8 +7119,8 @@ class Transpiler:
                 if len(node.args) == 1:
                     it = self.wrap_obj(node.args[0])
                 else:
-                    it = "list_of(%d, %s)" % (len(node.args),
-                        ", ".join(self.wrap_obj(x) for x in node.args))
+                    it = self._list_literal(
+                        [self.wrap_obj(x) for x in node.args])
                 return "py%s(%s, %s, %s)" % (fn, it, dflt, has)
             if fn == "sum" and node.args:
                 start = self.wrap_obj(node.args[1]) if len(node.args) > 1 \
@@ -7349,10 +7367,7 @@ class Transpiler:
             if fn in self.mod_global_types and self.mod_global_types[fn] == OBJ \
                     and fn not in self.scope:
                 args = [self.wrap_obj(a) for a in node.args]
-                if args:
-                    return "call_obj(%s, %d, %s)" % (self._msym(fn), len(args),
-                                                     ", ".join(args))
-                return "call_closure(%s, list_new())" % self._msym(fn)
+                return self._emit_call_obj(self._msym(fn), args)
             if self.stdlib_root and fn in STDLIB_BUILTINS:
                 return self._mp_import_call("builtins", fn, node)
             if fn in self.from_imports and fn not in self.scope \
@@ -7377,10 +7392,7 @@ class Transpiler:
                 if varcall:
                     return varcall
                 args = [self.wrap_obj(a) for a in node.args]
-                if args:
-                    return "call_obj(%s, %d, %s)" % (self.fnsym(fn), len(args),
-                                                     ", ".join(args))
-                return "call_closure(%s, list_new())" % self.fnsym(fn)
+                return self._emit_call_obj(self.fnsym(fn), args)
 
         if isinstance(func, ast.Attribute) and is_super_call(func.value):
             base = self.cur_class.base if self.cur_class else None
@@ -7737,9 +7749,7 @@ class Transpiler:
                         and any(f == func.attr for f, _ in rci.own_fields):
                     fld = self.expr(func)
                     wargs = [self.wrap_obj(a) for a in node.args]
-                    return "call_obj(%s, %d%s)" % (
-                        fld, len(wargs),
-                        (", " + ", ".join(wargs)) if wargs else "")
+                    return self._emit_call_obj(fld, wargs)
             if self.stdlib_root:
                 return self._mp_method_call(func.value, func.attr, node)
             recv = self.expr(func.value)
@@ -7765,10 +7775,7 @@ class Transpiler:
             if varcall:
                 return varcall
             wargs = [self.wrap_obj(a) for a in node.args]
-            if wargs:
-                return "call_obj(%s, %d, %s)" % (self.expr(func), len(wargs),
-                                                 ", ".join(wargs))
-            return "call_closure(%s, list_new())" % self.expr(func)
+            return self._emit_call_obj(self.expr(func), wargs)
         if isinstance(func, ast.Name) and func.id in self.scope and \
                 self.scope[func.id] == OBJ and func.id not in self.func_params \
                 and func.id not in self.classes:
@@ -7834,12 +7841,11 @@ class Transpiler:
             return None
         if star is None:
             if prefix:
-                star = "list_of(%d, %s)" % (len(prefix), ", ".join(prefix))
+                star = self._list_literal(prefix)
             else:
                 star = "list_new()"
         elif prefix:
-            star = "obj_add(list_of(%d, %s), %s)" % (
-                len(prefix), ", ".join(prefix), star)
+            star = "obj_add(%s, %s)" % (self._list_literal(prefix), star)
         if not self.stdlib_root and not node.keywords:
             # rpython runtime: call a dynamic callable with a runtime arg list.
             return "call_closure(%s, %s)" % (func_expr, star)
@@ -7858,7 +7864,7 @@ class Transpiler:
                 parts.append(self.wrap_obj(k.value))
         if not parts:
             return "dict_new()"
-        return "dict_of(%d, %s)" % (len(parts) // 2, ", ".join(parts))
+        return self._emit_dict_of(parts)
 
     # ---- OO call lowering helpers ---------------------------------------
 
@@ -7921,8 +7927,7 @@ class Transpiler:
             wrapped = [self.coerce_to(OBJ, a, self.expr(a)) for a in extra]
             parts = [recv]
             if wrapped:
-                parts.append("list_of(%d, %s)" % (len(wrapped),
-                                                 ", ".join(wrapped)))
+                parts.append(self._list_literal(wrapped))
             else:
                 parts.append("list_new()")
             return "%s_%s(%s)" % (owner.csym, m.name, ", ".join(parts))
@@ -9013,23 +9018,57 @@ class Transpiler:
         parts.append("_tl;")
         return "({ " + " ".join(parts) + " })"
 
-    def ex_List(self, node):
-        if not node.elts:
+    def _emit_call_obj(self, clo_expr, arg_exprs):
+        """call_obj without obj-through-varargs: args go into a stack array."""
+        n = len(arg_exprs)
+        if n == 0:
+            return "call_obj_a(%s, (obj*)0, 0)" % clo_expr
+        self._list_tmp = getattr(self, "_list_tmp", 0) + 1
+        v = "_ca%d" % self._list_tmp
+        stores = " ".join("%s[%d] = %s;" % (v, i, e)
+                          for i, e in enumerate(arg_exprs))
+        return "({ obj %s[%d]; %s call_obj_a(%s, %s, %d); })" % (
+            v, n, stores, clo_expr, v, n)
+
+    def _emit_dict_of(self, flat_exprs):
+        """dict_of without obj-through-varargs. flat_exprs = k0,v0,k1,v1,..."""
+        npairs = len(flat_exprs) // 2
+        if npairs == 0:
+            return "dict_new()"
+        self._list_tmp = getattr(self, "_list_tmp", 0) + 1
+        v = "_da%d" % self._list_tmp
+        stores = " ".join("%s[%d] = %s;" % (v, i, e)
+                          for i, e in enumerate(flat_exprs))
+        return "({ obj %s[%d]; %s dict_of_a(%s, %d); })" % (
+            v, len(flat_exprs), stores, v, npairs)
+
+    def _list_literal(self, elem_exprs):
+        """Build a list from rendered element exprs without C varargs: store
+        them into a stack array and hand list_from a pointer. A 16-byte obj
+        passed through `...` mis-lowers on some backends (only the first arg
+        survives), so list literals avoid varargs entirely."""
+        n = len(elem_exprs)
+        if n == 0:
             return "list_new()"
-        items = ", ".join(self.wrap_obj(e) for e in node.elts)
-        return "list_of(%d, %s)" % (len(node.elts), items)
+        self._list_tmp = getattr(self, "_list_tmp", 0) + 1
+        v = "_lt%d" % self._list_tmp
+        stores = " ".join("%s[%d] = %s;" % (v, i, e)
+                          for i, e in enumerate(elem_exprs))
+        return "({ obj %s[%d]; %s list_from(%s, %d); })" % (v, n, stores, v, n)
+
+    def ex_List(self, node):
+        return self._list_literal([self.wrap_obj(e) for e in node.elts])
 
     def ex_Tuple(self, node):
         if not node.elts:
             return "list_new() /* () */"
-        items = ", ".join(self.wrap_obj(e) for e in node.elts)
-        return "list_of(%d, %s)" % (len(node.elts), items)
+        return self._list_literal([self.wrap_obj(e) for e in node.elts])
 
     def ex_Set(self, node):
         if not node.elts:
             return "list_new() /* set */"
-        items = ", ".join(self.wrap_obj(e) for e in node.elts)
-        return "list_of(%d, %s) /* set */" % (len(node.elts), items)
+        return self._list_literal(
+            [self.wrap_obj(e) for e in node.elts]) + " /* set */"
 
     def ex_Dict(self, node):
         pairs = [(k, v) for k, v in zip(node.keys, node.values)
@@ -9040,7 +9079,7 @@ class Transpiler:
         for k, v in pairs:
             flat.append(self.wrap_obj(k))
             flat.append(self.wrap_obj(v))
-        return "dict_of(%d, %s)" % (len(pairs), ", ".join(flat))
+        return self._emit_dict_of(flat)
 
     def ex_ListComp(self, node):
         return self.lower_comp(node, "list")
