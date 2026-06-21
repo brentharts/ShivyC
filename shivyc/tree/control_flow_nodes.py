@@ -263,10 +263,18 @@ class SwitchStatement(Node):
     def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make code for this node."""
         import shivyc.il_cmds.math as math_cmds
+        import shivyc.ctypes as ctypes
         val = self.cond.make_il(il_code, symbol_table, c)
         if not val.ctype.is_integral():
             err = "switch controlling expression must have integer type"
             raise CompilerError(err, self.cond.r)
+
+        # C requires integer promotion on the controlling expression (6.8.4.2);
+        # the dispatch chain below subtracts each case value from it, and a
+        # sub-int width (char/short/_Bool) makes that subtract/compare misbehave
+        # on the backend. Promote so the comparison happens in `int`.
+        if val.ctype.size < ctypes.integer.size:
+            val = set_type(val, ctypes.integer, il_code)
 
         dispatch = il_code.get_label()
         end = il_code.get_label()
