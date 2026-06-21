@@ -321,7 +321,7 @@ an inline first-character type switch, no dict and no bridge), `rtattr/`
 runtime helpers — again no micropython bridge), `crossattr/` (cross-class field
 discovery: attributes a configurator stamps onto another class via
 `obj.attr =`/`setattr` are promoted to real slots so the writes persist),
-`io/`, `net/`, and `mandelbrot/`. Run them all with `make rpython`.
+`aggregates/` (varargs-free list/dict/call construction — a 16-byte `obj` mis-lowers through C `...` on the self-compiled backend, so literals and calls build via a stack array instead), `io/`, `net/`, and `mandelbrot/`. Run them all with `make rpython`.
 
 ---
 

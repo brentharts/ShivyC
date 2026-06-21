@@ -70,6 +70,15 @@ and unboxing macros — `OBJ_INT`, `OBJ_STR`, `OBJ_OBJ`, `OBJ_BOOL`, `OBJ_NONE`,
 Python truthiness and `OBJ_ISINST(v, t)` for `isinstance`. The runtime compiles
 `-Wall`-clean.
 
+**No obj through C varargs.** The tagged `obj` is a 16-byte struct, and passing
+a 16-byte struct by value through a `...` parameter mis-lowers on the
+self-compiled backend (only the first variadic argument survives). So aggregate
+construction never uses varargs: list/tuple/set/dict literals, dynamic-call
+argument packing, and the pair-building inside `enumerate`/`zip` store their
+`obj` values into a stack array and pass a pointer to a non-variadic helper
+(`list_from`, `call_obj_a`, `dict_of_a`, `list_pair`). See the `aggregates`
+example.
+
 **Memory.** Everything is allocated from a single bump arena (`aalloc`); there is
 no garbage collector. This matches a compiler's lifetime profile — allocate
 freely during a compile, drop the whole arena at the end — and removes refcount
