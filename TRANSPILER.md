@@ -70,6 +70,12 @@ and unboxing macros — `OBJ_INT`, `OBJ_STR`, `OBJ_OBJ`, `OBJ_BOOL`, `OBJ_NONE`,
 Python truthiness and `OBJ_ISINST(v, t)` for `isinstance`. The runtime compiles
 `-Wall`-clean.
 
+**`%` is string formatting on a string.** `fmt % args` where the left operand is
+a string lowers to `str_mod` (a printf-style formatter), not the arithmetic
+`obj_mod`; a tuple right-hand side spreads into multiple arguments. f-strings
+lower to `pyfmt_a`. Both take arguments through a pointer (see below) and size
+their output to the arguments. See the `formatting` example.
+
 **No obj through C varargs.** The tagged `obj` is a 16-byte struct, and passing
 a 16-byte struct by value through a `...` parameter mis-lowers on the
 self-compiled backend (only the first variadic argument survives). So aggregate

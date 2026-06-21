@@ -149,6 +149,7 @@ rpython:
 	run $(RPY)/rtattr/app.py 48 ""; \
 	run $(RPY)/crossattr/app.py 114 ""; \
 	run $(RPY)/aggregates/app.py 84 ""; \
+	run $(RPY)/formatting/app.py 33 ""; \
 	runm 38 $(RPY)/multifile/app.py $(RPY)/multifile/geom.py; \
 	runm 45 $(RPY)/ambig/app.py $(RPY)/ambig/node_a.py $(RPY)/ambig/node_b.py; \
 	runm 55 $(RPY)/fieldwrite/app.py $(RPY)/fieldwrite/lib.py; \
