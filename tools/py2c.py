@@ -325,11 +325,14 @@ obj  pyreversed(obj it);
 obj  pyset(obj it);                     /* dedup iterable into a list-set      */
 #define PY_SLICE_END 0x7fffffffffffffffL
 obj  py_slice(obj seq, long lo, long hi);  /* str or list slice, Python rules  */
+obj  py_slice_step(obj seq, long lo, long hi, long step, int hl, int hh);
 str  char_at(str s, long i);            /* s[i] on a string -> 1-char string   */
 void set_add(obj s, obj v);             /* add to a list-set if absent         */
 void pyclear(obj c);                    /* list/set/dict .clear() (empty in place) */
 void list_remove(obj lst, obj v);       /* remove first matching element       */
 obj  list_index(obj lst, obj v);        /* position of first match (else abort) */
+long list_count(obj lst, obj v);        /* count of elements equal to v          */
+obj  list_reverse(obj lst);             /* in-place reverse, returns None         */
 obj  list_pop(obj lst);                 /* remove & return last element        */
 obj  float_to_bits(obj val, long size); /* IEEE-754 float -> int bit pattern   */
 obj  float_fromhex(str s);              /* float.fromhex: strtod (hex floats)  */
@@ -975,6 +978,15 @@ obj obj_mul(obj a, obj b) {
         for (long i = 0; i < n; i++) memcpy(o + i * l, a.u.s, l);
         o[l * (n < 0 ? 0 : n)] = 0; return OBJ_STR(o);
     }
+    if ((a.tag == T_LIST && b.tag == T_INT) ||
+        (b.tag == T_LIST && a.tag == T_INT)) {     /* list repeat: [x]*n / n*[x] */
+        obj lst = a.tag == T_LIST ? a : b;
+        long n = (a.tag == T_LIST ? b : a).u.i;
+        obj r = list_new(); List* l = (List*)lst.u.o;
+        for (long k = 0; k < n; k++)
+            for (int i = 0; i < l->len; i++) list_append(r, l->data[i]);
+        return r;
+    }
     return OBJ_INT(as_num(a) * as_num(b));
 }
 obj obj_fdiv(obj a, obj b) { long d = as_num(b); return OBJ_INT(d ? as_num(a) / d : 0); }
@@ -1258,6 +1270,23 @@ obj list_index(obj lst, obj v) {
     }
     fprintf(stderr, "list.index: value not found\n"); abort();
 }
+long list_count(obj lst, obj v) {  /* number of elements equal to v */
+    long c = 0;
+    if (lst.tag == T_LIST) {
+        List* l = (List*)lst.u.o;
+        for (long i = 0; i < l->len; i++) if (obj_eq(l->data[i], v)) c++;
+    }
+    return c;
+}
+obj list_reverse(obj lst) {        /* in-place reverse; returns None */
+    if (lst.tag == T_LIST) {
+        List* l = (List*)lst.u.o;
+        for (long i = 0, j = l->len - 1; i < j; i++, j--) {
+            obj t = l->data[i]; l->data[i] = l->data[j]; l->data[j] = t;
+        }
+    }
+    return OBJ_NONE;
+}
 obj obj_augop(obj a, char op, obj b) {
     int set_like = (a.tag == T_LIST || b.tag == T_LIST);
     if (op == '+') return obj_add(a, b);
@@ -1327,6 +1356,30 @@ obj py_slice(obj seq, long lo, long hi) {
                                       : clamp_index(hi, n);
     obj r = list_new();
     for (long i = a; i < b; i++) list_append(r, index_obj(seq, i));
+    return r;
+}
+obj py_slice_step(obj seq, long lo, long hi, long step, int has_lo, int has_hi) {
+    /* Full Python slice with step (incl. negative step, e.g. [::-1]). */
+    if (step == 0) step = 1;
+    int is_str = (seq.tag == T_STR);
+    long n = is_str ? (long)strlen(seq.u.s ? seq.u.s : "") : pylen(seq);
+    if (!has_lo) lo = step > 0 ? 0 : n - 1;
+    else { if (lo < 0) lo += n;
+           if (step > 0) { if (lo < 0) lo = 0; if (lo > n) lo = n; }
+           else { if (lo < -1) lo = -1; if (lo > n - 1) lo = n - 1; } }
+    if (!has_hi) hi = step > 0 ? n : -1;
+    else { if (hi < 0) hi += n;
+           if (step > 0) { if (hi < 0) hi = 0; if (hi > n) hi = n; }
+           else { if (hi < -1) hi = -1; if (hi > n - 1) hi = n - 1; } }
+    if (is_str) {
+        const char* s = seq.u.s ? seq.u.s : "";
+        char* o = aalloc(n + 1); long k = 0;
+        for (long i = lo; step > 0 ? i < hi : i > hi; i += step) o[k++] = s[i];
+        o[k] = 0; return OBJ_STR(o);
+    }
+    obj r = list_new();
+    for (long i = lo; step > 0 ? i < hi : i > hi; i += step)
+        list_append(r, index_obj(seq, i));
     return r;
 }
 long pyord(obj c) { return (c.tag == T_STR && c.u.s) ? (unsigned char)c.u.s[0] : (long)as_num(c); }
@@ -7163,7 +7216,9 @@ class Transpiler:
             if fn in ("any", "all") and len(node.args) == 1:
                 return self.lower_any_all(fn, node.args[0])
             if fn == "bool" and len(node.args) == 1:
-                return self.bool_expr(node.args[0])
+                # Python bool() yields exactly 0 or 1 as a *value* (not just a
+                # truthy-in-context expression), so normalize.
+                return "(%s ? 1 : 0)" % self.bool_expr(node.args[0])
             if fn == "range":
                 a = [self.coerce_to("int", x, self.expr(x))
                      for x in node.args]
@@ -7246,6 +7301,14 @@ class Transpiler:
                 return "0"
             if fn == "abs" and node.args:
                 return "pyabs(%s)" % self.as_long(node.args[0])
+            if fn == "divmod" and len(node.args) == 2:
+                # (a // b, a % b) as a 2-tuple; uses the same C division as the
+                # `//`/`%` operators so divmod stays consistent with them.
+                return ("({ long _a = %s, _b = %s; obj _dm[2]; "
+                        "_dm[0] = OBJ_INT(_b ? _a / _b : 0); "
+                        "_dm[1] = OBJ_INT(_b ? _a %% _b : 0); "
+                        "list_from(_dm, 2); })" % (self.as_long(node.args[0]),
+                                                   self.as_long(node.args[1])))
             if fn == "iter" and len(node.args) == 1:
                 # Iterables are materialized lists in this runtime, so iter() is
                 # the identity (the list is directly indexable).
@@ -7575,13 +7638,18 @@ class Transpiler:
                     func.attr not in self.method_owners:
                 return "list_index(%s, %s)" % (self.wrap_obj(func.value),
                                                self.wrap_obj(node.args[0]))
+            if func.attr == "count" and len(node.args) == 1 and \
+                    func.attr not in self.method_owners:
+                return "list_count(%s, %s)" % (self.wrap_obj(func.value),
+                                               self.wrap_obj(node.args[0]))
             if func.attr == "sort":
                 ks = self._sort_with_key(func, node)
                 if ks is not None:
                     return ks
                 return "list_sort(%s)" % self.expr(func.value)
-            if func.attr == "reverse":
-                return "/* .reverse() omitted */ (void)0"
+            if func.attr == "reverse" and not node.args and \
+                    func.attr not in self.method_owners:
+                return "list_reverse(%s)" % self.wrap_obj(func.value)
             # string methods (guard against user methods of the same name)
             if func.attr in self.STR_METHODS and \
                     func.attr not in self.method_owners:
@@ -8967,6 +9035,14 @@ class Transpiler:
                 return "%s_%s(%s, %s)" % (owner.name, d, key, i)
         sl = node.slice
         if isinstance(sl, ast.Slice):
+            if sl.step is not None:
+                step = self.as_long(sl.step)
+                lo = self.as_long(sl.lower) if sl.lower else "0"
+                hi = self.as_long(sl.upper) if sl.upper else "0"
+                hl = "1" if sl.lower else "0"
+                hh = "1" if sl.upper else "0"
+                return "py_slice_step(%s, %s, %s, %s, %s, %s)" % (
+                    self.wrap_obj(node.value), lo, hi, step, hl, hh)
             lo = self.as_long(sl.lower) if sl.lower else "0"
             hi = self.as_long(sl.upper) if sl.upper else "PY_SLICE_END"
             return "py_slice(%s, %s, %s)" % (self.wrap_obj(node.value), lo, hi)
