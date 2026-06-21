@@ -6150,8 +6150,11 @@ class Transpiler:
         for it in node.items:
             tv = it.optional_vars
             if isinstance(tv, ast.Name):
-                binds.append("obj %s = %s;" % (
-                    cname(tv.id), self.expr(it.context_expr)))
+                ct = self.value_ctype(it.context_expr) or OBJ
+                rhs = self.expr(it.context_expr)   # before tv enters scope
+                self.scope[tv.id] = ct             # body sees the real type
+                binds.append("%s %s = %s;" % (
+                    self.ctype_csym(ct), self.lid(tv.id), rhs))
             else:
                 binds.append("%s;" % self.expr(it.context_expr))
         lines += self.indent_lines(binds)
