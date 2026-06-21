@@ -220,17 +220,21 @@ configurator doing `target.attr = …` or `setattr(target, "attr", …)` — is 
 captured, **provided the receiver's class is statically known**: from a
 `var = Cls()` binding or a parameter annotation (`target: "Widget"`). A pre-pass
 (`discover_fields_from_ctor_locals`) walks top-level functions and method bodies,
-and promotes each such `attr` to an `obj` field on the receiver's class, which
-its subclasses then inherit. This is what lets a cross-class dynamic write land
-in a real slot instead of being dropped by `rt_setattr` — see the `crossattr`
-example.
+and promotes each such `attr` to a field on the receiver's class, which its
+subclasses then inherit. This is what lets a cross-class dynamic write land in a
+real slot instead of being dropped by `rt_setattr` — see the `crossattr` example.
+
+The promoted field's type is `obj` by default, but is inferred when every write
+to it assigns a direct constructor result of one local class — `target.style =
+Style(3)` makes `style` a real `Style*`, so it can be used as a typed pointer
+(`b.style.inset()` becomes a direct call) rather than a boxed obj. Any
+disagreement between sites, or any non-constructor right-hand side, keeps the
+field `obj`.
 
 Two cases remain out of reach. A receiver that stays an untyped `obj` at the
-write site gives no class to attribute the field to. And a discovered field is
-typed as the generic `obj` word, which is correct for scalars and dynamic values
-but conflicts if that same attribute is elsewhere read as a *typed object
-pointer*; giving it a concrete type would require inferring the assigned value's
-type at the discovery site.
+write site gives no class to attribute the field to. And the type inference
+fires only for a direct local-class constructor on the right-hand side; a value
+reached indirectly (e.g. `target.x = self.y`) still lands as `obj`.
 
 
 ## 5. `isinstance` narrowing — blocks and `and`-chains
