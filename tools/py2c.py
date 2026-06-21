@@ -235,6 +235,7 @@ void package(const char* name);
 str  pystr(obj v);                 /* str(x)                                  */
 str  pyrepr(obj v);                 /* repr() — quotes strings inside containers */
 str  pyfmt(int n, const char* fmt, ...); /* f-strings: "{}..." + obj args     */
+str  pyfmt_a(const char* fmt, obj* args, int n);  /* varargs-free f-strings    */
 str  pyconcat(str a, str b);       /* "x" + y                                 */
 bool truthy(obj v);                /* Python truthiness of a Tier-2 value     */
 
@@ -282,6 +283,7 @@ obj  obj_sub(obj a, obj b);
 obj  obj_mul(obj a, obj b);        /* *  (int, str/list repeat)               */
 obj  obj_fdiv(obj a, obj b);       /* // */
 obj  obj_mod(obj a, obj b);
+str  str_mod(const char* fmt, obj* args, int n);  /* `fmt % args` formatting */
 obj  obj_neg(obj a);               /* unary -  */
 obj  obj_invert(obj a);            /* unary ~  */
 obj  obj_bin(char op, obj a, obj b);  /* &|^ and << >>                        */
@@ -662,6 +664,23 @@ str pyfmt(int n, const char* fmt, ...) {
     va_end(ap);
     return out;
 }
+str pyfmt_a(const char* fmt, obj* args, int n) {   /* varargs-free pyfmt; also
+                                          sizes the buffer to the args */
+    size_t cap = strlen(fmt) + 1;
+    for (int i = 0; i < n; i++) { str s = pystr(args[i]); cap += s ? strlen(s) : 0; }
+    char* out = aalloc(cap + 1);
+    char* p = out; const char* f = fmt; int ai = 0;
+    while (*f) {
+        if (f[0] == '{' && f[1] == '}') {
+            str s = (ai < n) ? pystr(args[ai++]) : ""; if (!s) s = "";
+            size_t l = strlen(s); memcpy(p, s, l); p += l; f += 2;
+        } else {
+            *p++ = *f++;
+        }
+    }
+    *p = 0;
+    return out;
+}
 
 str pyconcat(str a, str b) {
     size_t la = a ? strlen(a) : 0, lb = b ? strlen(b) : 0;
@@ -946,6 +965,49 @@ obj obj_mul(obj a, obj b) {
 }
 obj obj_fdiv(obj a, obj b) { long d = as_num(b); return OBJ_INT(d ? as_num(a) / d : 0); }
 obj obj_mod(obj a, obj b) { long d = as_num(b); return OBJ_INT(d ? as_num(a) % d : 0); }
+str str_mod(const char* fmt, obj* args, int n) {
+    /* Python `fmt % args` (printf-style). args already collected into an array
+       by the caller (a tuple right-hand side spreads; anything else is one
+       arg), so there are no varargs and no tuple/list ambiguity. */
+    size_t cap = strlen(fmt) + 1;
+    int specs = 0;
+    for (const char* t = fmt; *t; t++) if (*t == '%') specs++;
+    cap += (size_t)specs * 512;
+    for (int i = 0; i < n; i++)
+        if (args[i].tag == T_STR && args[i].u.s) cap += strlen(args[i].u.s);
+    char* out = aalloc(cap + 64);
+    size_t len = 0;
+    int ai = 0;
+    const char* f = fmt;
+    while (*f) {
+        if (*f != '%') { out[len++] = *f++; continue; }
+        f++;                                    /* past '%' */
+        if (*f == '%') { out[len++] = '%'; f++; continue; }
+        char spec[64]; int sl = 0; spec[sl++] = '%';
+        while (*f && !strchr("diouxXeEfFgGcsr", *f) && sl < 58)
+            spec[sl++] = *f++;
+        char conv = *f ? *f++ : 's';
+        obj a = (ai < n) ? args[ai++] : OBJ_NONE;
+        if (conv == 's' || conv == 'r') {       /* plain string copy (no flags) */
+            str s = pystr(a); if (!s) s = "";
+            size_t l = strlen(s); memcpy(out + len, s, l); len += l;
+        } else {
+            char buf[512];
+            if (conv == 'f' || conv == 'F' || conv == 'e' || conv == 'E' ||
+                conv == 'g' || conv == 'G') {
+                spec[sl++] = conv; spec[sl] = 0;
+                double d = a.tag == T_FLOAT ? a.u.d : (double)as_num(a);
+                snprintf(buf, sizeof buf, spec, d);
+            } else {                            /* d i o u x X c -> long */
+                spec[sl++] = 'l'; spec[sl++] = conv; spec[sl] = 0;
+                snprintf(buf, sizeof buf, spec, as_num(a));
+            }
+            size_t l = strlen(buf); memcpy(out + len, buf, l); len += l;
+        }
+    }
+    out[len] = 0;
+    return out;
+}
 obj obj_neg(obj a) { return OBJ_INT(-as_num(a)); }
 obj obj_invert(obj a) { return OBJ_INT(~as_num(a)); }
 long ipow(long base, long exp) {
@@ -5599,6 +5661,8 @@ class Transpiler:
             if isinstance(node.op, ast.Add) and (self.looks_str(node.left) or
                                                  self.looks_str(node.right)):
                 return "char*"
+            if isinstance(node.op, ast.Mod) and self.looks_str(node.left):
+                return "char*"          # `fmt % args` -> formatted string
             lt = self.value_ctype(node.left)
             rt = self.value_ctype(node.right)
             numeric = ("int", "bool", "double", "float", "long",
@@ -8466,6 +8530,14 @@ class Transpiler:
                                              self.looks_str(node.right)):
             return "pyconcat(%s, %s)" % (self.as_str(node.left),
                                          self.as_str(node.right))
+        if isinstance(node.op, ast.Mod) and self.looks_str(node.left):
+            # `fmt % args` is string formatting, not arithmetic modulo. A tuple
+            # right-hand side spreads into multiple args; anything else is one.
+            if isinstance(node.right, ast.Tuple):
+                args = [self.wrap_obj(e) for e in node.right.elts]
+            else:
+                args = [self.wrap_obj(node.right)]
+            return self._emit_str_mod(self.as_str(node.left), args)
         lt = self.value_ctype(node.left)
         rt = self.value_ctype(node.right)
         numeric = {"int", "bool", "double", "float", "long",
@@ -9018,6 +9090,18 @@ class Transpiler:
         parts.append("_tl;")
         return "({ " + " ".join(parts) + " })"
 
+    def _emit_str_mod(self, fmt_expr, arg_exprs):
+        """`fmt % args` without obj-through-varargs: args go in a stack array."""
+        n = len(arg_exprs)
+        if n == 0:
+            return "str_mod(%s, (obj*)0, 0)" % fmt_expr
+        self._list_tmp = getattr(self, "_list_tmp", 0) + 1
+        v = "_sm%d" % self._list_tmp
+        stores = " ".join("%s[%d] = %s;" % (v, i, e)
+                          for i, e in enumerate(arg_exprs))
+        return "({ obj %s[%d]; %s str_mod(%s, %s, %d); })" % (
+            v, n, stores, fmt_expr, v, n)
+
     def _emit_call_obj(self, clo_expr, arg_exprs):
         """call_obj without obj-through-varargs: args go into a stack array."""
         n = len(arg_exprs)
@@ -9115,8 +9199,15 @@ class Transpiler:
                 fmt.append("{}")
                 exprs.append(self.wrap_obj(part.value))
         lit = c_string("".join(fmt))
-        return "pyfmt(%d, %s%s)" % (len(exprs), lit,
-                                    (", " + ", ".join(exprs)) if exprs else "")
+        n = len(exprs)
+        if n == 0:
+            return "pyfmt_a(%s, (obj*)0, 0)" % lit
+        self._list_tmp = getattr(self, "_list_tmp", 0) + 1
+        v = "_pf%d" % self._list_tmp
+        stores = " ".join("%s[%d] = %s;" % (v, i, e)
+                          for i, e in enumerate(exprs))
+        return "({ obj %s[%d]; %s pyfmt_a(%s, %s, %d); })" % (
+            v, n, stores, lit, v, n)
 
     def ex_FormattedValue(self, node):
         return self.expr(node.value)
