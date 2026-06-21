@@ -84,6 +84,10 @@ the constructor's C parameter type: `int`->`AS_INT`, `bool`->`truthy`,
 `switch` is now integer-promoted, so `switch` on a one-byte tag -- e.g. inside
 `truthy` -- compares correctly.)
 
+**Set literals de-duplicate.** A `{a, b, ...}` literal lowers to `set_from`,
+which is `list_from` minus elements already present (by `obj_eq`), so
+`len({1, 1, 2})` is 2. (Sets are still backed by the list representation.)
+
 **No obj through C varargs.** The tagged `obj` is a 16-byte struct, and passing
 a 16-byte struct by value through a `...` parameter mis-lowers on the
 self-compiled backend (only the first variadic argument survives). So aggregate

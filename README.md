@@ -323,6 +323,8 @@ discovery: attributes a configurator stamps onto another class via
 `obj.attr =`/`setattr` are promoted to real slots so the writes persist),
 `aggregates/` (varargs-free list/dict/call construction — a 16-byte `obj` mis-lowers through C `...` on the self-compiled backend, so literals and calls build via a stack array instead), `formatting/` (`%` string formatting and f-strings — `fmt % args` is real printf-style formatting, not arithmetic modulo, lowered to a varargs-free `str_mod`), `ctorval/` (constructors used as values: trampoline unboxing of int/float/bool arguments, plus the switch-on-narrow-type integer-promotion fix that makes boolean truthiness correct), `io/`, `net/`, and `mandelbrot/`. Run them all with `make rpython`.
 
+`make testfast` is a fast smoke test: a single-file syntax sweep and a multi-file cross-module case, each compiled with CPython (the oracle), the ShivyCX self-compiler, and the py2c->gcc transpiler, requiring all three to agree. It covers most of the language subset in a few seconds.
+
 ---
 
 ## References

@@ -158,6 +158,41 @@ rpython:
 	else echo "rpython examples: FAILURES"; fi; exit $$fail
 
 # ---------------------------------------------------------------------------
+# Fast smoke test: two oracle programs (a single-file syntax sweep and a
+# multi-file cross-module case) compiled three ways -- CPython (the oracle),
+# the ShivyCX self-compiler, and the py2c->gcc transpiler -- requiring all
+# three to agree. Covers most of the language subset in a few seconds, so it
+# stands in for the full suite when iterating.
+#     make testfast
+FAST    := tests/fast
+FASTBIN := build/fast
+testfast:
+	@mkdir -p $(FASTBIN)
+	@fail=0; \
+	sx_run() { out=$(FASTBIN)/$$1_sx; shift; \
+	  if ! python3 -m shivyc.main --no-cache "$$@" -o $$out >/dev/null 2>&1; then echo ERR; return; fi; \
+	  timeout 30 $$out >/dev/null 2>&1; echo $$?; }; \
+	gcc_run() { d=$(FASTBIN)/$$1_c; rm -rf $$d; mkdir -p $$d; shift; \
+	  if ! python3 tools/py2c.py "$$@" --out $$d >/dev/null 2>&1; then echo ERR; return; fi; \
+	  python3 -c "import sys;sys.path.insert(0,'tools');import py2c;py2c.write_runtime('$$d')" >/dev/null 2>&1; \
+	  if ! gcc -std=c99 -I$$d $$d/*.c -o $$d/bin 2>/dev/null; then echo ERR; return; fi; \
+	  timeout 30 $$d/bin >/dev/null 2>&1; echo $$?; }; \
+	report() { if [ "$$3" = "$$2" ] && [ "$$4" = "$$2" ]; then \
+	    echo "  ok    $$1 (cpython=$$2 shivycx=$$3 gcc=$$4)"; \
+	  else echo "  FAIL  $$1 (cpython=$$2 shivycx=$$3 gcc=$$4)"; fail=1; fi; }; \
+	orc=`python3 $(FAST)/syntax_core.py >/dev/null 2>&1; echo $$?`; \
+	sx=`sx_run syntax_core $(FAST)/syntax_core.py`; \
+	cc=`gcc_run syntax_core $(FAST)/syntax_core.py`; \
+	report "syntax_core (single file)" $$orc $$sx $$cc; \
+	orc=`cd $(FAST)/multi && python3 main.py >/dev/null 2>&1; echo $$?`; \
+	M="$(FAST)/multi/main.py $(FAST)/multi/geometry.py $(FAST)/multi/shapes.py"; \
+	sx=`sx_run multi $$M`; \
+	cc=`gcc_run multi $$M`; \
+	report "multi (cross-module)" $$orc $$sx $$cc; \
+	if [ $$fail = 0 ]; then echo "testfast: PASS"; \
+	else echo "testfast: FAIL"; fi; exit $$fail
+
+# ---------------------------------------------------------------------------
 # Benchmarks: whole-program SIMD vs gcc -O0/-O2, memory-safety table, etc.
 #     make benchmarks
 benchmarks:
@@ -316,7 +351,7 @@ run-irq: baremetal-irq
 self:
 	cd tools && pypy3 py2c.py
 
-.PHONY: default test shim install clean baremetal baremetal-hello \
+.PHONY: default test testfast shim install clean baremetal baremetal-hello \
         selfhost selfhost_objcore selfhost_bench selfhost_coverage \
         selfhost_coverage_musl selfhost_link \
         rpython benchmarks \
