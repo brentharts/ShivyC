@@ -4920,9 +4920,13 @@ class Transpiler:
         self.hoisted = set()
         self.narrowed = {}          # name -> ctype, active in an isinstance block
         self.elem_types = {}        # list var -> element ctype (from List[T])
+        self.array_sizes = {}       # array var -> fixed element count N (T[N])
         args = fn.args.args[1:] if skip_self else fn.args.args
         for arg in args:
             ct = self.arg_ctype_q(fn, arg)
+            sz = ann_array_size(arg.annotation)
+            if sz:
+                self.array_sizes[arg.arg] = sz
             if fn.name in VTABLE_METHODS and self._is_class_ptr(ct) \
                     and id(fn) not in self._pod_method_nodes:
                 # boxed `obj` param (vtable ABI) with a known concrete class:
@@ -5984,6 +5988,161 @@ class Transpiler:
     def st_Assign(self, node):
         return self.assign(node)
 
+    # ---- NumPy-style elementwise array-expression fusion ----------------
+    # A whole-array store `out[:] = <elementwise expr over arrays>` is lowered
+    # to ONE C loop with no intermediate array temporaries (operator fusion +
+    # allocation elision, in the spirit of Codon's core-numpy-fusion pass).
+    # ShivyCX then vectorizes the resulting scalar loop.
+    _FUSE_SCALAR_CTS = {"double", "float", "int", "long", "short", "char",
+                        "unsigned char", "unsigned", "signed char",
+                        "unsigned int"}
+    _FUSE_BINOP = {ast.Add: ("+", 1), ast.Sub: ("-", 1), ast.Mult: ("*", 1),
+                   ast.Div: ("/", 8), ast.Mod: ("%", 8), ast.BitAnd: ("&", 1),
+                   ast.BitOr: ("|", 1), ast.BitXor: ("^", 1)}
+    _FUSE_CMP = {ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=",
+                 ast.Eq: "==", ast.NotEq: "!="}
+    _FUSE_UFUNCS = {"sqrt": ("sqrt", 2), "exp": ("exp", 5), "log": ("log", 5),
+                    "log2": ("log2", 5), "log10": ("log10", 5),
+                    "exp2": ("exp2", 5), "cbrt": ("cbrt", 5),
+                    "sin": ("sin", 10), "cos": ("cos", 10), "tan": ("tan", 10),
+                    "sinh": ("sinh", 10), "cosh": ("cosh", 10),
+                    "tanh": ("tanh", 10), "fabs": ("fabs", 1),
+                    "floor": ("floor", 1), "ceil": ("ceil", 1)}
+
+    def _array_elem_ct(self, node):
+        """Element C type if `node` is a Name bound to a native scalar array
+        (`double*`/`float*`/`int*`/...), else None."""
+        if isinstance(node, ast.Name):
+            ct = self.scope.get(node.id)
+            if isinstance(ct, str) and ct.endswith("*") \
+                    and ct[:-1] in self._FUSE_SCALAR_CTS:
+                return ct[:-1]
+        return None
+
+    def _fuse_analyze(self, node):
+        """Validate an elementwise array expression. Returns
+        (is_array, cost, [array_names]) or None if not purely elementwise."""
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, bool):
+                return None
+            return (False, 0, []) if isinstance(node.value, (int, float)) \
+                else None
+        if isinstance(node, ast.Name):
+            if self._array_elem_ct(node):
+                return (True, 0, [node.id])
+            ct = self.scope.get(node.id)
+            if ct in ("int", "long", "double", "float", "short", "char",
+                      "unsigned", "bool"):
+                return (False, 0, [])
+            return None
+        if isinstance(node, ast.UnaryOp) and \
+                isinstance(node.op, (ast.USub, ast.UAdd)):
+            return self._fuse_analyze(node.operand)
+        if isinstance(node, ast.BinOp):
+            if isinstance(node.op, ast.Pow):
+                lb = self._fuse_analyze(node.left)
+                rb = self._fuse_analyze(node.right)
+                if lb is None or rb is None:
+                    return None
+                sq = isinstance(node.right, ast.Constant) and \
+                    node.right.value == 2
+                return (lb[0] or rb[0], lb[1] + rb[1] + (1 if sq else 8),
+                        lb[2] + rb[2])
+            opc = self._FUSE_BINOP.get(type(node.op))
+            if opc is None:
+                return None
+            lb = self._fuse_analyze(node.left)
+            rb = self._fuse_analyze(node.right)
+            if lb is None or rb is None:
+                return None
+            return (lb[0] or rb[0], lb[1] + rb[1] + opc[1], lb[2] + rb[2])
+        if isinstance(node, ast.Compare) and len(node.ops) == 1:
+            if type(node.ops[0]) not in self._FUSE_CMP:
+                return None
+            lb = self._fuse_analyze(node.left)
+            rb = self._fuse_analyze(node.comparators[0])
+            if lb is None or rb is None:
+                return None
+            return (lb[0] or rb[0], lb[1] + rb[1] + 1, lb[2] + rb[2])
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id in self._FUSE_UFUNCS \
+                and len(node.args) == 1 and not node.keywords:
+            a = self._fuse_analyze(node.args[0])
+            if a is None:
+                return None
+            return (a[0], a[1] + self._FUSE_UFUNCS[node.func.id][1], a[2])
+        return None
+
+    def _fuse_render(self, node, idx):
+        if isinstance(node, ast.Constant):
+            v = node.value
+            return repr(float(v)) if isinstance(v, float) else str(int(v))
+        if isinstance(node, ast.Name):
+            if self._array_elem_ct(node):
+                return "%s[%s]" % (self.lid(node.id), idx)
+            return self.lid(node.id)
+        if isinstance(node, ast.UnaryOp):
+            if isinstance(node.op, ast.USub):
+                return "(-(%s))" % self._fuse_render(node.operand, idx)
+            return self._fuse_render(node.operand, idx)
+        if isinstance(node, ast.BinOp):
+            if isinstance(node.op, ast.Pow):
+                base = self._fuse_render(node.left, idx)
+                e = node.right
+                if isinstance(e, ast.Constant) and isinstance(e.value, int) \
+                        and 1 <= e.value <= 4:
+                    return "(" + "*".join("(%s)" % base
+                                          for _ in range(e.value)) + ")"
+                return "pow(%s, %s)" % (base, self._fuse_render(e, idx))
+            cop = self._FUSE_BINOP[type(node.op)][0]
+            return "(%s %s %s)" % (self._fuse_render(node.left, idx), cop,
+                                   self._fuse_render(node.right, idx))
+        if isinstance(node, ast.Compare):
+            cop = self._FUSE_CMP[type(node.ops[0])]
+            return "(%s %s %s)" % (self._fuse_render(node.left, idx), cop,
+                                   self._fuse_render(node.comparators[0], idx))
+        if isinstance(node, ast.Call):
+            return "%s(%s)" % (self._FUSE_UFUNCS[node.func.id][0],
+                               self._fuse_render(node.args[0], idx))
+        return "0"
+
+    def _try_fused_array_store(self, node):
+        if len(node.targets) != 1:
+            return None
+        tgt = node.targets[0]
+        if not (isinstance(tgt, ast.Subscript)
+                and isinstance(tgt.value, ast.Name)
+                and isinstance(tgt.slice, ast.Slice)
+                and tgt.slice.step is None and tgt.slice.lower is None):
+            return None
+        elem = self._array_elem_ct(tgt.value)
+        if not elem:
+            return None
+        info = self._fuse_analyze(node.value)
+        if info is None:
+            return None
+        is_arr, cost, names = info
+        if tgt.slice.upper is not None:
+            n = self.coerce_to("long", tgt.slice.upper,
+                               self.expr(tgt.slice.upper))
+        else:
+            sz = self.array_sizes.get(tgt.value.id)
+            if sz is None:
+                return None
+            n = str(sz)
+        self.loop_n += 1
+        iv = "_fi%d" % self.loop_n
+        body = self._fuse_render(node.value, iv)
+        if os.environ.get("PY2C_NPFUSE_VERBOSE"):
+            kind = "array" if is_arr else "scalar-fill"
+            sys.stderr.write(
+                "npfuse: %s[:] := %s expr over {%s} [cost=%d] -> 1 pass, "
+                "0 temporaries\n" % (tgt.value.id, kind,
+                                     ", ".join(sorted(set(names))) or "-",
+                                     cost))
+        return ["for (long %s = 0; %s < %s; %s++) %s[%s] = (%s)(%s);" % (
+            iv, iv, n, iv, self.lid(tgt.value.id), iv, elem, body)]
+
     def _subscript_container_is_obj(self, node):
         if self.is_obj_word(node) or self.value_ctype(node) == OBJ:
             return True
@@ -5992,6 +6151,9 @@ class Transpiler:
         return False
 
     def assign(self, node, toplevel=False):
+        fused = self._try_fused_array_store(node)
+        if fused is not None:
+            return fused
         rhs = self.expr(node.value)
         lines = []
         for tgt in node.targets:
@@ -6487,6 +6649,9 @@ class Transpiler:
                     et = kv[0]                # iterating a dict yields keys
             if et:
                 self.elem_types[node.target.id] = et
+            sz = ann_array_size(node.annotation)
+            if sz:
+                self.array_sizes[node.target.id] = sz
         tgt = self.expr(node.target)
         if node.value is None:
             return ["%s %s;" % (ctype, tgt)]
