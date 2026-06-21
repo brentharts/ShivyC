@@ -133,6 +133,7 @@ rpython:
 	run $(RPY)/numpy/fusion.py       97 ""; \
 	run $(RPY)/numpy/matmul.py      239 ""; \
 	run $(RPY)/nn/neural_net.py     199 ""; \
+	run $(RPY)/nn/torch_mlp.py        4 ""; \
 	run $(RPY)/nbody/nbody.py        11 ""; \
 	run $(RPY)/classes/polymorphism.py 22 ""; \
 	run $(RPY)/classes/pod_vs_object.py  48 ""; \
@@ -296,6 +297,30 @@ testfuse:
 	else echo "testfuse: FAIL"; fi; exit $$fail
 
 # ---------------------------------------------------------------------------
+# rpy_torch mini-PyTorch check: the bundled library auto-attaches when imported,
+# and a trainable MLP (forward + full backprop + SGD, all through the API, every
+# elementwise kernel fused) must learn XOR (exit 4) identically under gcc and the
+# ShivyCX self-backend.
+#     make testtorch
+testtorch:
+	@mkdir -p $(FASTBIN)
+	@fail=0; \
+	gccbuild() { src=$$1; d=$(FASTBIN)/torch_`basename $$src .py`; rm -rf $$d; mkdir -p $$d; \
+	  if ! python3 tools/py2c.py $$src --out $$d >/dev/null 2>&1; then echo ERR; return; fi; \
+	  python3 -c "import sys;sys.path.insert(0,'tools');import py2c;py2c.write_runtime('$$d')" >/dev/null 2>&1; \
+	  if ! gcc -std=c99 -I$$d $$d/*.c -o $$d/bin -lm 2>/dev/null; then echo ERR; return; fi; \
+	  timeout 30 $$d/bin >/dev/null 2>&1; echo $$?; }; \
+	sxbuild() { src=$$1; out=$(FASTBIN)/torchsx_`basename $$src .py`; \
+	  if ! python3 -m shivyc.main --no-cache $$src -o $$out >/dev/null 2>&1; then echo ERR; return; fi; \
+	  timeout 30 $$out >/dev/null 2>&1; echo $$?; }; \
+	chk() { src=$$1; exp=$$2; g=`gccbuild $$src`; s=`sxbuild $$src`; \
+	  if [ "$$g" = "$$exp" ] && [ "$$s" = "$$exp" ]; then echo "  ok    $$src (gcc==shivycx==$$exp)"; \
+	  else echo "  FAIL  $$src (gcc=$$g shivycx=$$s, expected $$exp)"; fail=1; fi; }; \
+	chk $(RPY)/nn/torch_mlp.py 4; \
+	if [ $$fail = 0 ]; then echo "testtorch: PASS"; \
+	else echo "testtorch: FAIL"; fi; exit $$fail
+
+# ---------------------------------------------------------------------------
 # Benchmarks: whole-program SIMD vs gcc -O0/-O2, memory-safety table, etc.
 #     make benchmarks
 benchmarks:
@@ -454,7 +479,7 @@ run-irq: baremetal-irq
 self:
 	cd tools && pypy3 py2c.py
 
-.PHONY: default test testfast testpromote testpgo testfuse shim install clean baremetal baremetal-hello \
+.PHONY: default test testfast testpromote testpgo testfuse testtorch shim install clean baremetal baremetal-hello \
         selfhost selfhost_objcore selfhost_bench selfhost_coverage \
         selfhost_coverage_musl selfhost_link \
         rpython benchmarks \
