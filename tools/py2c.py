@@ -2247,14 +2247,31 @@ def discover_fields_from_ctor_locals(tree, classes):
     `self` -- `var.attr = ...` / `setattr(var, "attr", ...)` where `var`'s class
     is known from a `var = Cls()` binding or a parameter annotation. These
     cross-class dynamic attributes otherwise have no struct slot, so rt_setattr
-    would silently drop the write; giving them a slot makes the write persist."""
+    would silently drop the write; giving them a slot makes the write persist.
 
-    def add_field(clsname, attr):
+    A discovered field is typed `obj` by default, but when *every* write to it
+    assigns a direct constructor result of one local class -- `recv.layout =
+    Layout()` -- the field takes that concrete `Layout*` type, so it can be
+    used as a typed pointer rather than a boxed obj. Any disagreement or any
+    non-constructor value falls back to `obj` (which holds anything safely)."""
+
+    # (clsname, attr) -> set of candidate ctypes; `None` marks an
+    # un-inferable (non-constructor) write, which forces the obj fallback.
+    candidates = {}
+
+    def note(clsname, attr, ctype):
         ci = classes.get(clsname)
-        if ci is None:
+        if ci is None or any(f == attr for f, _ in ci.own_fields):
             return
-        if not any(f == attr for f, _ in ci.own_fields):
-            ci.own_fields.append((attr, OBJ))
+        candidates.setdefault((clsname, attr), set()).add(ctype)
+
+    def rhs_ctype(val, locals_types):
+        """Concrete `Cls*` type of an assigned value, or None if not a direct
+        local-class constructor / a local bound to one."""
+        cls = _ctor_class_name(val, classes)
+        if cls is None and isinstance(val, ast.Name) and val.id in locals_types:
+            cls = locals_types[val.id]
+        return (classes[cls].csym + "*") if cls else None
 
     def scan_scope(body, seed=None):
         locals_types = dict(seed) if seed else {}
@@ -2272,7 +2289,8 @@ def discover_fields_from_ctor_locals(tree, classes):
                             isinstance(tgt.value, ast.Name) and \
                             tgt.value.id != "self" and \
                             tgt.value.id in locals_types:
-                        add_field(locals_types[tgt.value.id], tgt.attr)
+                        note(locals_types[tgt.value.id], tgt.attr,
+                             rhs_ctype(sub.value, locals_types))
             elif isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) \
                     and sub.func.id == "setattr" and len(sub.args) == 3 \
                     and isinstance(sub.args[0], ast.Name) \
@@ -2280,7 +2298,8 @@ def discover_fields_from_ctor_locals(tree, classes):
                     and sub.args[0].id in locals_types \
                     and isinstance(sub.args[1], ast.Constant) \
                     and isinstance(sub.args[1].value, str):
-                add_field(locals_types[sub.args[0].id], sub.args[1].value)
+                note(locals_types[sub.args[0].id], sub.args[1].value,
+                     rhs_ctype(sub.args[2], locals_types))
 
     def params_seed(fn):
         seed = {}
@@ -2298,6 +2317,14 @@ def discover_fields_from_ctor_locals(tree, classes):
     for ci in classes.values():
         for fn in ci.methods.values():
             scan_scope(fn.body, params_seed(fn))
+
+    for (clsname, attr), types in candidates.items():
+        ci = classes[clsname]
+        if any(f == attr for f, _ in ci.own_fields):
+            continue
+        ctype = next(iter(types)) if (None not in types and len(types) == 1) \
+            else OBJ
+        ci.own_fields.append((attr, ctype))
 
 
 def discover_fields(classnode, method_names=None):
