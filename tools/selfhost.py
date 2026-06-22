@@ -594,10 +594,124 @@ def cmd_link(build_root, args):
     return 0
 
 
+def _compiler_init_order(out):
+    """A valid module-init order for the whole compiler. Import shivyc.main
+    under the host to get a dependency-respecting order of module names, map
+    each to its emitted .c, and read that file's actual `<slug>_init` symbol
+    (rather than guessing the slug). Lazily-imported modules are appended."""
+    import re as _re
+    sys.path.insert(0, REPO)
+    import importlib
+    importlib.import_module("shivyc.main")
+    eager = [m for m in sys.modules if m.startswith("shivyc")]
+
+    def cbase(mod):
+        if mod == "shivyc":
+            return "__init__"
+        rest = mod[len("shivyc."):]
+        return mod if "." in rest else rest
+
+    def init_sym(cpath):
+        m = _re.search(r"^void ([A-Za-z0-9_]+_init)\(void\) \{",
+                       open(cpath).read(), _re.M)
+        return m.group(1) if m else None
+
+    cfiles = sorted(f for f in os.listdir(out)
+                    if f.endswith(".c") and f != "shivyc_rt.c"
+                    and f != "_entry.c")
+    base_to_file = {f[:-2]: f for f in cfiles}
+    order, seen = [], set()
+    for m in eager:
+        f = base_to_file.get(cbase(m))
+        if f and f not in seen:
+            order.append(f); seen.add(f)
+    for f in cfiles:                           # lazily-imported remainder
+        if f not in seen:
+            order.append(f); seen.add(f)
+    syms = []
+    for f in order:
+        s = init_sym(os.path.join(out, f))
+        if s:
+            syms.append(s)
+    return syms
+
+
+def cmd_compiler(build_root, args):
+    """Build the whole self-hosted compiler as a native binary.
+
+    Transpiles all modules (no bridge), compiles them, generates a C entry
+    point that runs every module's import-time init and then the Python
+    `main(argc, argv)`, and links a single executable. The emitted `main.c`
+    defines the Python entry as `obj main(...)`, which clashes with C's entry,
+    so its symbol is renamed at build time (main.py is left untouched -- the
+    host tests still call shivyc.main.main())."""
+    import glob
+    out = args.build_dir or os.path.join(build_root, "compiler")
+    os.makedirs(out, exist_ok=True)
+    mods = []
+    for g in COVERAGE_GLOBS:
+        mods += glob.glob(os.path.join(REPO, g))
+    r = run([sys.executable, PY2C, *mods, "--out", out], cwd=REPO)
+    if r.returncode != 0:
+        print("transpile failed:\n" + r.stderr); return 1
+    sys.path.insert(0, os.path.join(REPO, "tools"))
+    import py2c as _p
+    _p.write_runtime(out)
+
+    # Rename the Python entry `main` -> `shivyc_pymain` in the emitted main.c
+    # so it doesn't clash with the C `int main` we generate below.
+    mainc = os.path.join(out, "main.c")
+    src = open(mainc).read().replace(
+        "obj main(int argc, char** argv)",
+        "obj shivyc_pymain(int argc, char** argv)")
+    open(mainc, "w").write(src)
+
+    inits = _compiler_init_order(out)
+    entry = ['#include "shivyc_rt.h"', ""]
+    entry += ["void %s(void);" % s for s in inits]
+    entry.append("obj shivyc_pymain(int argc, char** argv);")
+    entry.append("int main(int argc, char** argv) {")
+    entry += ["    %s();" % s for s in inits]
+    entry.append("    obj rc = shivyc_pymain(argc, argv);")
+    entry.append("    return (rc.tag == T_INT || rc.tag == T_BOOL) "
+                 "? (int)rc.u.i : 0;")
+    entry.append("}")
+    with open(os.path.join(out, "_entry.c"), "w") as f:
+        f.write("\n".join(entry) + "\n")
+
+    objs, fails = [], []
+    for c in sorted(f for f in os.listdir(out) if f.endswith(".c")):
+        oo = os.path.join(out, c[:-2] + ".o")
+        res = compile_c(os.path.join(out, c), oo, inc_dirs=[out], extra=["-O0"])
+        (objs.append(oo) if res.returncode == 0 else fails.append(c[:-2]))
+    if fails:
+        print("compile fails: %s" % ", ".join(fails[:10])); return 1
+    exe = os.path.join(out, "shivyc_native")
+    fl = run(["gcc"] + objs + ["-o", exe, "-lm",
+              "-Wl,--allow-multiple-definition"])
+    if fl.returncode != 0:
+        print("link failed:\n" + fl.stderr[:1500]); return 1
+
+    # Copy the bundled fallback headers next to the binary. The transpiled
+    # preproc resolves <stddef.h> etc. relative to its module path, which under
+    # self-host reduces to "include/<name>" off the current directory -- so the
+    # headers must sit at <out>/include for the native compiler to find them
+    # when it preprocesses a real C input.
+    import shutil
+    inc_src = os.path.join(REPO, "shivyc", "include")
+    if os.path.isdir(inc_src):
+        shutil.copytree(inc_src, os.path.join(out, "include"),
+                        dirs_exist_ok=True)
+
+    print("built native self-host compiler: %s (%d modules linked)"
+          % (exe, len(objs) - 2))
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="ShivyCX self-host build/test")
     ap.add_argument("cmd", choices=["list", "test", "bench", "coverage",
-                                    "link"])
+                                    "link", "compiler"])
     ap.add_argument("names", nargs="*", help="target name(s)")
     ap.add_argument("--musl", action="store_true",
                     help="compile transpiled C against packaged musl headers")
@@ -634,6 +748,8 @@ def main():
             rc = cmd_coverage(build_root, args)
         elif args.cmd == "link":
             rc = cmd_link(build_root, args)
+        elif args.cmd == "compiler":
+            rc = cmd_compiler(build_root, args)
     finally:
         if args.keep:
             print("build dir:", build_root)

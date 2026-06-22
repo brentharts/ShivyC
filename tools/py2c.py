@@ -144,6 +144,7 @@ RUNTIME_H = r'''#ifndef SHIVYC_RT_H
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <setjmp.h>
 
 typedef char* str;
 
@@ -258,6 +259,13 @@ bool obj_eq(obj a, obj b);         /* == on Tier-2 values                     */
 bool pycontains(obj container, obj v);  /* v in container                     */
 bool in_str(str needle, const str* hay, int n);  /* x in ("a","b",...)        */
 void pyprint(obj v);               /* print(x)                                */
+
+/* exceptions: try/except lowers to setjmp on g_exc_jmp; raise -> rt_raise. */
+extern jmp_buf g_exc_jmp[];
+extern int     g_exc_sp;
+extern obj     g_exc_val;
+obj  rt_exc_value(void);
+void rt_raise(obj e);
 
 /* ---- dicts: insertion-ordered obj->obj map, tagged obj (T_DICT) ----------- */
 typedef struct { obj key; obj val; } DEnt;
@@ -609,6 +617,22 @@ void afree(void* p, size_t n) {
 }
 
 void arena_reset(void) { g_ap = 0; memset(g_free, 0, sizeof g_free); }
+
+/* ---- exceptions: setjmp/longjmp. An uncaught raise prints the exception and
+ * exits (the native compiler reports the first error and stops; the Python
+ * build keeps the full error_collector). try/except pushes a frame; raise
+ * longjmps to the innermost frame, or prints+exits if none is active. ------- */
+#define EXC_STACK_MAX 2048
+jmp_buf g_exc_jmp[EXC_STACK_MAX];
+int     g_exc_sp = 0;
+obj     g_exc_val = {T_NONE, {0}};
+obj  rt_exc_value(void) { return g_exc_val; }
+void rt_raise(obj e) {
+    g_exc_val = e;
+    if (g_exc_sp > 0) longjmp(g_exc_jmp[g_exc_sp - 1], 1);
+    pyprint(e);
+    exit(1);
+}
 
 void metadata(void) {}
 void module(const char* name) { (void)name; }
@@ -3460,6 +3484,9 @@ class Transpiler:
         self.hoisted = set()        # locals declared at function top
         self.cur_ret = OBJ          # current function's return ctype
         self.loop_n = 0             # unique-id counter for generated loops
+        self.exc_n = 0              # unique-id counter for try/except frames
+        self.cm_n = 0               # unique-id counter for inlined contextmanagers
+        self.try_stack = []         # open try/loop scopes for return/break/continue cleanup
         self.indent = 0
 
     def emit(self, line=""):
@@ -4687,10 +4714,22 @@ class Transpiler:
         self.vt_root_mod = self.xclass_module.get(rname)
         canon = {m for m in r.methods if not (m.startswith("__")
                                               and m.endswith("__"))}
-        # The layout must match the root module's TypeInfo *exactly*, so it is
-        # precisely the root's virtual interface. Module-private helpers stay
-        # off the vtable (they are self-calls on concrete types).
-        VTABLE_METHODS = canon
+        # When the external root has a virtual interface (`canon` non-empty),
+        # the local classes that extend it must lay their vtable slots out to
+        # match the root module's TypeInfo *exactly*, so cross-module dispatch
+        # of a root method on a derived instance (e.g. node.make_il() through a
+        # Node vtable) hits the right slot. In that case the layout is precisely
+        # `canon`; module-private helpers stay off the vtable (self-calls on
+        # concrete types). But if the root interface is empty (e.g. ParserError
+        # extends CompilerError, which has only dunder methods), there is no
+        # layout to pin -- and overwriting with the empty set would wrongly drop
+        # the module's own virtual methods. parser.utils is exactly this: its
+        # standalone SimpleSymbolTable is dispatched virtually from parser.parser
+        # (symbols.snapshot()), so those methods must stay in the TypeInfo to
+        # match the importer's replicated VT_<module>. Keep the per-module vt
+        # (set from collect_classes above) in that case.
+        if canon:
+            VTABLE_METHODS = canon
 
     def is_ancestor(self, a, b):
         c = b
@@ -7624,15 +7663,50 @@ class Transpiler:
                                 self.coerce_to(tt, node.value,
                                                self.expr(node.value)))]
 
+    def _try_finallys(self, stop_at_loop):
+        """Finally bodies (innermost-first) and the g_exc_sp restore target for
+        an early exit (return / break / continue) that escapes open try blocks.
+        Returns (list_of_c_lines, restore_target_or_None)."""
+        out, restore = [], None
+        scan = []
+        for e in reversed(self.try_stack):
+            if e["kind"] == "loop":
+                if stop_at_loop:
+                    restore = e["esp"]
+                    break
+                else:
+                    continue
+            scan.append(e)              # a try, innermost-first
+        for e in scan:
+            if e["finally"]:
+                out += self.suite(e["finally"])
+            if not stop_at_loop:
+                restore = e["fr"]       # for return: pop to outermost try's frame
+        if not stop_at_loop and scan:
+            restore = scan[-1]["fr"]    # outermost open try
+        return out, restore
+
     def st_Return(self, node):
-        if node.value is None:
-            ret = getattr(self, "cur_ret", OBJ)
-            if ret == OBJ or ret == "obj":
-                return ["return OBJ_NONE;"]
-            return ["return;"]
+        pre, restore = self._try_finallys(stop_at_loop=False)
         ret = getattr(self, "cur_ret", OBJ)
-        return ["return %s;" % self.coerce_to(ret, node.value,
-                                              self.expr(node.value))]
+        if node.value is None:
+            r = "return OBJ_NONE;" if ret in (OBJ, "obj") else "return;"
+            tail = (["g_exc_sp = %s;" % restore] if restore is not None else [])
+            return pre + tail + [r]
+        val = self.coerce_to(ret, node.value, self.expr(node.value))
+        if restore is None and not pre:
+            return ["return %s;" % val]
+        # Inside a try: evaluate the return expression while the handler frames
+        # are still active (so a raise from within it is caught here), THEN run
+        # finallys, pop frames, and return the stashed value.
+        self.exc_n += 1
+        tmp = "_rv%d" % self.exc_n
+        out = ["%s %s = %s;" % (ret, tmp, val)]
+        out += pre
+        if restore is not None:
+            out.append("g_exc_sp = %s;" % restore)
+        out.append("return %s;" % tmp)
+        return out
 
     def st_Assert(self, node):
         test = self.bool_expr(node.test)
@@ -7645,10 +7719,14 @@ class Transpiler:
         return ["/* pass */"]
 
     def st_Break(self, node):
-        return ["break;"]
+        pre, restore = self._try_finallys(stop_at_loop=True)
+        tail = (["g_exc_sp = %s;" % restore] if restore is not None else [])
+        return pre + tail + ["break;"]
 
     def st_Continue(self, node):
-        return ["continue;"]
+        pre, restore = self._try_finallys(stop_at_loop=True)
+        tail = (["g_exc_sp = %s;" % restore] if restore is not None else [])
+        return pre + tail + ["continue;"]
 
     def st_Global(self, node):
         return ["/* global %s */" % ", ".join(node.names)]
@@ -7703,10 +7781,75 @@ class Transpiler:
     def st_ImportFrom(self, node):
         return ["/* " + self.src1(node) + " */"]
 
+    def _exc_class_ci(self, nm):
+        if nm in self.classes:
+            return self.classes[nm]
+        if nm in self.xclasses:
+            return self.xclasses[nm][0]
+        return None
+
+    def _exc_ctor_total(self, ci):
+        """Positional arg count of a class's (possibly inherited) __init__,
+        excluding self; 0 if none is defined in the transpiled chain."""
+        while ci is not None:
+            init = ci.methods.get("__init__")
+            if init is not None:
+                return len(init.args.args) - 1
+            ci = ci.base
+        return 0
+
     def st_Raise(self, node):
-        what = self.src1(node.exc) if node.exc else ""
-        return ['fprintf(stderr, "raise %s\\n"); abort();' %
-                what.replace('"', '\\"')]
+        if node.exc is None:
+            return ["rt_raise(g_exc_val);"]   # bare re-raise
+        exc = node.exc
+        if isinstance(exc, ast.Call):
+            f = exc.func
+            nm = (f.id if isinstance(f, ast.Name)
+                  else f.attr if isinstance(f, ast.Attribute) else None)
+            ci = self._exc_class_ci(nm) if nm else None
+            if ci is not None:
+                # A real transpiled exception class: construct an instance so
+                # `except <Class>` (isinstance) matches. Trim surplus args to
+                # the constructor's arity (e.g. _PPExprError("msg") has a 0-arg
+                # ctor inherited from Exception).
+                total = self._exc_ctor_total(ci)
+                if not exc.keywords and len(exc.args) > total:
+                    exc = ast.Call(func=f, args=exc.args[:total], keywords=[])
+                    ast.copy_location(exc, node.exc)
+                return ["rt_raise(%s);" % self.wrap_obj(exc)]
+            # builtin / unknown exception (NotImplementedError, ValueError, ...):
+            # carry its message (or name) as a printable obj. Uncaught -> print
+            # and exit; a catch-all handler still catches it.
+            if exc.args:
+                a0 = exc.args[0]
+                if isinstance(a0, ast.Constant) and isinstance(a0.value, str):
+                    return ["rt_raise(OBJ_STR(%s));" % c_string(a0.value)]
+                return ["rt_raise(%s);" % self.wrap_obj(a0)]
+            return ["rt_raise(OBJ_STR(%s));" % c_string(nm or "Exception")]
+        if isinstance(exc, ast.Name) and exc.id not in self.scope \
+                and self._exc_class_ci(exc.id) is None:
+            # bare builtin exception name, e.g. `raise NotImplementedError`
+            return ["rt_raise(OBJ_STR(%s));" % c_string(exc.id)]
+        return ["rt_raise(%s);" % self.wrap_obj(exc)]
+
+    def _exc_match_cond(self, htype):
+        """C condition matching the in-flight exception g_exc_val against an
+        except clause's type. None means 'catch all' (bare except, Exception,
+        or a builtin/unknown type -- the native compiler is first-error-and-exit
+        so precise builtin matching is unnecessary)."""
+        if htype is None:
+            return None
+        if isinstance(htype, ast.Tuple):
+            sub = [self._exc_match_cond(e) for e in htype.elts]
+            if any(c is None for c in sub):
+                return None
+            return " || ".join("(%s)" % c for c in sub)
+        csym = self._isinstance_class(htype) \
+            if isinstance(htype, (ast.Name, ast.Attribute)) else None
+        if csym is None:
+            return None
+        return ("(IS_OBJ(g_exc_val) && isinstance_of(AS_OBJ(g_exc_val), "
+                "(const void*)&%s_type))" % csym)
 
     def _isinstance_class(self, ref):
         """Resolve an isinstance() 2nd-arg class reference to a known class
@@ -7771,13 +7914,50 @@ class Transpiler:
         lines.append("}")
         return lines
 
+    def _body_has_try(self, body):
+        # A loop needs its exception-frame marker (so break/continue inside an
+        # enclosed try can restore g_exc_sp) when the body opens a try frame.
+        # That includes a `with` statement: a @contextmanager `with` is inlined
+        # into a try/except, and the generic `with` is lowered with a try frame
+        # too -- so either form can leave an open frame a break/continue must
+        # pop. Matching ast.Try alone missed `with log_error(): ... continue`,
+        # which leaked g_exc_sp every iteration and corrupted the handler stack.
+        for n in body:
+            for sub in ast.walk(n):
+                if isinstance(sub, (ast.Try, ast.With)):
+                    return True
+        return False
+
+    def _loop_wrap(self, node, impl):
+        """Run a loop body codegen `impl` with a loop marker on the try-stack so
+        break/continue inside an enclosed try restore the exception-frame
+        pointer to the loop's level."""
+        esp = None
+        pre = []
+        if self._body_has_try(node.body):
+            self.exc_n += 1
+            esp = "_lesp%d" % self.exc_n
+            pre = ["int %s = g_exc_sp;" % esp]
+        self.try_stack.append({"kind": "loop", "esp": esp})
+        try:
+            lines = impl()
+        finally:
+            self.try_stack.pop()
+        return pre + lines
+
     def st_While(self, node):
+        return self._loop_wrap(node, lambda: self._st_While_impl(node))
+
+    def _st_While_impl(self, node):
         lines = ["while (%s) {" % self.bool_expr(node.test)]
         lines += self.indent_lines(self.suite(node.body))
         lines.append("}")
         return lines
 
     def st_For(self, node):
+        return self._loop_wrap(node, lambda: self._st_For_impl(node))
+
+    def _st_For_impl(self, node):
         it, tgt = node.iter, node.target
         if isinstance(it, ast.Call) and isinstance(it.func, ast.Name) \
                 and it.func.id == "range" and isinstance(tgt, ast.Name):
@@ -7982,31 +8162,181 @@ class Transpiler:
         return "({ obj %s = %s; %s %s; })" % (acc, init, body, acc)
 
     def st_Try(self, node):
-        lines = ["/* try */ {"]
-        lines += self.indent_lines(self.suite(node.body))
-        lines.append("}")
-        for h in node.handlers:
-            et = self.src1(h.type) if h.type else "..."
-            # `raise` aborts with no stack unwinding, so a handler can never be
-            # reached: if the try body raises it has already aborted, and if it
-            # completes there is no exception. Keep the body for readability but
-            # guard it so it never executes (and still type-checks / compiles).
-            lines.append("if (0) { /* except %s */" % et)
+        self.exc_n += 1
+        fr = "_ef%d" % self.exc_n
+        st = "_es%d" % self.exc_n
+        hd = "_eh%d" % self.exc_n
+
+        def fin():
+            return self.suite(node.finalbody) if node.finalbody else []
+
+        lines = ["{ int %s = g_exc_sp++;" % fr]
+        lines.append("  int %s = setjmp(g_exc_jmp[%s]);" % (st, fr))
+        lines.append("  if (%s == 0) {" % st)
+        # --- normal path: run the body with this try on the cleanup stack ---
+        self.try_stack.append({"kind": "try", "fr": fr,
+                               "finally": node.finalbody})
+        body_lines = self.suite(node.body)
+        self.try_stack.pop()
+        lines += self.indent_lines(self.indent_lines(body_lines))
+        lines.append("    g_exc_sp = %s;" % fr)
+        lines += self.indent_lines(self.indent_lines(fin()))
+        # --- exception path: dispatch handlers, run finally, re-raise if unhandled
+        lines.append("  } else {")
+        lines.append("    g_exc_sp = %s;" % fr)
+        lines.append("    int %s = 0;" % hd)
+        chain = []
+        for i, h in enumerate(node.handlers):
+            cond = self._exc_match_cond(h.type)
             binds = []
             if h.name:
-                en = cname(h.name)
                 if h.name not in self.scope:
                     self.scope[h.name] = OBJ
-                binds.append("obj %s = OBJ_NONE;" % en)
-            lines += self.indent_lines(binds + self.suite(h.body))
-            lines.append("}")
-        if node.finalbody:
-            lines.append("/* finally */ {")
-            lines += self.indent_lines(self.suite(node.finalbody))
-            lines.append("}")
+                binds.append("obj %s = g_exc_val;" % cname(h.name))
+            hbody = binds + self.suite(h.body) + ["%s = 1;" % hd]
+            if cond is None:
+                opener = "{" if i == 0 else "else {"
+                chain.append(opener)
+                chain += self.indent_lines(hbody)
+                chain.append("}")
+                break
+            kw = "if" if i == 0 else "else if"
+            chain.append("%s (%s) {" % (kw, cond))
+            chain += self.indent_lines(hbody)
+            chain.append("}")
+        lines += self.indent_lines(self.indent_lines(chain))
+        lines += self.indent_lines(self.indent_lines(fin()))
+        lines.append("    if (!%s) rt_raise(g_exc_val);" % hd)
+        lines.append("  }")
+        lines.append("}")
         return lines
 
+    def _is_contextmanager(self, fn):
+        for d in getattr(fn, "decorator_list", []):
+            nm = d.attr if isinstance(d, ast.Attribute) else getattr(d, "id", None)
+            if nm == "contextmanager":
+                return True
+        return False
+
+    @staticmethod
+    def _stmt_is_yield(s):
+        return isinstance(s, ast.Expr) and isinstance(s.value,
+                                                      (ast.Yield, ast.YieldFrom))
+
+    @staticmethod
+    def _is_docstring(s):
+        return isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant) \
+            and isinstance(s.value.value, str)
+
+    def _inline_ctxmgr(self, fn, with_body, defining_mod=None):
+        """Inline a single-`yield` @contextmanager generator: the code before
+        the yield runs first, the with-body replaces the yield, and the
+        surrounding try/except/finally (if any) wraps the with-body. The
+        generator's own locals are renamed per site to avoid collisions, and
+        its module globals are rewritten so they resolve in the using module."""
+        import copy
+        self.cm_n += 1
+        # names the generator declares `global` are NOT locals -- they refer to
+        # the *defining* module's globals.
+        gnames = set()
+        for s in ast.walk(fn):
+            if isinstance(s, ast.Global):
+                gnames.update(s.names)
+        locals_ = {a.arg for a in fn.args.args}
+        for s in ast.walk(fn):
+            if isinstance(s, ast.Name) and isinstance(s.ctx, ast.Store) \
+                    and s.id not in gnames:
+                locals_.add(s.id)
+            if isinstance(s, ast.ExceptHandler) and s.name and s.name not in gnames:
+                locals_.add(s.name)
+        rename = {n: "_cm%d_%s" % (self.cm_n, n) for n in locals_}
+        # how the *current* module reaches the generator's module globals
+        alias = None
+        if defining_mod and defining_mod != getattr(self, "modname", None):
+            alias = next((a for a, m in self.import_alias.items()
+                          if m == defining_mod), None)
+            if alias is None:
+                for g in gnames:
+                    self.from_imports.setdefault(g, defining_mod)
+            # Free names the generator uses from its own module (imported
+            # singletons/globals/funcs, e.g. report_err's error_collector) must
+            # resolve -- and get an extern -- in the using module too.
+            reg = self.load_xmod(defining_mod) or {}
+            mimp = reg.get("imports", {})
+            mown = (set(reg.get("singletons", {})) | set(reg.get("globals", {}))
+                    | set(reg.get("funcs", {})) | set(reg.get("classes", {})))
+            for s in ast.walk(fn):
+                if isinstance(s, ast.Name) and isinstance(s.ctx, ast.Load):
+                    n = s.id
+                    if n in rename or n in gnames:
+                        continue
+                    if n in mimp:
+                        self.from_imports.setdefault(n, mimp[n])
+                    elif n in mown:
+                        self.from_imports.setdefault(n, defining_mod)
+
+        class R(ast.NodeTransformer):
+            def visit_Name(self, n):
+                if n.id in rename:
+                    n.id = rename[n.id]
+                elif alias and n.id in gnames:
+                    a = ast.Attribute(value=ast.Name(id=alias, ctx=ast.Load()),
+                                      attr=n.id, ctx=n.ctx)
+                    return ast.copy_location(a, n)
+                return n
+
+            def visit_ExceptHandler(self, h):
+                self.generic_visit(h)
+                if h.name in rename:
+                    h.name = rename[h.name]
+                return h
+
+        out = []
+        for s in fn.body:
+            if isinstance(s, ast.Global) or self._is_docstring(s):
+                continue
+            if self._stmt_is_yield(s):
+                out.extend(copy.deepcopy(with_body))
+            elif isinstance(s, ast.Try) and any(self._stmt_is_yield(b)
+                                                for b in s.body):
+                t = R().visit(copy.deepcopy(s))
+                nb = []
+                for b in t.body:
+                    if self._stmt_is_yield(b):
+                        nb.extend(copy.deepcopy(with_body))
+                    else:
+                        nb.append(b)
+                t.body = nb
+                out.append(t)
+            else:
+                out.append(R().visit(copy.deepcopy(s)))
+        return out
+
+    def _resolve_ctxmgr_fn(self, name):
+        """Find a no-arg @contextmanager function `name`, returning (fn, mod)
+        where mod is the defining module (None if local). Handles imports
+        (e.g. the parser's log_error, defined in shivyc.parser.utils)."""
+        fn = self.func_nodes.get(name)
+        mod = None
+        if fn is None and name in self.from_imports:
+            mod = self.from_imports[name]
+            reg = self.load_xmod(mod)
+            if reg:
+                fn = reg.get("funcs", {}).get(name)
+        if fn is not None and self._is_contextmanager(fn):
+            return fn, mod
+        return None, None
+
     def st_With(self, node):
+        # Inline a no-arg @contextmanager call (e.g. the parser's `log_error`)
+        # into the equivalent try/except/finally so backtracking works.
+        if len(node.items) == 1 and node.items[0].optional_vars is None:
+            ce = node.items[0].context_expr
+            if isinstance(ce, ast.Call) and isinstance(ce.func, ast.Name) \
+                    and not ce.args and not ce.keywords:
+                fn, mod = self._resolve_ctxmgr_fn(ce.func.id)
+                if fn is not None:
+                    return self.suite(self._inline_ctxmgr(fn, node.body, mod))
         items = ", ".join(self.src1(i.context_expr) for i in node.items)
         lines = ["/* with %s */ {" % items]
         binds = []
