@@ -4659,11 +4659,18 @@ class Transpiler:
     def resolve_project_xmethod(self, attr):
         """Last-resort resolution for a method called on an untyped/dynamic obj
         receiver whose class is not imported here: consult the project-wide
-        scan. Only binds when `attr` has a SINGLE definer across the whole
-        package (so the receiver, if it has that method, must be that class --
-        the cast is sound). The class is loaded as an xclass on demand (so its
-        struct, return type, and an extern decl are emitted), exactly as an
-        explicit import would. Returns the ClassInfo or None."""
+        scan. Returns (ClassInfo, is_static) or None.
+
+        Binds in two sound cases:
+        - `attr` has a SINGLE definer across the package (so the receiver, if it
+          has that method, must be that class -- the cast is sound); or
+        - `attr` has one @staticmethod definer and every *other* definer is a
+          trivial forwarder `return X.attr(...)` to it. A static method ignores
+          the receiver, and the forwarders return the same value, so calling the
+          static directly is correct regardless of the receiver's exact class.
+
+        The chosen class is loaded as an xclass on demand (struct, return type,
+        extern decl emitted), exactly as an explicit import would."""
         if attr in self.method_owners or attr in self.xmethod_owners \
                 or attr in self.hierarchy_method:
             return None
@@ -4672,13 +4679,53 @@ class Transpiler:
         defs = project_method_owners(self.base_dir).get(attr, set())
         # ignore a definition in the current module (handled by other paths)
         defs = {(m, c) for (m, c) in defs if m != self.py_modname}
-        if len(defs) != 1:
+        if not defs:
             return None
-        modname, classname = next(iter(defs))
-        kind, info = self.xref(classname, modname)
-        if kind == "class" and info is not None and attr in info.methods:
-            return info
-        return None
+        if len(defs) == 1:
+            modname, classname = next(iter(defs))
+            kind, info = self.xref(classname, modname)
+            if kind == "class" and info is not None and attr in info.methods:
+                return (info, attr in info.static_methods)
+            return None
+        return self._resolve_static_forwarded(attr, defs)
+
+    def _resolve_static_forwarded(self, attr, defs):
+        """Multiple definers: bind only if exactly one is a @staticmethod and
+        every other is a trivial forwarder to a same-named method. Returns
+        (static_ClassInfo, True) or None."""
+        static_ci = None
+        others = []
+        for modname, classname in defs:
+            kind, info = self.xref(classname, modname)
+            if kind != "class" or info is None or attr not in info.methods:
+                return None
+            if attr in info.static_methods:
+                if static_ci is not None:
+                    return None                # >1 static definer: ambiguous
+                static_ci = info
+            else:
+                others.append(info.methods[attr])
+        if static_ci is None:
+            return None
+        for m in others:
+            if not self._is_forwarder_to(m, attr):
+                return None
+        return (static_ci, True)
+
+    @staticmethod
+    def _is_forwarder_to(fn, attr):
+        """True if `fn`'s body is just `return <expr>.attr(...)` (ignoring a
+        docstring and inline imports) -- i.e. it delegates to a same-named
+        method, so it yields the same value as the method it forwards to."""
+        body = [s for s in fn.body
+                if not (isinstance(s, ast.Expr)
+                        and isinstance(s.value, ast.Constant))
+                and not isinstance(s, (ast.Import, ast.ImportFrom))]
+        if len(body) != 1 or not isinstance(body[0], ast.Return):
+            return False
+        val = body[0].value
+        return isinstance(val, ast.Call) \
+            and isinstance(val.func, ast.Attribute) and val.func.attr == attr
 
     @staticmethod
     def vt_struct_name(modname):
@@ -9328,13 +9375,17 @@ class Transpiler:
                                        func.value, func.attr, node.args)
                 # last resort: a method whose sole project-wide definer is a
                 # class not imported here (e.g. layout.slot_for_spot where
-                # layout came from getattr). Load it on demand and bind.
-                powner = self.resolve_project_xmethod(func.attr)
-                if powner is not None:
+                # layout came from getattr), or a @staticmethod with forwarders.
+                presult = self.resolve_project_xmethod(func.attr)
+                if presult is not None:
+                    powner, is_static = presult
                     m = powner.methods.get(func.attr)
                     ret = self._c_ret(m) if m else OBJ
                     self.used_xmethods[(powner.name, func.attr)] = ret
                     args = [self.expr(a) for a in node.args]
+                    if is_static:        # @staticmethod: receiver discarded
+                        return "%s_%s(%s)" % (
+                            powner.csym, func.attr, ", ".join(args))
                     return "%s_%s((%s*)AS_OBJ(%s)%s)" % (
                         powner.csym, func.attr, powner.csym,
                         self.expr(func.value),
