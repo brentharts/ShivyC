@@ -5,6 +5,19 @@ import copy
 import shivyc.token_kinds as token_kinds
 
 
+# Set True by the -f-pointer-compression flag. When set, data/object pointers
+# are 4 bytes instead of 8 (V8/x32-style flat 32-bit pointers): the program is
+# linked non-PIE in the low 4 GiB (-f-low-mem) so every address fits in 32 bits
+# and is recovered by zero-extension. This shrinks pointer-dense data and the
+# pointer fields of structs. POINTER_SIZE is read by PointerCType so sizeof,
+# struct layout, and the size-driven asm backend all follow automatically.
+pointer_compression = False
+
+
+def pointer_size():
+    return 4 if pointer_compression else 8
+
+
 class CType:
     """Represents a C type, like `int` or `double` or a struct or union.
 
@@ -237,7 +250,7 @@ class PointerCType(CType):
     def __init__(self, arg, const=False):
         """Initialize type."""
         self.arg = arg
-        super().__init__(8, const)
+        super().__init__(pointer_size(), const)
 
     def weak_compat(self, other):
         """Return True iff other is a compatible type to self."""

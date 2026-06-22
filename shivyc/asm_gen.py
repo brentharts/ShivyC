@@ -117,8 +117,11 @@ class ASMCode:
                 _, sym, addend = val
                 msym = mangle_symbol(sym)
                 ref = msym if not addend else f"{msym}+{addend}"
-                self.data.append(f"\t.quad {ref}")
-                size = 8
+                # A symbol reference is an address. Normally 8 bytes, but under
+                # -f-pointer-compression a pointer-sized field is 4 bytes: emit
+                # a 32-bit relocation (.int), valid because the whole image is
+                # based in the low 4 GiB (-f-low-mem).
+                self.data.append(f"\t.{size_strs.get(size, 'quad')} {ref}")
             else:
                 self.data.append(
                     f"\t.{size_strs[size]} {_float_to_bits(val, size)}")

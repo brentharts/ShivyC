@@ -89,6 +89,13 @@ def main():
         import shivyc.ctypes as ctypes
         ctypes.long_double_as_double = getattr(
             arguments, "long_double_as_double", False)
+        # 32-bit pointer compression (-f-pointer-compression). Drives
+        # PointerCType.size, hence sizeof / struct layout / the size-driven
+        # asm backend. It requires the low-4GiB image, so it implies -f-low-mem.
+        ctypes.pointer_compression = getattr(
+            arguments, "pointer_compression", False)
+        if ctypes.pointer_compression:
+            arguments.low_mem = True
 
     # Load a per-function register budget (thread partitioning) if supplied;
     # ASMGen consults arguments._thread_alloc to restrict allocation.
@@ -875,6 +882,7 @@ class Arguments:
         self.print_eliminated_members = False
         self.long_double_as_double = False
         self.low_mem = False
+        self.pointer_compression = False
         self.opt_level = 0
         self.output_name = None
         self.include_dirs = []
@@ -958,6 +966,9 @@ def _parse_args_selfhost(argv):
             args.long_double_as_double = True
         elif a == '-f-low-mem':
             args.low_mem = True
+        elif a == '-f-pointer-compression':
+            args.pointer_compression = True
+            args.low_mem = True   # 32-bit pointers require the low-4GiB image
         elif len(a) > 0 and a[0] == '-':
             pass
         else:
@@ -1051,6 +1062,18 @@ def get_arguments(argv=None):
                  "groundwork for a future -f-pointer-compression that shrinks "
                  "in-struct pointers to 32 bits",
             dest="low_mem", action="store_true")
+
+        parser.add_argument(
+            "-f-pointer-compression",
+            help="compile data/object pointers as 4 bytes instead of 8 "
+                 "(V8/x32-style). Implies -f-low-mem: the image is based in "
+                 "the low 4 GiB so every address fits in 32 bits and is "
+                 "recovered by zero-extension. Shrinks pointer-dense data and "
+                 "struct pointer fields. NOTE: addresses handed to the program "
+                 "must lie in the low 4 GiB (globals/.text and the compression "
+                 "arena do; see limitations re: stack addresses and 64-bit "
+                 "libc calls)",
+            dest="pointer_compression", action="store_true")
 
         # Optimization level. -O4 is aggressive and, like -fmetamorphic, depends on
         # a writable text segment; it turns on whole-program stackless lowering and
