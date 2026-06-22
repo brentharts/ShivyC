@@ -6556,6 +6556,13 @@ class Transpiler:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
                 and node.func.id == "__closure_env__":
             return OBJ                  # make_closure(...) yields a Tier-2 obj
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id == "next":
+            # next(it[, default]) is always emitted as an obj statement-expr
+            # (`({ obj _nx = ...; ... : OBJ_NONE; })`), so its static type must
+            # be obj too -- otherwise a name-typed-int target like
+            # `chunk = next(...)` is declared `int` and the obj RHS won't assign.
+            return OBJ
         t = self.static_type(node)
         if t:
             return t
