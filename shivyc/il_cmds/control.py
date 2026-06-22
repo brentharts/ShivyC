@@ -584,7 +584,11 @@ class Call(ILCommand):
         if self.direct_name:
             asm_code.add(asm_cmds.Raw("call " + self.direct_name))
         else:
-            asm_code.add(asm_cmds.AsmCall(target, None, self.func.ctype.size))
+            # The call target is held in a register as a full machine address,
+            # so it is always 64-bit -- even under -f-pointer-compression where
+            # the stored function pointer is 4 bytes (it is loaded zero-extended
+            # into the 64-bit register before the call).
+            asm_code.add(asm_cmds.AsmCall(target, None, 8))
 
         # Caller cleans up any stack-passed arguments.
         if cleanup:

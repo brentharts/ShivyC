@@ -582,7 +582,12 @@ class ReadAt(_ValueCmd):
             addr_r = addr_spot
         else:
             addr_r = get_reg([], [output_spot])
-            asm_code.add(asm_cmds.Mov(addr_r, addr_spot, 8))
+            # Load the address operand at the pointer's own width. Under
+            # -f-pointer-compression a pointer is 4 bytes: a 32-bit load
+            # zero-extends into the full 64-bit register, giving the real
+            # low-4GiB address. A hardcoded 8 would read 4 bytes past the
+            # pointer and corrupt the high half of the address.
+            asm_code.add(asm_cmds.Mov(addr_r, addr_spot, self.addr.ctype.size))
 
         indir_spot = MemSpot(addr_r)
         if isinstance(output_spot, RegSpot):
@@ -622,7 +627,9 @@ class SetAt(_ValueCmd):
             addr_r = addr_spot
         else:
             addr_r = get_reg([], [value_spot])
-            asm_code.add(asm_cmds.Mov(addr_r, addr_spot, 8))
+            # See ReadAt: load the destination address at the pointer's own
+            # width so a compressed (4-byte) pointer zero-extends correctly.
+            asm_code.add(asm_cmds.Mov(addr_r, addr_spot, self.addr.ctype.size))
 
         indir_spot = MemSpot(addr_r)
         if isinstance(value_spot, RegSpot):
