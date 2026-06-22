@@ -2957,6 +2957,58 @@ static obj _re_slice(char* t, long a, long b) {
 """
 
 
+OS_SYS_PRELUDE = r"""/* ---- rpython os.path / sys shim ---- */
+#include <unistd.h>
+#include <sys/stat.h>
+static char* _ospath_dirname(char* p) {
+    long n = (long)strlen(p), i;
+    for (i = n - 1; i >= 0; i--) if (p[i] == '/') break;
+    if (i < 0) return "";
+    if (i == 0) return "/";
+    char* s = (char*)aalloc((size_t)i + 1);
+    for (long k = 0; k < i; k++) s[k] = p[k];
+    s[i] = 0; return s;
+}
+static char* _ospath_basename(char* p) {
+    long n = (long)strlen(p), i;
+    for (i = n - 1; i >= 0; i--) if (p[i] == '/') break;
+    return p + i + 1;
+}
+static char* _ospath_join(char* a, char* b) {
+    if (b[0] == '/') return b;
+    long la = (long)strlen(a); if (la == 0) return b;
+    long lb = (long)strlen(b); int sep = (a[la - 1] != '/');
+    char* s = (char*)aalloc((size_t)la + lb + 2); long k = 0;
+    for (long i = 0; i < la; i++) s[k++] = a[i];
+    if (sep) s[k++] = '/';
+    for (long i = 0; i < lb; i++) s[k++] = b[i];
+    s[k] = 0; return s;
+}
+static char* _ospath_abspath(char* p) {
+    if (p[0] == '/') return p;
+    char _cwd[4096]; if (!getcwd(_cwd, sizeof _cwd)) return p;
+    return _ospath_join(_cwd, p);
+}
+static int _ospath_exists(char* p) { return access(p, 0) == 0; }
+static obj _os_makedirs(char* p) {
+    char b[4096]; long n = (long)strlen(p); if (n >= 4096) return OBJ_NONE;
+    for (long i = 0; i <= n; i++) {
+        b[i] = p[i];
+        if ((p[i] == '/' || p[i] == 0) && i > 0) {
+            char c = b[i]; b[i] = 0; mkdir(b, 0777); b[i] = c;
+        }
+    }
+    return OBJ_NONE;
+}
+static obj _os_unlink(char* p) { unlink(p); return OBJ_NONE; }
+static obj _sys_path_get(void) {
+    static obj _sp; static int _init = 0;
+    if (!_init) { _sp = list_new(); _init = 1; }
+    return _sp;
+}
+"""
+
+
 def c_char_literal(ch):
     """A C char constant for a single character."""
     if ch == "\\":
@@ -3234,6 +3286,7 @@ class Transpiler:
         self.modules = set()
         self._regex_ids = {}        # pattern string -> matcher id (per module)
         self._regex_parsed = {}     # id -> parsed pattern struct
+        self._ossys_used = False    # os.path/sys shim referenced
         self.import_alias = {}      # alias -> full dotted module name
         self.from_imports = {}      # imported name -> full dotted module name
         self.star_import_mods = []  # modules imported via `from X import *`
@@ -3522,6 +3575,9 @@ class Transpiler:
         if self._sock_used:
             self.lines[self.extern_idx:self.extern_idx] = \
                 SOCKET_PRELUDE.splitlines()
+        if self._ossys_used:
+            self.lines[self.extern_idx:self.extern_idx] = \
+                OS_SYS_PRELUDE.splitlines()
         if self._regex_ids:
             pre = REGEX_HELPER.splitlines()
             for pid in sorted(self._regex_parsed):
@@ -6889,6 +6945,18 @@ class Transpiler:
             # they default to int and a boolean/assign context mis-handles the
             # obj the matcher actually returns.
             return OBJ
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            _f = node.func
+            if isinstance(_f.value, ast.Attribute) and \
+                    isinstance(_f.value.value, ast.Name) and \
+                    _f.value.value.id == "os" and _f.value.attr == "path":
+                if _f.attr in ("dirname", "basename", "abspath", "join"):
+                    return "char*"       # returns a C string
+                if _f.attr == "exists":
+                    return "int"
+            if isinstance(_f.value, ast.Name) and _f.value.id == "os" and \
+                    _f.attr in ("makedirs", "unlink", "remove"):
+                return OBJ               # returns OBJ_NONE
         t = self.static_type(node)
         if t:
             return t
@@ -7882,6 +7950,12 @@ class Transpiler:
         if stream is not None:
             self._io_used.add(stream)
             return stream
+        if isinstance(node.value, ast.Name) and node.value.id == "sys":
+            if node.attr == "path":
+                self._ossys_used = True
+                return "_sys_path_get()"
+            if node.attr == "executable":
+                return 'OBJ_STR("python3")'
         if self._is_sys_impl_name(node):
             return 'OBJ_STR("%s")' % self.IMPL_NAME
         if isinstance(node.value, ast.Name) and node.value.id == "socket" \
@@ -8182,6 +8256,40 @@ class Transpiler:
                     and f.attr == "system" and node.args:
                 self._io_used.add("system")
                 return "system(%s)" % self.as_str(node.args[0])
+            # os.path.<fn>(...) -> string / libc shims (see OS_SYS_PRELUDE)
+            if isinstance(recv, ast.Attribute) and \
+                    isinstance(recv.value, ast.Name) and \
+                    recv.value.id == "os" and recv.attr == "path" and node.args:
+                cs = lambda i: self.coerce_to(
+                    "char*", node.args[i], self.expr(node.args[i]))
+                if f.attr == "dirname":
+                    self._ossys_used = True
+                    return "_ospath_dirname(%s)" % cs(0)
+                if f.attr == "basename":
+                    self._ossys_used = True
+                    return "_ospath_basename(%s)" % cs(0)
+                if f.attr == "abspath":
+                    self._ossys_used = True
+                    return "_ospath_abspath(%s)" % cs(0)
+                if f.attr == "exists":
+                    self._ossys_used = True
+                    return "_ospath_exists(%s)" % cs(0)
+                if f.attr == "join" and len(node.args) >= 2:
+                    self._ossys_used = True
+                    e = "_ospath_join(%s, %s)" % (cs(0), cs(1))
+                    for i in range(2, len(node.args)):
+                        e = "_ospath_join(%s, %s)" % (e, cs(i))
+                    return e
+            # a few os.* filesystem ops
+            if isinstance(recv, ast.Name) and recv.id == "os" and node.args:
+                if f.attr == "makedirs":
+                    self._ossys_used = True
+                    return "_os_makedirs(%s)" % self.coerce_to(
+                        "char*", node.args[0], self.expr(node.args[0]))
+                if f.attr in ("unlink", "remove"):
+                    self._ossys_used = True
+                    return "_os_unlink(%s)" % self.coerce_to(
+                        "char*", node.args[0], self.expr(node.args[0]))
             if self.value_ctype(recv) == "FILE*":
                 fe = self.expr(recv)
                 if f.attr == "write" and node.args:
@@ -9632,6 +9740,10 @@ class Transpiler:
                 return "truthy(%s)" % rendered
             if target == "char*":
                 return "AS_STR(%s)" % rendered
+            if target in ("double", "float"):
+                # pyfloat first so an int-tagged obj converts numerically
+                # (a bare AS_FLOAT would read the int slot as a double).
+                return "AS_FLOAT(pyfloat(%s))" % rendered
         if target == "bool" and vt in ("int", "bool"):
             return "(%s != 0)" % rendered if vt == "int" else rendered
         if target == OBJ and vt in ("int", "bool", "char*", "double"):
