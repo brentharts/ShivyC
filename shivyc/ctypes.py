@@ -39,6 +39,13 @@ class CType:
         """
         raise NotImplementedError
 
+    def set_members(self, members, bitfields=None):
+        """Populate a struct/union type's members. Only struct/union types
+        support this; defined on the base so it is part of the canonical CType
+        vtable and `ctype.set_members(...)` dispatches virtually on a CType
+        whose concrete class isn't statically known."""
+        raise NotImplementedError
+
     def is_complete(self):
         """Check whether this is a complete type."""
         return False

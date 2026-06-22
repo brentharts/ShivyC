@@ -166,6 +166,7 @@ def build_program_graph(files, args):
     import shivyc.main as main_mod
     from shivyc.errors import error_collector
     from shivyc.parser.parser import parse
+    from shivyc.tree.general_nodes import Root
     from shivyc.il_gen import ILCode, SymbolTable, Context
 
     graph = WholeProgramGraph()
@@ -193,11 +194,18 @@ def build_program_graph(files, args):
         tokens = main_mod._concat_adjacent_strings(tokens)
 
         key = cache.token_key(tokens)
-        ast = cache.load_ast(key)
-        if ast is None:
+        if sys.implementation.name != 'shivyc':
+            ast = cache.load_ast(key)
+            if ast is None:
+                ast = parse(tokens)
+                if ast is not None and error_collector.ok():
+                    cache.store_ast(key, ast)
+        else:
+            # The on-disk AST cache is host-only (it pickles); the self-hosted
+            # compiler always parses. Coming straight from parse() keeps `ast`
+            # concretely typed, so `ast.make_il(...)` is a vtable dispatch rather
+            # than an unresolved bare call.
             ast = parse(tokens)
-            if ast is not None and error_collector.ok():
-                cache.store_ast(key, ast)
         if ast is None:
             ok = False
             continue

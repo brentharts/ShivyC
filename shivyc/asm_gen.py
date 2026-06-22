@@ -50,6 +50,8 @@ class ASMCode:
         self.frameless = False
         self.metamorphic_funcs = set()
         self.metamorphic_current = None
+        self.pack_args_enabled = False
+        self.simd_pack = None
 
     def add(self, cmd):
         """Add a command to the code.

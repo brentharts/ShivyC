@@ -81,6 +81,7 @@ def load_program(files, args):
     import shivyc.extensions as extensions
     from shivyc.errors import error_collector
     from shivyc.parser.parser import parse
+    from shivyc.tree.general_nodes import Root
     from shivyc.il_gen import ILCode, SymbolTable, Context
 
     prog = Program()
@@ -111,11 +112,16 @@ def load_program(files, args):
         tokens, _ = weak_alias.extract_aliases(tokens)
         tokens = main_mod._concat_adjacent_strings(tokens)
         key = cache.token_key(tokens)
-        ast = cache.load_ast(key)
-        if ast is None:
+        if sys.implementation.name != 'shivyc':
+            ast = cache.load_ast(key)
+            if ast is None:
+                ast = parse(tokens)
+                if ast is not None and error_collector.ok():
+                    cache.store_ast(key, ast)
+        else:
+            # Host-only AST cache (pickles); self-host parses directly so `ast`
+            # stays typed and `ast.make_il(...)` is a vtable dispatch.
             ast = parse(tokens)
-            if ast is not None and error_collector.ok():
-                cache.store_ast(key, ast)
         if ast is None:
             ok = False
             continue
