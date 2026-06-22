@@ -1,69 +1,68 @@
-# 8-bit quantized networks + PSADBW byte-sum — change summary
+# rpython FFI / ctypes bridge — change summary
 
-Builds on `48b88ce "rpy torch SIMD float32 part II"`. Seven files (one new). The
-new file **`examples/rpython2c/nn/quant_mlp.py` needs `git add`.** Two files are
-the **live compiler** (`shivyc/simd_contracts.py`, `shivyc/asm_gen.py`) and one
-is the transpiler (`tools/py2c.py`) — re-run the unit tests after integrating.
+Builds on `b224c42 "rpy 8bit quantized neural networks"`. Five files (three new).
+**`tools/rpy_lib/rpy_ctypes.py` and the `examples/rpython2c/ffi/` directory are
+new — they need `git add`.** Only the transpiler (`tools/py2c.py`) changed this
+turn; the live ShivyCX compiler (`shivyc/*.py`) was untouched.
 
-## What changed
+## What it does
 
-A `u8` (unsigned-byte) sum-reduction now lowers to the **PSADBW** instruction —
-sum-of-absolute-differences against a zeroed register, the ideal hardware byte
-accumulator. It sums 16 bytes into two 64-bit lanes per instruction with no
-intermediate 8-bit overflow; `PADDQ` accumulates across iterations.
+A small, transpilable `ctypes` subset turns the common "load a library and call
+its functions" pattern into direct, statically-linked C — the dynamic lookup is
+resolved at transpile time, nothing is `dlopen`'d at runtime:
 
-### `shivyc/simd_contracts.py`
-* `_arg_layout` now records each pointer's element **signedness**.
-* `analyze` tags an unsigned-byte sum-reduction with `elem="u8"`.
-* New `synth_sse2_reduce_u8` emits `pxor`/`movdqu`/`psadbw`/`paddq` + a lane
-  fold (the int32 path still uses `paddd`).
-* `_is_sum_reduction` follows `Set` conversion chains, so a byte load widened to
-  the accumulator's `int` is still recognised as a load.
+    import ctypes
+    libm = ctypes.CDLL("libm.so.6")
+    libm.pow.restype  = ctypes.c_double
+    libm.pow.argtypes = [ctypes.c_double, ctypes.c_double]
+    r = libm.pow(2.0, 10.0)        # -> `pow(2.0, 10.0)` in C
+    f = libm.sqrt                  # bind the lookup to a local
+    s = f(r)                       # -> `sqrt(...)` in C
 
-### `shivyc/asm_gen.py`
-* Dispatches `elem=="u8"` reductions to `synth_sse2_reduce_u8`.
+py2c tracks the `CDLL` handle and each `lib.symbol` attribute as a compile-time
+constant, emits a real prototype (`extern double pow(double, double);`), lowers
+the calls to direct C calls (coercing args to the declared `argtypes`), drops
+the `CDLL`/`restype`/`argtypes` statements (no code), and leaves the symbol to
+the linker (ShivyCX links `-lc -lm`).
 
-### `tools/py2c.py`
-* `"unsigned char"` added to `_SCALAR_CTYPES`, to the auto-contract byte-lane
-  table (16 lanes / 128-bit register), and to **both** numeric-promotion sets
-  (`value_ctype` and `ex_BinOp`) — without these, `acc + w[i]` on a `u8` array
-  boxed to `obj_add`.
-* `_extract_contracts` now skips a leading **docstring** before lifting the
-  `assert len(...)` contract clauses, so a documented kernel still vectorizes.
+## Files
 
-### `tools/rpy_lib/rpy_torch.py`
-* Quantized kernels `qbytesum_u8`, `qdot_u8`, `qlinear_u8` (the mini-PyTorch
-  "8-bit" API).
-
-### New example `examples/rpython2c/nn/quant_mlp.py`
-* A self-contained post-training-quantized 2-layer MLP (32->16->8, all `u8`).
-  `qbytesum` (the PSADBW kernel) computes the zero-point correction term and is
-  called directly on each `malloc`'d buffer, so ShivyCX **proves** the contract
-  at both call sites and emits packed `PSADBW`/`PADDQ`. Returns `50`.
-
-### `Makefile`
-* `quant_mlp.py` added to the `rpython` and `testtorch` (dual-backend) targets.
+* **`tools/rpy_lib/rpy_ctypes.py`** (new): the ctypes subset — scalar type
+  markers (`c_int`, `c_double`, `c_char_p`, ...) and `CDLL`. Under CPython it
+  delegates to the real `ctypes`, so the same source cross-validates against the
+  genuine dynamic-loading implementation.
+* **`tools/py2c.py`**:
+  - `_CTYPES_TYPEMAP` (ctypes marker -> C type).
+  - `_scan_ctypes(tree)` (called from `run` after `collect_imports`): tracks
+    `CDLL` handles, `lib.symbol` bindings, `restype`/`argtypes`, the symbols
+    actually called, and the statement-ids that emit no C.
+  - `ctypes_call_symbol` / `_emit_ctypes_call`: lower a tracked call to
+    `symbol(args)`.
+  - `ctypes_externs` + an emit hook in `emit_forward_decls` for the prototypes.
+  - `value_ctype` returns a call's `restype`.
+  - Config statements are skipped in `stmt`, `toplevel`, and
+    `collect_module_globals`; bound FFI names are excluded from local hoisting
+    (so no shadowing `obj` is declared).
+  - Every hook is a no-op when no ctypes import is present.
+* **`examples/rpython2c/ffi/ffi_math.py`** (new): libm `pow`/`sqrt`/`cbrt` via
+  the subset; returns `35`.
+* **`examples/rpython2c/ffi/README.md`** (new).
+* **`Makefile`**: `ffi_math.py` added to the `rpython` and `testtorch` targets.
 
 ## Verification (no regressions)
 
+* `ffi_math.py` returns **35** under all three: ShivyCX, gcc (`-lm`), and CPython
+  (real ctypes) — same source.
 * unit tests `FAILED (errors=29)` — unchanged
 * `selfhost test` -> 3 OK — unchanged
-* `make rpython` all pass: simd_kernels=55, simd_blas=186, fusion=97,
-  neural_net=199, torch_mlp=4, torch_mlp_f32=4, **quant_mlp=50**
+* `make rpython` all pass (incl. ffi_math=35; simd_kernels=55, torch_mlp=4,
+  torch_mlp_f32=4, quant_mlp=50, fusion=97, neural_net=199, ...)
 * `make testtorch / testfast / testpromote / testpgo / testfuse` -> PASS
-  (testtorch checks quant_mlp on gcc **and** ShivyCX)
-* cross-module / numeric-heavy examples unchanged (crossattr=114, dictops=186,
-  aggregates=84, wordfreq=93, untyped=41, promote=70, pgo=70)
-* numpy reductions still proven (simd_blas=186 `scale`+`dot`, ufuncs=49)
-* int32 reduction still selects `PADDD` (not PSADBW) and is correct
+  (testtorch checks ffi_math on gcc **and** ShivyCX)
 * gcc coverage 45/60 — unchanged
-* `quant_mlp.py`: PSADBW proven at 2 call sites; gcc=50, ShivyCX=50, matches a
-  pure-Python integer reference
 
-## Scope note
+## Scope
 
-A SIMD contract is proven only when the kernel and its call sites share one
-translation unit, so the self-contained `quant_mlp.py` is where PSADBW is
-actually emitted. The same `u8` kernels on the bundled `rpy_torch` API
-(`torch.qbytesum_u8`, ...) run as correct **scalar** code across a module
-boundary — consistent with how the f32 SIMD kernels behave when bundled.
+Minimal by design: `CDLL`, scalar type markers, per-function
+`restype`/`argtypes`, direct calls, and `f = lib.symbol` bindings. Struct/array
+marshalling, callbacks, `byref`/pointer out-params, and `errno` are future work.
