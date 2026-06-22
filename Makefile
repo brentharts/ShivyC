@@ -95,6 +95,22 @@ selfhost_bench:
 selfhost_coverage:
 	python3 tools/selfhost.py coverage
 
+# Build the self-host artifacts into a fixed /tmp directory (kept on disk) and
+# run the simple per-module self-host tests against them. The build dir holds
+# the transpiled+compiled module test exes (tokens, ilbase, weak_alias).
+#     make selfhost_build              # -> /tmp/shivyc-selfhost
+SELFHOST_DIR ?= /tmp/shivyc-selfhost
+selfhost_build:
+	python3 tools/selfhost.py test --build-dir $(SELFHOST_DIR)
+	@echo "self-host build kept in $(SELFHOST_DIR)"
+
+# Compile-speed benchmark: time the ShivyCX compiler vs gcc on the same input.
+# Override the compiler under test with SHIVYC=... (e.g. a native binary):
+#     make bench_compile_speed
+#     make bench_compile_speed SHIVYC='pypy3 -m shivyc.main'
+bench_compile_speed:
+	python3 benchmarks/compile_speed/bench_compile_speed.py $(BENCH_ARGS)
+
 selfhost_link:
 	python3 tools/selfhost.py link
 
