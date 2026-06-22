@@ -1,78 +1,69 @@
-# SIMD + float32 for the mini-PyTorch — change summary
+# 8-bit quantized networks + PSADBW byte-sum — change summary
 
-Builds on `a085c75 "rpy torch part I"`. Six files (one new). Integrate the same
-way as before; **`examples/rpython2c/nn/torch_mlp_f32.py` is a NEW file and needs
-`git add`.** `shivyc/main.py` is the live compiler — re-run the unit tests after
-integrating.
+Builds on `48b88ce "rpy torch SIMD float32 part II"`. Seven files (one new). The
+new file **`examples/rpython2c/nn/quant_mlp.py` needs `git add`.** Two files are
+the **live compiler** (`shivyc/simd_contracts.py`, `shivyc/asm_gen.py`) and one
+is the transpiler (`tools/py2c.py`) — re-run the unit tests after integrating.
 
 ## What changed
 
-1. **Contract syntax behind `#ifdef __SHIVYC__`** (`tools/py2c.py`).
-   SIMD contract clauses (`assert not len(x) % 4`) are now emitted between
-   `#ifdef __SHIVYC__` / `#endif`. ShivyCX (which predefines `__SHIVYC__`) reads
-   them and vectorizes; gcc skips the block and compiles the plain function.
-   `numpy/simd_kernels.py` now compiles under **both** backends (was ShivyCX-only;
-   gcc choked on `unknown type name 'assert'`).
+A `u8` (unsigned-byte) sum-reduction now lowers to the **PSADBW** instruction —
+sum-of-absolute-differences against a zeroed register, the ideal hardware byte
+accumulator. It sums 16 bytes into two 64-bit lanes per instruction with no
+intermediate 8-bit overflow; `PADDQ` accumulates across iterations.
 
-2. **Dtype-aware fusion** (`tools/py2c.py` `_fuse_render`).
-   A fused store into an `f32*` now emits true single precision —
-   `expf`/`sqrtf`/`powf` and `1.0f` literals — instead of computing in `double`
-   and casting. `shivyc/main.py` `_libm_protos` gained the matching `f`-variant
-   prototypes.
+### `shivyc/simd_contracts.py`
+* `_arg_layout` now records each pointer's element **signedness**.
+* `analyze` tags an unsigned-byte sum-reduction with `elem="u8"`.
+* New `synth_sse2_reduce_u8` emits `pxor`/`movdqu`/`psadbw`/`paddq` + a lane
+  fold (the int32 path still uses `paddd`).
+* `_is_sum_reduction` follows `Set` conversion chains, so a byte load widened to
+  the accumulator's `int` is still recognised as a load.
 
-3. **f32 kernel set in `rpy_torch`** (`tools/rpy_lib/rpy_torch.py`).
-   `relu_f32`, `sigmoid_f32`, `linear_f32`, `mse_f32`, `mse_grad_f32`,
-   `sigmoid_grad_f32`, `linear_grad_f32`, `sgd_step_f32`, plus a `saxpy_f32` SSE
-   primitive. Activations/gradients are fused f32; `saxpy_f32`/`sgd_step_f32` are
-   explicit loops carrying `#ifdef`-guarded SIMD contracts.
+### `shivyc/asm_gen.py`
+* Dispatches `elem=="u8"` reductions to `synth_sse2_reduce_u8`.
 
-4. **New example** `examples/rpython2c/nn/torch_mlp_f32.py`: the XOR MLP in f32,
-   using the import switch. Returns `4` under both gcc and ShivyCX.
+### `tools/py2c.py`
+* `"unsigned char"` added to `_SCALAR_CTYPES`, to the auto-contract byte-lane
+  table (16 lanes / 128-bit register), and to **both** numeric-promotion sets
+  (`value_ctype` and `ex_BinOp`) — without these, `acc + w[i]` on a `u8` array
+  boxed to `obj_add`.
+* `_extract_contracts` now skips a leading **docstring** before lifting the
+  `assert len(...)` contract clauses, so a documented kernel still vectorizes.
 
-5. **Makefile**: `torch_mlp_f32.py` added to the `rpython` and `testtorch`
-   (dual-backend) targets.
+### `tools/rpy_lib/rpy_torch.py`
+* Quantized kernels `qbytesum_u8`, `qdot_u8`, `qlinear_u8` (the mini-PyTorch
+  "8-bit" API).
 
-## Two real compiler bugs fixed (both in `tools/py2c.py`)
+### New example `examples/rpython2c/nn/quant_mlp.py`
+* A self-contained post-training-quantized 2-layer MLP (32->16->8, all `u8`).
+  `qbytesum` (the PSADBW kernel) computes the zero-point correction term and is
+  called directly on each `malloc`'d buffer, so ShivyCX **proves** the contract
+  at both call sites and emits packed `PSADBW`/`PADDQ`. Returns `50`.
 
-* **Module alias shadowed under a static `if`.** With
-  `if sys.implementation.name=='shivyc': import rpy_torch as torch` /
-  `else: import torch`, `collect_imports` walked *both* branches, so the dead
-  `else` overwrote the alias and `torch.linear_f32(...)` emitted
-  `OBJ_NONE /* unsupported */`. Fixed with a `_walk_live` helper that descends
-  only the live branch of a foldable `if`.
-
-* **K&R extern dropped the float ABI.** Cross-module functions were declared
-  `extern void f();` (no prototype). A `double` learning rate passed to a
-  `float lr` parameter arrived as `0.0` (the low 32 bits of the double-2.0 bit
-  pattern), so `sgd_step_f32` never updated weights — only the manually-updated
-  bias learned. Externs now carry full prototypes
-  (`extern void sgd_step_f32(float*, float*, float, int);`). The f64 path was
-  unaffected because `double` matched the default promotion.
+### `Makefile`
+* `quant_mlp.py` added to the `rpython` and `testtorch` (dual-backend) targets.
 
 ## Verification (no regressions)
 
 * unit tests `FAILED (errors=29)` — unchanged
-* `selfhost test` → 3 OK — unchanged
+* `selfhost test` -> 3 OK — unchanged
 * `make rpython` all pass: simd_kernels=55, simd_blas=186, fusion=97,
-  neural_net=199, torch_mlp(f64)=4, **torch_mlp_f32=4**
-* `make testtorch / testfast / testpromote / testpgo / testfuse` → PASS
-  (testtorch now checks torch_mlp_f32 on gcc **and** ShivyCX)
-* cross-module examples unchanged (crossattr=114, dictops=186, aggregates=84,
-  dynattr=126, sets=35, wordfreq=93, untyped=41, promote=70, pgo=70)
+  neural_net=199, torch_mlp=4, torch_mlp_f32=4, **quant_mlp=50**
+* `make testtorch / testfast / testpromote / testpgo / testfuse` -> PASS
+  (testtorch checks quant_mlp on gcc **and** ShivyCX)
+* cross-module / numeric-heavy examples unchanged (crossattr=114, dictops=186,
+  aggregates=84, wordfreq=93, untyped=41, promote=70, pgo=70)
+* numpy reductions still proven (simd_blas=186 `scale`+`dot`, ufuncs=49)
+* int32 reduction still selects `PADDD` (not PSADBW) and is correct
 * gcc coverage 45/60 — unchanged
-* `simd_kernels.py` dual-backend: gcc=55, ShivyCX=55 (3 contracts proven)
-* `torch_mlp_f32.py`: gcc=4, ShivyCX=4 — matches the pure-Python f32 reference
+* `quant_mlp.py`: PSADBW proven at 2 call sites; gcc=50, ShivyCX=50, matches a
+  pure-Python integer reference
 
-## Honest scope notes
+## Scope note
 
-* A SIMD contract is **proven only when the kernel and its call sites are in one
-  translation unit** (e.g. `simd_kernels.py`). For the auto-bundled `rpy_torch`
-  module ShivyCX reports "no call sites visible" and keeps correct scalar code,
-  so the f32 speedup there is from smaller data + single-precision libm, not
-  packed SSE. A fused store and a SIMD contract also do not combine — use
-  explicit loops for kernels you want vectorized.
-* The import-switch **mechanism** works, but `rpy_torch` is a low-level buffer
-  API (malloc'd `f32*`), not a drop-in for `torch.nn`'s tensor API, and `malloc`
-  is a ShivyCX builtin — so running unmodified under real PyTorch needs a
-  tensor-API shim (future work). Validation here is against a pure-Python f32
-  reference, which the compiled result matches exactly.
+A SIMD contract is proven only when the kernel and its call sites share one
+translation unit, so the self-contained `quant_mlp.py` is where PSADBW is
+actually emitted. The same `u8` kernels on the bundled `rpy_torch` API
+(`torch.qbytesum_u8`, ...) run as correct **scalar** code across a module
+boundary — consistent with how the f32 SIMD kernels behave when bundled.
