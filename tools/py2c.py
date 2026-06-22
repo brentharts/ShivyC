@@ -144,6 +144,7 @@ RUNTIME_H = r'''#ifndef SHIVYC_RT_H
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <setjmp.h>
 
 typedef char* str;
@@ -173,6 +174,25 @@ typedef struct { unsigned char tag; union { long i; str s; Obj* o; double d; } u
    used by isinstance lives at a fixed offset, so isinstance_of works on any
    module's TypeInfo as long as {name; base;} are the first two members. */
 struct Obj { const void* type; };
+
+/* ---- Pointer compression (V8-style flat 32-bit in-struct pointers) --------
+   With -f-pointer-compression the program is linked non-PIE at a low load
+   address (-f-low-mem), so EVERY object address -- arena objects and .rodata
+   string/TypeInfo pointers alike -- fits in the low 4 GiB. A class-pointer
+   struct field can then be stored as a 32-bit `cptr` (the low 32 address bits)
+   and recovered by zero-extension, halving 8-byte pointer fields to 4 bytes.
+   PACK truncates, UNPACK<T> zero-extends back to a real pointer. When the flag
+   is off, `cptr` is a plain pointer and PACK/UNPACK are identities, so the
+   default build is byte-for-byte unchanged. */
+#ifdef SHIVYC_PCOMPRESS
+typedef uint32_t cptr;
+#define PTR_PACK(p)       ((cptr)(uintptr_t)(const void*)(p))
+#define PTR_UNPACK(T, c)  ((T)(uintptr_t)(c))
+#else
+typedef void* cptr;
+#define PTR_PACK(p)       ((void*)(p))
+#define PTR_UNPACK(T, c)  ((T)(c))
+#endif
 
 /* Per-type field table for bridge-free dynamic attribute access. Each entry is
    a field name -> byte offset within the struct + a 1-char storage code:
