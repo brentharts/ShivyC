@@ -10528,9 +10528,38 @@ class Transpiler:
         t = self.value_ctype(node)
         return bool(t) and t.endswith("*") and t != OBJ
 
+    def _type_dispatch_subscript(self, node):
+        """Lower `{Cls: val, ...}[type(x)]` to an isinstance chain, or None if
+        the node isn't that idiom. Every key must resolve to a known class."""
+        d, sl = node.value, node.slice
+        if not isinstance(d, ast.Dict) or not d.keys:
+            return None
+        if not (isinstance(sl, ast.Call) and isinstance(sl.func, ast.Name)
+                and sl.func.id == "type" and len(sl.args) == 1):
+            return None
+        pairs = []
+        for k, v in zip(d.keys, d.values):
+            if k is None or self._resolve_class_ref(k) is None:
+                return None                    # ** unpack or non-class key
+            pairs.append((k, v))
+        x = sl.args[0]
+        out = "OBJ_NONE"                       # type matched no key (KeyError)
+        for k, v in reversed(pairs):
+            out = "(%s ? %s : %s)" % (
+                self.lower_isinstance(x, k), self.wrap_obj(v), out)
+        return out
+
     def ex_Subscript(self, node):
         if self._is_sys_argv(node.value) and not isinstance(node.slice, ast.Slice):
             return "argv[%s]" % self.as_long(node.slice)   # char* command-line arg
+        # `{Cls1: v1, Cls2: v2, ...}[type(x)]` -- a type->value dispatch table.
+        # A dict keyed by classes can't be built and looked up by type() in the
+        # obj model (class-as-value is a ctor closure, type() is a TypeInfo*, so
+        # the keys never match), so lower the whole expression to an isinstance
+        # chain instead.
+        disp = self._type_dispatch_subscript(node)
+        if disp is not None:
+            return disp
         if isinstance(node.value, ast.Subscript):
             inner = node.value
             owner = self.const_dict_owner(inner.value) \
