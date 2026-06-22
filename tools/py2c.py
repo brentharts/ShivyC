@@ -2309,6 +2309,12 @@ def convert_block_closures(tree):
     def process(fn, prefix, cls):
         toplevel = {id(s) for s in fn.body}   # handled by the other lift
         encl = {a.arg for a in fn.args.args} | _assigned_names(fn)
+        # A block-nested `def f` becomes a local `f = __closure_env__(...)`, so a
+        # sibling closure that references `f` must be able to capture it. Such
+        # def names are not picked up by _assigned_names, so add them here.
+        for n in ast.walk(fn):
+            if isinstance(n, ast.FunctionDef) and n is not fn:
+                encl.add(n.name)
         if fn.args.vararg:
             encl.add(fn.args.vararg.arg)
         if fn.args.kwarg:
