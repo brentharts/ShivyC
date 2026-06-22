@@ -200,7 +200,7 @@ class _GeneralCmp(ILCommand):
         result = get_reg([spotmap[self.output]], [])
         a1, a2 = spotmap[self.arg1], spotmap[self.arg2]
         one, zero = LiteralSpot(1), LiteralSpot(0)
-        end = asm_code.get_label()
+        end_label = asm_code.get_label()
 
         if self.f_eq or self.f_neq:
             asm_code.add(fmov(XMM0, a1, size))
@@ -208,17 +208,17 @@ class _GeneralCmp(ILCommand):
             keep, other = (zero, one) if self.f_eq else (one, zero)
             # Unordered (parity) and inequality (ZF=0) both leave `keep`.
             asm_code.add(asm_cmds.Mov(result, keep, out_size))
-            asm_code.add(asm_cmds.Jp(end))
-            asm_code.add(asm_cmds.Jne(end))
+            asm_code.add(asm_cmds.Jp(end_label))
+            asm_code.add(asm_cmds.Jne(end_label))
             asm_code.add(asm_cmds.Mov(result, other, out_size))
         else:
             first, second = (a2, a1) if self.f_swap else (a1, a2)
             asm_code.add(fmov(XMM0, first, size))
             asm_code.add(ucomi(XMM0, second, size))
             asm_code.add(asm_cmds.Mov(result, one, out_size))
-            asm_code.add(self.f_jump(end))
+            asm_code.add(self.f_jump(end_label))
             asm_code.add(asm_cmds.Mov(result, zero, out_size))
-        asm_code.add(asm_cmds.AsmLabel(end))
+        asm_code.add(asm_cmds.AsmLabel(end_label))
 
         if result != spotmap[self.output]:
             asm_code.add(asm_cmds.Mov(spotmap[self.output], result, out_size))
