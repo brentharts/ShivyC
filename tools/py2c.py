@@ -8535,6 +8535,16 @@ class Transpiler:
                                ", ".join(self.coerce_to("double", a,
                                                         self.expr(a))
                                          for a in node.args))
+        # bare `round(x)` / `floor(x)` / ... : C math funcs take double, so the
+        # argument (often an obj from true division) must be coerced. value_ctype
+        # already reports double for these, so the result wraps correctly in
+        # context. Guarded so a local of the same name isn't hijacked.
+        if isinstance(f0, ast.Name) and f0.id in MATH_FUNCS and \
+                f0.id not in self.scope and f0.id not in self.classes:
+            return "%s(%s)" % (f0.id,
+                               ", ".join(self.coerce_to("double", a,
+                                                        self.expr(a))
+                                         for a in node.args))
         io = self._io_call(node)
         if io is not None:
             return io
