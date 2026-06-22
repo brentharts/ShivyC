@@ -3005,6 +3005,205 @@ def project_method_owners(base_dir):
     return owners
 
 
+_PROJECT_HIER_CACHE = {}
+
+
+def project_class_hierarchy(base_dir):
+    """Global class map for cross-module vtable consistency, computed once over
+    the whole package (+ local dirs) and cached.
+
+    Returns (classes, byname):
+      classes : (mod, name) -> {"base": base_name|None, "fns": name->FunctionDef}
+      byname  : name -> [mods]   (to resolve a base reference to its module)
+
+    Keyed by (mod, name) because class names are NOT globally unique (e.g.
+    general_nodes.Root extends Node while decl_nodes.Root extends DeclNode); a
+    flat by-name map would mis-root one of them and break the canon."""
+    ckey = (base_dir, tuple(sorted(_LOCAL_MODULE_DIRS)))
+    if ckey in _PROJECT_HIER_CACHE:
+        return _PROJECT_HIER_CACHE[ckey]
+    classes, byname = {}, {}
+
+    def base_of(n):
+        for b in n.bases:
+            if isinstance(b, ast.Name):
+                return b.id
+            if isinstance(b, ast.Attribute):
+                return b.attr
+        return None
+
+    def scan(path, modname):
+        try:
+            t = ast.parse(open(path, encoding="utf-8").read())
+        except Exception:
+            return
+        for n in t.body:
+            if not isinstance(n, ast.ClassDef):
+                continue
+            fns = {it.name: it for it in n.body
+                   if isinstance(it, ast.FunctionDef)}
+            classes[(modname, n.name)] = {"base": base_of(n), "fns": fns}
+            byname.setdefault(n.name, [])
+            if modname not in byname[n.name]:
+                byname[n.name].append(modname)
+
+    pkg = os.path.join(base_dir or ".", "shivyc")
+    pkg_abs = os.path.abspath(pkg)
+    for dp, _dirs, fns in os.walk(pkg):
+        if "musl" in dp.split(os.sep):
+            continue
+        for fn in fns:
+            if not fn.endswith(".py"):
+                continue
+            p = os.path.join(dp, fn)
+            mod = os.path.relpath(p, base_dir or ".")[:-3].replace(os.sep, ".")
+            scan(p, mod)
+    for d in _LOCAL_MODULE_DIRS:
+        da = os.path.abspath(d)
+        if not os.path.isdir(d) or da == pkg_abs \
+                or da.startswith(pkg_abs + os.sep):
+            continue
+        for fn in sorted(os.listdir(d)):
+            if fn.endswith(".py"):
+                scan(os.path.join(d, fn), fn[:-3])
+    _PROJECT_HIER_CACHE[ckey] = (classes, byname)
+    return classes, byname
+
+
+def _hier_resolve(classes, byname, mod, name):
+    """Resolve class `name` as referenced from module `mod` to a (mod,name) key:
+    prefer the same module, else a globally-unique definition, else None."""
+    if (mod, name) in classes:
+        return (mod, name)
+    mods = byname.get(name)
+    if mods and len(mods) == 1:
+        return (mods[0], name)
+    return None
+
+
+_HIER_ROOT_MEMO = {}
+
+
+def hier_root_key(classes, byname, mod, name):
+    """(mod,name) key of the hierarchy root for `name` referenced from `mod`."""
+    memo = _HIER_ROOT_MEMO.get(id(classes))
+    if memo is None:
+        memo = _HIER_ROOT_MEMO[id(classes)] = {}
+    mk = (mod, name)
+    if mk in memo:
+        return memo[mk]
+    cur = _hier_resolve(classes, byname, mod, name)
+    seen = set()
+    while cur and cur not in seen:
+        seen.add(cur)
+        base = classes[cur]["base"]
+        if not base:
+            break
+        nxt = _hier_resolve(classes, byname, cur[0], base)
+        if nxt is None:
+            break               # base unresolved/ambiguous: cur is the root
+        cur = nxt
+    memo[mk] = cur
+    return cur
+
+
+def _hier_skip_method(m, fn):
+    if m == "__init__" or (m.startswith("__") and m.endswith("__")):
+        return True
+    return any(isinstance(d, ast.Name) and d.id in ("staticmethod", "property")
+               for d in fn.decorator_list)
+
+
+def hier_members(classes, byname, root_key):
+    return [k for k in classes
+            if hier_root_key(classes, byname, k[0], k[1]) == root_key]
+
+
+def _fn_arity(fn):
+    return len(fn.args.posonlyargs) + len(fn.args.args)   # includes self
+
+
+def _slot_paddable(fns):
+    """True if every definition of a method can be uniformly called through one
+    widest slot: the widest fn's params beyond the NARROWEST definition's arity
+    must all have defaults (so a narrow call pads with them). This admits real
+    optional-arg overrides (Node.make_il vs Compound.make_il(no_scope=False))
+    but rejects same-named helpers with incompatible shapes (arith
+    _check_type(left,right) vs unary _check_type(expr)), which must stay
+    statically dispatched."""
+    widest = max(fns, key=_fn_arity)
+    if widest.args.vararg:
+        return True                       # vararg slots route via mp_call
+    nparams = _fn_arity(widest)           # includes self
+    ndef = len(widest.args.defaults)
+    first_defaulted = nparams - ndef      # index of first param with a default
+    lo = min(_fn_arity(f) for f in fns)   # narrowest call arity (incl. self)
+    return lo >= first_defaulted
+
+
+def hier_canon_key(classes, byname, root_key):
+    """Canonical vtable method names for a hierarchy: every method that is
+    polymorphically dispatched. That is the root's own interface PLUS any method
+    overridden across the hierarchy (defined in >= 2 member classes) -- the
+    latter catches virtuals introduced by an intermediate class (e.g. ExprNode's
+    `lvalue`). A method is admitted only if its definitions share one paddable
+    slot signature; same-named private helpers with incompatible shapes stay
+    statically dispatched. A hierarchy with no subclasses needs no vtable."""
+    members = hier_members(classes, byname, root_key)
+    if len(members) < 2:
+        return set()
+    defs = {}
+    for k in members:
+        for m, fn in classes[k]["fns"].items():
+            if _hier_skip_method(m, fn):
+                continue
+            defs.setdefault(m, []).append(fn)
+    root_fns = classes.get(root_key, {}).get("fns", {})
+    canon = set()
+    for m, fns in defs.items():
+        in_root = m in root_fns and not _hier_skip_method(m, root_fns[m])
+        if not (in_root or len(fns) >= 2):
+            continue
+        if _slot_paddable(fns):
+            canon.add(m)
+    return canon
+
+
+def hier_widest_fn(classes, byname, root_key, mname):
+    """Across every class whose root is `root_key`, the FunctionDef for `mname`
+    with the most positional parameters (the slot must take the widest arity)."""
+    best, bestn = None, -1
+    for key in hier_members(classes, byname, root_key):
+        fn = classes[key]["fns"].get(mname)
+        if fn is None:
+            continue
+        n = len(fn.args.posonlyargs) + len(fn.args.args)
+        if n > bestn:
+            bestn, best = n, fn
+    return best
+
+
+def module_external_canon(base_dir, modname, local_names):
+    """The canonical vtable (canon_method_set, root_key) for `modname`'s
+    classes. Works whether the hierarchy root is defined in this module (the
+    root-defining module must lay out the SAME union as its subclass modules) or
+    imported. Returns None when the module's virtual classes don't share a
+    single hierarchy (so there is no one layout to pin)."""
+    classes, byname = project_class_hierarchy(base_dir)
+    roots = {}
+    for nm in local_names:
+        rk = hier_root_key(classes, byname, modname, nm)
+        if rk is None:
+            continue
+        canon = hier_canon_key(classes, byname, rk)
+        if canon:
+            roots[rk] = canon
+    if len(roots) != 1:
+        return None
+    rk, canon = next(iter(roots.items()))
+    return canon, rk
+
+
 def pod_csyms(tree, order, pod_enabled):
     """Csyms of classes in `order` (parsed from `tree`) that qualify for the
     POD lowering (bare struct, no Obj header / vtable). Mirrors the core of
@@ -4588,6 +4787,17 @@ class Transpiler:
                     if ci.csym not in pods:
                         non_pod_methods.update(ci.methods)
                 vt = {m for m in vt if m in non_pod_methods}
+                # Cross-module layout: if these classes extend a root defined in
+                # ANOTHER module, the defining module pinned the vtable to that
+                # root's interface (canon). Replicate it so the VT_<mod> struct
+                # built here matches the emitted TypeInfo slot-for-slot. canon
+                # is used as-is (NOT filtered by this module's own methods: a
+                # root method like make_il_raw may be defined only in the
+                # external root, yet still occupies a slot here).
+                ext = module_external_canon(self.base_dir, modname,
+                                            set(classes))
+                if ext is not None:
+                    vt = set(ext[0])
                 reg["classes"] = classes
                 reg["order"] = order
                 reg["vt"] = vt
@@ -4727,29 +4937,21 @@ class Transpiler:
             if r is not ci and r.name in self.xclasses \
                     and r.name not in self.classes:
                 roots[r.name] = r
-        if len(roots) != 1:
-            return                   # no / ambiguous external hierarchy
-        rname, r = next(iter(roots.items()))
-        self.vt_root = r
-        self.vt_root_mod = self.xclass_module.get(rname)
-        canon = {m for m in r.methods if not (m.startswith("__")
-                                              and m.endswith("__"))}
-        # When the external root has a virtual interface (`canon` non-empty),
-        # the local classes that extend it must lay their vtable slots out to
-        # match the root module's TypeInfo *exactly*, so cross-module dispatch
-        # of a root method on a derived instance (e.g. node.make_il() through a
-        # Node vtable) hits the right slot. In that case the layout is precisely
-        # `canon`; module-private helpers stay off the vtable (self-calls on
-        # concrete types). But if the root interface is empty (e.g. ParserError
-        # extends CompilerError, which has only dunder methods), there is no
-        # layout to pin -- and overwriting with the empty set would wrongly drop
-        # the module's own virtual methods. parser.utils is exactly this: its
-        # standalone SimpleSymbolTable is dispatched virtually from parser.parser
-        # (symbols.snapshot()), so those methods must stay in the TypeInfo to
-        # match the importer's replicated VT_<module>. Keep the per-module vt
-        # (set from collect_classes above) in that case.
-        if canon:
-            VTABLE_METHODS = canon
+        if len(roots) == 1:          # record the imported root for method_proto
+            rname, r = next(iter(roots.items()))
+            self.vt_root = r
+            self.vt_root_mod = self.xclass_module.get(rname)
+        # Canonical vtable layout, computed from the WHOLE cross-module
+        # hierarchy (root interface + every overridden method) so each module --
+        # the root-defining one included -- emits a byte-identical TypeInfo and
+        # importers replicate it slot-for-slot. None => this module's virtual
+        # classes don't form a single pinned hierarchy; keep the per-module vt
+        # (e.g. a standalone class dispatched virtually from elsewhere).
+        ext = module_external_canon(self.base_dir, self.modname,
+                                    {ci.name for ci in self.class_order})
+        self._vt_root_key = ext[1] if ext is not None else None
+        if ext is not None:
+            VTABLE_METHODS = set(ext[0])
 
     def is_ancestor(self, a, b):
         c = b
@@ -4895,23 +5097,38 @@ class Transpiler:
         """(ret_ctype, [param_ctypes]) for method `mname` in imported `mod`,
         replicating that module's emitted slot signature."""
         reg = self.load_xmod(mod)
-        for ci in reg["order"]:
-            fn = ci.methods.get(mname)
-            if fn:
-                ret = self._c_ret(fn)
-                params = [arg_ctype(fn, a) for a in fn.args.args[1:]]
+        ext = module_external_canon(self.base_dir, mod, set(reg["classes"]))
+        if ext is not None:
+            cands = self._hier_method_fns(ext[1], mname)
+            if cands:
+                ret, params, _ = self._proto_from_fns(cands)
                 return ret, params
-        return OBJ, []
+        cands = [ci.methods[mname] for ci in reg["order"]
+                 if mname in ci.methods]
+        if not cands:
+            return OBJ, []
+        ret, params, _ = self._proto_from_fns(cands)
+        return ret, params
 
     def ximported_method_fn(self, mod, mname):
-        """The AST FunctionDef for method `mname` in imported `mod`, or None
-        (used to recover default-argument values for vtable calls)."""
+        """The widest FunctionDef for `mname` in imported `mod` (used to recover
+        default-argument values for vtable calls). Must match the slot's widest
+        signature so a narrower call site pads the missing args with the widest
+        implementation's defaults."""
         reg = self.load_xmod(mod)
-        for ci in reg["order"]:
-            fn = ci.methods.get(mname)
-            if fn:
-                return fn
-        return None
+        ext = module_external_canon(self.base_dir, mod, set(reg["classes"]))
+        cands = []
+        if ext is not None:
+            cands = self._hier_method_fns(ext[1], mname)
+        if not cands:
+            cands = [ci.methods[mname] for ci in reg["order"]
+                     if mname in ci.methods]
+        best, bestn = None, -1
+        for fn in cands:
+            n = len(fn.args.posonlyargs) + len(fn.args.args)
+            if n > bestn:
+                bestn, best = n, fn
+        return best
 
     def xvcall(self, mod, recv_node, mname, arg_nodes):
         """Cross-module virtual call: index the defining module's TypeInfo
@@ -5165,50 +5382,49 @@ class Transpiler:
         ret, params, _ = self.method_proto(mname)
         return "%s (*%s)(%s)" % (ret, vslot_name(mname), ", ".join(["Obj*"] + params))
 
-    def method_proto(self, mname):
-        ret, params, fndef = OBJ, [], None
-        n_kwonly = 0
-        for ci in self.class_order:
-            fn = ci.methods.get(mname)
-            if not fn:
-                continue
-            ret = self._c_ret(fn)
+    def _proto_from_fns(self, cands):
+        """Uniform vtable slot proto (ret, params) from candidate FunctionDefs:
+        widest positional arity, with kwonly/vararg/kwarg padding unioned over
+        all candidates. `fndef` is the widest fn (used for param names)."""
+        ret, params, fndef, n_kwonly = OBJ, [], None, 0
+        has_vararg = has_kwarg = False
+        for fn in cands:
             p = self._method_proto_params(fn)
-            if len(p) > len(params):
-                params = list(p)
-                fndef = fn
-            elif len(p) == len(params) and fndef is None:
-                fndef = fn
+            if len(p) > len(params) or fndef is None:
+                params, fndef, ret = list(p), fn, self._c_ret(fn)
             n_kwonly = max(n_kwonly, len(fn.args.kwonlyargs))
-        # canonical methods not overridden locally: take the imported root's
-        # signature so the slot layout matches the defining module exactly.
-        if fndef is None and getattr(self, "vt_root", None) is not None:
-            fn = self.vt_root.methods.get(mname)
-            if fn is not None:
-                ret = self._c_ret(fn)
-                params = self._method_proto_params(fn)
-                fndef = fn
-                n_kwonly = max(n_kwonly, len(fn.args.kwonlyargs))
-        has_vararg = False
-        has_kwarg = False
-        for ci in self.class_order:
-            fn = ci.methods.get(mname)
-            if fn and fn.args.vararg:
-                has_vararg = True
-            if fn and fn.args.kwarg:
-                has_kwarg = True
-        if fndef is None and getattr(self, "vt_root", None) is not None:
-            fn = self.vt_root.methods.get(mname)
-            if fn is not None and fn.args.vararg:
-                has_vararg = True
-            if fn is not None and fn.args.kwarg:
-                has_kwarg = True
+            has_vararg = has_vararg or bool(fn.args.vararg)
+            has_kwarg = has_kwarg or bool(fn.args.kwarg)
         params = list(params) + [OBJ] * n_kwonly
         if has_vararg:
             params.append(OBJ)
         if has_kwarg:
             params.append(OBJ)
         return ret, params, fndef
+
+    def _hier_method_fns(self, root_key, mname):
+        """Every FunctionDef for `mname` across the hierarchy rooted at
+        `root_key` (the global source of truth for a slot's signature)."""
+        classes_h, byname_h = project_class_hierarchy(self.base_dir)
+        out = []
+        for key in hier_members(classes_h, byname_h, root_key):
+            fn = classes_h[key]["fns"].get(mname)
+            if fn is not None:
+                out.append(fn)
+        return out
+
+    def method_proto(self, mname):
+        # A pinned cross-module hierarchy: the slot signature is the WIDEST
+        # across the whole hierarchy, identical in every module, so all emitted
+        # TypeInfos and replicated VT structs agree.
+        rk = getattr(self, "_vt_root_key", None)
+        if rk is not None:
+            cands = self._hier_method_fns(rk, mname)
+            if cands:
+                return self._proto_from_fns(cands)
+        cands = [ci.methods[mname] for ci in self.class_order
+                 if mname in ci.methods]
+        return self._proto_from_fns(cands)
 
     def _canon_vtable_param_names(self, fn, n):
         """Parameter names for the first `n` vtable positional slots of `fn`."""
