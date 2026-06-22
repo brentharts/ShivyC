@@ -3985,13 +3985,18 @@ class Transpiler:
             self.emit("/* module-level globals (init in %s_init) */"
                       % self.modname)
             for name, ctype, kind, val in self.mod_globals:
+                # A leading underscore marks a module-private global (Python
+                # convention); give it `static` linkage so identically-named
+                # privates in different modules (e.g. a compiled-regex `_NAME_RE`)
+                # don't collide at link time.
+                stor = "static " if name.startswith("_") else ""
                 if kind == "const":     # literal: define with initializer here
                     if name in C_STDIO_MACRO_NAMES:
                         self.emit("#undef %s" % name)
-                    self.emit("%s %s = %s;" % (ctype, self._msym(name),
-                                               self.expr(val)))
+                    self.emit("%s%s %s = %s;" % (stor, ctype, self._msym(name),
+                                                 self.expr(val)))
                 else:                   # complex: declare now, init in _init()
-                    self.emit("%s %s;" % (ctype, self._msym(name)))
+                    self.emit("%s%s %s;" % (stor, ctype, self._msym(name)))
             self.emit()
         statics = [(ci, nm) for ci in self.class_order
                    for nm in ci.class_statics]

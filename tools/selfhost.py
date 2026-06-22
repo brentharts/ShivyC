@@ -606,6 +606,8 @@ def main():
     ap.add_argument("--keep", action="store_true",
                     help="keep the scratch build dir")
     ap.add_argument("-q", "--quiet", action="store_true")
+    ap.add_argument("--build-dir", default=None,
+                    help="build into this dir (kept) instead of a temp dir")
     args = ap.parse_args()
 
     if args.cmd == "list":
@@ -617,7 +619,12 @@ def main():
             print("  %-8s [%s]  %s" % (n, s["backend"], s["desc"]))
         return 0
 
-    build_root = tempfile.mkdtemp(prefix="shivyc-selfhost-")
+    if args.build_dir:
+        build_root = args.build_dir
+        os.makedirs(build_root, exist_ok=True)
+        args.keep = True
+    else:
+        build_root = tempfile.mkdtemp(prefix="shivyc-selfhost-")
     try:
         if args.cmd == "test":
             rc = cmd_test(args.names, build_root, args)
