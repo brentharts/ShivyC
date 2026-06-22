@@ -1585,7 +1585,7 @@ OBJ = "obj"
 # C scalar types whose pointer form is a real array (native indexing), as
 # opposed to a class pointer (Foo*) or the boxed `obj`.
 _SCALAR_CTYPES = {"int", "double", "float", "char", "long", "short",
-                  "bool", "unsigned"}
+                  "bool", "unsigned", "unsigned char"}
 
 
 def _tlist_name(et):
@@ -5475,6 +5475,13 @@ class Transpiler:
         """
         clauses = []
         body = list(node.body)
+        # A leading docstring (an expression statement holding a string) sits
+        # before any contract asserts; skip it so a documented kernel still has
+        # its `assert len(...)` clauses lifted into the contract region.
+        if body and isinstance(body[0], ast.Expr) \
+                and isinstance(body[0].value, ast.Constant) \
+                and isinstance(body[0].value.value, str):
+            body = body[1:]
         while body and isinstance(body[0], ast.Assert):
             test = body[0].test
             clause = self._contract_clause(test)
@@ -5515,7 +5522,7 @@ class Transpiler:
         multiple of that lane count, emit the divisibility + minimum-length
         contracts that license ShivyCX's vectorized kernel."""
         bytesz = {"char": 1, "bool": 1, "short": 2, "int": 4, "unsigned": 4,
-                  "float": 4, "long": 8, "double": 8}
+                  "float": 4, "long": 8, "double": 8, "unsigned char": 1}
         clauses = []
         for a in node.args.args:
             if a.annotation is None:
@@ -6404,7 +6411,7 @@ class Transpiler:
             lt = self.value_ctype(node.left)
             rt = self.value_ctype(node.right)
             numeric = ("int", "bool", "double", "float", "long",
-                       "short", "unsigned", "char")
+                       "short", "unsigned", "char", "unsigned char")
             if lt in numeric and rt in numeric:
                 if isinstance(node.op, ast.Div):
                     return "double"          # Python `/` is always float
@@ -9319,7 +9326,7 @@ class Transpiler:
         lt = self.value_ctype(node.left)
         rt = self.value_ctype(node.right)
         numeric = {"int", "bool", "double", "float", "long",
-                   "short", "unsigned", "char"}
+                   "short", "unsigned", "char", "unsigned char"}
         # both sides are concrete numbers -> plain C arithmetic
         if lt in numeric and rt in numeric:
             if isinstance(node.op, ast.Pow):     # C has no ** operator
