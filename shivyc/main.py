@@ -101,9 +101,14 @@ def main():
         import shivyc.memory_safety as memory_safety
         return memory_safety.run(arguments.files, arguments)
 
-    if getattr(arguments, "pdf", None):
-        import shivyc.pdf_report as pdf_report
-        return pdf_report.run(arguments.files, arguments, arguments.pdf)
+    # pdf_report is an optional, host-only feature (it shells out to LaTeX and
+    # uses host stdlib). Guard it so the self-hosted compiler doesn't pull it
+    # in: `sys.implementation.name` is 'shivyc' under the translator (folded to
+    # a compile-time-false branch) but the real name under CPython.
+    if sys.implementation.name != "shivyc":
+        if getattr(arguments, "pdf", None):
+            import shivyc.pdf_report as pdf_report
+            return pdf_report.run(arguments.files, arguments, arguments.pdf)
 
     # Micro-slicing analysis: find pure, independent fragments and a slice plan
     # for productive spin-waiting, then exit.
