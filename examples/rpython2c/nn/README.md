@@ -198,3 +198,68 @@ were needed to make the switch real:
 > real PyTorch. Validation here is against a pure-Python f32 reference, which the
 > compiled result matches exactly (all four XOR cases correct, exit `4` under both
 > gcc and ShivyCX; `make testtorch` checks both).
+
+---
+
+## `quant_mlp.py` — 8-bit quantized inference + PSADBW
+
+`quant_mlp.py` is a post-training-quantized MLP: weights and activations are
+unsigned bytes (`u8`). It runs integer inference and demonstrates the
+hardware byte-sum contract.
+
+### Quantized linear
+
+With real values `w = sw*(qw - zpw)` and `x = sx*qx`, a quantized layer is
+
+```
+y[o] = sw*sx * ( sum_i qw[o][i]*qx[i]  -  zpw * sum_i qx[i] )
+                   (integer dot)              (byte sum)
+```
+
+The integer dot (`qdot`) is a plain `u8 * u8 -> int` loop; the second term is a
+**sum of unsigned bytes** (`qbytesum`) reused across every output neuron.
+
+### PSADBW: the hardware byte accumulator
+
+ShivyCX lowers a proven `u8` sum-reduction to `PSADBW` (sum of absolute
+differences against a zeroed register). `|byte - 0|` is the byte itself, and
+PSADBW horizontally sums each group of 8 bytes into the low word of a 64-bit
+lane — so one instruction reduces 16 bytes to two partial sums with **no
+intermediate 8-bit overflow**. `PADDQ` accumulates across iterations:
+
+```python
+def qbytesum(x: "u8*", n) -> int:
+    assert len(x) % 16 == 0          # SIMD contract (16 bytes / iteration)
+    acc = 0
+    i = 0
+    while i < n:
+        acc = acc + x[i]
+        i = i + 1
+    return acc
+```
+
+```asm
+    pxor   xmm0, xmm0        ; 2 x 64-bit lane accumulators
+    pxor   xmm2, xmm2        ; zero operand
+.loop:
+    movdqu xmm1, [rdi + rax]
+    psadbw xmm1, xmm2        ; sum 16 |bytes| -> two 64-bit lanes
+    paddq  xmm0, xmm1
+    ...
+```
+
+The contract is auto-generated from `assert len(x) % 16 == 0` (or inferred from a
+fixed `u8[256]` size) and emitted behind `#ifdef __SHIVYC__`, so gcc compiles the
+same source as a plain loop. Because `qbytesum` is called *directly* on each
+`malloc`'d activation buffer in this single file, ShivyCX proves alignment at
+both call sites and emits packed `PSADBW`/`PADDQ` with no scalar remainder.
+
+> **What made it work.** Three things had to be taught the byte type: py2c's
+> numeric promotion (`acc + w[i]` was boxing `unsigned char` to an object),
+> the contract analyser's sum-reduction recogniser (it now follows the `Set`
+> that widens a byte load to the accumulator's `int`), and a `u8`-specific
+> code path in `synth_sse2_reduce` that selects `PSADBW` over the `int32`
+> `PADDD` reduction. The same `u8` kernels are available on the mini-PyTorch API
+> as `torch.qbytesum_u8` / `torch.qdot_u8` / `torch.qlinear_u8`; bundled across a
+> module boundary they run as correct scalar code (the contract is proven only
+> when kernel and caller share a translation unit, as in this example).
