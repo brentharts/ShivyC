@@ -321,14 +321,18 @@ def match_symbol_kind_at(content: list, start):
 
     """
     for symbol_kind in symbol_kinds:
-        try:
-            for i, c in enumerate(symbol_kind.text_repr):
-                if content[start + i].c != c:
-                    break
-            else:
-                return symbol_kind
-        except IndexError:
-            pass
+        # Match each character of the symbol's spelling against the line.
+        # An out-of-range index means the line ends before the symbol could
+        # match, so this candidate fails. (The original relied on catching
+        # IndexError here; an explicit bounds check is equivalent and keeps the
+        # logic free of exception-as-control-flow.)
+        matched = True
+        for i, c in enumerate(symbol_kind.text_repr):
+            if start + i >= len(content) or content[start + i].c != c:
+                matched = False
+                break
+        if matched:
+            return symbol_kind
 
     return None
 
