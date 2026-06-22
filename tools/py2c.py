@@ -2844,6 +2844,57 @@ def ambiguous_class_names(base_dir):
     return amb
 
 
+_PROJECT_METHOD_CACHE = {}
+
+
+def project_method_owners(base_dir):
+    """method name -> set of (modname, classname) over the whole shivyc package
+    (plus any local module dirs). Lets a method called on an untyped/dynamic obj
+    receiver resolve to its defining class even when that class is not imported
+    by the calling module -- but only when it is the SOLE definer of the name
+    (the caller enforces that), so the cast to that class is sound. Computed and
+    cached once, like ambiguous_class_names."""
+    ckey = (base_dir, tuple(sorted(_LOCAL_MODULE_DIRS)))
+    if ckey in _PROJECT_METHOD_CACHE:
+        return _PROJECT_METHOD_CACHE[ckey]
+    owners = {}
+    pkg = os.path.join(base_dir or ".", "shivyc")
+    pkg_abs = os.path.abspath(pkg)
+
+    def scan(path, modname):
+        try:
+            t = ast.parse(open(path, encoding="utf-8").read())
+        except Exception:
+            return
+        for n in t.body:
+            if not isinstance(n, ast.ClassDef):
+                continue
+            for item in n.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                        and item.name != "__init__":
+                    owners.setdefault(item.name, set()).add((modname, n.name))
+
+    for dp, _dirs, fns in os.walk(pkg):
+        if "musl" in dp.split(os.sep):
+            continue
+        for fn in fns:
+            if not fn.endswith(".py"):
+                continue
+            p = os.path.join(dp, fn)
+            mod = os.path.relpath(p, base_dir or ".")[:-3].replace(os.sep, ".")
+            scan(p, mod)
+    for d in _LOCAL_MODULE_DIRS:
+        da = os.path.abspath(d)
+        if not os.path.isdir(d) or da == pkg_abs \
+                or da.startswith(pkg_abs + os.sep):
+            continue
+        for fn in sorted(os.listdir(d)):
+            if fn.endswith(".py"):
+                scan(os.path.join(d, fn), fn[:-3])
+    _PROJECT_METHOD_CACHE[ckey] = owners
+    return owners
+
+
 def pod_csyms(tree, order, pod_enabled):
     """Csyms of classes in `order` (parsed from `tree`) that qualify for the
     POD lowering (bare struct, no Obj header / vtable). Mirrors the core of
@@ -4570,6 +4621,30 @@ class Transpiler:
             return None                    # vtable; never bind to one (base) impl
         owners = self.xmethod_owners.get(attr, [])
         return owners[0] if len(owners) == 1 else None
+
+    def resolve_project_xmethod(self, attr):
+        """Last-resort resolution for a method called on an untyped/dynamic obj
+        receiver whose class is not imported here: consult the project-wide
+        scan. Only binds when `attr` has a SINGLE definer across the whole
+        package (so the receiver, if it has that method, must be that class --
+        the cast is sound). The class is loaded as an xclass on demand (so its
+        struct, return type, and an extern decl are emitted), exactly as an
+        explicit import would. Returns the ClassInfo or None."""
+        if attr in self.method_owners or attr in self.xmethod_owners \
+                or attr in self.hierarchy_method:
+            return None
+        if not self.base_dir and not _LOCAL_MODULE_DIRS:
+            return None
+        defs = project_method_owners(self.base_dir).get(attr, set())
+        # ignore a definition in the current module (handled by other paths)
+        defs = {(m, c) for (m, c) in defs if m != self.py_modname}
+        if len(defs) != 1:
+            return None
+        modname, classname = next(iter(defs))
+        kind, info = self.xref(classname, modname)
+        if kind == "class" and info is not None and attr in info.methods:
+            return info
+        return None
 
     @staticmethod
     def vt_struct_name(modname):
@@ -8139,7 +8214,15 @@ class Transpiler:
             # runtime header and defined by the stdlib bridge.)
             return "mp_getattr(%s, %s, OBJ_NONE)" % (
                 self.wrap_obj(node.value), c_string(node.attr))
-        return "%s.%s" % (self.expr(node.value), cname(node.attr))
+        # Receiver type is unknown or a stale scalar (e.g. the ambiguous field
+        # `self.count`, value_ctyped int in some classes but emitted obj here):
+        # a raw `x.attr` is only valid C when x is a real struct-by-value class.
+        # Otherwise fall back to a runtime attribute lookup on the actual expr,
+        # which is always valid (the emitted receiver is an obj at runtime).
+        if bt in self.classes or bt in self.xclasses:
+            return "%s.%s" % (self.expr(node.value), cname(node.attr))
+        return "mp_getattr(%s, %s, OBJ_NONE)" % (
+            self.expr(node.value), c_string(node.attr))
 
     def ex_Call(self, node):
         s = self._ex_call_inner(node)
@@ -9184,6 +9267,19 @@ class Transpiler:
                 if func.attr in self.hierarchy_method:
                     return self.xvcall(self.hierarchy_method[func.attr],
                                        func.value, func.attr, node.args)
+                # last resort: a method whose sole project-wide definer is a
+                # class not imported here (e.g. layout.slot_for_spot where
+                # layout came from getattr). Load it on demand and bind.
+                powner = self.resolve_project_xmethod(func.attr)
+                if powner is not None:
+                    m = powner.methods.get(func.attr)
+                    ret = self._c_ret(m) if m else OBJ
+                    self.used_xmethods[(powner.name, func.attr)] = ret
+                    args = [self.expr(a) for a in node.args]
+                    return "%s_%s((%s*)AS_OBJ(%s)%s)" % (
+                        powner.csym, func.attr, powner.csym,
+                        self.expr(func.value),
+                        (", " + ", ".join(args)) if args else "")
             if func.attr == "insert" and len(node.args) == 2 and \
                     func.attr not in self.method_owners:
                 lo = self.coerce_to("int", node.args[0], self.expr(node.args[0]))
