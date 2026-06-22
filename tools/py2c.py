@@ -3066,6 +3066,36 @@ static obj _sys_path_get(void) {
 """
 
 
+STRUCT_PRELUDE = r"""/* ---- rpython struct.pack/unpack subset: <f <d <I <Q ----
+   A packed value is represented as an obj holding the raw little-endian bit
+   pattern (OBJ_INT); pack does any float->bits conversion, unpack reads it back
+   per the format. Covers exactly the IEEE-754 reinterpretation asm_gen needs. */
+static obj _struct_pack(char* fmt, double val) {
+    char c = (fmt[0] == '<' || fmt[0] == '>' || fmt[0] == '=') ? fmt[1] : fmt[0];
+    if (c == 'f') { union { float f; unsigned int u; } x; x.f = (float)val;
+                    return OBJ_INT((long)x.u); }
+    if (c == 'd') { union { double d; unsigned long long u; } x; x.d = val;
+                    return OBJ_INT((long)x.u); }
+    if (c == 'I' || c == 'L') return OBJ_INT((long)(unsigned int)val);
+    if (c == 'Q') return OBJ_INT((long)(unsigned long long)val);
+    return OBJ_INT((long)val);
+}
+static obj _struct_unpack(char* fmt, obj packed) {
+    char c = (fmt[0] == '<' || fmt[0] == '>' || fmt[0] == '=') ? fmt[1] : fmt[0];
+    long bits = AS_INT(packed);
+    obj r = list_new();
+    if (c == 'I' || c == 'L') list_append(r, OBJ_INT((long)(unsigned int)bits));
+    else if (c == 'Q') list_append(r, OBJ_INT(bits));
+    else if (c == 'f') { union { unsigned int u; float f; } x;
+                         x.u = (unsigned int)bits; list_append(r, OBJ_FLOAT(x.f)); }
+    else if (c == 'd') { union { unsigned long long u; double d; } x;
+                         x.u = (unsigned long long)bits; list_append(r, OBJ_FLOAT(x.d)); }
+    else list_append(r, OBJ_INT(bits));
+    return r;
+}
+"""
+
+
 def c_char_literal(ch):
     """A C char constant for a single character."""
     if ch == "\\":
@@ -3344,6 +3374,7 @@ class Transpiler:
         self._regex_ids = {}        # pattern string -> matcher id (per module)
         self._regex_parsed = {}     # id -> parsed pattern struct
         self._ossys_used = False    # os.path/sys shim referenced
+        self._struct_used = False    # struct.pack/unpack shim referenced
         self.import_alias = {}      # alias -> full dotted module name
         self.from_imports = {}      # imported name -> full dotted module name
         self.star_import_mods = []  # modules imported via `from X import *`
@@ -3635,6 +3666,9 @@ class Transpiler:
         if self._ossys_used:
             self.lines[self.extern_idx:self.extern_idx] = \
                 OS_SYS_PRELUDE.splitlines()
+        if self._struct_used:
+            self.lines[self.extern_idx:self.extern_idx] = \
+                STRUCT_PRELUDE.splitlines()
         if self._regex_ids:
             pre = REGEX_HELPER.splitlines()
             for pid in sorted(self._regex_parsed):
@@ -7038,6 +7072,9 @@ class Transpiler:
             if isinstance(_f.value, ast.Name) and _f.value.id == "os" and \
                     _f.attr in ("makedirs", "unlink", "remove"):
                 return OBJ               # returns OBJ_NONE
+            if isinstance(_f.value, ast.Name) and _f.value.id == "struct" and \
+                    _f.attr in ("pack", "unpack"):
+                return OBJ               # packed bytes / unpacked list
         t = self.static_type(node)
         if t:
             return t
@@ -9120,6 +9157,18 @@ class Transpiler:
                             txt = self.coerce_to("char*", node.args[1],
                                                  self.expr(node.args[1]))
                             return "_re_search(%d, %s, %s)" % (pid, txt, anc)
+                    # struct.pack/unpack subset (see STRUCT_PRELUDE)
+                    if modname == "struct" and func.attr in ("pack", "unpack") \
+                            and len(node.args) == 2:
+                        self._struct_used = True
+                        fmt = self.coerce_to("char*", node.args[0],
+                                             self.expr(node.args[0]))
+                        if func.attr == "pack":
+                            val = self.coerce_to("double", node.args[1],
+                                                 self.expr(node.args[1]))
+                            return "_struct_pack(%s, %s)" % (fmt, val)
+                        return "_struct_unpack(%s, %s)" % (
+                            fmt, self.wrap_obj(node.args[1]))
                     for a in node.args:
                         self.expr(a)
                     return "OBJ_NONE /* %s.%s(...) unsupported */" % (
