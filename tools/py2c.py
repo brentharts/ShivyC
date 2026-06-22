@@ -1587,6 +1587,18 @@ OBJ = "obj"
 _SCALAR_CTYPES = {"int", "double", "float", "char", "long", "short",
                   "bool", "unsigned", "unsigned char"}
 
+# ctypes scalar markers -> C types, for the FFI bridge (see rpy_ctypes.py).
+_CTYPES_TYPEMAP = {
+    "c_void": "void", "c_bool": "bool", "c_char": "char",
+    "c_byte": "signed char", "c_ubyte": "unsigned char",
+    "c_short": "short", "c_ushort": "unsigned short",
+    "c_int": "int", "c_uint": "unsigned",
+    "c_long": "long", "c_ulong": "unsigned long",
+    "c_size_t": "long", "c_ssize_t": "long",
+    "c_float": "float", "c_double": "double",
+    "c_char_p": "char*", "c_void_p": "void*",
+}
+
 
 def _tlist_name(et):
     """C struct name for a typed list of element ctype `et` (a scalar)."""
@@ -3009,6 +3021,7 @@ class Transpiler:
         self._compute_pod_set(tree)
         self.build_owner_maps()
         self.collect_imports(tree)
+        self._scan_ctypes(tree)
         # cross-module class registry: clsname -> (ClassInfo, modname)
         self.xclasses = {}
         # names of imported module-level singletons/globals: a local of the
@@ -3499,6 +3512,12 @@ class Transpiler:
             for p in protos:
                 self.emit(p)
             self.emit()
+        _ctp = self.ctypes_externs() if hasattr(self, "ctypes_externs") else []
+        if _ctp:
+            self.emit("/* ctypes FFI: dynamic lookups resolved to C externs */")
+            for p in _ctp:
+                self.emit(p)
+            self.emit()
         if self.mod_globals:
             self.emit("/* module-level globals (init in %s_init) */"
                       % self.modname)
@@ -3584,6 +3603,129 @@ class Transpiler:
                                     self.from_imports.setdefault(n, abs_mod)
                     else:
                         self.from_imports[a.asname or a.name] = abs_mod
+
+    def _scan_ctypes(self, tree):
+        """FFI bridge: track `ctypes.CDLL` handles and `lib.symbol` lookups as
+        compile-time constants so `lib.symbol(args)` lowers to a direct C call
+        `symbol(args)` with a real `extern` prototype (see rpy_ctypes.py).
+
+        Populates:
+          self.ctypes_libs  {handle var -> .so name}
+          self.ctypes_funcs {symbol -> {"restype": ct, "argtypes": [ct]|None}}
+          self.ctypes_bind  {local var -> symbol}   (func = lib.symbol)
+          self.ctypes_used  set of symbols actually called (drives externs)
+        """
+        ctypes_mods = {a for a, m in self.import_alias.items()
+                       if m in ("ctypes", "rpy_ctypes")}
+        self.ctypes_mods = ctypes_mods
+        self.ctypes_libs = {}
+        self.ctypes_funcs = {}
+        self.ctypes_bind = {}
+        self.ctypes_used = set()
+        self.ctypes_skip = set()        # ids of statements that emit no C
+        if not ctypes_mods:
+            return
+
+        def is_ct_attr(n):
+            return (isinstance(n, ast.Attribute)
+                    and isinstance(n.value, ast.Name)
+                    and n.value.id in ctypes_mods)
+
+        def ctype_of(n):
+            if is_ct_attr(n):
+                return _CTYPES_TYPEMAP.get(n.attr)
+            return None
+
+        def sym_of(n):
+            if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) \
+                    and n.value.id in self.ctypes_libs:
+                return n.attr
+            if isinstance(n, ast.Name) and n.id in self.ctypes_bind:
+                return self.ctypes_bind[n.id]
+            return None
+
+        def rec_for(sym):
+            return self.ctypes_funcs.setdefault(
+                sym, {"restype": "int", "argtypes": None})
+
+        for node in self._walk_live(tree):
+            if not (isinstance(node, ast.Assign) and len(node.targets) == 1):
+                continue
+            tgt, val = node.targets[0], node.value
+            # lib = ctypes.CDLL("name.so")
+            if isinstance(tgt, ast.Name) and isinstance(val, ast.Call) \
+                    and is_ct_attr(val.func) and val.func.attr == "CDLL":
+                if val.args and isinstance(val.args[0], ast.Constant):
+                    self.ctypes_libs[tgt.id] = val.args[0].value
+                self.ctypes_skip.add(id(node))
+                continue
+            # func = lib.symbol
+            if isinstance(tgt, ast.Name):
+                s = sym_of(val)
+                if s is not None:
+                    self.ctypes_bind[tgt.id] = s
+                    rec_for(s)
+                    self.ctypes_skip.add(id(node))
+                    continue
+            # lib.symbol.restype = ctypes.c_double / func.argtypes = [...]
+            if isinstance(tgt, ast.Attribute) \
+                    and tgt.attr in ("restype", "argtypes"):
+                s = sym_of(tgt.value)
+                if s is not None:
+                    rec = rec_for(s)
+                    if tgt.attr == "restype":
+                        rec["restype"] = ctype_of(val) or "int"
+                    elif isinstance(val, (ast.List, ast.Tuple)):
+                        rec["argtypes"] = [ctype_of(e) or "int"
+                                           for e in val.elts]
+                    self.ctypes_skip.add(id(node))
+
+        # second pass: record which externs are actually called, so the prelude
+        # can emit a prototype for each (the call sites are now resolvable).
+        for node in self._walk_live(tree):
+            if isinstance(node, ast.Call):
+                s = self.ctypes_call_symbol(node)
+                if s is not None:
+                    self.ctypes_used.add(s)
+
+    def ctypes_externs(self):
+        """`extern <ret> sym(<args>);` lines for every called FFI symbol."""
+        lines = []
+        for sym in sorted(self.ctypes_used):
+            rec = self.ctypes_funcs.get(sym, {"restype": "int",
+                                              "argtypes": None})
+            ret = rec.get("restype") or "int"
+            ats = rec.get("argtypes")
+            plist = ", ".join(ats) if ats else "void"
+            lines.append("extern %s %s(%s);" % (ret, sym, plist))
+        return lines
+
+    def ctypes_call_symbol(self, node):
+        """If `node` is a Call to a tracked ctypes extern, return its C symbol,
+        else None. Handles both `lib.symbol(args)` and a bound `func(args)`."""
+        if not getattr(self, "ctypes_mods", None):
+            return None
+        f = node.func
+        if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) \
+                and f.value.id in self.ctypes_libs:
+            return f.attr
+        if isinstance(f, ast.Name) and f.id in self.ctypes_bind:
+            return self.ctypes_bind[f.id]
+        return None
+
+    def _emit_ctypes_call(self, node, sym):
+        """Lower a tracked FFI call to a direct C call `symbol(args)`, coercing
+        each argument to its declared `argtypes` C type."""
+        self.ctypes_used.add(sym)
+        rec = self.ctypes_funcs.get(sym, {"restype": "int", "argtypes": None})
+        argtypes = rec.get("argtypes")
+        args = []
+        for i, a in enumerate(node.args):
+            ax = self.expr(a)
+            if argtypes and i < len(argtypes):
+                ax = self.coerce_to(argtypes[i], a, ax)
+            args.append(ax)
+        return "%s(%s)" % (sym, ", ".join(args))
 
     def ccls(self, name):
         """C base symbol for a class referenced by `name` in local context:
@@ -4241,6 +4383,8 @@ class Transpiler:
                 self.func_nodes[node.name] = node
             if not isinstance(node, ast.Assign):
                 continue
+            if id(node) in getattr(self, "ctypes_skip", ()):
+                continue                    # ctypes config: no C declaration
             val = node.value
             names = [t.id for t in node.targets if isinstance(t, ast.Name)]
             for i, tgt in enumerate(node.targets):
@@ -4255,6 +4399,8 @@ class Transpiler:
         # assignments, aug-assignments, bare calls) run at import time, so they
         # are deferred into <module>_init() rather than emitted at file scope.
         for node in tree.body:
+            if id(node) in getattr(self, "ctypes_skip", ()):
+                continue                    # ctypes config: compile-time only
             if isinstance(node, ast.Assign) and len(node.targets) == 1 \
                     and not isinstance(node.targets[0], ast.Name):
                 self.mod_init_stmts.append(node)
@@ -5126,6 +5272,8 @@ class Transpiler:
                 if isinstance(sub, ast.Assign):
                     for t in sub.targets:
                         if isinstance(t, ast.Name):
+                            if t.id in getattr(self, "ctypes_bind", ()):
+                                continue    # FFI binding: not a real local
                             if isinstance(sub.value, ast.Name) and \
                                     sub.value.id in STDLIB_BUILTINS:
                                 ct = OBJ
@@ -5177,6 +5325,8 @@ class Transpiler:
     def toplevel(self, node):
         if getattr(self, "mod_init_stmts", None) and node in self.mod_init_stmts:
             return                          # emitted inside <module>_init()
+        if id(node) in getattr(self, "ctypes_skip", ()):
+            return                          # ctypes config: compile-time only
         if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) \
                 and isinstance(node.value.value, str):
             doc = node.value.value.strip().splitlines()
@@ -6009,6 +6159,8 @@ class Transpiler:
     # ---- statements ------------------------------------------------------
 
     def stmt(self, node):
+        if id(node) in getattr(self, "ctypes_skip", ()):
+            return []                       # ctypes config: compile-time only
         m = getattr(self, "st_" + type(node).__name__, None)
         if m is None:
             return ["/* stmt %s: %s */" % (type(node).__name__,
@@ -6387,6 +6539,11 @@ class Transpiler:
 
     def value_ctype(self, node):
         """Best-effort C type of an expression, when determinable."""
+        if isinstance(node, ast.Call):
+            _sym = self.ctypes_call_symbol(node)
+            if _sym is not None:
+                return self.ctypes_funcs.get(
+                    _sym, {}).get("restype", "int")
         if isinstance(node, ast.Call) and len(node.args) == 1:
             f = node.func
             is_copy = (
@@ -7800,6 +7957,9 @@ class Transpiler:
         return None
 
     def _ex_call_inner(self, node):
+        sym = self.ctypes_call_symbol(node)
+        if sym is not None:
+            return self._emit_ctypes_call(node, sym)
         f0 = node.func
         if isinstance(f0, ast.Attribute) and f0.attr in MATH_FUNCS and \
                 isinstance(f0.value, ast.Name) and \
