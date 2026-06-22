@@ -22,3 +22,10 @@ class Node:
         modify this object.
         """
         raise NotImplementedError
+
+    def make_il_raw(self, il_code, symbol_table, c):
+        """Generate IL code for this node without any lvalue-to-rvalue
+        conversion. Declared here so it is part of the root virtual interface
+        (and thus a vtable slot) for the expression-node hierarchy.
+        """
+        raise NotImplementedError
