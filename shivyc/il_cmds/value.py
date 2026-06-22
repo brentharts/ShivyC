@@ -437,8 +437,8 @@ class Set(_ValueCmd):
         self.move_data(val_reg, spotmap[self.arg],
                        self.output.ctype.size, val_reg, asm_code)
         # Two more distinct scratch registers for the bit-insert sequence.
-        acc_reg = get_reg(conf=[val_reg])
-        msk_reg = get_reg(conf=[val_reg, acc_reg])
+        acc_reg = get_reg(None, [val_reg])
+        msk_reg = get_reg(None, [val_reg, acc_reg])
         asm_code.simd_pack.emit_write(asm_code, slot, val_reg, acc_reg, msk_reg)
 
     def _set_packed_read(self, slot, spotmap, get_reg, asm_code):
