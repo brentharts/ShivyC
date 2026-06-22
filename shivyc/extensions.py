@@ -33,7 +33,6 @@ The pre-pass deliberately leaves ordinary C untouched: a header whose
 inter-`)`-and-`{` region is only whitespace is not an extended definition.
 """
 
-import ast
 import re
 
 # A candidate function name immediately followed by its parameter list's open
@@ -282,104 +281,125 @@ def _parse_region(region, func_name):
     return attrs, contracts, threads
 
 
+def _is_identifier(s):
+    """True if `s` is a Python-style identifier (no `ast` needed)."""
+    if not s:
+        return False
+    head = s[0]
+    if not (head.isalpha() or head == "_"):
+        return False
+    body = s.replace("_", "")        # an all-underscore name is valid
+    return body == "" or body.isalnum()
+
+
+def _is_int(s):
+    """True if `s` is a non-negative integer literal."""
+    return s != "" and s.isdigit()
+
+
 def _parse_thread_assert(line, func_name):
     """Recognize `assert FN in threads.left(core=N)` / `.right(core=N)`.
 
     Returns (FN, {'side': 'left'|'right', 'core': int}) or None if the line is
     not a thread declaration (so the caller can try the contract grammar).
+
+    Parsed with plain string operations rather than the `ast` module, so this
+    is self-hostable.
     """
-    try:
-        node = ast.parse(line, mode="exec").body[0]
-    except SyntaxError:
+    s = line.strip()
+    if not s.startswith("assert"):
         return None
-    if not isinstance(node, ast.Assert):
+    body = s[len("assert"):].strip()
+    in_pos = body.find(" in ")
+    if in_pos < 0:
         return None
-    test = node.test
-    # FN in threads.SIDE(core=N)
-    if not (isinstance(test, ast.Compare) and len(test.ops) == 1
-            and isinstance(test.ops[0], ast.In)
-            and isinstance(test.left, ast.Name)
-            and len(test.comparators) == 1
-            and isinstance(test.comparators[0], ast.Call)):
+    left = body[:in_pos].strip()
+    right = body[in_pos + 4:].strip()
+    if not _is_identifier(left):
         return None
-    call = test.comparators[0]
-    func = call.func
-    if not (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
-            and func.value.id == "threads"):
+    if not right.startswith("threads."):
         return None
-    side = func.attr
-    if side not in ("left", "right"):
+    rest = right[len("threads."):]
+    lp = rest.find("(")
+    if lp < 0:
+        return None
+    side = rest[:lp].strip()
+    inner = rest[lp + 1:].strip()
+    if not inner.endswith(")"):
+        return None
+    inner = inner[:len(inner) - 1].strip()
+    if side != "left" and side != "right":
         raise ExtensionError(
             f"thread group must be 'left' or 'right' in '{func_name}': "
             f"{line!r}")
     core = 0
-    for kw in call.keywords:
-        if kw.arg == "core" and isinstance(kw.value, ast.Constant) \
-                and isinstance(kw.value.value, int):
-            core = kw.value.value
-        else:
+    if inner != "":
+        eq = inner.find("=")
+        key = inner[:eq].strip() if eq >= 0 else inner
+        val = inner[eq + 1:].strip() if eq >= 0 else ""
+        if eq < 0 or key != "core" or not _is_int(val):
             raise ExtensionError(
                 f"thread declaration takes only core=<int> in '{func_name}': "
                 f"{line!r}")
-    return test.left.id, {"side": side, "core": core}
+        core = int(val)
+    return left, {"side": side, "core": core}
 
 
 def _parse_assert(line, func_name):
-    """Parse one `assert` contract line via the `ast` module.
+    """Parse one `assert` contract line with plain string operations.
 
     Recognizes:
         assert len(x) >= N      -> ('x', {'len>=': N})
         assert len(x) <= N      -> ('x', {'len<=': N})
         assert not len(x) % N   -> ('x', {'div-by': N})
     """
-    try:
-        node = ast.parse(line, mode="exec").body[0]
-    except SyntaxError as e:
-        raise ExtensionError(
-            f"invalid contract in '{func_name}': {line!r} ({e})")
-
-    if not isinstance(node, ast.Assert):
+    s = line.strip()
+    if not s.startswith("assert"):
         raise ExtensionError(f"expected an assert in '{func_name}': {line!r}")
-
-    test = node.test
+    body = s[len("assert"):].strip()
 
     # assert not len(x) % N  -> divisibility
-    if (isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not)
-            and isinstance(test.operand, ast.BinOp)
-            and isinstance(test.operand.op, ast.Mod)):
-        arg = _len_arg(test.operand.left, func_name, line)
-        n = _const_int(test.operand.right, func_name, line)
+    if body.startswith("not "):
+        rest = body[4:].strip()
+        pct = rest.find("%")
+        if pct < 0:
+            raise ExtensionError(
+                f"unsupported contract in '{func_name}': {line!r}")
+        arg = _len_arg(rest[:pct].strip(), func_name, line)
+        n = _const_int(rest[pct + 1:].strip(), func_name, line)
         return arg, {"div-by": n}
 
     # assert len(x) >= N  /  assert len(x) <= N
-    if (isinstance(test, ast.Compare) and len(test.ops) == 1
-            and len(test.comparators) == 1):
-        arg = _len_arg(test.left, func_name, line)
-        n = _const_int(test.comparators[0], func_name, line)
-        if isinstance(test.ops[0], ast.GtE):
-            return arg, {"len>=": n}
-        if isinstance(test.ops[0], ast.LtE):
-            return arg, {"len<=": n}
-        raise ExtensionError(
-            f"unsupported comparison in '{func_name}': {line!r}")
+    ge = body.find(">=")
+    le = body.find("<=")
+    if ge >= 0:
+        arg = _len_arg(body[:ge].strip(), func_name, line)
+        n = _const_int(body[ge + 2:].strip(), func_name, line)
+        return arg, {"len>=": n}
+    if le >= 0:
+        arg = _len_arg(body[:le].strip(), func_name, line)
+        n = _const_int(body[le + 2:].strip(), func_name, line)
+        return arg, {"len<=": n}
 
     raise ExtensionError(f"unsupported contract in '{func_name}': {line!r}")
 
 
-def _len_arg(node, func_name, line):
+def _len_arg(s, func_name, line):
     """Require `len(name)` and return `name`."""
-    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-            and node.func.id == "len" and len(node.args) == 1
-            and isinstance(node.args[0], ast.Name)):
-        return node.args[0].id
+    s = s.strip()
+    if s.startswith("len(") and s.endswith(")"):
+        inner = s[4:len(s) - 1].strip()
+        if _is_identifier(inner):
+            return inner
     raise ExtensionError(
         f"contract must use len(arg) in '{func_name}': {line!r}")
 
 
-def _const_int(node, func_name, line):
+def _const_int(s, func_name, line):
     """Require a non-negative integer constant."""
-    if isinstance(node, ast.Constant) and isinstance(node.value, int):
-        return node.value
+    s = s.strip()
+    if _is_int(s):
+        return int(s)
     raise ExtensionError(
         f"contract bound must be an integer constant in '{func_name}': "
         f"{line!r}")
