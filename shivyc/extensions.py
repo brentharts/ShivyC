@@ -33,14 +33,85 @@ The pre-pass deliberately leaves ordinary C untouched: a header whose
 inter-`)`-and-`{` region is only whitespace is not an extended definition.
 """
 
-import re
+# (no `re`: the small amount of scanning this module needs is done by hand in
+# _find_name_parens / _extract_specifiers, so the module is self-hostable.)
 
 # A candidate function name immediately followed by its parameter list's open
-# paren. We pair the parens structurally (regex can't), then look at what sits
-# between the close paren and the body's `{`.
-_NAME_PAREN_RE = re.compile(r"(?P<name>[A-Za-z_]\w*)\s*\(")
-
+# paren. We pair the parens structurally, then look at what sits between the
+# close paren and the body's `{`. Scanned by hand (no `re`) so this module is
+# self-hostable.
 _SPECIFIERS = {"__stackless__", "__metamorphic__"}
+
+
+def _is_re_space(c):
+    """Whitespace per regex `\\s`: space, tab, newline, CR, form-feed, v-tab."""
+    return (c == " " or c == "\t" or c == "\n" or c == "\r"
+            or c == "\f" or c == "\v")
+
+
+def _is_word_char(c):
+    """A `\\w` character: alphanumeric or underscore."""
+    return c.isalnum() or c == "_"
+
+
+def _find_name_parens(scan):
+    """Every `(start, name, open_idx)` where an identifier is followed by `(`
+    (optionally with whitespace between) -- replaces the
+    `(?P<name>[A-Za-z_]\\w*)\\s*\\(` finditer. Matches are non-overlapping,
+    leftmost, and the identifier is taken greedily, like `re.finditer`."""
+    out = []
+    n = len(scan)
+    i = 0
+    while i < n:
+        c = scan[i]
+        if c.isalpha() or c == "_":
+            j = i + 1
+            while j < n and _is_word_char(scan[j]):
+                j = j + 1
+            k = j
+            while k < n and _is_re_space(scan[k]):
+                k = k + 1
+            if k < n and scan[k] == "(":
+                out.append((i, scan[i:j], k))
+                i = k + 1
+                continue
+        i = i + 1
+    return out
+
+
+def _extract_specifiers(region, attrs):
+    """Blank every `__specifier__` token (matching `__[A-Za-z_]\\w*__`) in
+    `region` space-for-space, recording each stripped name in `attrs`. Replaces
+    `re.sub(r"__[A-Za-z_]\\w*__", take_specifier, region)`."""
+    out = []
+    n = len(region)
+    i = 0
+    while i < n:
+        end = -1
+        if i + 1 < n and region[i] == "_" and region[i + 1] == "_":
+            j = i + 2
+            if j < n and (region[j].isalpha() or region[j] == "_"):
+                k = j + 1
+                while k < n and _is_word_char(region[k]):
+                    k = k + 1
+                # greedy \w* then a trailing `__`: the longest match ends at
+                # the rightmost `__` in the word run that still leaves >=1 char
+                # after the opening `__` (so e >= j + 3).
+                e = k
+                while e >= j + 3:
+                    if region[e - 1] == "_" and region[e - 2] == "_":
+                        end = e
+                        break
+                    e = e - 1
+        if end >= 0:
+            seg = region[i:end]
+            attrs.add(seg.strip("_"))
+            out.append(" " * len(seg))
+            i = end
+        else:
+            out.append(region[i])
+            i = i + 1
+    return "".join(out)
 
 
 def _blank_preproc_directives(code):
@@ -211,16 +282,15 @@ def preprocess_extensions(code):
     # found here apply directly to `chars`.
     scan = _blank_preproc_directives(_blank_comments_and_strings(code))
 
-    for m in _NAME_PAREN_RE.finditer(scan):
-        if m.start() < consumed_until:
+    for start, name, open_idx in _find_name_parens(scan):
+        if start < consumed_until:
             continue
         # Ignore matches inside a preprocessor directive line (e.g. a
         # function-like macro definition `#define likely(x) ...`), which is
         # not a function definition with an extension region.
-        line_start = scan.rfind("\n", 0, m.start()) + 1
-        if scan[line_start:m.start()].lstrip().startswith("#"):
+        line_start = scan.rfind("\n", 0, start) + 1
+        if scan[line_start:start].lstrip().startswith("#"):
             continue
-        open_idx = m.end() - 1
         close_idx = _match_paren(scan, open_idx)
         if close_idx is None:
             continue
@@ -230,7 +300,6 @@ def preprocess_extensions(code):
         if not _looks_like_extension(region):
             continue
 
-        name = m.group("name")
         attrs, contracts, threads = _parse_region(region, name)
         if attrs:
             info.attrs.setdefault(name, set()).update(attrs)
@@ -256,11 +325,7 @@ def _parse_region(region, func_name):
     threads = {}
 
     # Pull out specifier tokens first; whatever remains should be asserts.
-    def take_specifier(match):
-        attrs.add(match.group(0).strip("_"))
-        return " " * len(match.group(0))
-
-    remaining = re.sub(r"__[A-Za-z_]\w*__", take_specifier, region)
+    remaining = _extract_specifiers(region, attrs)
 
     for line in remaining.splitlines():
         line = line.strip()
