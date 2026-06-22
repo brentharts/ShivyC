@@ -454,10 +454,12 @@ class Call(ILCommand):
             _emit_parallel_int_moves(moves, asm_code)
             for regs, arg in struct_reg_moves:
                 base = spotmap[arg]
-                for k, reg in enumerate(regs):
+                k = 0
+                for reg in regs:
                     remaining = arg.ctype.size - 8 * k
                     chunk = next(cs for cs in (8, 4, 2, 1) if remaining >= cs)
                     asm_code.add(asm_cmds.Mov(reg, base.shift(8 * k), chunk))
+                    k = k + 1
             for xreg, arg in flt_moves:
                 if spotmap[arg] != xreg:
                     size = arg.ctype.size

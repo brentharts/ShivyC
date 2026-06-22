@@ -200,10 +200,12 @@ class LoadStructArg(_ValueCmd):
         if self.regs is not None:
             # Register-passed: store each incoming eightbyte register into the
             # matching 8-byte slot of the home.
-            for i, reg in enumerate(self.regs):
+            i = 0
+            for reg in self.regs:
                 remaining = size - 8 * i
                 chunk = next(cs for cs in (8, 4, 2, 1) if remaining >= cs)
                 asm_code.add(asm_cmds.Mov(home.shift(8 * i), reg, chunk))
+                i = i + 1
         else:
             # Stack-passed: copy `size` bytes from the incoming stack slots.
             src = MemSpot(spots.RBP, 16 + 8 * self.stack_index)
