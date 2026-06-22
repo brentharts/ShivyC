@@ -637,7 +637,7 @@ class SetAt(_ValueCmd):
 class _RelCommand(_ValueCmd):
     """Parent class for the relative commands."""
 
-    def __init__(self, val, base, chunk, count):  # noqa D102
+    def __init__(self, val, base, chunk, count: "object"):  # noqa D102
         self.val = val
         self.base = base
         self.chunk = chunk
