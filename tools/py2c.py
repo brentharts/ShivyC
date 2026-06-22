@@ -2925,6 +2925,296 @@ def func_csym(name, modname, ambiguous_funcs):
     return cname(name)
 
 
+# ==========================================================================
+# Translation-time regex: a small `re` subset compiled straight to C.
+#
+# Each static pattern from `re.compile("...")` (or `re.search("...", s)`) is
+# parsed here and lowered to a specialized C matcher function, so the dynamic
+# `re` engine is never needed. A compiled pattern is represented at runtime as
+# an integer id (OBJ_INT); `pat.search(text)` dispatches by id and returns a
+# match as an obj LIST of captured strings ([whole, g1, g2, ...]) -- which is
+# truthy when matched (None when not), so `if m:` and `m.group(n)` (->
+# index_obj) work with no new runtime types.
+#
+# Supported subset (anything else returns None -> caller falls back, so we
+# never emit a silently-wrong matcher): literals and escaped literals, the
+# anchors ^ and $, the classes \d \w \s \D \W \S and `.`, character classes
+# [...] (with ranges and a leading-^ negation), capturing groups (...), and
+# AT MOST ONE quantifier (+ * ?) in the whole pattern. Rejected: alternation
+# |, non-capturing/named groups (?...), backreferences, {m,n}, \b, lookaround,
+# and more than one quantifier.
+# ==========================================================================
+
+REGEX_HELPER = r"""/* ---- rpython translation-time regex: support helpers ---- */
+static obj _re_slice(char* t, long a, long b) {
+    if (a < 0 || b < a) return OBJ_NONE;
+    long n = b - a;
+    char* s = (char*)aalloc((size_t)n + 1);
+    for (long i = 0; i < n; i++) s[i] = t[a + i];
+    s[n] = 0;
+    return OBJ_STR(s);
+}
+"""
+
+
+def c_char_literal(ch):
+    """A C char constant for a single character."""
+    if ch == "\\":
+        return "'\\\\'"
+    if ch == "'":
+        return "'\\''"
+    if ch == "\n":
+        return "'\\n'"
+    if ch == "\t":
+        return "'\\t'"
+    if ch == "\r":
+        return "'\\r'"
+    o = ord(ch)
+    if 32 <= o < 127:
+        return "'%s'" % ch
+    return "%d" % o
+
+
+def _re_class_test(atom, var):
+    """C boolean expr testing whether char `var` matches a single atom."""
+    t = atom["type"]
+    if t == "lit":
+        return "%s == %s" % (var, c_char_literal(atom["ch"]))
+    if t == "digit":
+        return "(%s >= '0' && %s <= '9')" % (var, var)
+    if t == "ndigit":
+        return "!(%s >= '0' && %s <= '9')" % (var, var)
+    if t == "word":
+        return ("((%s>='a'&&%s<='z')||(%s>='A'&&%s<='Z')||"
+                "(%s>='0'&&%s<='9')||%s=='_')" % ((var,) * 7))
+    if t == "nword":
+        return ("!((%s>='a'&&%s<='z')||(%s>='A'&&%s<='Z')||"
+                "(%s>='0'&&%s<='9')||%s=='_')" % ((var,) * 7))
+    if t == "space":
+        return ("(%s==' '||%s=='\\t'||%s=='\\n'||%s=='\\r'||"
+                "%s=='\\f'||%s=='\\v')" % ((var,) * 6))
+    if t == "nspace":
+        return ("!(%s==' '||%s=='\\t'||%s=='\\n'||%s=='\\r'||"
+                "%s=='\\f'||%s=='\\v')" % ((var,) * 6))
+    if t == "dot":
+        return "%s != '\\n'" % var
+    if t == "class":
+        neg, items = atom["cls"]
+        terms = []
+        for it in items:
+            if isinstance(it, tuple):
+                terms.append("(%s >= %s && %s <= %s)" % (
+                    var, c_char_literal(it[0]), var, c_char_literal(it[1])))
+            else:
+                terms.append("%s == %s" % (var, c_char_literal(it)))
+        inner = " || ".join(terms) if terms else "0"
+        return "!(%s)" % inner if neg else "(%s)" % inner
+    return "0"
+
+
+def regex_parse(pattern):
+    """Parse `pattern` into the supported subset, or return None.
+
+    Returns dict(start_anchor, end_anchor, ngroups, atoms) where each atom is
+    dict(type, ch?/cls?, quant, gopen, gclose). Rejects anything outside the
+    documented subset by returning None.
+    """
+    i, n = 0, len(pattern)
+    start_anchor = False
+    end_anchor = False
+    if n and pattern[0] == "^":
+        start_anchor = True
+        i = 1
+    atoms = []
+    ngroups = 0
+    open_stack = []          # group indices currently open
+    pending_open = []        # opens to attach to the next atom
+    nquant = 0
+
+    while i < n:
+        c = pattern[i]
+        if c == "$" and i == n - 1:
+            end_anchor = True
+            i += 1
+            break
+        if c == "|":
+            return None                      # alternation unsupported
+        if c == "(":
+            if pattern[i:i + 2] == "(?":
+                return None                  # non-capturing / named / lookaround
+            ngroups += 1
+            open_stack.append(ngroups)
+            pending_open.append(ngroups)
+            i += 1
+            continue
+        if c == ")":
+            if not open_stack or not atoms:
+                return None
+            g = open_stack.pop()
+            atoms[-1].setdefault("gclose", []).append(g)
+            i += 1
+            continue
+        if c == "{":
+            return None                      # counted repetition unsupported
+        # build one atom
+        atom = {"quant": "", "gopen": [], "gclose": []}
+        if c == "\\":
+            if i + 1 >= n:
+                return None
+            e = pattern[i + 1]
+            mapping = {"d": "digit", "D": "ndigit", "w": "word", "W": "nword",
+                       "s": "space", "S": "nspace"}
+            if e in mapping:
+                atom["type"] = mapping[e]
+            elif e == "b" or e.isdigit():
+                return None                  # word boundary / backref unsupported
+            else:
+                atom["type"] = "lit"
+                atom["ch"] = e               # escaped literal (\. \( \\ ...)
+            i += 2
+        elif c == ".":
+            atom["type"] = "dot"
+            i += 1
+        elif c == "[":
+            j = i + 1
+            neg = False
+            if j < n and pattern[j] == "^":
+                neg = True
+                j += 1
+            items = []
+            if j < n and pattern[j] == "]":      # literal ] as first member
+                items.append("]")
+                j += 1
+            while j < n and pattern[j] != "]":
+                ch = pattern[j]
+                if ch == "\\" and j + 1 < n:
+                    ch = pattern[j + 1]
+                    j += 1
+                if j + 2 < n and pattern[j + 1] == "-" and pattern[j + 2] != "]":
+                    items.append((ch, pattern[j + 2]))
+                    j += 3
+                else:
+                    items.append(ch)
+                    j += 1
+            if j >= n:
+                return None                  # unterminated class
+            atom["type"] = "class"
+            atom["cls"] = (neg, items)
+            i = j + 1
+        else:
+            atom["type"] = "lit"
+            atom["ch"] = c
+            i += 1
+        # optional quantifier
+        if i < n and pattern[i] in "+*?":
+            atom["quant"] = pattern[i]
+            nquant += 1
+            i += 1
+        atom["gopen"] = list(pending_open)
+        pending_open.clear()
+        atoms.append(atom)
+
+    if open_stack or pending_open:
+        return None                          # unbalanced groups
+    if i < n:
+        return None                          # leftover (e.g. a stray $ midway)
+    if nquant > 1:
+        return None                          # at most one quantifier supported
+    return {"start_anchor": start_anchor, "end_anchor": end_anchor,
+            "ngroups": ngroups, "atoms": atoms}
+
+
+def _re_emit_build(pid, ng, indent):
+    parts = ["%s{ obj _m = list_new();" % indent]
+    parts.append("%s  list_append(_m, _re_slice(_t, _g0s, _g0e));" % indent)
+    for k in range(1, ng + 1):
+        parts.append("%s  list_append(_m, _re_slice(_t, _g%ds, _g%de));"
+                     % (indent, k, k))
+    parts.append("%s  return _m; }" % indent)
+    return "\n".join(parts)
+
+
+def regex_emit_c(pid, parsed):
+    """Emit `static obj _re_p<pid>(char* _t, int _anchored)` for `parsed`."""
+    atoms = parsed["atoms"]
+    ng = parsed["ngroups"]
+    out = []
+    a = out.append
+    a("static obj _re_p%d(char* _t, int _anchored) {" % pid)
+    a("    if (!_t) return OBJ_NONE;")
+    a("    long _L = (long)strlen(_t);")
+    gvars = ["_g0s", "_g0e"] + sum(
+        ([("_g%ds" % k), ("_g%de" % k)] for k in range(1, ng + 1)), [])
+    a("    long %s;" % ", ".join(gvars))
+    a("    for (long _s = 0; _s <= _L; _s++) {")
+    a("        long p = _s; _g0s = _s;")
+    for k in range(1, ng + 1):
+        a("        _g%ds = -1; _g%de = -1;" % (k, k))
+    fail = "_fail%d" % pid
+
+    qidx = next((idx for idx, at in enumerate(atoms) if at["quant"]), None)
+
+    def emit_opens(at, indent):
+        for g in at.get("gopen", []):
+            a("%s_g%ds = p;" % (indent, g))
+
+    def emit_closes(at, indent):
+        for g in at.get("gclose", []):
+            a("%s_g%de = p;" % (indent, g))
+
+    def emit_fixed(at, indent, failgoto):
+        emit_opens(at, indent)
+        a("%sif (p >= _L || !(%s)) goto %s;" % (
+            indent, _re_class_test(at, "_t[p]"), failgoto))
+        a("%sp++;" % indent)
+        emit_closes(at, indent)
+
+    if qidx is None:
+        for at in atoms:
+            emit_fixed(at, "        ", fail)
+        if parsed["end_anchor"]:
+            a("        if (p != _L) goto %s;" % fail)
+        a("        _g0e = p;")
+        a(_re_emit_build(pid, ng, "        "))
+        a("      %s:;" % fail)
+    else:
+        for at in atoms[:qidx]:
+            emit_fixed(at, "        ", fail)
+        qat = atoms[qidx]
+        emit_opens(qat, "        ")
+        a("        { long _qs = p;")
+        a("          while (p < _L && (%s)) p++;" % _re_class_test(qat, "_t[p]"))
+        q = qat["quant"]
+        if q == "?":
+            a("          long _qmax = (p > _qs + 1) ? _qs + 1 : p;")
+        else:
+            a("          long _qmax = p;")
+        qmin = "_qs + 1" if q == "+" else "_qs"
+        a("          for (long _q = _qmax; _q >= %s; _q--) {" % qmin)
+        a("            p = _q;")
+        for g in qat.get("gclose", []):
+            a("            _g%de = p;" % g)
+        bt = "_bt%d" % pid
+        for at in atoms[qidx + 1:]:
+            emit_fixed(at, "            ", bt)
+        if parsed["end_anchor"]:
+            a("            if (p != _L) goto %s;" % bt)
+        a("            _g0e = p;")
+        a(_re_emit_build(pid, ng, "            "))
+        a("          %s:;" % bt)
+        a("          } }")
+        a("        goto %s;" % fail)
+        a("      %s:;" % fail)
+
+    a("        if (_anchored) break;")
+    if parsed["start_anchor"]:
+        a("        break;")                 # ^ anchors the search to position 0
+    a("    }")
+    a("    return OBJ_NONE;")
+    a("}")
+    return "\n".join(out)
+
+
 class Transpiler:
     def __init__(self, modname, base_dir=None, stdlib_root=None,
                  py_modname=None, pod_classes=True):
@@ -2942,6 +3232,8 @@ class Transpiler:
         self.lines = []
         self.cur_class = None
         self.modules = set()
+        self._regex_ids = {}        # pattern string -> matcher id (per module)
+        self._regex_parsed = {}     # id -> parsed pattern struct
         self.import_alias = {}      # alias -> full dotted module name
         self.from_imports = {}      # imported name -> full dotted module name
         self.star_import_mods = []  # modules imported via `from X import *`
@@ -3021,6 +3313,18 @@ class Transpiler:
         self._compute_pod_set(tree)
         self.build_owner_maps()
         self.collect_imports(tree)
+        # regex pre-pass: intern every static re.compile/search/match pattern
+        # up front, so a function body emitted before the module-init (where a
+        # module-global `_RE = re.compile(...)` lives) already knows the
+        # feature is active and can lower `.search`/`.group` to the matcher.
+        for _n in ast.walk(tree):
+            if isinstance(_n, ast.Call) and isinstance(_n.func, ast.Attribute) \
+                    and isinstance(_n.func.value, ast.Name) \
+                    and _n.func.value.id == "re" \
+                    and _n.func.attr in ("compile", "search", "match") \
+                    and _n.args and isinstance(_n.args[0], ast.Constant) \
+                    and isinstance(_n.args[0].value, str):
+                self._re_intern(_n.args[0].value)
         self._scan_ctypes(tree)
         # cross-module class registry: clsname -> (ClassInfo, modname)
         self.xclasses = {}
@@ -3218,6 +3522,18 @@ class Transpiler:
         if self._sock_used:
             self.lines[self.extern_idx:self.extern_idx] = \
                 SOCKET_PRELUDE.splitlines()
+        if self._regex_ids:
+            pre = REGEX_HELPER.splitlines()
+            for pid in sorted(self._regex_parsed):
+                pre.extend(regex_emit_c(pid, self._regex_parsed[pid]).splitlines())
+            disp = ["static obj _re_search(long id, char* t, int anc) {"]
+            for pid in sorted(self._regex_parsed):
+                disp.append("    if (id == %d) return _re_p%d(t, anc);"
+                            % (pid, pid))
+            disp.append("    return OBJ_NONE;")
+            disp.append("}")
+            pre.extend(disp)
+            self.lines[self.extern_idx:self.extern_idx] = pre
         return "\n".join(self.lines) + "\n"
 
     def struct_body_lines(self, ci):
@@ -6563,6 +6879,16 @@ class Transpiler:
             # be obj too -- otherwise a name-typed-int target like
             # `chunk = next(...)` is declared `int` and the obj RHS won't assign.
             return OBJ
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and self._regex_ids \
+                and node.func.attr in ("search", "match", "group") \
+                and node.func.attr not in self.method_owners \
+                and node.func.attr not in self.xmethod_owners:
+            # translation-time regex: `.search`/`.match` return a match list or
+            # None, `.group` returns a captured string -- all obj. Without this
+            # they default to int and a boolean/assign context mis-handles the
+            # obj the matcher actually returns.
+            return OBJ
         t = self.static_type(node)
         if t:
             return t
@@ -8583,6 +8909,20 @@ class Transpiler:
                         cc = self._shallow_copy(node)
                         if cc:
                             return cc
+                    # translation-time regex: re.compile / re.search / re.match
+                    # with a constant pattern lower to a generated C matcher.
+                    if modname == "re" and func.attr in (
+                            "compile", "search", "match") and node.args and \
+                            isinstance(node.args[0], ast.Constant) and \
+                            isinstance(node.args[0].value, str):
+                        pid = self._re_intern(node.args[0].value)
+                        if pid is not None:
+                            if func.attr == "compile":
+                                return "OBJ_INT(%d)" % pid
+                            anc = "1" if func.attr == "match" else "0"
+                            txt = self.coerce_to("char*", node.args[1],
+                                                 self.expr(node.args[1]))
+                            return "_re_search(%d, %s, %s)" % (pid, txt, anc)
                     for a in node.args:
                         self.expr(a)
                     return "OBJ_NONE /* %s.%s(...) unsupported */" % (
@@ -8766,6 +9106,28 @@ class Transpiler:
                     fld = self.expr(func)
                     wargs = [self.wrap_obj(a) for a in node.args]
                     return self._emit_call_obj(fld, wargs)
+            # translation-time regex methods on a compiled-pattern obj (an
+            # OBJ_INT id) or a match obj (a list). Active only when at least one
+            # static pattern compiled, and never shadows a real ShivyCX method.
+            if self._regex_ids and func.attr not in self.method_owners \
+                    and func.attr not in self.xmethod_owners:
+                if func.attr in ("search", "match") and len(node.args) == 1:
+                    anc = "1" if func.attr == "match" else "0"
+                    txt = self.coerce_to("char*", node.args[0],
+                                         self.expr(node.args[0]))
+                    return "_re_search(AS_INT(%s), %s, %s)" % (
+                        self.wrap_obj(func.value), txt, anc)
+                if func.attr == "group":
+                    n_arg = node.args[0] if node.args else None
+                    if n_arg is None:
+                        gi = "0"
+                    elif isinstance(n_arg, ast.Constant) and \
+                            isinstance(n_arg.value, int):
+                        gi = str(n_arg.value)
+                    else:
+                        gi = self.coerce_to("int", n_arg, self.expr(n_arg))
+                    return "index_obj(%s, %s)" % (
+                        self.wrap_obj(func.value), gi)
             if self.stdlib_root:
                 return self._mp_method_call(func.value, func.attr, node)
             recv = self.expr(func.value)
@@ -9214,6 +9576,20 @@ class Transpiler:
                 if owner:
                     return owner.field_ctype(tgt.attr)
         return None
+
+    def _re_intern(self, pattern):
+        """Register a static regex `pattern` and return its matcher id, or None
+        if the pattern falls outside the supported subset (caller then falls
+        back to the dynamic/unsupported path -- never a wrong matcher)."""
+        if pattern in self._regex_ids:
+            return self._regex_ids[pattern]
+        parsed = regex_parse(pattern)
+        if parsed is None:
+            return None
+        pid = len(self._regex_ids)
+        self._regex_ids[pattern] = pid
+        self._regex_parsed[pid] = parsed
+        return pid
 
     def coerce_to(self, target, value_node, rendered):
         """Coerce `rendered` (an expr for value_node) to the `target` C type."""
