@@ -55,12 +55,17 @@ from shivyc.asm_gen import ASMCode, ASMGen
 def main():
     """Run the main compiler script."""
 
-    if platform.system() != "Linux":
-        err = "only x86_64 Linux is supported"
-        print(CompilerError(err))
-        return 1
+    if sys.implementation.name != "shivyc":
+        if platform.system() != "Linux":
+            err = "only x86_64 Linux is supported"
+            print(CompilerError(err))
+            return 1
 
-    arguments = get_arguments()
+    if sys.implementation.name != "shivyc":
+        arguments = get_arguments()
+    else:
+        arguments = get_arguments(
+            [sys.argv[i] for i in range(len(sys.argv))])
 
     # When --musl is given, materialize the packaged musl headers and put their
     # include directories (and required defines) ahead of the user's, so that
@@ -68,20 +73,22 @@ def main():
     # build self-contained: no musl tree needs to exist in the source checkout.
     include_dirs = list(getattr(arguments, "include_dirs", []))
     defines = list(getattr(arguments, "defines", []))
-    if getattr(arguments, "use_musl", False):
-        from shivyc import musl as _musl
-        _tree = _musl.materialize(getattr(arguments, "musl_dir", None))
-        defines = _tree.defines() + defines
-        include_dirs = _tree.public_include_dirs() + include_dirs
+    if sys.implementation.name != "shivyc":
+        if getattr(arguments, "use_musl", False):
+            from shivyc import musl as _musl
+            _tree = _musl.materialize(getattr(arguments, "musl_dir", None))
+            defines = _tree.defines() + defines
+            include_dirs = _tree.public_include_dirs() + include_dirs
 
     # Apply any -I include directories to the preprocessor.
     preproc.set_include_dirs(include_dirs)
     preproc.set_defines(defines)
 
     # Whether to alias long double to double (-f-long-double-as-double).
-    import shivyc.ctypes as ctypes
-    ctypes.long_double_as_double = getattr(
-        arguments, "long_double_as_double", False)
+    if sys.implementation.name != "shivyc":
+        import shivyc.ctypes as ctypes
+        ctypes.long_double_as_double = getattr(
+            arguments, "long_double_as_double", False)
 
     # Load a per-function register budget (thread partitioning) if supplied;
     # ASMGen consults arguments._thread_alloc to restrict allocation.
@@ -147,7 +154,8 @@ def main():
 
     # Whole-program elimination of never-accessed struct members.
     import shivyc.member_elim as member_elim
-    member_elim.enabled = getattr(arguments, "eliminate_unused_members", False)
+    if sys.implementation.name != "shivyc":
+        member_elim.enabled = getattr(arguments, "eliminate_unused_members", False)
     member_elim.install({})
 
     needs_graph = (getattr(arguments, "metamorphic", False)
@@ -190,34 +198,42 @@ def main():
 
     objs = []
     arguments._extra_objs = []
-    py_files = [f for f in arguments.files if f.endswith(".py")]
-    # Auto-bundle the rpy_torch mini-library when a source imports it, so a
-    # single `shivyc.main model.py` still co-compiles the library it needs.
-    if py_files:
-        try:
-            import os as _os
-            import sys as _sys
-            _td = _os.path.join(_os.path.dirname(_os.path.dirname(
-                _os.path.abspath(__file__))), "tools")
-            if _td not in _sys.path:
-                _sys.path.insert(0, _td)
-            import rpy_torch as _rpy_torch
-            py_files = _rpy_torch.bundle(py_files)
-        except Exception:
-            pass
-    if len(py_files) > 1:
-        # Several rpython sources: translate them together as one unit so the
-        # runtime is emitted and compiled exactly once (no duplicate-symbol
-        # link errors) and cross-module calls between them resolve against a
-        # single output directory -- the whole program in one translation unit,
-        # no on-disk AST cache required.
-        unit_objs = process_py_unit(py_files, arguments)
-        if unit_objs is None:
-            error_collector.show()
-            return 1
-        objs.extend(unit_objs)
-        for file in arguments.files:
-            if not file.endswith(".py"):
+    # The multi-source rpython co-compilation path imports py2c (the translator)
+    # and uses os.path/sys.path/rpy_torch -- all host-only bootstrap machinery.
+    # The self-hosted compiler only compiles C inputs, so guard the whole block;
+    # under the translator the condition folds to false and it is dropped.
+    if sys.implementation.name != "shivyc":
+        py_files = [f for f in arguments.files if f.endswith(".py")]
+        # Auto-bundle the rpy_torch mini-library when a source imports it, so a
+        # single `shivyc.main model.py` still co-compiles the library it needs.
+        if py_files:
+            try:
+                import os as _os
+                import sys as _sys
+                _td = _os.path.join(_os.path.dirname(_os.path.dirname(
+                    _os.path.abspath(__file__))), "tools")
+                if _td not in _sys.path:
+                    _sys.path.insert(0, _td)
+                import rpy_torch as _rpy_torch
+                py_files = _rpy_torch.bundle(py_files)
+            except Exception:
+                pass
+        if len(py_files) > 1:
+            # Several rpython sources: translate them together as one unit so the
+            # runtime is emitted and compiled exactly once (no duplicate-symbol
+            # link errors) and cross-module calls between them resolve against a
+            # single output directory -- the whole program in one translation
+            # unit, no on-disk AST cache required.
+            unit_objs = process_py_unit(py_files, arguments)
+            if unit_objs is None:
+                error_collector.show()
+                return 1
+            objs.extend(unit_objs)
+            for file in arguments.files:
+                if not file.endswith(".py"):
+                    objs.append(process_file(file, arguments))
+        else:
+            for file in arguments.files:
                 objs.append(process_file(file, arguments))
     else:
         for file in arguments.files:
@@ -249,7 +265,7 @@ def main():
             out = arguments.output_name[0]
         writable_text = (getattr(arguments, "metamorphic", False)
                          or getattr(arguments, "opt_level", 0) >= 4)
-        if not link(out, objs, writable_text):
+        if not link_objs(out, objs, writable_text):
             err = "linker returned non-zero status"
             print(CompilerError(err))
             return 1
@@ -338,6 +354,29 @@ def process_py_unit(py_files, args):
     return objs
 
 
+def _is_word_char(c):
+    return c == "_" or ("0" <= c <= "9") or ("a" <= c <= "z") \
+        or ("A" <= c <= "Z")
+
+
+def _has_word(text, word):
+    """True if `word` occurs in `text` as a standalone identifier (the
+    \\bword\\b test, without regex)."""
+    wlen = len(word)
+    tlen = len(text)
+    start = 0
+    while True:
+        idx = text.find(word, start)
+        if idx < 0:
+            return False
+        before_ok = (idx == 0) or (not _is_word_char(text[idx - 1]))
+        after = idx + wlen
+        after_ok = (after >= tlen) or (not _is_word_char(text[after]))
+        if before_ok and after_ok:
+            return True
+        start = idx + 1
+
+
 def _libm_protos(code):
     """libm prototypes for the math functions actually referenced in `code`.
 
@@ -347,28 +386,27 @@ def _libm_protos(code):
     the standard signatures (so they are compatible whether or not the runtime
     header is present)."""
     protos = []
-    import re
-    if re.search(r"\bsqrt\b", code):
+    if _has_word(code, "sqrt"):
         protos.append("double sqrt(double);")
     for fn in ("cbrt", "exp", "exp2", "expm1", "log", "log2", "log10",
                "log1p", "sin", "cos", "tan", "asin", "acos", "atan",
                "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "fabs",
                "floor", "ceil", "round", "trunc"):
-        if re.search(r"\b" + fn + r"\b", code):
+        if _has_word(code, fn):
             protos.append("double %s(double);" % fn)
     for fn in ("pow", "fmod", "fmax", "fmin", "atan2", "hypot", "copysign"):
-        if re.search(r"\b" + fn + r"\b", code):
+        if _has_word(code, fn):
             protos.append("double %s(double, double);" % fn)
     # single-precision variants (expf/sqrtf/...) for f32 kernels
     for fn in ("sqrtf", "cbrtf", "expf", "exp2f", "expm1f", "logf", "log2f",
                "log10f", "log1pf", "sinf", "cosf", "tanf", "asinf", "acosf",
                "atanf", "sinhf", "coshf", "tanhf", "asinhf", "acoshf",
                "atanhf", "fabsf", "floorf", "ceilf", "roundf", "truncf"):
-        if re.search(r"\b" + fn + r"\b", code):
+        if _has_word(code, fn):
             protos.append("float %s(float);" % fn)
     for fn in ("powf", "fmodf", "fmaxf", "fminf", "atan2f", "hypotf",
                "copysignf"):
-        if re.search(r"\b" + fn + r"\b", code):
+        if _has_word(code, fn):
             protos.append("float %s(float, float);" % fn)
     return protos
 
@@ -383,94 +421,95 @@ def process_py_file(file, args):
     for linking; pure kernels (the SIMD examples) reference no runtime, so the
     runtime include is dropped and the kernel C compiles on its own.
     """
-    import os
-    import sys
-    import re
-    import tempfile
+    if sys.implementation.name != "shivyc":
+        import os
+        import sys
+        import re
+        import tempfile
 
-    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    tools_dir = os.path.join(repo_root, "tools")
-    if tools_dir not in sys.path:
-        sys.path.insert(0, tools_dir)
-    try:
-        import py2c
-    except Exception as e:                       # pragma: no cover
-        error_collector.add(CompilerError(f"cannot import py2c: {e}"))
-        return None
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        tools_dir = os.path.join(repo_root, "tools")
+        if tools_dir not in sys.path:
+            sys.path.insert(0, tools_dir)
+        try:
+            import py2c
+        except Exception as e:                       # pragma: no cover
+            error_collector.add(CompilerError(f"cannot import py2c: {e}"))
+            return None
 
-    out_dir = tempfile.mkdtemp(prefix="shivyc_py2c_")
-    try:
-        out_c, err = py2c.transpile_file(file, out_dir)
-    except Exception as e:
-        error_collector.add(CompilerError(f"py2c failed on '{file}': {e}"))
-        return None
-    if err or not out_c:
-        error_collector.add(
-            CompilerError(f"py2c could not translate '{file}': {err}"))
-        return None
+        out_dir = tempfile.mkdtemp(prefix="shivyc_py2c_")
+        try:
+            out_c, err = py2c.transpile_file(file, out_dir)
+        except Exception as e:
+            error_collector.add(CompilerError(f"py2c failed on '{file}': {e}"))
+            return None
+        if err or not out_c:
+            error_collector.add(
+                CompilerError(f"py2c could not translate '{file}': {err}"))
+            return None
 
-    code = open(out_c, encoding="utf-8").read()
-    uses_rt = re.search(
-        r"\b(obj_[a-z]|OBJ_[A-Z]|aalloc|afree|pystr|subscript|truthy|"
-        r"list_of|make_closure|pyconcat)", code)
-    if uses_rt:
-        # Module needs the runtime: emit and queue shivyc_rt.c for linking.
-        py2c.write_runtime(out_dir)
-        rt_c = os.path.join(out_dir, "shivyc_rt.c")
-        if os.path.exists(rt_c):
-            rt_obj = process_c_file(rt_c, args)
-            if rt_obj:
-                getattr(args, "_extra_objs", []).append(rt_obj)
-        # shivyc_rt.h supplies the libc prototypes (malloc/printf/...) but not
-        # <math.h>; re-supply any libm prototypes the kernel actually uses so
-        # bare exp/sqrt/... resolve in functions that also touch the runtime.
-        mprotos = _libm_protos(code)
-        if mprotos:
-            code = "\n".join(mprotos) + "\n" + code
+        code = open(out_c, encoding="utf-8").read()
+        uses_rt = re.search(
+            r"\b(obj_[a-z]|OBJ_[A-Z]|aalloc|afree|pystr|subscript|truthy|"
+            r"list_of|make_closure|pyconcat)", code)
+        if uses_rt:
+            # Module needs the runtime: emit and queue shivyc_rt.c for linking.
+            py2c.write_runtime(out_dir)
+            rt_c = os.path.join(out_dir, "shivyc_rt.c")
+            if os.path.exists(rt_c):
+                rt_obj = process_c_file(rt_c, args)
+                if rt_obj:
+                    getattr(args, "_extra_objs", []).append(rt_obj)
+            # shivyc_rt.h supplies the libc prototypes (malloc/printf/...) but not
+            # <math.h>; re-supply any libm prototypes the kernel actually uses so
+            # bare exp/sqrt/... resolve in functions that also touch the runtime.
+            mprotos = _libm_protos(code)
+            if mprotos:
+                code = "\n".join(mprotos) + "\n" + code
+                with open(out_c, "w", encoding="utf-8") as f:
+                    f.write(code)
+        else:
+            # Pure kernel/program: drop the (unused) runtime include so the
+            # C11-subset front end compiles it directly, but re-supply the handful
+            # of libc prototypes the dropped header would have provided.
+            code = re.sub(r'#include "shivyc_rt\.h"\n', "", code)
+            prelude = []
+            if re.search(r"\bmalloc\b", code):
+                prelude.append("void *malloc(unsigned long);")
+            if re.search(r"\bfree\b", code):
+                prelude.append("void free(void *);")
+            if re.search(r"\brealloc\b", code):
+                prelude.append("void *realloc(void *, unsigned long);")
+            if re.search(r"\bprintf\b", code):
+                prelude.append("int printf(const char *, ...);")
+            prelude.extend(_libm_protos(code))
+            if re.search(r"\batoi\b", code):
+                prelude.append("int atoi(const char *);")
+            for sym, proto in [
+                    ("fopen", "void *fopen(const char *, const char *);"),
+                    ("fputs", "int fputs(const char *, void *);"),
+                    ("fgets", "char *fgets(char *, int, void *);"),
+                    ("fwrite", "unsigned long fwrite(const void *, unsigned long, unsigned long, void *);"),
+                    ("fclose", "int fclose(void *);"),
+                    ("system", "int system(const char *);"),
+                    ("puts", "int puts(const char *);"),
+                    ("strlen", "unsigned long strlen(const char *);"),
+                    ("strcmp", "int strcmp(const char *, const char *);"),
+                    ("fork", "int fork(void);"),
+                    ("_exit", "void _exit(int);"),
+                    ("waitpid", "int waitpid(int, int *, int);")]:
+                if re.search(r"\b" + sym + r"\b", code):
+                    prelude.append(proto)
+            for stream in ("stdin", "stdout", "stderr"):
+                if re.search(r"\b" + stream + r"\b", code):
+                    prelude.append("extern void *" + stream + ";")
+            if prelude:
+                code = "\n".join(prelude) + "\n" + code
             with open(out_c, "w", encoding="utf-8") as f:
                 f.write(code)
-    else:
-        # Pure kernel/program: drop the (unused) runtime include so the
-        # C11-subset front end compiles it directly, but re-supply the handful
-        # of libc prototypes the dropped header would have provided.
-        code = re.sub(r'#include "shivyc_rt\.h"\n', "", code)
-        prelude = []
-        if re.search(r"\bmalloc\b", code):
-            prelude.append("void *malloc(unsigned long);")
-        if re.search(r"\bfree\b", code):
-            prelude.append("void free(void *);")
-        if re.search(r"\brealloc\b", code):
-            prelude.append("void *realloc(void *, unsigned long);")
-        if re.search(r"\bprintf\b", code):
-            prelude.append("int printf(const char *, ...);")
-        prelude.extend(_libm_protos(code))
-        if re.search(r"\batoi\b", code):
-            prelude.append("int atoi(const char *);")
-        for sym, proto in [
-                ("fopen", "void *fopen(const char *, const char *);"),
-                ("fputs", "int fputs(const char *, void *);"),
-                ("fgets", "char *fgets(char *, int, void *);"),
-                ("fwrite", "unsigned long fwrite(const void *, unsigned long, unsigned long, void *);"),
-                ("fclose", "int fclose(void *);"),
-                ("system", "int system(const char *);"),
-                ("puts", "int puts(const char *);"),
-                ("strlen", "unsigned long strlen(const char *);"),
-                ("strcmp", "int strcmp(const char *, const char *);"),
-                ("fork", "int fork(void);"),
-                ("_exit", "void _exit(int);"),
-                ("waitpid", "int waitpid(int, int *, int);")]:
-            if re.search(r"\b" + sym + r"\b", code):
-                prelude.append(proto)
-        for stream in ("stdin", "stdout", "stderr"):
-            if re.search(r"\b" + stream + r"\b", code):
-                prelude.append("extern void *" + stream + ";")
-        if prelude:
-            code = "\n".join(prelude) + "\n" + code
-        with open(out_c, "w", encoding="utf-8") as f:
-            f.write(code)
 
-    return process_c_file(out_c, args)
-
+        return process_c_file(out_c, args)
+    return None
 
 def process_c_file(file, args):
     """Compile a C file into an object file and return the object file name."""
@@ -818,170 +857,279 @@ def process_c_file(file, args):
     return obj_file
 
 
-def get_arguments():
+class Arguments:
+    """Concrete, rpython-friendly replacement for the argparse Namespace:
+    every option is a real field with a fixed type, so attribute access
+    compiles to a struct member read instead of a dynamic getattr."""
+
+    def __init__(self):
+        self.files = []
+        self.show_reg_alloc_perf = False
+        self.simd_pack_globals = False
+        self.stackless_calls = False
+        self.pack_args = False
+        self.metamorphic = False
+        self.compile_only = False
+        self.asm_only = False
+        self.eliminate_unused_members = False
+        self.print_eliminated_members = False
+        self.long_double_as_double = False
+        self.opt_level = 0
+        self.output_name = None
+        self.include_dirs = []
+        self.defines = []
+        self.use_musl = False
+        self.musl_dir = None
+        self.print_call_graph = False
+        self.emit_thread_switcher = None
+        self.thread_alloc_json = None
+        self.no_cache = False
+        self.check_memory = False
+        self.auto_free = False
+        self.no_peephole = False
+        self.microslice = False
+        self.slice_budget = None
+        self.emit_microslice = None
+        self.pdf = None
+        self._thread_alloc = None
+        self._extra_objs = []
+        self._wp_graph = None
+        self._simd_pack_layout = None
+        self._inline_bodies = None
+
+
+def _parse_args_selfhost(argv):
+    """Minimal command-line parser for the self-hosted build (no argparse).
+    Handles the flags the compiler itself needs; unknown flags are ignored
+    and everything else is treated as an input file."""
+    args = Arguments()
+    i = 1
+    n = len(argv)
+    while i < n:
+        a = argv[i]
+        if a == '-c':
+            args.compile_only = True
+        elif a == '-S':
+            args.asm_only = True
+        elif a == '-o':
+            i += 1
+            if i < n:
+                args.output_name = [argv[i]]
+        elif a == '-O':
+            i += 1
+            if i < n:
+                args.opt_level = int(argv[i])
+        elif len(a) > 2 and a[0] == '-' and a[1] == 'O':
+            args.opt_level = int(a[2:])
+        elif a == '-I':
+            i += 1
+            if i < n:
+                args.include_dirs.append(argv[i])
+        elif len(a) > 2 and a[0] == '-' and a[1] == 'I':
+            args.include_dirs.append(a[2:])
+        elif a == '-D':
+            i += 1
+            if i < n:
+                args.defines.append(argv[i])
+        elif len(a) > 2 and a[0] == '-' and a[1] == 'D':
+            args.defines.append(a[2:])
+        elif a == '--musl':
+            args.use_musl = True
+        elif a == '--musl-dir':
+            i += 1
+            if i < n:
+                args.musl_dir = argv[i]
+        elif a == '--no-cache':
+            args.no_cache = True
+        elif a == '--no-peephole':
+            args.no_peephole = True
+        elif a == '-fsimd-pack-globals':
+            args.simd_pack_globals = True
+        elif a == '-fstackless-calls':
+            args.stackless_calls = True
+        elif a == '-f-pack-args':
+            args.pack_args = True
+        elif a == '-fmetamorphic':
+            args.metamorphic = True
+        elif a == '-f-eliminate-unused-members':
+            args.eliminate_unused_members = True
+        elif a == '-f-long-double-as-double':
+            args.long_double_as_double = True
+        elif len(a) > 0 and a[0] == '-':
+            pass
+        else:
+            args.files.append(a)
+        i += 1
+    return args
+
+
+def get_arguments(argv=None):
     """Get the command-line arguments.
 
     This function sets up the argument parser. Returns a tuple containing
     an object storing the argument values and a list of the file names
     provided on command line.
     """
-    desc = """Compile, assemble, and link C files. Option flags starting
-    with `-z` are primarily for debugging or diagnostic purposes."""
-    parser = argparse.ArgumentParser(
-        prog='ShivyC',
-        description=desc,
-        usage="shivyc [-h] [options] files...")
+    if sys.implementation.name != "shivyc":
+        desc = """Compile, assemble, and link C files. Option flags starting
+        with `-z` are primarily for debugging or diagnostic purposes."""
+        parser = argparse.ArgumentParser(
+            prog='ShivyC',
+            description=desc,
+            usage="shivyc [-h] [options] files...")
 
-    # Files to compile
-    parser.add_argument("files", metavar="files", nargs="+")
+        # Files to compile
+        parser.add_argument("files", metavar="files", nargs="+")
 
-    # Boolean flag for whether to print register allocator performance info
-    parser.add_argument("-z-reg-alloc-perf",
-                        help="display register allocator performance info",
-                        dest="show_reg_alloc_perf", action="store_true")
+        # Boolean flag for whether to print register allocator performance info
+        parser.add_argument("-z-reg-alloc-perf",
+                            help="display register allocator performance info",
+                            dest="show_reg_alloc_perf", action="store_true")
 
-    # Pack small (1-8 bit) static global flags into the last SIMD register
-    # (xmm15) for zero-latency reads in hot / interrupt routines.
-    parser.add_argument("-fsimd-pack-globals",
-                        help="pack small global flags into xmm15",
-                        dest="simd_pack_globals", action="store_true")
+        # Pack small (1-8 bit) static global flags into the last SIMD register
+        # (xmm15) for zero-latency reads in hot / interrupt routines.
+        parser.add_argument("-fsimd-pack-globals",
+                            help="pack small global flags into xmm15",
+                            dest="simd_pack_globals", action="store_true")
 
-    # Lower deeply-nested calls with direct calls, tail-call jumps, and
-    # frame-pointer omission to cut call overhead.
-    parser.add_argument("-fstackless-calls",
-                        help="direct calls, tail-call jmps, frameless funcs",
-                        dest="stackless_calls", action="store_true")
+        # Lower deeply-nested calls with direct calls, tail-call jumps, and
+        # frame-pointer omission to cut call overhead.
+        parser.add_argument("-fstackless-calls",
+                            help="direct calls, tail-call jmps, frameless funcs",
+                            dest="stackless_calls", action="store_true")
 
-    # Argument packing: a non-standard calling convention that bit-packs several
-    # small integer parameters into as few argument registers as possible.
-    # Applied to statically-known (direct) calls of qualifying functions only.
-    parser.add_argument("-f-pack-args",
-                        help="pack small integer args into shared registers",
-                        dest="pack_args", action="store_true")
+        # Argument packing: a non-standard calling convention that bit-packs several
+        # small integer parameters into as few argument registers as possible.
+        # Applied to statically-known (direct) calls of qualifying functions only.
+        parser.add_argument("-f-pack-args",
+                            help="pack small integer args into shared registers",
+                            dest="pack_args", action="store_true")
 
-    # Advanced/experimental: metamorphic returns. Requires a writable text
-    # segment (the linker is told to make it writable). The return address is
-    # patched into the callee's code by the caller, so no return address is
-    # pushed. Enable per-function with the __metamorphic__ specifier.
-    parser.add_argument("-fmetamorphic",
-                        help="enable metamorphic returns (writable .text)",
-                        dest="metamorphic", action="store_true")
+        # Advanced/experimental: metamorphic returns. Requires a writable text
+        # segment (the linker is told to make it writable). The return address is
+        # patched into the callee's code by the caller, so no return address is
+        # pushed. Enable per-function with the __metamorphic__ specifier.
+        parser.add_argument("-fmetamorphic",
+                            help="enable metamorphic returns (writable .text)",
+                            dest="metamorphic", action="store_true")
 
-    parser.add_argument("-c",
-                        help="compile and assemble to .o, but do not link",
-                        dest="compile_only", action="store_true")
+        parser.add_argument("-c",
+                            help="compile and assemble to .o, but do not link",
+                            dest="compile_only", action="store_true")
 
-    parser.add_argument("-S",
-                        help="emit assembly (.s) and stop; do not assemble or "
-                             "link",
-                        dest="asm_only", action="store_true")
+        parser.add_argument("-S",
+                            help="emit assembly (.s) and stop; do not assemble or "
+                                 "link",
+                            dest="asm_only", action="store_true")
 
-    parser.add_argument(
-        "-f-eliminate-unused-members",
-        help="whole-program: remove struct members never accessed in any "
-             "translation unit (only when provably safe)",
-        dest="eliminate_unused_members", action="store_true")
+        parser.add_argument(
+            "-f-eliminate-unused-members",
+            help="whole-program: remove struct members never accessed in any "
+                 "translation unit (only when provably safe)",
+            dest="eliminate_unused_members", action="store_true")
 
-    parser.add_argument(
-        "--print-eliminated-members",
-        help="report struct members removed by -f-eliminate-unused-members",
-        dest="print_eliminated_members", action="store_true")
+        parser.add_argument(
+            "--print-eliminated-members",
+            help="report struct members removed by -f-eliminate-unused-members",
+            dest="print_eliminated_members", action="store_true")
 
-    parser.add_argument(
-        "-f-long-double-as-double",
-        help="treat 'long double' as 64-bit double (with a warning); this "
-             "compiler never supports 80-bit floats",
-        dest="long_double_as_double", action="store_true")
+        parser.add_argument(
+            "-f-long-double-as-double",
+            help="treat 'long double' as 64-bit double (with a warning); this "
+                 "compiler never supports 80-bit floats",
+            dest="long_double_as_double", action="store_true")
 
-    # Optimization level. -O4 is aggressive and, like -fmetamorphic, depends on
-    # a writable text segment; it turns on whole-program stackless lowering and
-    # near-function scratch storage to reduce stack pressure.
-    parser.add_argument("-O", type=int, default=0,
-                        help="optimization level (0-4); 4 needs writable .text",
-                        dest="opt_level")
-    # Generate binary file with file name
-    parser.add_argument(
-        "-o",
-        nargs=1,
-        metavar="file",
-        help="place output into <file>",
-        dest="output_name")
+        # Optimization level. -O4 is aggressive and, like -fmetamorphic, depends on
+        # a writable text segment; it turns on whole-program stackless lowering and
+        # near-function scratch storage to reduce stack pressure.
+        parser.add_argument("-O", type=int, default=0,
+                            help="optimization level (0-4); 4 needs writable .text",
+                            dest="opt_level")
+        # Generate binary file with file name
+        parser.add_argument(
+            "-o",
+            nargs=1,
+            metavar="file",
+            help="place output into <file>",
+            dest="output_name")
 
-    # Additional directories searched for #include files.
-    parser.add_argument("-I", metavar="dir", dest="include_dirs",
-                        action="append", default=[],
-                        help="add a directory to the include search path")
+        # Additional directories searched for #include files.
+        parser.add_argument("-I", metavar="dir", dest="include_dirs",
+                            action="append", default=[],
+                            help="add a directory to the include search path")
 
-    # Predefine a macro (NAME or NAME=VALUE), like the C compiler's -D.
-    parser.add_argument("-D", metavar="name[=value]", dest="defines",
-                        action="append", default=[],
-                        help="predefine a preprocessor macro")
+        # Predefine a macro (NAME or NAME=VALUE), like the C compiler's -D.
+        parser.add_argument("-D", metavar="name[=value]", dest="defines",
+                            action="append", default=[],
+                            help="predefine a preprocessor macro")
 
-    # Compile against the packaged musl libc (bypassing glibc). Materializes
-    # musl's headers to a temp dir and prepends their include paths + defines,
-    # so user code resolves #include against musl. The needed musl .c sources
-    # can then be extracted/compiled on demand (see shivyc.musl).
-    parser.add_argument("--musl", dest="use_musl", action="store_true",
-                        help="compile against the packaged musl libc, not glibc")
-    parser.add_argument("--musl-dir", dest="musl_dir", default=None,
-                        help="where to materialize musl headers/sources "
-                             "(default: a temp directory)")
+        # Compile against the packaged musl libc (bypassing glibc). Materializes
+        # musl's headers to a temp dir and prepends their include paths + defines,
+        # so user code resolves #include against musl. The needed musl .c sources
+        # can then be extracted/compiled on demand (see shivyc.musl).
+        parser.add_argument("--musl", dest="use_musl", action="store_true",
+                            help="compile against the packaged musl libc, not glibc")
+        parser.add_argument("--musl-dir", dest="musl_dir", default=None,
+                            help="where to materialize musl headers/sources "
+                                 "(default: a temp directory)")
 
-    # Build and print the whole-program (cross-TU) call graph, then exit.
-    parser.add_argument("--print-call-graph", dest="print_call_graph",
-                        action="store_true",
-                        help="print the cross-translation-unit call graph")
+        # Build and print the whole-program (cross-TU) call graph, then exit.
+        parser.add_argument("--print-call-graph", dest="print_call_graph",
+                            action="store_true",
+                            help="print the cross-translation-unit call graph")
 
-    # Register-partitioned threads (bare-metal).
-    parser.add_argument("--emit-thread-switcher", dest="emit_thread_switcher",
-                        metavar="OUT.s", default=None,
-                        help="analyze threads.left/right declarations across "
-                             "the inputs and write a specialized context "
-                             "switcher to OUT.s, then exit")
-    parser.add_argument("--thread-alloc-json", dest="thread_alloc_json",
-                        metavar="FILE", default=None,
-                        help="constrain each function's register pool to the "
-                             "{func: [reg,...]} budget in FILE (used by the "
-                             "thread partitioner to make footprints disjoint)")
+        # Register-partitioned threads (bare-metal).
+        parser.add_argument("--emit-thread-switcher", dest="emit_thread_switcher",
+                            metavar="OUT.s", default=None,
+                            help="analyze threads.left/right declarations across "
+                                 "the inputs and write a specialized context "
+                                 "switcher to OUT.s, then exit")
+        parser.add_argument("--thread-alloc-json", dest="thread_alloc_json",
+                            metavar="FILE", default=None,
+                            help="constrain each function's register pool to the "
+                                 "{func: [reg,...]} budget in FILE (used by the "
+                                 "thread partitioner to make footprints disjoint)")
 
-    # Disable the on-disk AST parse cache.
-    parser.add_argument("--no-cache", dest="no_cache", action="store_true",
-                        help="disable the on-disk parsed-AST cache")
+        # Disable the on-disk AST parse cache.
+        parser.add_argument("--no-cache", dest="no_cache", action="store_true",
+                            help="disable the on-disk parsed-AST cache")
 
-    # Whole-program memory-safety analysis.
-    parser.add_argument("--check-memory", dest="check_memory",
-                        action="store_true",
-                        help="run the whole-program use-after-free / double-free "
-                             "analysis over the inputs and exit")
-    parser.add_argument("--auto-free", dest="auto_free", action="store_true",
-                        help="with --check-memory, also report (and where safe, "
-                             "insert) automatic frees for non-escaping allocations")
+        # Whole-program memory-safety analysis.
+        parser.add_argument("--check-memory", dest="check_memory",
+                            action="store_true",
+                            help="run the whole-program use-after-free / double-free "
+                                 "analysis over the inputs and exit")
+        parser.add_argument("--auto-free", dest="auto_free", action="store_true",
+                            help="with --check-memory, also report (and where safe, "
+                                 "insert) automatic frees for non-escaping allocations")
 
-    parser.add_argument("--no-peephole", dest="no_peephole",
-                        action="store_true",
-                        help="disable the IL peephole optimizer "
-                             "(compare-and-branch fusion, arithmetic identities)")
+        parser.add_argument("--no-peephole", dest="no_peephole",
+                            action="store_true",
+                            help="disable the IL peephole optimizer "
+                                 "(compare-and-branch fusion, arithmetic identities)")
 
-    # Micro-slicing: productive spin-waiting analysis.
-    parser.add_argument("--microslice", dest="microslice", action="store_true",
-                        help="analyze the inputs for pure, independent fragments "
-                             "and print a slice plan for productive spinning")
-    parser.add_argument("--slice-budget", dest="slice_budget", type=int,
-                        metavar="N", default=None,
-                        help="per-slice cost budget for --microslice (default 64)")
-    parser.add_argument("--emit-microslice", dest="emit_microslice",
-                        metavar="OUT.c", default=None,
-                        help="with --microslice, write a work-injected acquire "
-                             "scaffold for the hottest fragment to OUT.c")
+        # Micro-slicing: productive spin-waiting analysis.
+        parser.add_argument("--microslice", dest="microslice", action="store_true",
+                            help="analyze the inputs for pure, independent fragments "
+                                 "and print a slice plan for productive spinning")
+        parser.add_argument("--slice-budget", dest="slice_budget", type=int,
+                            metavar="N", default=None,
+                            help="per-slice cost budget for --microslice (default 64)")
+        parser.add_argument("--emit-microslice", dest="emit_microslice",
+                            metavar="OUT.c", default=None,
+                            help="with --microslice, write a work-injected acquire "
+                                 "scaffold for the hottest fragment to OUT.c")
 
-    parser.add_argument("--pdf", dest="pdf", nargs="?", const="/tmp",
-                        default=None, metavar="DIR",
-                        help="generate a LaTeX/PDF build report (overview, "
-                             "per-module sections, safety findings in red, a "
-                             "TikZ call graph, and the run output in an "
-                             "appendix). Output directory defaults to /tmp.")
+        parser.add_argument("--pdf", dest="pdf", nargs="?", const="/tmp",
+                            default=None, metavar="DIR",
+                            help="generate a LaTeX/PDF build report (overview, "
+                                 "per-module sections, safety findings in red, a "
+                                 "TikZ call graph, and the run output in an "
+                                 "appendix). Output directory defaults to /tmp.")
 
-    return parser.parse_args()
+        return parser.parse_args()
+
+    return _parse_args_selfhost(argv)
 
 
 def read_file(file):
@@ -1011,16 +1159,22 @@ def write_asm(asm_source, asm_filename):
 
 def assemble(asm_name, obj_name):
     """Assemble the given assembly file into an object file."""
-    try:
-        subprocess.check_call(["as", "-o", obj_name, asm_name])
+    if sys.implementation.name != 'shivyc':
+        try:
+            subprocess.check_call(["as", "-o", obj_name, asm_name])
+            return True
+        except subprocess.CalledProcessError:
+            err = "assembler returned non-zero status"
+            error_collector.add(CompilerError(err))
+            return False
+    else:
+        # Simpler self-hosted path (uses os.system, already supported by the
+        # translator). Breaks on paths with spaces, which is acceptable here.
+        os.system("as -o %s %s" % (obj_name, asm_name))
         return True
-    except subprocess.CalledProcessError:
-        err = "assembler returned non-zero status"
-        error_collector.add(CompilerError(err))
-        return False
 
 
-def link(binary_name, obj_names, writable_text=False):
+def link_objs(binary_name, obj_names, writable_text=False):
     """Assemble the given object files into a binary.
 
     When `writable_text` is set (for -fmetamorphic / -O4), the linker is asked
@@ -1028,33 +1182,37 @@ def link(binary_name, obj_names, writable_text=False):
     self-modifying metamorphic-return code can patch instruction bytes at run
     time. This is intentionally unsafe and opt-in.
     """
+    import os
 
-    try:
-        crtnum = find_crtnum()
-        if not crtnum: return
-
-        crti = find_library_or_err("crti.o")
-        if not crti: return
-
-        linux_so = find_library_or_err("ld-linux-x86-64.so.2")
-        if not linux_so: return
-
-        crtn = find_library_or_err("crtn.o")
-        if not crtn: return
-
-        cmd = ["ld"]
-        # Writable text for metamorphic returns is arranged via the .text
-        # section's "awx" flag (set in asm_gen), which is compatible with the
-        # glibc crt startup; the older -N/OMAGIC route is not.
-        cmd += ["-dynamic-linker", linux_so, crtnum, crti, "-lc", "-lm"]
-
-        # find files to link
-        subprocess.check_call(cmd + obj_names + [crtn, "-o", binary_name])
-
-        return True
-
-    except subprocess.CalledProcessError:
+    crtnum = find_crtnum()
+    if not crtnum:
         return False
+    crti = find_library_or_err("crti.o")
+    if not crti:
+        return False
+    linux_so = find_library_or_err("ld-linux-x86-64.so.2")
+    if not linux_so:
+        return False
+    crtn = find_library_or_err("crtn.o")
+    if not crtn:
+        return False
+
+    cmd = ["ld"]
+    # Writable text for metamorphic returns is arranged via the .text
+    # section's "awx" flag (set in asm_gen), which is compatible with the
+    # glibc crt startup; the older -N/OMAGIC route is not.
+    cmd += ["-dynamic-linker", linux_so, crtnum, crti, "-lc", "-lm"]
+    cmd = cmd + obj_names + [crtn, "-o", binary_name]
+
+    if sys.implementation.name != 'shivyc':
+        try:
+            subprocess.check_call(cmd)
+            return True
+        except subprocess.CalledProcessError:
+            return False
+    else:
+        os.system(" ".join(cmd))
+        return True
 
 
 def find_crtnum():
@@ -1091,22 +1249,23 @@ def find_library(file):
 
     If found, returns the path. Otherwise, returns None.
     """
-    search_paths = [pathlib.Path("/usr/local/lib/x86_64-linux-gnu"),
-                    pathlib.Path("/lib/x86_64-linux-gnu"),
-                    pathlib.Path("/usr/lib/x86_64-linux-gnu"),
-                    pathlib.Path("/usr/local/lib64"),
-                    pathlib.Path("/lib64"),
-                    pathlib.Path("/usr/lib64"),
-                    pathlib.Path("/usr/local/lib"),
-                    pathlib.Path("/lib"),
-                    pathlib.Path("/usr/lib"),
-                    pathlib.Path("/usr/x86_64-linux-gnu/lib64"),
-                    pathlib.Path("/usr/x86_64-linux-gnu/lib")]
+    import os
+    search_paths = ["/usr/local/lib/x86_64-linux-gnu",
+                    "/lib/x86_64-linux-gnu",
+                    "/usr/lib/x86_64-linux-gnu",
+                    "/usr/local/lib64",
+                    "/lib64",
+                    "/usr/lib64",
+                    "/usr/local/lib",
+                    "/lib",
+                    "/usr/lib",
+                    "/usr/x86_64-linux-gnu/lib64",
+                    "/usr/x86_64-linux-gnu/lib"]
 
     for path in search_paths:
-        full = path.joinpath(file)
-        if full.is_file():
-            return str(full)
+        full = os.path.join(path, file)
+        if os.path.exists(full):
+            return full
     return None
 
 
