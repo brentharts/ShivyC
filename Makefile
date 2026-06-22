@@ -114,6 +114,15 @@ bench_compile_speed:
 selfhost_link:
 	python3 tools/selfhost.py link
 
+# EXPERIMENTAL: build the whole self-hosted compiler as a single native binary
+# into a fixed /tmp dir. Links cleanly (0 undefined refs); full module-init
+# ordering is still being worked out, so the binary is not yet a working
+# compiler. Useful as a reproducible base for that work.
+#     make selfhost_compiler            # -> $(SELFHOST_NATIVE_DIR)/shivyc_native
+SELFHOST_NATIVE_DIR ?= /tmp/shivyc-native
+selfhost_compiler:
+	python3 tools/selfhost.py compiler --build-dir $(SELFHOST_NATIVE_DIR)
+
 selfhost_coverage_musl:
 	python3 tools/selfhost.py coverage --musl
 
