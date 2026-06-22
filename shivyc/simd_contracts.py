@@ -105,6 +105,12 @@ def analyze(il_code, symbol_table, ext_info):
         cmds = il_code.commands[fname]
         if _is_sum_reduction(cmds):
             desc = {"kind": "reduce"}
+            # An unsigned-byte sum lowers to PSADBW (sum of absolute differences
+            # against zero), which sums 16 bytes into two 64-bit lanes with no
+            # intermediate overflow -- the ideal hardware byte accumulator.
+            p0 = ptrs[0]
+            if p0.get("elem_size") == 1 and not p0.get("elem_signed", True):
+                desc["elem"] = "u8"
         else:
             desc = _classify_elementwise(cmds, ptrs, layout, name_of)
         if not desc:
@@ -167,6 +173,8 @@ def _arg_layout(fname, symbol_table):
             "index": i,
             "is_ptr": is_ptr,
             "elem_size": (at.arg.size if is_ptr else None),
+            "elem_signed": (getattr(at.arg, "signed", True) if is_ptr
+                            else None),
             "is_int": (not is_ptr) and at.is_integral(),
             "is_float": (not is_ptr) and at.is_floating(),
         })
@@ -533,6 +541,19 @@ def _is_sum_reduction(cmds):
         if isinstance(c, value_cmds.ReadAt):
             read_outputs.add(c.output)
 
+    # A narrow element (e.g. `unsigned char`) is widened to the accumulator's
+    # type by a scalar `Set` between the load and the `Add`. Follow such Set
+    # conversions transitively so a widened byte load still counts as a load.
+    load_derived = set(read_outputs)
+    changed = True
+    while changed:
+        changed = False
+        for c in cmds:
+            if isinstance(c, value_cmds.Set) and c.output not in load_derived \
+                    and any(i in load_derived for i in c.inputs()):
+                load_derived.add(c.output)
+                changed = True
+
     # Set arg -> output, to find what an Add result is copied into.
     set_targets = {}
     for c in cmds:
@@ -543,8 +564,8 @@ def _is_sum_reduction(cmds):
         if not isinstance(c, math_cmds.Add):
             continue
         ins = c.inputs()
-        loads = [i for i in ins if i in read_outputs]
-        others = [i for i in ins if i not in read_outputs]
+        loads = [i for i in ins if i in load_derived]
+        others = [i for i in ins if i not in load_derived]
         if not loads or not others:
             continue
         # The Add result must be written back into one of its non-load inputs
@@ -586,6 +607,45 @@ def synth_sse2_reduce(asm_code, func_ctype):
         "psrldq xmm1, 4",
         "paddd xmm0, xmm1",
         "movd eax, xmm0",
+        "mov rsp, rbp",
+        "pop rbp",
+        "ret",
+    ]
+    for line in raw:
+        asm_code.add(asm_cmds.Raw(line))
+
+
+def synth_sse2_reduce_u8(asm_code, func_ctype):
+    """Emit a fallback-free SSE2 sum of an unsigned-byte array via PSADBW.
+
+    System V: rdi = ptr, esi = len (a multiple of 16 by contract). The result is
+    returned in eax. PSADBW computes, for each byte, |b - 0| = b, then
+    horizontally sums each group of 8 bytes into the low word of a 64-bit lane;
+    so one PSADBW reduces a 16-byte vector to two partial sums with no risk of
+    8-bit overflow. PADDQ accumulates across iterations, and a final lane fold
+    yields the total. No scalar remainder is emitted -- len % 16 == 0 is proven.
+    """
+    loop = asm_code.get_label()
+    raw = [
+        "push rbp",
+        "mov rbp, rsp",
+        "pxor xmm0, xmm0",      # two 64-bit lane accumulators
+        "pxor xmm2, xmm2",      # zero operand for PSADBW
+        "mov ecx, esi",         # ecx = len
+        "shr ecx, 4",           # ecx = len / 16  (groups of 16 bytes)
+        "xor rax, rax",         # rax = byte offset
+        loop + ":",
+        "movdqu xmm1, [rdi + rax]",
+        "psadbw xmm1, xmm2",    # |byte - 0| summed into 2 x 64-bit lanes
+        "paddq xmm0, xmm1",     # accumulate without overflow
+        "add rax, 16",
+        "dec ecx",
+        "jnz " + loop,
+        # fold the two 64-bit lanes -> eax
+        "movdqa xmm1, xmm0",
+        "psrldq xmm1, 8",
+        "paddq xmm0, xmm1",
+        "movd eax, xmm0",       # low 32 bits (a u8-array sum fits in int)
         "mov rsp, rbp",
         "pop rbp",
         "ret",

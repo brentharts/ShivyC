@@ -451,7 +451,11 @@ class ASMGen:
             if _simd_desc is not None:
                 import shivyc.simd_contracts as simd_contracts
                 if _simd_desc.get("kind") == "reduce":
-                    simd_contracts.synth_sse2_reduce(self.asm_code, None)
+                    if _simd_desc.get("elem") == "u8":
+                        simd_contracts.synth_sse2_reduce_u8(
+                            self.asm_code, None)
+                    else:
+                        simd_contracts.synth_sse2_reduce(self.asm_code, None)
                 else:
                     simd_contracts.synth_sse_elementwise(
                         self.asm_code, _simd_desc)
