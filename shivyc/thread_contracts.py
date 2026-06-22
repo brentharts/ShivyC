@@ -62,6 +62,7 @@ def scan_asm_registers(asm_text):
     This is the real, post-register-allocation footprint.
     """
     import re
+    import sys
     tok = re.compile(r"\b([a-z][a-z0-9]*)\b")
     funcs = {}
     cur = None
@@ -81,13 +82,19 @@ def scan_asm_registers(asm_text):
         # only look at the operand text, after the mnemonic
         parts = line.split(None, 1)
         operands = parts[1] if len(parts) > 1 else ""
-        for t in tok.findall(operands):
-            if t in _SUB_TO_R64:
-                r64 = _SUB_TO_R64[t]
-                if r64 in GP_POOL:
-                    funcs[cur]["gp"].add(r64)
-            elif t.startswith("xmm"):
-                funcs[cur]["xmm"].add(t)
+        # The asm token scan uses regex .findall with a \b pattern, which is
+        # outside the translator's regex subset. This whole driver only runs on
+        # the host (it shells out to a compiler), so guard it: under the
+        # self-hosted build the condition folds to false and the block is
+        # dropped; under CPython it runs normally.
+        if sys.implementation.name != "shivyc":
+            for t in tok.findall(operands):
+                if t in _SUB_TO_R64:
+                    r64 = _SUB_TO_R64[t]
+                    if r64 in GP_POOL:
+                        funcs[cur]["gp"].add(r64)
+                elif t.startswith("xmm"):
+                    funcs[cur]["xmm"].add(t)
     funcs.pop(None, None)
     return funcs
 
@@ -479,6 +486,7 @@ def run(files, args):
     """
     import json
     import os
+    import sys
     import tempfile
     import shivyc.callgraph as callgraph
     from shivyc.errors import error_collector
@@ -498,16 +506,21 @@ def run(files, args):
     print(format_report(plan0))
     print()
 
-    # Pass 2: feed disjoint budgets back into the allocator, re-scan.
+    # Pass 2: feed disjoint budgets back into the allocator, re-scan. This
+    # round-trips budgets through a temp JSON file and re-invokes the compiler,
+    # so it is host-only (no tempfile/subprocess in the self-hosted build).
     budgets = allocation_budgets(plan0)
     flat = {fn: b["gp"] for fn, b in budgets.items()}
-    bj = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
-    json.dump(flat, bj)
-    bj.close()
-    try:
-        fr1 = _compile_and_scan(files, budget_json=bj.name)
-    finally:
-        os.unlink(bj.name)
+    if sys.implementation.name != "shivyc":
+        bj = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        json.dump(flat, bj)
+        bj.close()
+        try:
+            fr1 = _compile_and_scan(files, budget_json=bj.name)
+        finally:
+            os.unlink(bj.name)
+    else:
+        fr1 = fr0
     plan1 = analyze(threads, graph.edges, fr1)
 
     print("=== after constrained re-allocation ===")
