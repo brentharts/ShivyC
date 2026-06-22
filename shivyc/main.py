@@ -423,7 +423,6 @@ def process_py_file(file, args):
     """
     if sys.implementation.name != "shivyc":
         import os
-        import sys
         import re
         import tempfile
 
