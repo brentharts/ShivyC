@@ -5586,10 +5586,15 @@ class Transpiler:
             self.emit("va_list _ap; va_start(_ap, _n_%s);" % vn)
             self.emit("obj %s = varg_list(_n_%s, _ap);" % (cname(vn), vn))
             self.emit("va_end(_ap);")
-        self.emit("%s___init__(%s);" % (ci.csym,
-                                        ", ".join(["self"] + argnames)))
+        # Class-level attributes (constants like AT/GOT/AFTER and list/dict
+        # statics) exist before any __init__ runs in Python, and __init__ may
+        # read them (e.g. ParserError.__init__ dispatches on self.AT/AFTER), so
+        # initialize them BEFORE calling __init__. Doing it after left those
+        # fields uninitialized during __init__, which read garbage.
         self.emit_class_attr_init(ci)
         self.emit_class_static_instance_init(ci)
+        self.emit("%s___init__(%s);" % (ci.csym,
+                                        ", ".join(["self"] + argnames)))
         self.emit("return self;")
         self.indent -= 1
         self.emit("}")
@@ -5634,11 +5639,11 @@ class Transpiler:
             self.xstructs_needed.add(owner.name)
             if "__init__" in owner.methods:
                 self.used_xmethods[(owner.name, "__init__")] = "void"
+        self.emit_class_attr_init(ci)
+        self.emit_class_static_instance_init(ci)
         self.emit("%s___init__((%s*)self%s);" % (
             owner.csym, owner.csym,
             (", " + ", ".join(argnames)) if argnames else ""))
-        self.emit_class_attr_init(ci)
-        self.emit_class_static_instance_init(ci)
         self.emit("return self;")
         self.indent -= 1
         self.emit("}")
@@ -7217,8 +7222,15 @@ class Transpiler:
     def _emit_attr_assign(self, tgt, value_node):
         val = self.wrap_obj(value_node)
         if self._attr_is_property(tgt) or self._attr_assign_needs_setattr(tgt):
+            # mp_call_import reads each variadic argument as a 16-byte `obj`
+            # (va_arg(ap, obj)), so the attribute name must be passed as an
+            # OBJ_STR, not a bare `const char*` -- otherwise the 8-byte pointer
+            # is misread as the front half of an obj and the rest is pulled
+            # from the next argument, yielding a garbage name (AS_STR -> NULL,
+            # crashing rt_setattr's strcmp).
             return 'mp_call_import("builtins", "setattr", 3, %s, %s, %s);' % (
-                self.wrap_obj(tgt.value), c_string(tgt.attr), val)
+                self.wrap_obj(tgt.value),
+                "OBJ_STR(%s)" % c_string(tgt.attr), val)
         t = self.target_ctype(tgt) or OBJ
         raw = self.expr(value_node)
         return "%s = %s;" % (self.expr(tgt), self.coerce_to(t, value_node, raw))
@@ -7721,6 +7733,16 @@ class Transpiler:
     def st_Break(self, node):
         pre, restore = self._try_finallys(stop_at_loop=True)
         tail = (["g_exc_sp = %s;" % restore] if restore is not None else [])
+        # A break means the loop did NOT run to completion, so its else-suite
+        # must be skipped: clear the nearest enclosing loop's for/while-else
+        # flag (if any) before leaving.
+        fe = None
+        for e in reversed(self.try_stack):
+            if e["kind"] == "loop":
+                fe = e.get("fe")
+                break
+        if fe:
+            tail = ["%s = 0;" % fe] + tail
         return pre + tail + ["break;"]
 
     def st_Continue(self, node):
@@ -7938,11 +7960,26 @@ class Transpiler:
             self.exc_n += 1
             esp = "_lesp%d" % self.exc_n
             pre = ["int %s = g_exc_sp;" % esp]
-        self.try_stack.append({"kind": "loop", "esp": esp})
+        # for/while ... else: the else-suite runs iff the loop finishes WITHOUT
+        # a break. Lower it with a flag that starts 1 and is cleared by any
+        # break targeting this loop (see st_Break); after the loop, run the
+        # else-suite when the flag is still set. Previously the orelse was
+        # dropped entirely, which silently broke `for x in xs: if ...: break
+        # else: return` patterns -- e.g. the parser's parse_series fell through
+        # to parse another base instead of returning when no separator matched.
+        fe = None
+        if node.orelse:
+            self.exc_n += 1
+            fe = "_fe%d" % self.exc_n
+            pre = pre + ["int %s = 1;" % fe]
+        self.try_stack.append({"kind": "loop", "esp": esp, "fe": fe})
         try:
             lines = impl()
         finally:
             self.try_stack.pop()
+        if fe:
+            lines = lines + ["if (%s) {" % fe] \
+                + self.indent_lines(self.suite(node.orelse)) + ["}"]
         return pre + lines
 
     def st_While(self, node):
@@ -7969,6 +8006,19 @@ class Transpiler:
                 lo, hi, stp = a[0], a[1], "1"
             else:
                 lo, hi, stp = a[0], a[1], a[2]
+            # range() with a negative step counts DOWN, so the C continuation
+            # test must be `>` (not `<`): `for i in range(n, -1, -1)` visits
+            # n, n-1, ..., 0. Emitting `<` unconditionally made every such
+            # descending loop fall through without running (e.g. the parser's
+            # _find_pair_backward returned its start index instead of scanning
+            # back to the matching paren). Pick the test from the step's sign:
+            # a compile-time-constant step decides it directly; a runtime step
+            # is tested per-iteration so either direction works.
+            stepc = _const_value(it.args[2]) if len(it.args) >= 3 else 1
+            if stepc is not None:
+                cont = "%s %s %s" % (v, ">" if stepc < 0 else "<", hi)
+            else:
+                cont = "(%s) < 0 ? %s > %s : %s < %s" % (stp, v, hi, v, hi)
             decl = "" if tgt.id in self.hoisted else "int "
             if tgt.id in self.hoisted and self.scope.get(tgt.id) == OBJ:
                 # The loop variable is also used as a boxed obj elsewhere (e.g.
@@ -7978,14 +8028,19 @@ class Transpiler:
                 # of assigning an int straight into the obj variable.
                 self.loop_n += 1
                 ii = "_ri%d" % self.loop_n
-                lines = ["for (long %s = %s; %s < %s; %s += %s) {" %
-                         (ii, lo, ii, hi, ii, stp)]
+                if stepc is not None:
+                    icont = "%s %s %s" % (ii, ">" if stepc < 0 else "<", hi)
+                else:
+                    icont = "(%s) < 0 ? %s > %s : %s < %s" % (stp, ii, hi,
+                                                              ii, hi)
+                lines = ["for (long %s = %s; %s; %s += %s) {" %
+                         (ii, lo, icont, ii, stp)]
                 lines.append("    %s = OBJ_INT(%s);" % (v, ii))
                 lines += self.indent_lines(self.suite(node.body))
                 lines.append("}")
                 return lines
-            lines = ["for (%s%s = %s; %s < %s; %s += %s) {" %
-                     (decl, v, lo, v, hi, v, stp)]
+            lines = ["for (%s%s = %s; %s; %s += %s) {" %
+                     (decl, v, lo, cont, v, stp)]
             lines += self.indent_lines(self.suite(node.body))
             lines.append("}")
             return lines
