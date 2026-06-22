@@ -200,3 +200,58 @@ def sgd_step_f32(w: "f32*", grad: "f32*", lr: "f32", n) -> None:
     while i < n:
         w[i] = w[i] - lr * grad[i]
         i = i + 1
+
+
+# =========================================================================
+# int8 / uint8 quantized path -- post-training-quantized inference.
+#
+# Weights and activations are unsigned bytes (`u8`). A quantized linear layer
+# with real values w = sw*(qw - zpw) and x = sx*qx expands to
+#
+#     y[o] = sw*sx * ( sum_i qw[o][i]*qx[i]  -  zpw * sum_i qx[i] )
+#
+# `qbytesum_u8` is the zero-point correction term: a sum of unsigned bytes,
+# which ShivyCX lowers to the PSADBW instruction (a hardware byte accumulator
+# that sums 16 bytes into two 64-bit lanes with no 8-bit overflow). The
+# `assert len(x) % 16 == 0` contract licenses that lowering and sits behind
+# `#ifdef __SHIVYC__` so gcc compiles the same source.
+#
+# Note: a SIMD contract is only *proven* when the kernel and its call sites
+# share one translation unit. When `rpy_torch` is auto-bundled as a separate
+# module the byte sum still runs (correct) but as scalar code; the self-contained
+# `examples/rpython2c/nn/quant_mlp.py` is where PSADBW is actually proven and
+# emitted. Layer widths must be multiples of 16 for the contract to hold.
+# =========================================================================
+
+
+def qbytesum_u8(x: "u8*", n) -> int:
+    assert len(x) % 16 == 0                          # PSADBW contract (guarded)
+    acc = 0
+    i = 0
+    while i < n:
+        acc = acc + x[i]
+        i = i + 1
+    return acc
+
+
+def qdot_u8(w: "u8*", x: "u8*", off: "int", n) -> int:
+    acc = 0
+    i = 0
+    while i < n:
+        acc = acc + w[off + i] * x[i]
+        i = i + 1
+    return acc
+
+
+def qlinear_u8(w: "u8*", x: "u8*", xsum: "int", out: "u8*",
+               n_in: "int", n_out: "int", zpw: "int", shift: "int") -> None:
+    o = 0
+    while o < n_out:
+        acc = qdot_u8(w, x, o * n_in, n_in) - zpw * xsum
+        acc = acc >> shift
+        if acc < 0:
+            acc = 0                                   # ReLU
+        if acc > 255:
+            acc = 255                                 # saturate to u8
+        out[o] = acc
+        o = o + 1
