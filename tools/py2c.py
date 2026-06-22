@@ -9528,7 +9528,7 @@ class Transpiler:
             parts.append(str(len(wrapped)))
             parts.extend(wrapped)
             return "%s_%s(%s)" % (owner.csym, m.name, ", ".join(parts))
-        cargs = self.coerce_args(pct, arg_nodes)
+        cargs = self.coerce_args(pct, arg_nodes, self.defaults_for(m, True))
         return "%s_%s(%s%s)" % (
             owner.csym, m.name, recv,
             (", " + ", ".join(cargs)) if cargs else "")
