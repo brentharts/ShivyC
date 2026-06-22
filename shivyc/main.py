@@ -265,7 +265,8 @@ def main():
             out = arguments.output_name[0]
         writable_text = (getattr(arguments, "metamorphic", False)
                          or getattr(arguments, "opt_level", 0) >= 4)
-        if not link_objs(out, objs, writable_text):
+        if not link_objs(out, objs, writable_text,
+                         getattr(arguments, "low_mem", False)):
             err = "linker returned non-zero status"
             print(CompilerError(err))
             return 1
@@ -873,6 +874,7 @@ class Arguments:
         self.eliminate_unused_members = False
         self.print_eliminated_members = False
         self.long_double_as_double = False
+        self.low_mem = False
         self.opt_level = 0
         self.output_name = None
         self.include_dirs = []
@@ -954,6 +956,8 @@ def _parse_args_selfhost(argv):
             args.eliminate_unused_members = True
         elif a == '-f-long-double-as-double':
             args.long_double_as_double = True
+        elif a == '-f-low-mem':
+            args.low_mem = True
         elif len(a) > 0 and a[0] == '-':
             pass
         else:
@@ -1037,6 +1041,16 @@ def get_arguments(argv=None):
             help="treat 'long double' as 64-bit double (with a warning); this "
                  "compiler never supports 80-bit floats",
             dest="long_double_as_double", action="store_true")
+
+        parser.add_argument(
+            "-f-low-mem",
+            help="link the output as a non-PIE executable based in the low "
+                 "32-bit address range (text segment at 0x400000). Every "
+                 "static address then fits in 32 bits, so a 64-bit register "
+                 "holding such a pointer is zero-extended for free -- the "
+                 "groundwork for a future -f-pointer-compression that shrinks "
+                 "in-struct pointers to 32 bits",
+            dest="low_mem", action="store_true")
 
         # Optimization level. -O4 is aggressive and, like -fmetamorphic, depends on
         # a writable text segment; it turns on whole-program stackless lowering and
@@ -1173,13 +1187,23 @@ def assemble(asm_name, obj_name):
         return True
 
 
-def link_objs(binary_name, obj_names, writable_text=False):
+def link_objs(binary_name, obj_names, writable_text=False, low_mem=False):
     """Assemble the given object files into a binary.
 
     When `writable_text` is set (for -fmetamorphic / -O4), the linker is asked
     to emit a writable, non-page-aligned text segment via `-N` (OMAGIC), so
     self-modifying metamorphic-return code can patch instruction bytes at run
     time. This is intentionally unsafe and opt-in.
+
+    When `low_mem` is set (-f-low-mem), the binary is linked as a non-PIE
+    executable based in the low 32-bit address range (text segment at
+    0x400000, the classic ET_EXEC base -- well above the kernel's
+    vm.mmap_min_addr guard, so it is not rejected). With the whole image below
+    4 GiB, every static code/data address fits in 32 bits; on x86-64 a write to
+    a 32-bit register zero-extends its 64-bit counterpart, so such a pointer
+    needs no base-register add to reconstruct. This is the groundwork for a
+    later -f-pointer-compression (32-bit in-struct pointers); the heap side of
+    that would additionally map the arena with MAP_32BIT.
     """
     import os
 
@@ -1200,6 +1224,11 @@ def link_objs(binary_name, obj_names, writable_text=False):
     # Writable text for metamorphic returns is arranged via the .text
     # section's "awx" flag (set in asm_gen), which is compatible with the
     # glibc crt startup; the older -N/OMAGIC route is not.
+    if low_mem:
+        # Force a fixed, low load address (non-PIE ET_EXEC). -no-pie keeps ld
+        # from emitting a position-independent ET_DYN that the loader would
+        # place at a random high address.
+        cmd += ["-no-pie", "-Ttext-segment=0x400000"]
     cmd += ["-dynamic-linker", linux_so, crtnum, crti, "-lc", "-lm"]
     cmd = cmd + obj_names + [crtn, "-o", binary_name]
 
