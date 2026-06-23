@@ -1233,7 +1233,7 @@ class Declaration(Node):
         base_specs = set(ctypes.simple_types)
         base_specs |= {token_kinds.signed_kw, token_kinds.unsigned_kw}
 
-        our_base_specs = [str(spec.kind) for spec in specs
+        our_base_specs = [spec.kind.text_repr for spec in specs
                           if spec.kind in base_specs]
         specs_str = " ".join(sorted(our_base_specs))
 
