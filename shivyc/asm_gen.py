@@ -192,11 +192,11 @@ class NodeGraph:
         self._conf = {n: [] for n in self._all_nodes}
         self._pref = {n: [] for n in self._all_nodes}
 
-    def is_node(self, n):
+    def is_node(self, n: "object"):
         """Check whether given node is in the graph."""
         return n in self._conf and n in self._pref
 
-    def add_dummy_node(self, v):
+    def add_dummy_node(self, v: "object"):
         """Add a dummy node to graph."""
         self._all_nodes.append(v)
         self._conf[v] = []
@@ -207,21 +207,21 @@ class NodeGraph:
             if n not in self._real_nodes and n != v:
                 self.add_conflict(n, v)
 
-    def add_conflict(self, n1, n2):
+    def add_conflict(self, n1: "object", n2: "object"):
         """Add a conflict edge between n1 and n2."""
         if n2 not in self._conf[n1]:
             self._conf[n1].append(n2)
         if n1 not in self._conf[n2]:
             self._conf[n2].append(n1)
 
-    def add_pref(self, n1, n2):
+    def add_pref(self, n1: "object", n2: "object"):
         """Add a preference edge between n1 and n2."""
         if n2 not in self._pref[n1]:
             self._pref[n1].append(n2)
         if n1 not in self._pref[n2]:
             self._pref[n2].append(n1)
 
-    def pop(self, n):
+    def pop(self, n: "object"):
         """Remove and return node n from this graph."""
         del self._conf[n]
         del self._pref[n]
@@ -238,7 +238,7 @@ class NodeGraph:
                 self._pref[v].remove(n)
         return n
 
-    def merge(self, n1, n2):
+    def merge(self, n1: "object", n2: "object"):
         """Merge nodes n1 and n2.
 
         This function merges n2 into n1. That is, it removes n2 from the
@@ -283,16 +283,16 @@ class NodeGraph:
         self._real_nodes.remove(n2)
         self._all_nodes.remove(n2)
 
-    def remove_pref(self, n1, n2):
+    def remove_pref(self, n1: "object", n2: "object"):
         """Remove the preference edge between n1 and n2."""
         self._pref[n1].remove(n2)
         self._pref[n2].remove(n1)
 
-    def prefs(self, n):
+    def prefs(self, n: "object"):
         """Return the list of nodes to which n has a preference edge."""
         return self._pref[n]
 
-    def confs(self, n):
+    def confs(self, n: "object"):
         """Return the list of nodes with which n has a conflict edge."""
         return self._conf[n]
 
