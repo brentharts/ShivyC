@@ -161,7 +161,7 @@ wayland:
 
 rpyqt:
 	@mkdir -p $(GUIBIN)/rpyqt
-	@cp -f $(RPY)/rpyqt/xdg-shell.xml $(GUIBIN)/rpyqt/ 2>/dev/null || true
+	@cp -f $(RPY)/rpy_lib/xdg-shell.xml $(GUIBIN)/rpyqt/ 2>/dev/null || true
 	python3 tools/py2c.py $(RPY)/rpyqt_helloworld.py --out $(GUIBIN)/rpyqt
 	cc $(WL_CFLAGS) -I$(GUIBIN)/rpyqt $(GUIBIN)/rpyqt/*.c \
 	    -o $(GUIBIN)/qt_app $(WL_LIBS)
@@ -169,8 +169,8 @@ rpyqt:
 
 controls:
 	@mkdir -p $(GUIBIN)/controls
-	@cp -f $(RPY)/controls/xdg-shell.xml $(GUIBIN)/controls/ 2>/dev/null || true
-	python3 tools/py2c.py $(RPY)/controls/app.py --out $(GUIBIN)/controls
+	@cp -f $(RPY)/rpy_lib/xdg-shell.xml $(GUIBIN)/controls/ 2>/dev/null || true
+	python3 tools/py2c.py $(RPY)/rpyqt_controls.py --out $(GUIBIN)/controls
 	cc $(WL_CFLAGS) -I$(GUIBIN)/controls $(GUIBIN)/controls/*.c \
 	    -o $(GUIBIN)/controls_app $(WL_LIBS)
 	@echo "built $(GUIBIN)/controls_app  (run it under a Wayland compositor)"
