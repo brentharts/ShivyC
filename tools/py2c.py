@@ -986,6 +986,15 @@ bool obj_eq(obj a, obj b) {
         case T_INT:
         case T_BOOL: return a.u.i == b.u.i;
         case T_STR:  return strcmp(a.u.s, b.u.s) == 0;
+        case T_LIST: {                /* ordered: same length, elementwise equal
+                                         (also covers tuples, which are lists) */
+            List* la = (List*)a.u.o; List* lb = (List*)b.u.o;
+            if (la == lb) return true;
+            if (la->len != lb->len) return false;
+            for (int i = 0; i < la->len; i++)
+                if (!obj_eq(la->data[i], lb->data[i])) return false;
+            return true;
+        }
         case T_SET: {                 /* order-independent: same elements */
             List* la = (List*)a.u.o; List* lb = (List*)b.u.o;
             if (la->len != lb->len) return false;
@@ -1679,7 +1688,7 @@ FLOAT_SUFFIXES = ("ratio", "rate", "pct", "scale", "factor", "freq", "prob")
 STR_NAMES = {
     "name", "text", "s", "string", "msg", "message", "filename", "fname",
     "func_name", "tag", "rep", "content", "spelling", "label", "identifier",
-    "prog", "code", "asm_code", "asm_str", "text_repr", "mangled", "suffix",
+    "prog", "code", "asm_str", "text_repr", "mangled", "suffix",
     "prefix",
 }
 STR_SUFFIXES = ("str",)
@@ -3141,6 +3150,62 @@ def _slot_paddable(fns):
     return lo >= first_defaulted
 
 
+def _is_true_const(node):
+    """True if `node` is the literal `True` (a `while True:` test)."""
+    return isinstance(node, ast.Constant) and node.value is True
+
+
+def _stmt_has_own_break(s):
+    """True if statement `s` contains a `break` that targets the loop directly
+    enclosing it -- i.e. not descending into a nested loop (whose break belongs
+    to that nested loop)."""
+    if isinstance(s, ast.Break):
+        return True
+    if isinstance(s, (ast.For, ast.While, ast.AsyncFor)):
+        return False
+    if isinstance(s, ast.If):
+        return any(_stmt_has_own_break(x) for x in s.body) or \
+            any(_stmt_has_own_break(x) for x in s.orelse)
+    if isinstance(s, ast.With):
+        return any(_stmt_has_own_break(x) for x in s.body)
+    if isinstance(s, ast.Try):
+        return (any(_stmt_has_own_break(x) for x in s.body) or
+                any(_stmt_has_own_break(x) for h in s.handlers
+                    for x in h.body) or
+                any(_stmt_has_own_break(x) for x in s.orelse) or
+                any(_stmt_has_own_break(x) for x in s.finalbody))
+    return False
+
+
+def _stmts_always_exit(stmts):
+    """True if executing `stmts` always leaves via return/raise (never falls off
+    the end). Conservative: only returns True when certain, so an uncertain
+    function gets a (harmless if unreachable) default return appended."""
+    return bool(stmts) and _stmt_always_exits(stmts[-1])
+
+
+def _stmt_always_exits(s):
+    if isinstance(s, (ast.Return, ast.Raise)):
+        return True
+    if isinstance(s, ast.If):
+        if not s.orelse:
+            return False
+        return _stmts_always_exit(s.body) and _stmts_always_exit(s.orelse)
+    if isinstance(s, ast.While):
+        # `while True:` with no break of its own never falls through.
+        return _is_true_const(s.test) and not any(
+            _stmt_has_own_break(x) for x in s.body)
+    if isinstance(s, ast.With):
+        return _stmts_always_exit(s.body)
+    if isinstance(s, ast.Try):
+        if s.finalbody and _stmts_always_exit(s.finalbody):
+            return True
+        main = s.orelse if s.orelse else s.body
+        return _stmts_always_exit(main) and \
+            all(_stmts_always_exit(h.body) for h in s.handlers)
+    return False
+
+
 def hier_canon_key(classes, byname, root_key):
     """Canonical vtable method names for a hierarchy: every method that is
     polymorphically dispatched. That is the root's own interface PLUS any method
@@ -4034,6 +4099,26 @@ class Transpiler:
                     self.xclass_module.setdefault(bn, src)
                 return True
             work += list(reg["imports"].values())
+        # Fallback: the class's defining module is not reachable through this
+        # module's import graph (the graph is directional -- e.g. il_cmds never
+        # imports asm_gen, though asm_gen imports il_cmds). Resolve it through
+        # the project-wide class scan: if exactly one project module defines
+        # `cls`, load that module so a `mod.Class` annotation can still type the
+        # param (letting an ambiguous method like `add` dispatch through the
+        # receiver's real class vtable).
+        try:
+            _classes_h, byname_h = project_class_hierarchy(self.base_dir)
+        except Exception:
+            byname_h = {}
+        mods = byname_h.get(cls)
+        if mods and len(mods) == 1:
+            src = mods[0]
+            reg = self.load_xmod(src)
+            if reg and cls in reg["classes"]:
+                for bn, bci in reg["classes"].items():
+                    self.xclasses.setdefault(bn, (bci, src))
+                    self.xclass_module.setdefault(bn, src)
+                return True
         return False
 
     def _load_missing_xclass(self, base, from_mod):
@@ -4575,6 +4660,13 @@ class Transpiler:
         if not (cls and (cls[0].isupper() or cls[0] == "_")
                 and cls.isidentifier()):
             return None
+        if cls not in self.classes and cls not in self.xclasses:
+            # The class is referenced via a module import (e.g. `il_gen.ILCode`
+            # from `import ... as il_gen`), so it isn't in xclasses yet. Load it
+            # from a reachable import so the annotation can type the param (which
+            # lets a method call on it dispatch through the RIGHT class's vtable,
+            # not an unrelated module that defines a same-named method).
+            self._load_xclass_anywhere(cls)
         if cls not in self.classes and cls not in self.xclasses:
             return None                  # not a class whose fields we can resolve
         if cls in self.ambiguous:
@@ -5438,8 +5530,25 @@ class Transpiler:
         return out
 
     def _method_proto_params(self, fn):
-        """Positional params only (vtable slots share a uniform positional ABI)."""
-        return [arg_ctype(fn, a) for a in fn.args.args[1:]]
+        """Positional params only (vtable slots share a uniform positional ABI).
+
+        A class-pointer param (e.g. `NodeGraph*` from a bare `g: "NodeGraph"`
+        annotation) is narrowed to the boxed `obj` ABI -- matching what the impl
+        signature (_vtable_c_param_list) and enter_scope already do -- so the
+        slot doesn't declare `NodeGraph*` while the impl takes `obj` (which made
+        a caller pass an 8-byte pointer where the callee reads a 16-byte obj).
+        The test is purely lexical (uppercase/underscore-led base), NOT a
+        self.classes/xclasses membership check, so the slot signature is
+        identical in every module and cross-module vtable layouts stay in sync.
+        """
+        out = []
+        for a in fn.args.args[1:]:
+            ct = arg_ctype(fn, a)
+            if fn.name in VTABLE_METHODS and ct.endswith("*") and ct != OBJ \
+                    and (ct[0].isupper() or ct[0] == "_"):
+                ct = OBJ
+            out.append(ct)
+        return out
 
     def _vtable_kwonly_union(self, mname):
         n = 0
@@ -5800,6 +5909,7 @@ class Transpiler:
             argnames.append(self.pname(a.arg))
         self.emit("void %s___init__(%s) {" % (ci.csym, init_sig))
         self.indent += 1
+        self.cur_ret = "void"
         self.emit_hoisted_body(fn.body)
         self.indent -= 1
         self.emit("}")
@@ -6246,6 +6356,19 @@ class Transpiler:
             self.hoisted.add(name)
             self.emit("%s %s;" % (self.ctype_csym(ct), self.pname(name)))
         self.emit_body(body)
+        # A Python function that can fall off the end implicitly returns None.
+        # Emit the matching default return so a non-void C function never leaves
+        # an uninitialised (garbage, usually truthy) value in the return
+        # register -- which otherwise makes callers that test the result loop
+        # forever (e.g. `while _coalesce_once(g): ...` on an empty graph).
+        ret = getattr(self, "cur_ret", OBJ)
+        if ret and ret != "void" and not _stmts_always_exit(body):
+            if ret in (OBJ, "obj"):
+                self.emit("return OBJ_NONE;")
+            elif ret.endswith("*"):
+                self.emit("return NULL;")
+            else:
+                self.emit("return 0;")
 
     # ---- top level (non-class) -------------------------------------------
 
@@ -9713,7 +9836,7 @@ class Transpiler:
                 kind, info = self.xref(fn, self.from_imports[fn])
                 if kind == "class":
                     self._ref_xclass(info, body=True)
-                    init = info.methods.get("__init__")
+                    init = self._resolve_init(info)
                     pct = [arg_ctype(init, a) for a in init.args.args[1:]] \
                         if init else []
                     defs = self.defaults_for(init, True) if init else None
@@ -9945,7 +10068,7 @@ class Transpiler:
                 kind, info = self.xref(func.attr, modname)
                 if kind == "class":
                     self._ref_xclass(info, body=True)
-                    init = info.methods.get("__init__")
+                    init = self._resolve_init(info)
                     pct = [arg_ctype(init, a) for a in init.args.args[1:]] \
                         if init else []
                     defs = self.defaults_for(init, True) if init else None
@@ -10016,6 +10139,9 @@ class Transpiler:
             if func.attr in self.hierarchy_method and \
                     not self._local_method_accepts_argc(func.attr,
                                                          len(node.args)):
+                _nmod = self._narrowed_recv_vt_module(func)
+                if _nmod is not None:
+                    return self.xvcall(_nmod, func.value, func.attr, node.args)
                 return self.xvcall(self.hierarchy_method[func.attr],
                                    func.value, func.attr, node.args)
             # A static method invoked on the class itself
@@ -10344,6 +10470,35 @@ class Transpiler:
             return "AS_OBJ(%s)" % s
         return "(Obj*)(%s)" % s
 
+    def _narrowed_recv_vt_module(self, func):
+        """If `func.value` is a receiver narrowed to a concrete class whose OWN
+        module dispatches `func.attr` through its vtable, return that module.
+        Lets an ambiguous method name (e.g. `add`, defined in both
+        ErrorCollector and ILCode) bind to the receiver's real class vtable
+        rather than whichever hierarchy the generic resolver happened to pick."""
+        if not (isinstance(func.value, ast.Name)
+                and func.value.id in self.narrowed):
+            return None
+        cls = self.narrowed[func.value.id][:-1]
+        ci = self.classes.get(cls) or (self.xclasses[cls][0]
+                                       if cls in self.xclasses else None) \
+            or self._ci_by_csym(cls)
+        if ci is None:
+            return None
+        owner = ci.find_method_owner(func.attr)
+        if owner is None and func.attr in ci.methods:
+            owner = ci
+        if owner is None or func.attr not in owner.methods:
+            return None
+        if owner.name in self.classes:      # local impl: not a cross-module call
+            return None
+        mod = self.xclass_module.get(owner.name) \
+            or self.xclasses.get(owner.name, (None, None))[1]
+        reg = self.load_xmod(mod) if mod else None
+        if reg and func.attr in reg["vt"]:
+            return mod
+        return None
+
     def vtable_recv(self, recv_node):
         """Single (Obj*) cast of a receiver for TYPE()/vtable dispatch."""
         s = self.expr(recv_node)
@@ -10441,8 +10596,19 @@ class Transpiler:
         cargs = self.coerce_args(pct, arg_nodes, defs)
         return "TYPE(%s)->%s(%s)" % (xo, vslot_name(meth), ", ".join([xo] + cargs))
 
-    def init_param_ctypes(self, ci):
+    def _resolve_init(self, ci):
+        """The __init__ FunctionDef for `ci`, inherited from a base when the
+        class defines none of its own (so constructor calls to a subclass that
+        only inherits its initializer still coerce args to the right types)."""
         init = ci.methods.get("__init__")
+        if not init:
+            owner = ci.find_method_owner("__init__")
+            if owner is not None:
+                init = owner.methods.get("__init__")
+        return init
+
+    def init_param_ctypes(self, ci):
+        init = self._resolve_init(ci)
         if not init:
             return []
         return [arg_ctype(init, a) for a in init.args.args[1:]]
