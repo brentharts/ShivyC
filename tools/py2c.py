@@ -209,6 +209,7 @@ typedef struct TypeInfoHdr {
     const char* name;
     const struct TypeInfoHdr* base;
     const FieldDesc* fields;
+    obj (*tostr)(Obj*);
 } TypeInfoHdr;
 
 static inline bool isinstance_of(Obj* o, const void* t) {
@@ -764,7 +765,16 @@ str pystr(obj v) {
             }
             *p++ = '}'; *p = 0; return b;
         }
-        default:     b = aalloc(24); sprintf(b, "<obj %p>", (void*)v.u.o); return b;
+        default:
+            if (v.u.o) {
+                const TypeInfoHdr* _h = (const TypeInfoHdr*)v.u.o->type;
+                if (_h && _h->tostr) {
+                    obj _s = _h->tostr(v.u.o);
+                    if (_s.tag == T_STR) return _s.u.s ? _s.u.s : "";
+                    return pystr(_s);
+                }
+            }
+            b = aalloc(24); sprintf(b, "<obj %p>", (void*)v.u.o); return b;
     }
 }
 
@@ -3890,6 +3900,7 @@ class Transpiler:
         self.xvt_needed = set()     # imported modules needing a VT struct emitted
         self.xtype_externs = set()  # imported TypeInfo singletons (Cls_type)
         self.xvtable_impls = set()  # (clsname, method) imported vtable slot impls
+        self._tostr_externs = set()  # csyms of imported classes whose __str__ we reference
         self.xconstdict_externs = set()  # (clsname, dict) imported const-dict fns
         self.xclass_module = {}     # imported class name -> its module
         for cn, (ci, mod) in self.xclasses.items():
@@ -4225,7 +4236,8 @@ class Transpiler:
                     classes.add(base)
         if not (classes or funcs or singles or globs or self.used_xmethods or
                 self.xvt_needed or self.xtype_externs or self.xvtable_impls or
-                self.xconstdict_externs or self.xshadow_td):
+                self.xconstdict_externs or self.xshadow_td or
+                self._tostr_externs):
             return []
         out = ["/* ---- cross-module imports (extern declarations) ---- */"]
         emitted_td = set()
@@ -4296,6 +4308,8 @@ class Transpiler:
                     self.xcsym(cls), meth))
         for cls in sorted(self.xtype_externs):          # imported TypeInfo
             out.append("extern const TypeInfo %s_type;" % self.xcsym(cls))
+        for cs in sorted(self._tostr_externs):           # imported __str__ impls
+            out.append("extern obj %s___str__(Obj*);" % cs)
         for (cls, d) in sorted(self.xconstdict_externs):  # imported const-dicts
             out.append("extern str %s_%s();" % (self.xcsym(cls), d))
             out.append("extern obj %s_%s_items();" % (self.xcsym(cls), d))
@@ -4308,6 +4322,7 @@ class Transpiler:
             out.append("    const char* name;")
             out.append("    const struct %s* base;" % vt)
             out.append("    const FieldDesc* fields;")
+            out.append("    obj (*tostr)(Obj*);")
             for m in sorted(reg["vt"]):
                 ret, params = self.ximported_method_sig(mod, m)
                 out.append("    %s (*%s)(%s);" % (
@@ -4335,6 +4350,9 @@ class Transpiler:
                 else:
                     protos.append("%s* %s_new(void);" % (ci.csym, ci.csym))
             for mname, fn in ci.methods.items():
+                if mname == "__str__" and mname not in ci.static_methods:
+                    protos.append("obj %s___str__(Obj* self_);" % ci.csym)
+                    continue
                 if mname.startswith("__") and mname.endswith("__") \
                         and mname not in ("__init__", "__enter__", "__exit__"):
                     continue
@@ -5462,6 +5480,7 @@ class Transpiler:
         self.emit("const char* name;")
         self.emit("const struct TypeInfo* base;")
         self.emit("const FieldDesc* fields;")
+        self.emit("obj (*tostr)(Obj*);")
         for m in sorted(VTABLE_METHODS):
             self.emit(self.vslot_signature(m) + ";")
         self.indent -= 1
@@ -5706,6 +5725,9 @@ class Transpiler:
         for mname, fn in ci.methods.items():
             if mname == "__init__":
                 continue
+            if mname == "__str__" and mname not in ci.static_methods:
+                self.emit_tostr_method(ci, fn)
+                continue
             if mname.startswith("__") and mname.endswith("__"):
                 if mname not in ("__enter__", "__exit__"):
                     self.emit("/* %s.%s: dunder not lowered in this pass */"
@@ -5896,6 +5918,35 @@ class Transpiler:
             c = c.base
         return None
 
+    def _project_nearest_init(self, ci):
+        """Nearest `__init__` FunctionDef walking ci's base chain through the
+        project-wide class scan. Needed for the ctor trampoline of an *imported*
+        class whose `__init__` is inherited from a base that was never loaded as
+        an xclass in this module (so _nearest_init's local walk stops short and
+        the trampoline would call Class_new() with no args -> garbage fields)."""
+        if ci is None:
+            return None
+        classes_h, byname_h = project_class_hierarchy(self.base_dir)
+        mod = (self.xclass_module.get(ci.name)
+               or (self.xclasses[ci.name][1] if ci.name in self.xclasses
+                   else None)
+               or self.modname)
+        key = _hier_resolve(classes_h, byname_h, mod, ci.name)
+        seen = set()
+        while key and key not in seen:
+            seen.add(key)
+            entry = classes_h.get(key)
+            if entry is None:
+                return None
+            fn = entry["fns"].get("__init__")
+            if fn is not None:
+                return fn
+            bn = entry["base"]
+            if not bn:
+                return None
+            key = _hier_resolve(classes_h, byname_h, key[0], bn)
+        return None
+
     def emit_constructor(self, ci, fn):
         self.enter_scope(fn, skip_self=True)
         init_params = self._init_param_list(fn, skip_self=True)
@@ -6053,6 +6104,21 @@ class Transpiler:
         self.emit("}")
         self.emit()
 
+    def emit_tostr_method(self, ci, fn):
+        """Lower `__str__` to a standalone `obj <Class>___str__(Obj*)` so that
+        pystr can dispatch it through the TypeInfo `tostr` slot (str()/print() of
+        an object). __str__ is otherwise an unlowered dunder."""
+        self.enter_scope(fn, skip_self=True)
+        self.cur_ret = OBJ
+        self.emit("obj %s___str__(Obj* self_) {" % ci.csym)
+        self.indent += 1
+        self.emit("%s* self = (%s*)self_;" % (ci.csym, ci.csym))
+        self.emit("(void)self;")
+        self.emit_hoisted_body(fn.body)
+        self.indent -= 1
+        self.emit("}")
+        self.emit()
+
     def emit_vtable(self, ci):
         if ci.csym in self._pod_set:
             return                          # POD class: no TypeInfo / vtable
@@ -6070,9 +6136,17 @@ class Transpiler:
                 self.xvtable_impls.add((owner.name, m))
             slots.append(".%s = %s" % (vslot_name(m), ("%s_%s" % (owner.csym, method_cname(m)))
                                        if owner else "NULL"))
+        str_owner = ci.find_method_owner("__str__")
+        if str_owner and "__str__" not in str_owner.static_methods:
+            tostr = "%s___str__" % str_owner.csym
+            if str_owner.name not in self.classes:      # imported __str__ impl
+                self._tostr_externs.add(str_owner.csym)
+        else:
+            tostr = "NULL"
         init = ", ".join([".name = %s" % c_string(ci.name),
                           ".base = (const struct TypeInfo*)%s" % base,
-                          ".fields = %s__fields" % ci.csym] + slots)
+                          ".fields = %s__fields" % ci.csym,
+                          ".tostr = %s" % tostr] + slots)
         self.emit("const TypeInfo %s_type = { %s };" % (ci.csym, init))
         self.emit()
 
@@ -6611,8 +6685,18 @@ class Transpiler:
                            if c.csym == cls), None) \
                     or next((c for c, _ in self.xclasses.values()
                              if c.csym == cls), None)
+            if ci is None:
+                # An imported class used only as a first-class value (e.g. the
+                # parser stores node classes like `Plus` in an op table) was
+                # never loaded as an xclass here. Load it project-wide so its
+                # (possibly inherited) __init__ resolves -- otherwise the
+                # trampoline calls Class_new() with no args -> garbage fields.
+                self._load_xclass_anywhere(cls)
+                ci = self.xclasses[cls][0] if cls in self.xclasses else None
             ni = self._nearest_init(ci) if ci else None
             init = ni[1] if ni else (ci.methods.get("__init__") if ci else None)
+            if init is None and ci is not None:
+                init = self._project_nearest_init(ci)
             self._emit_ctortramp(cls, ci, init)
 
     def emit_module_init(self):
@@ -8754,6 +8838,7 @@ class Transpiler:
         items = ", ".join(self.src1(i.context_expr) for i in node.items)
         lines = ["/* with %s */ {" % items]
         binds = []
+        file_closes = []
         for it in node.items:
             tv = it.optional_vars
             if isinstance(tv, ast.Name):
@@ -8762,10 +8847,18 @@ class Transpiler:
                 self.scope[tv.id] = ct             # body sees the real type
                 binds.append("%s %s = %s;" % (
                     self.ctype_csym(ct), self.lid(tv.id), rhs))
+                # `with open(...) as f:` must flush+close the file on block exit
+                # (a libc FILE* otherwise buffers until process exit, so a
+                # subprocess reading the file mid-run sees it empty/partial).
+                if ct == "FILE*":
+                    self._io_used.add("fclose")
+                    file_closes.append("if (%s) fclose(%s);" % (
+                        self.lid(tv.id), self.lid(tv.id)))
             else:
                 binds.append("%s;" % self.expr(it.context_expr))
         lines += self.indent_lines(binds)
         lines += self.indent_lines(self.suite(node.body))
+        lines += self.indent_lines(file_closes)
         lines.append("}")
         return lines
 
@@ -11111,7 +11204,11 @@ class Transpiler:
         if self.is_obj_word(node) or \
                 (self.static_type(node) or self.value_ctype(node)) == OBJ:
             return "truthy(%s)" % s
-        return s
+        # A raw char* in a boolean context is truthy only when non-empty (Python
+        # string truthiness), not merely non-NULL -- otherwise `s if s else t`
+        # with an empty string picks the empty `s`. truth_test handles char*
+        # ((s && *s)), other pointers (s != NULL), and scalars ((s)) correctly.
+        return self.truth_test(node, s)
 
     # ---- operators -------------------------------------------------------
 
