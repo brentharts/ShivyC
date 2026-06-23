@@ -135,6 +135,45 @@ selfhost_coverage_musl:
 #     make rpython
 RPY    := examples/rpython2c
 RPYBIN := build/rpython
+
+# ---------------------------------------------------------------------------
+# GUI examples: pure-rpython native Wayland clients. py2c generates ALL the C
+# (the Wayland runtime + scanned xdg-shell + the bundled rwayland / rpyqt
+# libraries); we just transpile and link against libwayland-client.
+#
+#     make wayland   # the rwayland framebuffer demo  -> build/gui/wayland_app
+#     make rpyqt     # the PyQt-shaped counter        -> build/gui/qt_app
+#
+# Requires libwayland-dev + wayland-scanner (a vendored xdg-shell.xml is used
+# when /usr/share/wayland-protocols is absent). Run the binary under a Wayland
+# compositor; without one it prints "failed to connect" and exits non-zero.
+GUIBIN := build/gui
+WL_CFLAGS ?= -O2 -w
+WL_LIBS   ?= -lwayland-client
+
+wayland:
+	@mkdir -p $(GUIBIN)/wayland
+	@cp -f $(RPY)/rpy_lib/xdg-shell.xml $(GUIBIN)/wayland/ 2>/dev/null || true
+	python3 tools/py2c.py $(RPY)/wayland_helloworld.py --out $(GUIBIN)/wayland
+	cc $(WL_CFLAGS) -I$(GUIBIN)/wayland $(GUIBIN)/wayland/*.c \
+	    -o $(GUIBIN)/wayland_app $(WL_LIBS)
+	@echo "built $(GUIBIN)/wayland_app  (run it under a Wayland compositor)"
+
+rpyqt:
+	@mkdir -p $(GUIBIN)/rpyqt
+	@cp -f $(RPY)/rpyqt/xdg-shell.xml $(GUIBIN)/rpyqt/ 2>/dev/null || true
+	python3 tools/py2c.py $(RPY)/rpyqt_helloworld.py --out $(GUIBIN)/rpyqt
+	cc $(WL_CFLAGS) -I$(GUIBIN)/rpyqt $(GUIBIN)/rpyqt/*.c \
+	    -o $(GUIBIN)/qt_app $(WL_LIBS)
+	@echo "built $(GUIBIN)/qt_app  (run it under a Wayland compositor)"
+
+controls:
+	@mkdir -p $(GUIBIN)/controls
+	@cp -f $(RPY)/controls/xdg-shell.xml $(GUIBIN)/controls/ 2>/dev/null || true
+	python3 tools/py2c.py $(RPY)/controls/app.py --out $(GUIBIN)/controls
+	cc $(WL_CFLAGS) -I$(GUIBIN)/controls $(GUIBIN)/controls/*.c \
+	    -o $(GUIBIN)/controls_app $(WL_LIBS)
+	@echo "built $(GUIBIN)/controls_app  (run it under a Wayland compositor)"
 rpython:
 	@mkdir -p $(RPYBIN)
 	@fail=0; \
@@ -513,7 +552,7 @@ self:
 .PHONY: default test testfast testpromote testpgo testfuse testtorch shim install clean baremetal baremetal-hello \
         selfhost selfhost_objcore selfhost_bench selfhost_coverage \
         selfhost_coverage_musl selfhost_link \
-        rpython benchmarks \
+        rpython benchmarks wayland rpyqt controls \
         baremetal-kernel baremetal-irq minikraft run-irq \
         install_micropython clean_micropython test_micropython \
         test_micropython_core test_micropython_objects \
