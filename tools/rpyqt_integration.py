@@ -14,9 +14,10 @@ event loop, Wayland glue -- is generated. Link with `-lwayland-client`.
 """
 
 import os
+import sys
 import ast
 
-import rwayland as _rwayland   # reuse the runtime emitter
+import rwayland_integration as _rwayland   # reuse the runtime emitter
 
 LIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rpy_lib")
 LIB_FILE = os.path.join(LIB_DIR, "rpyqt.py")
@@ -43,6 +44,11 @@ def bundle(files):
     """Append the bundled rpy_lib/rpyqt.py iff some input imports it."""
     files = list(files)
     if not os.path.isfile(LIB_FILE):
+        if needed(files):
+            sys.stderr.write(
+                "py2c: a source imports `rpyqt` but the bundled library %s is "
+                "missing; the generated C will not compile. Restore "
+                "tools/rpy_lib/rpyqt.py.\n" % LIB_FILE)
         return files
     if any(os.path.basename(f) == "rpyqt.py" for f in files):
         return files

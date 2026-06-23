@@ -12328,23 +12328,38 @@ def main(argv):
         files = _rpy_torch.bundle(files)
     except Exception:
         pass
-    # First-class Wayland: bundle rpy_lib/rwayland.py and generate the glue
-    # (rwayland_rt.{h,c} + scanned xdg-shell) so no C is hand-written.
+    # First-class Wayland / PyQt: bundle rpy_lib/{rwayland,rpyqt}.py and emit the
+    # generated glue (runtime + scanned xdg-shell) so no C is hand-written. The
+    # integration modules live next to py2c.py; make that directory importable
+    # regardless of how py2c was launched (sys.path[0] is normally the script
+    # dir, but not when py2c is imported as a module or run via a wrapper).
+    _here = os.path.dirname(os.path.abspath(__file__))
+    if _here not in sys.path:
+        sys.path.insert(0, _here)
+
+    def _source_imports(mod):
+        # Cheap textual check so we can warn even when the integration import
+        # itself fails: True if any input .py imports the given rpython module.
+        for _f in files:
+            if not _f.endswith(".py"):
+                continue
+            try:
+                _src = open(_f, encoding="utf-8").read()
+            except Exception:
+                continue
+            if ("import " + mod) in _src:
+                return True
+        return False
+
     _rwayland_notes = []
-    try:
-        import rwayland as _rwayland
-        files = _rwayland.bundle(files)
-        _rwayland_notes = _rwayland.emit_runtime(out_dir, files)
-    except Exception:
-        pass
+    import rwayland_integration as _rwayland
+    files = _rwayland.bundle(files)
+    _rwayland_notes = _rwayland.emit_runtime(out_dir, files)
     # PyQt-compatible layer: bundle rpy_lib/rpyqt.py and emit the same runtime
     # (rpyqt binds it directly without importing the rwayland rpython module).
-    try:
-        import rpyqt as _rpyqt
-        files = _rpyqt.bundle(files)
-        _rwayland_notes += _rpyqt.emit_runtime(out_dir, files)
-    except Exception:
-        pass
+    import rpyqt_integration as _rpyqt
+    files = _rpyqt.bundle(files)
+    _rwayland_notes += _rpyqt.emit_runtime(out_dir, files)
     # Profile-guided auto-typing. Single .py inputs go through transpile_file's
     # per-file hook (so the ShivyCX front end gets them too); multi-file programs
     # are profiled once here as a set (one run, module-qualified types) so cross
