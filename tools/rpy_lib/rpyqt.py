@@ -74,6 +74,10 @@ COL_BTN = 0xFF0088FF
 COL_BTN_DOWN = 0xFF005FBF
 COL_TEXT = 0xFF202020
 COL_BTN_TEXT = 0xFFFFFFFF
+COL_ACCENT = 0xFF00AA00      # checkbox tick / slider handle / progress fill
+COL_TRACK = 0xFFCFCFCF       # slider / progress groove
+COL_BOX = 0xFFFFFFFF         # checkbox box interior
+COL_BORDER = 0xFF808080      # widget outlines
 
 
 # ---- 5x7 bitmap font -----------------------------------------------------
@@ -189,11 +193,60 @@ def draw_text(fb: "u32*", fbw: int, fbh: int, x: int, y: int,
         i = i + 1
 
 
-# ---- signal --------------------------------------------------------------
-class Signal:
-    """A one-slot signal: connect(fn) stores a no-arg handler, emit() calls it."""
+def _draw_border(fb: "u32*", x: int, y: int, w: int, h: int, color: int) -> None:
+    fill_rect(fb, WIN_W, WIN_H, x, y, w, 2, color)
+    fill_rect(fb, WIN_W, WIN_H, x, y + h - 2, w, 2, color)
+    fill_rect(fb, WIN_W, WIN_H, x, y, 2, h, color)
+    fill_rect(fb, WIN_W, WIN_H, x + w - 2, y, 2, h, color)
+
+
+# ---- universal base ------------------------------------------------------
+class _QtObject:
+    """Root of every rpyqt class. Carries the geometry (x/y/w/h) and the
+    place()/paint()/on_press() interface shared by BOTH widgets and layouts, so
+    a layout can hold a heterogeneous list of children (widgets or nested
+    layouts) and position, paint, and hit-test them uniformly through one
+    consistent vtable. A single local root also avoids cross-module vtable-canon
+    pinning, keeping VT_rpyqt identical on the defining and importing side."""
 
     def __init__(self):
+        self.x = 0
+        self.y = 0
+        self.w = 0
+        self.h = 0
+
+    def place(self, x: int, y: int, w: int, h: int) -> None:
+        self.x = x
+        self.y = y
+        self.w = w
+        self.h = h
+
+    def paint(self, fb: "u32*", fbw: int, fbh: int) -> None:
+        return
+
+    def contains(self, px: int, py: int) -> int:
+        # Hit-test against this object's own geometry. Done as a method (read on
+        # the concrete self) so a parent layout never reads x/y/w/h through an
+        # obj-typed child reference -- which would force those fields to be
+        # boxed (obj) instead of plain int.
+        if px >= self.x and px < self.x + self.w \
+                and py >= self.y and py < self.y + self.h:
+            return 1
+        return 0
+
+    def on_press(self, px: int, py: int) -> int:
+        return ACTION_NONE
+
+
+# ---- signal --------------------------------------------------------------
+class Signal(_QtObject):
+    """A one-slot signal: connect(fn) stores a no-arg handler, emit() calls it.
+    PyQt slots that take a value can instead read the widget's state on demand
+    (e.g. slider.value()), keeping the generated FFI simple. Object-model (via
+    _QtObject) so connect/emit are real vtable slots on both module sides."""
+
+    def __init__(self):
+        super().__init__()
         self.handler = None
 
     def connect(self, fn: "obj") -> None:
@@ -205,25 +258,31 @@ class Signal:
             f()
 
 
-# ---- widget hierarchy (all local -> one consistent vtable) ---------------
-class Widget:
-    """Base child widget. Geometry is assigned by the layout."""
+# ---- widgets -------------------------------------------------------------
+class Widget(_QtObject):
+    """Base child widget. Geometry is assigned by the parent layout via place().
+    The value/setValue/isChecked/setChecked accessors are declared here (not
+    only on the leaf widgets) so a call through an obj-typed reference -- e.g. a
+    widget stored in a slot/global -- dispatches virtually."""
 
     def __init__(self):
-        self.x = 0
-        self.y = 0
-        self.w = 0
-        self.h = 0
+        super().__init__()
         self.text = ""
 
     def setText(self, text: "char*") -> None:
         self.text = text
 
-    def paint(self, fb: "u32*", fbw: int, fbh: int) -> None:
+    def value(self) -> int:
+        return 0
+
+    def setValue(self, v: int) -> None:
         return
 
-    def on_press(self) -> int:
-        return ACTION_NONE
+    def isChecked(self) -> int:
+        return 0
+
+    def setChecked(self, v: int) -> None:
+        return
 
 
 class QLabel(Widget):
@@ -247,41 +306,123 @@ class QPushButton(Widget):
         draw_text(fb, fbw, fbh, self.x + 12, self.y + 14, self.text, 3,
                   COL_BTN_TEXT)
 
-    def on_press(self) -> int:
+    def on_press(self, px: int, py: int) -> int:
         self.clicked.emit()
         return ACTION_REDRAW
 
 
-class _QtObject:
-    """Empty local base. Giving QVBoxLayout/QWidget a base makes them
-    object-model (vtable-backed) so an instance can be boxed into an `obj` and
-    dispatched virtually. Safe here because rpyqt has no cross-module-rooted
-    class: every hierarchy is local, so they all share one consistent vtable."""
-    pass
+class QCheckBox(Widget):
+    """A labelled checkbox; clicking toggles it and emits stateChanged."""
+
+    def __init__(self, text: "char*"):
+        super().__init__()
+        self.text = text
+        self.checked = 0
+        self.stateChanged = Signal()
+
+    def isChecked(self) -> int:
+        return self.checked
+
+    def setChecked(self, v: int) -> None:
+        self.checked = v
+
+    def paint(self, fb: "u32*", fbw: int, fbh: int) -> None:
+        fill_rect(fb, fbw, fbh, self.x, self.y, self.w, self.h, COL_BG)
+        bs = 28
+        by = self.y + (self.h - bs) // 2
+        fill_rect(fb, fbw, fbh, self.x, by, bs, bs, COL_BOX)
+        _draw_border(fb, self.x, by, bs, bs, COL_BORDER)
+        if self.checked:
+            fill_rect(fb, fbw, fbh, self.x + 6, by + 6, bs - 12, bs - 12,
+                      COL_ACCENT)
+        draw_text(fb, fbw, fbh, self.x + bs + 12, self.y + 14, self.text, 3,
+                  COL_TEXT)
+
+    def on_press(self, px: int, py: int) -> int:
+        if self.checked:
+            self.checked = 0
+        else:
+            self.checked = 1
+        self.stateChanged.emit()
+        return ACTION_REDRAW
 
 
-class QVBoxLayout(_QtObject):
-    """A vertical stack of widgets."""
+class QSlider(Widget):
+    """A horizontal slider with an integer value in [0, 100]. Clicking sets the
+    value from the click x-position and emits valueChanged."""
 
     def __init__(self):
         super().__init__()
-        self.items: "list[Widget]" = []
+        self._val = 0
+        self.valueChanged = Signal()
+
+    def value(self) -> int:
+        return self._val
+
+    def setValue(self, v: int) -> None:
+        if v < 0:
+            v = 0
+        if v > 100:
+            v = 100
+        self._val = v
+
+    def paint(self, fb: "u32*", fbw: int, fbh: int) -> None:
+        fill_rect(fb, fbw, fbh, self.x, self.y, self.w, self.h, COL_BG)
+        ty = self.y + self.h // 2 - 3
+        fill_rect(fb, fbw, fbh, self.x, ty, self.w, 6, COL_TRACK)
+        hx = self.x + (self._val * (self.w - 16)) // 100
+        fill_rect(fb, fbw, fbh, hx, self.y + 4, 16, self.h - 8, COL_ACCENT)
+
+    def on_press(self, px: int, py: int) -> int:
+        rel = px - self.x
+        v = (rel * 100) // self.w
+        self.setValue(v)
+        self.valueChanged.emit()
+        return ACTION_REDRAW
+
+
+class QProgressBar(Widget):
+    """A display-only bar showing an integer value in [0, 100]."""
+
+    def __init__(self):
+        super().__init__()
+        self._val = 0
+
+    def value(self) -> int:
+        return self._val
+
+    def setValue(self, v: int) -> None:
+        if v < 0:
+            v = 0
+        if v > 100:
+            v = 100
+        self._val = v
+
+    def paint(self, fb: "u32*", fbw: int, fbh: int) -> None:
+        fill_rect(fb, fbw, fbh, self.x, self.y, self.w, self.h, COL_TRACK)
+        fw = (self._val * self.w) // 100
+        fill_rect(fb, fbw, fbh, self.x, self.y, fw, self.h, COL_ACCENT)
+        _draw_border(fb, self.x, self.y, self.w, self.h, COL_BORDER)
+
+
+# ---- layouts (also _QtObject, so they nest like widgets) -----------------
+class QBoxLayout(_QtObject):
+    """Holds child items (widgets OR nested layouts) and paints / hit-tests them
+    through the shared place()/paint()/on_press() interface. Subclasses override
+    place() to assign child geometry (vertical or horizontal)."""
+
+    def __init__(self):
+        super().__init__()
+        self.items: "list[obj]" = []
 
     def addWidget(self, w: "obj") -> None:
         self.items.append(w)
 
-    def layout(self, x: int, y: int, width: int) -> None:
-        cy = y
-        i = 0
-        n = len(self.items)
-        while i < n:
-            w = self.items[i]
-            w.x = x
-            w.y = cy
-            w.w = width
-            w.h = ROW_H
-            cy = cy + ROW_H + GAP
-            i = i + 1
+    def addLayout(self, lay: "obj") -> None:
+        self.items.append(lay)
+
+    def count(self) -> int:
+        return len(self.items)
 
     def paint(self, fb: "u32*", fbw: int, fbh: int) -> None:
         i = 0
@@ -290,21 +431,59 @@ class QVBoxLayout(_QtObject):
             self.items[i].paint(fb, fbw, fbh)
             i = i + 1
 
-    def press(self, px: int, py: int) -> int:
+    def on_press(self, px: int, py: int) -> int:
         i = 0
         n = len(self.items)
         while i < n:
-            w = self.items[i]
-            if px >= w.x and px < w.x + w.w and py >= w.y and py < w.y + w.h:
-                return w.on_press()
+            c = self.items[i]
+            if c.contains(px, py):
+                return c.on_press(px, py)
             i = i + 1
         return ACTION_NONE
 
 
+class QVBoxLayout(QBoxLayout):
+    """Stack children top-to-bottom, each full width, fixed row height."""
+
+    def place(self, x: int, y: int, w: int, h: int) -> None:
+        self.x = x
+        self.y = y
+        self.w = w
+        self.h = h
+        cy = y
+        i = 0
+        n = len(self.items)
+        while i < n:
+            self.items[i].place(x, cy, w, ROW_H)
+            cy = cy + ROW_H + GAP
+            i = i + 1
+
+
+class QHBoxLayout(QBoxLayout):
+    """Place children left-to-right in equal-width columns, full row height."""
+
+    def place(self, x: int, y: int, w: int, h: int) -> None:
+        self.x = x
+        self.y = y
+        self.w = w
+        self.h = h
+        n = len(self.items)
+        if n == 0:
+            return
+        cw = (w - (n - 1) * GAP) // n
+        cx = x
+        i = 0
+        while i < n:
+            self.items[i].place(cx, y, cw, h)
+            cx = cx + cw + GAP
+            i = i + 1
+
+
 # ---- top-level window ----------------------------------------------------
 class QWidget(_QtObject):
-    """A top-level window hosting a layout. Painted/pointer-routed by the
-    module-level rw_* trampolines, which the generated runtime calls."""
+    """A top-level window hosting one layout. Painted / pointer-routed by the
+    module-level rw_* trampolines the generated runtime calls. The layout is
+    dispatched virtually, so any QBoxLayout subclass works."""
 
     def __init__(self):
         super().__init__()
@@ -318,22 +497,18 @@ class QWidget(_QtObject):
 
     def setLayout(self, box: "obj") -> None:
         self.box = box
-        b = self._box()
-        b.layout(PAD, PAD, WIN_W - 2 * PAD)
-
-    def _box(self) -> "QVBoxLayout*":
-        return self.box
+        box.place(PAD, PAD, WIN_W - 2 * PAD, WIN_H - 2 * PAD)
 
     def on_paint(self, fb: "u32*") -> None:
         fill_rect(fb, WIN_W, WIN_H, 0, 0, WIN_W, WIN_H, COL_BG)
-        if self.box is not None:
-            b = self._box()
+        b = self.box
+        if b is not None:
             b.paint(fb, WIN_W, WIN_H)
 
     def on_pointer_button(self, x: int, y: int, pressed: int) -> int:
-        if pressed and self.box is not None:
-            b = self._box()
-            return b.press(x, y)
+        b = self.box
+        if pressed and b is not None:
+            return b.on_press(x, y)
         return ACTION_NONE
 
     def run(self) -> int:
@@ -341,10 +516,11 @@ class QWidget(_QtObject):
         return _wl.rwl_run()
 
 
-class QApplication:
+class QApplication(_QtObject):
     """Minimal QApplication. exec_(win) runs the window's Wayland loop."""
 
     def __init__(self):
+        super().__init__()
         self.ok = 1
 
     def exec_(self, win: "obj") -> int:
