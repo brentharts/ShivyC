@@ -2121,9 +2121,19 @@ class ClassInfo:
         self.class_statics = {}     # class-level obj constants (lists / dicts
                                     # the const_dict fast-path can't specialize)
         self.class_attrs = {}       # class-level scalar defaults (instance flds)
-        bases = [b for b in node.bases if isinstance(b, ast.Name)]
-        if bases:
-            self.base_name = bases[0].id
+        # Accept both `class X(Base)` and `class X(mod.Base)` (an imported
+        # base referenced through its module alias): the bare base name is what
+        # the hierarchy and POD logic key on.
+        self.base_attr = None       # module alias when base is `mod.Base`
+        for b in node.bases:
+            if isinstance(b, ast.Name):
+                self.base_name = b.id
+                break
+            if isinstance(b, ast.Attribute):
+                self.base_name = b.attr
+                if isinstance(b.value, ast.Name):
+                    self.base_attr = b.value.id
+                break
 
     def root(self):
         c = self
@@ -3279,15 +3289,18 @@ def module_external_canon(base_dir, modname, local_names):
     return canon, rk
 
 
-def pod_csyms(tree, order, pod_enabled):
+def pod_csyms(tree, order, pod_enabled, extra_subclassed=None):
     """Csyms of classes in `order` (parsed from `tree`) that qualify for the
     POD lowering (bare struct, no Obj header / vtable). Mirrors the core of
     Transpiler._compute_pod_set, but as a free function so an *importing*
     module can replicate a defining module's POD decision and keep struct
-    layout and dispatch in agreement across the module boundary."""
+    layout and dispatch in agreement across the module boundary.
+
+    `extra_subclassed` is a set of class names that are subclassed *elsewhere*
+    in the project; those are never POD even if this file shows no subclass."""
     if not pod_enabled:
         return set()
-    has_subclass = set()
+    has_subclass = set(extra_subclassed or ())
     for ci in order:
         if getattr(ci, "base_name", None):
             has_subclass.add(ci.base_name)
@@ -4889,7 +4902,8 @@ class Transpiler:
                 # importers must dispatch its methods directly (and not read a
                 # nonexistent Obj `type` header). Keep a method in vt only if
                 # some *non-POD* class in the module defines it.
-                pods = pod_csyms(t, order, self._pod_enabled)
+                pods = pod_csyms(t, order, self._pod_enabled,
+                                 self._project_subclassed())
                 for ci in order:
                     ci.pod = ci.csym in pods
                 non_pod_methods = set()
@@ -5309,6 +5323,12 @@ class Transpiler:
             self._register_mod_global(name, OBJ, "expr", val)
         elif isinstance(val, ast.Attribute):
             self._register_mod_global(name, OBJ, "expr", val)
+        elif isinstance(val, ast.Constant) and val.value is None:
+            # `X = None` at module scope: a nullable obj global (the common
+            # lazy-init / singleton sentinel). Registering it as a real global
+            # ensures a `global X; X = ...` inside a function stores into the
+            # module global instead of a shadowing local.
+            self._register_mod_global(name, OBJ, "expr", val)
         elif isinstance(val, (ast.List, ast.Dict, ast.Set, ast.Tuple,
                               ast.BinOp, ast.ListComp, ast.DictComp,
                               ast.SetComp, ast.Call)):
@@ -5390,6 +5410,29 @@ class Transpiler:
                 else:
                     self._register_mod_global(tgt.id, OBJ, "expr",
                                               ast.Name(id=names[0]))
+        # Module-level annotated assignments (`x: T = ...` / `x: T`) are emitted
+        # by toplevel() via st_AnnAssign, but must also be recorded as globals so
+        # a `global x; x = ...` inside a function stores into the module global
+        # instead of creating a shadowing local. Type-only registration (we do
+        # NOT append to mod_globals) avoids emitting a second file-scope decl.
+        for node in tree.body:
+            if not isinstance(node, ast.AnnAssign) \
+                    or not isinstance(node.target, ast.Name):
+                continue
+            nm = node.target.id
+            if nm in self.mod_global_names:
+                continue
+            try:
+                ct = self._local_ann_ctype(nm, node.annotation)
+            except Exception:
+                ct = OBJ
+            # Match st_AnnAssign(toplevel=True): a class-pointer/base annotation
+            # initialized to None lowers to obj (nullable, dynamic dispatch).
+            if isinstance(node.value, ast.Constant) and node.value.value is None \
+                    and isinstance(ct, str) and ct.endswith("*"):
+                ct = OBJ
+            self.mod_global_names.add(nm)
+            self.mod_global_types[nm] = ct
         # module-level statements that aren't declarations (attribute/subscript
         # assignments, aug-assignments, bare calls) run at import time, so they
         # are deferred into <module>_init() rather than emitted at file scope.
@@ -5627,6 +5670,20 @@ class Transpiler:
 
     # ---- struct emission -------------------------------------------------
 
+    def _project_subclassed(self):
+        """Set of bare class names that are used as a base anywhere in the
+        project (so they must not be POD; see _compute_pod_set)."""
+        names = set()
+        try:
+            _pc, _bn = project_class_hierarchy(self.base_dir)
+            for _key, _info in _pc.items():
+                b = _info.get("base")
+                if b:
+                    names.add(b)
+        except Exception:
+            pass
+        return names
+
     def _compute_pod_set(self, tree):
         """Decide which classes get the POD lowering (a bare struct passed by
         pointer, with malloc and no Obj header / vtable / runtime). A class is
@@ -5639,6 +5696,12 @@ class Transpiler:
         for ci in self.class_order:
             if getattr(ci, "base_name", None):
                 self._has_subclass.add(ci.base_name)
+        # Cross-module subclasses also disqualify POD: if *any* module in the
+        # project extends this class, it must carry the Obj header so struct
+        # layout and vtable dispatch agree across the module boundary (a class
+        # may be POD in its own file yet subclassed elsewhere). See RPYTHON.md:
+        # "the POD decision is propagated ... so layout and dispatch agree".
+        self._has_subclass |= self._project_subclassed()
         class_names = {ci.name for ci in self.class_order}
         value_used = set()
         for parent in ast.walk(tree):
@@ -6343,9 +6406,16 @@ class Transpiler:
         types = {}
         self._hoisting = types          # let value_ctype see earlier inferences
         float_locals = self._float_locals(body)
+        # Names declared `global` in this function are NOT locals: a write to
+        # one must store into the module global, never a shadowing local decl.
+        gnames = set()
+        for stmt in body:
+            for sub in ast.walk(stmt):
+                if isinstance(sub, ast.Global):
+                    gnames.update(sub.names)
 
         def consider(name, ctype):
-            if name in self.scope:
+            if name in self.scope or name in gnames:
                 return
             if name in float_locals:            # pinned real-valued
                 if name not in types:
@@ -12258,6 +12328,23 @@ def main(argv):
         files = _rpy_torch.bundle(files)
     except Exception:
         pass
+    # First-class Wayland: bundle rpy_lib/rwayland.py and generate the glue
+    # (rwayland_rt.{h,c} + scanned xdg-shell) so no C is hand-written.
+    _rwayland_notes = []
+    try:
+        import rwayland as _rwayland
+        files = _rwayland.bundle(files)
+        _rwayland_notes = _rwayland.emit_runtime(out_dir, files)
+    except Exception:
+        pass
+    # PyQt-compatible layer: bundle rpy_lib/rpyqt.py and emit the same runtime
+    # (rpyqt binds it directly without importing the rwayland rpython module).
+    try:
+        import rpyqt as _rpyqt
+        files = _rpyqt.bundle(files)
+        _rwayland_notes += _rpyqt.emit_runtime(out_dir, files)
+    except Exception:
+        pass
     # Profile-guided auto-typing. Single .py inputs go through transpile_file's
     # per-file hook (so the ShivyCX front end gets them too); multi-file programs
     # are profiled once here as a set (one run, module-qualified types) so cross
@@ -12303,6 +12390,8 @@ def main(argv):
             ok += 1
             print("  %-28s -> %s" % (os.path.basename(path), res))
     print("Transpiled %d/%d files into %s" % (ok, len(files), out_dir))
+    for _n in _rwayland_notes:
+        print("  rwayland: %s" % _n)
 
 
 if __name__ == "__main__":
