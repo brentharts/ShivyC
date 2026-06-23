@@ -76,7 +76,7 @@ class Label(ILCommand):
     def label_name(self):  # noqa D102
         return self.label
 
-    def make_asm(self, spotmap, home_spots, get_reg, asm_code): # noqa D102
+    def make_asm(self, spotmap, home_spots, get_reg, asm_code: "asm_gen.ASMCode"): # noqa D102
         asm_code.add(asm_cmds.AsmLabel(self.label))
 
 
@@ -95,7 +95,7 @@ class Jump(ILCommand):
     def targets(self): # noqa D102
         return [self.label]
 
-    def make_asm(self, spotmap, home_spots, get_reg, asm_code): # noqa D102
+    def make_asm(self, spotmap, home_spots, get_reg, asm_code: "asm_gen.ASMCode"): # noqa D102
         asm_code.add(asm_cmds.Jmp(self.label))
 
 
@@ -120,7 +120,7 @@ class _GeneralJump(ILCommand):
     def targets(self): # noqa D102
         return [self.label]
 
-    def make_asm(self, spotmap, home_spots, get_reg, asm_code): # noqa D102
+    def make_asm(self, spotmap, home_spots, get_reg, asm_code: "asm_gen.ASMCode"): # noqa D102
         size = self.cond.ctype.size
 
         if isinstance(spotmap[self.cond], LiteralSpot):
@@ -176,7 +176,7 @@ class Return(ILCommand):
             return {}
         return {self.arg: [spots.RAX]}
 
-    def make_asm(self, spotmap, home_spots, get_reg, asm_code): # noqa D102
+    def make_asm(self, spotmap, home_spots, get_reg, asm_code: "asm_gen.ASMCode"): # noqa D102
         if self.arg and self.arg.ctype.is_floating():
             size = self.arg.ctype.size
             mov = asm_cmds.Movss if size == 4 else asm_cmds.Movsd
@@ -385,7 +385,7 @@ class Call(ILCommand):
             asm_code.add(asm_cmds.Mov(reg, MemSpot(spots.RSP, 8 * ri), 8))
         asm_code.add(asm_cmds.AsmAdd(spots.RSP, LiteralSpot(str(8 * total)), 8))
 
-    def make_asm(self, spotmap, home_spots, get_reg, asm_code): # noqa D102
+    def make_asm(self, spotmap, home_spots, get_reg, asm_code: "asm_gen.ASMCode"): # noqa D102
         ret_size = self.func.ctype.arg.ret.size
         ret_float = self.func.ctype.arg.ret.is_floating()
 

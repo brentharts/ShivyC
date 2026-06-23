@@ -142,7 +142,7 @@ class LoadArg(ILCommand):
             return {}
         return {self.output: [self.arg_reg]} if self.arg_reg else {}
 
-    def make_asm(self, spotmap, home_spots, get_reg, asm_code):
+    def make_asm(self, spotmap, home_spots, get_reg, asm_code: "asm_gen.ASMCode"):
         dest = spotmap[self.output]
         size = self.output.ctype.size
         src = self.arg_reg if self.arg_reg else self.stack_spot
@@ -194,7 +194,7 @@ class LoadStructArg(_ValueCmd):
     def clobber(self):
         return list(self.regs) if self.regs else []
 
-    def make_asm(self, spotmap, home_spots, get_reg, asm_code):
+    def make_asm(self, spotmap, home_spots, get_reg, asm_code: "asm_gen.ASMCode"):
         home = spotmap[self.output]
         size = self.output.ctype.size
         if self.regs is not None:
@@ -247,7 +247,7 @@ class UnpackArgs(ILCommand):
     _GPRS = [spots.RAX, spots.RDI, spots.RSI, spots.RDX, spots.RCX,
              spots.R8, spots.R9, spots.R10, spots.R11]
 
-    def make_asm(self, spotmap, home_spots, get_reg, asm_code):
+    def make_asm(self, spotmap, home_spots, get_reg, asm_code: "asm_gen.ASMCode"):
         n = len(self.regs)
         out_reg_homes = {spotmap[o] for o in self.outs
                          if isinstance(spotmap[o], RegSpot)}
@@ -354,7 +354,7 @@ class Set(_ValueCmd):
         else:
             return {}
 
-    def make_asm(self, spotmap, home_spots, get_reg, asm_code): # noqa D102
+    def make_asm(self, spotmap, home_spots, get_reg, asm_code: "asm_gen.ASMCode"): # noqa D102
         # SIMD bit-packing dispatch (opt-in). A write to a packed flag is
         # written through to memory + xmm15 everywhere; a read of a packed
         # flag inside a hot/interrupt routine is served from xmm15 (no load).
@@ -545,7 +545,7 @@ class AddrOf(ILCommand):
     def references(self):  # noqa D102
         return {self.output: [self.var]}
 
-    def make_asm(self, spotmap, home_spots, get_reg, asm_code):  # noqa D102
+    def make_asm(self, spotmap, home_spots, get_reg, asm_code: "asm_gen.ASMCode"):  # noqa D102
         r = get_reg([spotmap[self.output]])
         asm_code.add(asm_cmds.Lea(r, home_spots[self.var]))
 
@@ -561,6 +561,8 @@ class ReadAt(_ValueCmd):
 
     """
 
+    addr: "ILValue"
+
     def __init__(self, output, addr):  # noqa D102
         self.output = output
         self.addr = addr
@@ -574,7 +576,7 @@ class ReadAt(_ValueCmd):
     def indir_read(self):  # noqa D102
         return [self.addr]
 
-    def make_asm(self, spotmap, home_spots, get_reg, asm_code):  # noqa D102
+    def make_asm(self, spotmap, home_spots, get_reg, asm_code: "asm_gen.ASMCode"):  # noqa D102
         addr_spot = spotmap[self.addr]
         output_spot = spotmap[self.output]
 
@@ -606,6 +608,8 @@ class SetAt(_ValueCmd):
 
     """
 
+    addr: "ILValue"
+
     def __init__(self, addr, val):  # noqa D102
         self.addr = addr
         self.val = val
@@ -619,7 +623,7 @@ class SetAt(_ValueCmd):
     def indir_write(self):  # noqa D102
         return [self.addr]
 
-    def make_asm(self, spotmap, home_spots, get_reg, asm_code):  # noqa D102
+    def make_asm(self, spotmap, home_spots, get_reg, asm_code: "asm_gen.ASMCode"):  # noqa D102
         addr_spot = spotmap[self.addr]
         value_spot = spotmap[self.val]
 
@@ -740,7 +744,7 @@ class SetRel(_RelCommand):
     def references(self):  # noqa D102
         return {None: [self.base]}
 
-    def make_asm(self, spotmap, home_spots, get_reg, asm_code):  # noqa D102
+    def make_asm(self, spotmap, home_spots, get_reg, asm_code: "asm_gen.ASMCode"):  # noqa D102
         if not isinstance(spotmap[self.base], MemSpot):
             raise NotImplementedError("expected base in memory spot")
 
@@ -779,7 +783,7 @@ class AddrRel(_RelCommand):
     def references(self):  # noqa D102
         return {self.output: [self.base]}
 
-    def make_asm(self, spotmap, home_spots, get_reg, asm_code):  # noqa D102
+    def make_asm(self, spotmap, home_spots, get_reg, asm_code: "asm_gen.ASMCode"):  # noqa D102
         if not isinstance(spotmap[self.base], MemSpot):
             raise NotImplementedError("expected base in memory spot")
 
@@ -811,7 +815,7 @@ class ReadRel(_RelCommand):
     def references(self):  # noqa D102
         return {None: [self.base]}
 
-    def make_asm(self, spotmap, home_spots, get_reg, asm_code):  # noqa D102
+    def make_asm(self, spotmap, home_spots, get_reg, asm_code: "asm_gen.ASMCode"):  # noqa D102
         if not isinstance(spotmap[self.base], MemSpot):
             raise NotImplementedError("expected base in memory spot")
 
@@ -853,7 +857,7 @@ class VaStartAddr(ILCommand):
     def clobber(self):
         return []
 
-    def make_asm(self, spotmap, home_spots, get_reg, asm_code):
+    def make_asm(self, spotmap, home_spots, get_reg, asm_code: "asm_gen.ASMCode"):
         off = 16 + 8 * self.named_count
         src = MemSpot(spots.RBP, off)
         dest = spotmap[self.output]
