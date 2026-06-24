@@ -563,7 +563,7 @@ class ReadAt(_ValueCmd):
 
     addr: "ILValue"
 
-    def __init__(self, output, addr):  # noqa D102
+    def __init__(self, output, addr: "ILValue"):  # noqa D102
         self.output = output
         self.addr = addr
 
@@ -610,7 +610,7 @@ class SetAt(_ValueCmd):
 
     addr: "ILValue"
 
-    def __init__(self, addr, val):  # noqa D102
+    def __init__(self, addr: "ILValue", val):  # noqa D102
         self.addr = addr
         self.val = val
 
