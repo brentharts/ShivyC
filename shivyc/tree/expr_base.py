@@ -53,7 +53,6 @@ class _RExprNode(_ExprNode):
     """
     def __init__(self):  # noqa D102
         Node.__init__(self)
-        self._cache_raw_ilvalue = None
 
     def make_il(self, il_code, symbol_table, c):  # noqa D102
         raise NotImplementedError

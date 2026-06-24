@@ -55,10 +55,17 @@ class SizeofExpr(_SizeofNode):
         return self.sizeof_ctype(expr.ctype, self.expr.r, il_code)
 
 
-class SizeofType(_SizeofNode, Declaration):
+class SizeofType(Declaration, _SizeofNode):
     """Node representing sizeof with abstract type as operand.
 
     node (decl_nodes.Root) - a declaration tree for the type
+
+    Declaration is listed first so that under the self-host transpiler it is the
+    struct-layout (prefix) base: SizeofType reaches Declaration's instance fields
+    (node, il_code, ...) through Declaration's own methods (make_specs_ctype,
+    set_self_vars), which address those fields at Declaration's offsets. The
+    _SizeofNode mixin carries no instance state, so it is layout-safe as a
+    secondary base. CPython is order-insensitive here (make_il is overridden).
     """
     def __init__(self, node):
         _SizeofNode.__init__(self)
@@ -107,9 +114,12 @@ class AlignofExpr(_AlignofNode):
         return self.alignof_ctype(expr.ctype, self.expr.r, il_code)
 
 
-class AlignofType(_AlignofNode, Declaration):
-    """Node representing _Alignof with an abstract type-name operand."""
+class AlignofType(Declaration, _AlignofNode):
+    """Node representing _Alignof with an abstract type-name operand.
 
+    Declaration is listed first for the same struct-layout reason as
+    SizeofType (the _AlignofNode mixin carries no instance state).
+    """
     def __init__(self, node):
         _AlignofNode.__init__(self)
         Declaration.__init__(self, node)
