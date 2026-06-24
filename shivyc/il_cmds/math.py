@@ -4,9 +4,20 @@ import shivyc.asm_cmds as asm_cmds
 import shivyc.spots as spots
 from shivyc.il_cmds.base import ILCommand
 
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from shivyc.il_gen import ILValue   # the transpiler reads this statically
+
 
 class _AddMult(ILCommand):
     """Base class for ADD, MULT, and SUB."""
+
+    # Field types for the transpiler: typing the operands as ILValue lets
+    # `self.argN.ctype.size` resolve `.size` against CType, instead of being
+    # mis-resolved against another class that happens to define a `size` field.
+    output: "ILValue"
+    arg1: "ILValue"
+    arg2: "ILValue"
 
     # Indicates whether this instruction is commutative. If not,
     # a "neg" instruction is inserted when the order is flipped. Override
