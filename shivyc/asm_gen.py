@@ -203,9 +203,9 @@ class NodeGraph:
         self._pref[v] = []
 
         # Dummy nodes must mutually conflict
-        for n in self._all_nodes:
-            if n not in self._real_nodes and n != v:
-                self.add_conflict(n, v)
+        for nd in self._all_nodes:
+            if nd not in self._real_nodes and nd != v:
+                self.add_conflict(nd, v)
 
     def add_conflict(self, n1: "object", n2: "object"):
         """Add a conflict edge between n1 and n2."""
@@ -515,7 +515,7 @@ class ASMGen:
             self.all_registers = type(self).all_registers
             return
         by_name = {r.name: r for r in spots.registers}
-        regs = [by_name[n] for n in budget if n in by_name]
+        regs = [by_name[rn] for rn in budget if rn in by_name]
         if len(regs) < 2:  # keep a minimum so get_reg always has scratch
             return
         self.alloc_registers = regs
@@ -654,11 +654,15 @@ class ASMGen:
             total_prefs = 0
             matched_prefs = 0
 
-            for n1, n2 in itertools.combinations(g_bak.all_nodes(), 2):
-                if n2 in g_bak.prefs(n1):
-                    total_prefs += 1
-                    if spotmap[n1] == spotmap[n2]:
-                        matched_prefs += 1
+            all_nodes_list = g_bak.all_nodes()
+            for ia in range(len(all_nodes_list)):
+                for ib in range(ia + 1, len(all_nodes_list)):
+                    na = all_nodes_list[ia]
+                    nb = all_nodes_list[ib]
+                    if nb in g_bak.prefs(na):
+                        total_prefs += 1
+                        if spotmap[na] == spotmap[nb]:
+                            matched_prefs += 1
 
             print("total prefs", total_prefs)
             print("matched prefs", matched_prefs)
@@ -858,27 +862,35 @@ class ASMGen:
         """
         g = NodeGraph(free_values)
         for i, command in enumerate(commands):
-            # Variables active during input
-            for n1, n2 in itertools.combinations(live_vars[i][0], 2):
-                g.add_conflict(n1, n2)
+            # Variables active during input mutually conflict. (Explicit pair
+            # loop rather than itertools.combinations, which the self-host
+            # transpiler does not support -- it would silently drop every
+            # conflict edge, letting simultaneously-live variables share a
+            # register.)
+            live_in = live_vars[i][0]
+            for ia in range(len(live_in)):
+                for ib in range(ia + 1, len(live_in)):
+                    g.add_conflict(live_in[ia], live_in[ib])
 
             # Variables active during output
-            for n1, n2 in itertools.combinations(live_vars[i][1], 2):
-                g.add_conflict(n1, n2)
+            live_out = live_vars[i][1]
+            for ia in range(len(live_out)):
+                for ib in range(ia + 1, len(live_out)):
+                    g.add_conflict(live_out[ia], live_out[ib])
 
             # Relative conflict set of this command
-            for n1 in command.rel_spot_conf():
-                for n2 in command.rel_spot_conf()[n1]:
-                    if n1 in free_values and n2 in free_values:
-                        g.add_conflict(n1, n2)
+            for na in command.rel_spot_conf():
+                for nb in command.rel_spot_conf()[na]:
+                    if na in free_values and nb in free_values:
+                        g.add_conflict(na, nb)
 
             # Absolute conflict set of this command
-            for n in command.abs_spot_conf():
-                for s in command.abs_spot_conf()[n]:
-                    if n in free_values:
+            for nd in command.abs_spot_conf():
+                for s in command.abs_spot_conf()[nd]:
+                    if nd in free_values:
                         if s not in g.all_nodes():
                             g.add_dummy_node(s)
-                        g.add_conflict(n, s)
+                        g.add_conflict(nd, s)
 
             # Clobber set of this command
             for s in command.clobber():
@@ -887,9 +899,9 @@ class ASMGen:
 
                 # Add a conflict with dummy node for every variable live
                 # during both entry and exit from this command.
-                for n in live_vars[i][0]:
-                    if n in live_vars[i][1]:
-                        g.add_conflict(n, s)
+                for nd in live_vars[i][0]:
+                    if nd in live_vars[i][1]:
+                        g.add_conflict(nd, s)
 
             # Form preferences based on rel_spot_pref
             for v1 in command.rel_spot_pref():
@@ -970,7 +982,7 @@ class ASMGen:
         # Cache each node's conflict set once for this pass: membership tests
         # and unions below are otherwise linear scans of conflict lists, which
         # dominated compile time on large functions.
-        confs_set = {n: set(g.confs(n)) for n in g.all_nodes()}
+        confs_set = {nd: set(g.confs(nd)) for nd in g.all_nodes()}
         nreg = len(self.alloc_registers)
         for v1 in g.nodes():
             for v2 in g.prefs(v1):
@@ -1010,8 +1022,8 @@ class ASMGen:
         """
 
         # Rank nodes by conflict degree (low first).
-        nodes = sorted(g.all_nodes(), key=lambda n: len(g.confs(n)))
-        pos = {n: i for i, n in enumerate(nodes)}
+        nodes = sorted(g.all_nodes(), key=lambda nd: len(g.confs(nd)))
+        pos = {nd: i for i, nd in enumerate(nodes)}
 
         # Find the preference edge whose endpoints have the lowest combined
         # rank, preferring to freeze edges between low-degree nodes. Iterate
@@ -1020,14 +1032,14 @@ class ASMGen:
         # dominated compile time on large functions).
         best = None
         best_key = None
-        for n1 in nodes:
-            p1 = pos[n1]
-            for n2 in g.prefs(n1):
-                p2 = pos[n2]
+        for na in nodes:
+            p1 = pos[na]
+            for nb in g.prefs(na):
+                p2 = pos[nb]
                 key = (p1 + p2, min(p1, p2), max(p1, p2))
                 if best_key is None or key < best_key:
                     best_key = key
-                    best = (n1, n2)
+                    best = (na, nb)
 
         if best is not None:
             g.remove_pref(best[0], best[1])
@@ -1038,18 +1050,21 @@ class ASMGen:
     def _generate_spotmap(self, removed_nodes, merged_nodes, g: "NodeGraph"):
         """Pop values off stack to generate spot assignments."""
 
-        # Get a set of nodes which interfere with n or anything merged into it
-        def get_conflicts(n):
-            conflicts = set(g.confs(n))
-            for n1 in merged_nodes.get(n, []):
-                conflicts |= get_conflicts(n1)
+        # Get a set of nodes which interfere with `node` or anything merged
+        # into it. (Node variables are deliberately *not* named n/n1/n2: those
+        # names are inferred as C int by the transpiler's name heuristic, which
+        # would corrupt the graph-node objects passed through them.)
+        def get_conflicts(node):
+            conflicts = set(g.confs(node))
+            for sub in merged_nodes.get(node, []):
+                conflicts |= get_conflicts(sub)
             return conflicts
 
-        # Get a set of nodes which are merged into `n`
-        def get_merged(n):
-            merged = {n}
-            for n1 in merged_nodes.get(n, []):
-                merged |= get_merged(n1)
+        # Get a set of nodes which are merged into `node`
+        def get_merged(node):
+            merged = {node}
+            for sub in merged_nodes.get(node, []):
+                merged |= get_merged(sub)
             return merged
 
         # Build up spotmap
@@ -1058,29 +1073,29 @@ class ASMGen:
         while removed_nodes:
             i += 1
 
-            # Allocate register to node `n`
-            n1 = removed_nodes.pop()
+            # Allocate register to node `cur`
+            cur = removed_nodes.pop()
             regs = self.alloc_registers[::-1]
 
-            # If n1 is a Spot (i.e. dummy node), immediately assign it a
+            # If cur is a Spot (i.e. dummy node), immediately assign it a
             # register.
-            if n1 in regs:
-                reg = n1
+            if cur in regs:
+                reg = cur
             else:
                 # Don't chose any conflicting spots
-                for n2 in get_conflicts(n1):
-                    # If n2 is a physical spot
-                    if n2 in regs:
-                        regs.remove(n2)
-                    if n2 in spotmap and spotmap[n2] in regs:
-                        regs.remove(spotmap[n2])
+                for other in get_conflicts(cur):
+                    # If other is a physical spot
+                    if other in regs:
+                        regs.remove(other)
+                    if other in spotmap and spotmap[other] in regs:
+                        regs.remove(spotmap[other])
 
                 # Based on algorithm, there should always be register remaining
                 reg = regs.pop()
 
-            # Assign this register to every node merged into n1
-            for n2 in get_merged(n1):
-                spotmap[n2] = reg
+            # Assign this register to every node merged into cur
+            for other in get_merged(cur):
+                spotmap[other] = reg
 
         return spotmap
 

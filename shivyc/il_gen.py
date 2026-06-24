@@ -312,7 +312,7 @@ class SymbolTable:
         """
         return self.linkage_type.get(self._lookup_raw(identifier.content))
 
-    def add_variable(self, identifier, ctype, defined, linkage,
+    def add_variable(self, identifier, ctype, defined: int, linkage,
                      storage) -> "ILValue":
         """Add an identifier with the given name and type to the symbol table.
 
