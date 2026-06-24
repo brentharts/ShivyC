@@ -234,6 +234,52 @@ python3 tools/py2c.py --out /tmp/out
 python3 tools/py2c.py --out /tmp/out shivyc/il_cmds/value.py
 ```
 
+To see exactly how the translator typed every field, parameter, and local —
+which values are plain C scalars (POD) and which are boxed into the object model
+— pass `--show-object-model`. The report makes the type-inference decisions
+visible, which is the fastest way to catch a value that was meant to be an
+object but got inferred as a scalar (a common source of runtime crashes):
+
+```sh
+python3 tools/py2c.py shivyc/tokens.py --show-object-model
+```
+
+---
+
+## Bootstrapping (`make bootstrap`)
+
+The transpiler feeds a classic two-stage bootstrap. Each stage is a `make`
+target; everything is built under `/tmp` (override with `BOOTSTRAP_DIR=`).
+
+```sh
+make bootstrap     # stage 1: build the native compiler, smoke-test, benchmark
+make bootstrap2    # stage 2: compile the compiler with itself, run the suite
+sudo make install  # install the bootstrapped compiler to /usr/local/bin/shivycx
+```
+
+- **`make bootstrap`** transpiles ShivyCX's own source with `py2c.py`, compiles
+  it with gcc into `shivyc_native`, runs a smoke test (arithmetic, control flow,
+  recursion, pointers, arrays, strings) through that native binary, and
+  benchmarks its compile speed against gcc on the same input. **This works
+  today**: 60 modules link into a single binary that compiles and runs real C.
+- **`make bootstrap2`** feeds the compiler's own generated C back through the
+  stage-1 binary to produce the final self-compiled `shivycx`, then runs the
+  full `tests/` suite against it. This is the **bootstrap milestone in
+  progress**: until the native compiler accepts every C construct it emits for
+  its own source (currently gated on function-pointer declarations), the target
+  reports how many of the generated modules already self-compile and the first
+  blocker.
+- **`make install`** copies the furthest-along bootstrapped compiler
+  (`shivycx` if stage 2 produced one, otherwise the stage-1 `shivyc_native`) to
+  `$(PREFIX)/bin/shivycx` (default prefix `/usr/local`).
+
+See [`tools/SELFHOST_STATUS.md`](tools/SELFHOST_STATUS.md) for the detailed
+stage-by-stage status and the next highest-leverage targets.
+
+> **Note:** `make install` now installs the bootstrapped compiler. To install
+> the build/test toolchain (gcc, binutils, qemu, pypy3) as before, use
+> `make install_deps`.
+
 ---
 
 ## rpython — a fast, safe Python subset that compiles to native C

@@ -59,7 +59,10 @@ shim:
 	@printf '#!/bin/sh\nexec pypy3 -m shivyc.main "$$@"\n' > bin/shivyc
 	@chmod +x bin/shivyc
 
-install:
+# Install the build/test toolchain (compilers, qemu, pypy3). This used to be
+# `make install`; that name now installs the bootstrapped compiler (see the
+# bootstrap section below).
+install_deps:
 	sudo apt-get update
 	sudo apt-get install -y build-essential gcc gcc-multilib binutils make \
 		python3 qemu-system-x86 git pypy3
@@ -122,6 +125,48 @@ selfhost_link:
 SELFHOST_NATIVE_DIR ?= /tmp/shivyc-native
 selfhost_compiler:
 	python3 tools/selfhost.py compiler --build-dir $(SELFHOST_NATIVE_DIR)
+
+# ---------------------------------------------------------------------------
+# Bootstrap: build the self-hosted compiler and (eventually) self-compile it.
+#
+# Everything lands in $(BOOTSTRAP_DIR) (kept on disk). Override to relocate:
+#     make bootstrap BOOTSTRAP_DIR=/tmp/shivyc-bootstrap
+#
+#   make bootstrap   Stage 1. Transpile ShivyCX's own source with py2c, compile
+#                    it with gcc into $(BOOTSTRAP_DIR)/shivyc_native, smoke-test
+#                    that native binary, then benchmark its compile speed
+#                    against gcc (the same headerless ~200-line program through
+#                    both compilers).
+#
+#   make bootstrap2  Stage 2. Feed the compiler's own generated C back through
+#                    the stage-1 native binary to produce the final
+#                    $(BOOTSTRAP_DIR)/shivycx, then run the full test suite
+#                    against it. A complete stage-2 self-compile is the
+#                    milestone we are working toward: until the native compiler
+#                    accepts every construct it emits for its own source, this
+#                    reports how many modules already self-compile (a progress
+#                    gauge) and the first blocker.
+#
+#   make install     Copy the bootstrapped compiler to $(PREFIX)/bin/shivycx
+#                    (prefers the stage-2 shivycx; falls back to the stage-1
+#                    native binary). Override PREFIX (default /usr/local).
+BOOTSTRAP_DIR ?= /tmp/shivyc-bootstrap
+PREFIX        ?= /usr/local
+
+bootstrap:
+	python3 tools/selfhost.py bootstrap --build-dir $(BOOTSTRAP_DIR)
+
+bootstrap2:
+	python3 tools/selfhost.py bootstrap2 --build-dir $(BOOTSTRAP_DIR)
+
+install:
+	@cx="$(BOOTSTRAP_DIR)/shivycx"; \
+	if [ ! -x "$$cx" ]; then cx="$(BOOTSTRAP_DIR)/shivyc_native"; fi; \
+	if [ ! -x "$$cx" ]; then \
+	  echo "no bootstrapped compiler in $(BOOTSTRAP_DIR); run 'make bootstrap' first"; \
+	  exit 1; fi; \
+	echo "installing $$cx -> $(PREFIX)/bin/shivycx"; \
+	install -d $(PREFIX)/bin && install -m 0755 "$$cx" $(PREFIX)/bin/shivycx
 
 selfhost_coverage_musl:
 	python3 tools/selfhost.py coverage --musl
@@ -549,9 +594,11 @@ run-irq: baremetal-irq
 self:
 	cd tools && pypy3 py2c.py
 
-.PHONY: default test testfast testpromote testpgo testfuse testtorch shim install clean baremetal baremetal-hello \
+.PHONY: default test testfast testpromote testpgo testfuse testtorch shim install install_deps clean baremetal baremetal-hello \
+        bootstrap bootstrap2 \
         selfhost selfhost_objcore selfhost_bench selfhost_coverage \
-        selfhost_coverage_musl selfhost_link \
+        selfhost_coverage_musl selfhost_link selfhost_build selfhost_compiler \
+        bench_compile_speed \
         rpython benchmarks wayland rpyqt controls \
         baremetal-kernel baremetal-irq minikraft run-irq \
         install_micropython clean_micropython test_micropython \
