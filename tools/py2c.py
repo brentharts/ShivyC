@@ -10187,7 +10187,13 @@ class Transpiler:
                     return "dict_new()"
                 if self.stdlib_root:
                     return self._mp_import_call("builtins", "dict", node)
-                return "dict_new() /* dict(arg) unsupported */"
+                # dict(d): shallow-copy the argument dict. pycopy handles the
+                # T_DICT case (new dict + dict_update). Previously this emitted
+                # an empty dict_new(), so `dict(scope)` silently produced an
+                # empty dict -- which wiped the parser's snapshot/restore of the
+                # typedef symbol table and made every typedef name unresolvable
+                # in the self-hosted compiler.
+                return "pycopy(%s)" % self.wrap_obj(node.args[0])
             if fn == "ord" and node.args:
                 a0 = node.args[0]
                 # ord(s[i]) on a char* -> direct byte read, no per-char string
