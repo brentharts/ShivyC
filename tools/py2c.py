@@ -5628,6 +5628,12 @@ class Transpiler:
         if mname == "add" and len(arg_nodes) == 1:
             tail = " else if (_d.tag == T_SET || _d.tag == T_LIST) { " \
                    "set_add(_d, %s); }" % self.wrap_obj(arg_nodes[0])
+        elif mname == "copy" and not arg_nodes:
+            # `copy` is also dict/list/set.copy(): a genuine container receiver
+            # matches none of the class TypeInfo branches, so fall back to the
+            # builtin shallow copy instead of returning None (or, worse, calling
+            # a null `copy` vtable slot the container does not have).
+            tail = " else { _dv = pycopy(_d); }"
         return ("({ obj _d = %s; const TypeInfoHdr* _dt = "
                 "(_d.tag == T_OBJ && _d.u.o) ? "
                 "(const TypeInfoHdr*)_d.u.o->type : (const TypeInfoHdr*)0; "
@@ -10597,13 +10603,25 @@ class Transpiler:
                     not self._recv_class_owns(func.value, "clear"):
                 return "pyclear(%s)" % self.wrap_obj(func.value)
             if func.attr == "copy" and not node.args and \
-                    func.attr not in self.method_owners and \
-                    func.attr not in self.xmethod_owners and \
                     not (isinstance(func.value, ast.Name) and
                          (func.value.id in self.import_alias or
                           func.value.id == "copy")):
-                # dict/list/set .copy() -> shallow copy (runtime-dispatched).
-                return "pycopy(%s)" % self.wrap_obj(func.value)
+                # `copy` is both a container builtin (dict/list/set.copy) and a
+                # user method (ILCode/NodeGraph/State.copy). When the receiver is
+                # an untyped obj we cannot tell them apart statically, so dispatch
+                # on the receiver's real TypeInfo: each defining class calls its
+                # own copy, and a genuine container falls back to pycopy via the
+                # helper's tail. Only when that runtime switch does not apply (no
+                # ambiguity / single-module host build) do we fall back to the
+                # flat pycopy, and then only if `copy` is not a user method here.
+                amb = self._obj_ambiguous_dispatch(
+                    func.value, func.attr, node.args)
+                if amb is not None:
+                    return amb
+                if func.attr not in self.method_owners and \
+                        func.attr not in self.xmethod_owners:
+                    # dict/list/set .copy() -> shallow copy (runtime-dispatched).
+                    return "pycopy(%s)" % self.wrap_obj(func.value)
             if func.attr == "remove" and len(node.args) == 1 and \
                     func.attr not in self.method_owners:
                 return "list_remove(%s, %s)" % (self.wrap_obj(func.value),
