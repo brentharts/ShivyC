@@ -151,7 +151,7 @@ class RelativeLValue(LValue):
         &base + chunk
 
     """
-    def __init__(self, ctype, base, chunk=0, count=None):
+    def __init__(self, ctype, base, chunk=0, count: "object" = None):
         self._ctype = ctype
         self.base = base
         self.chunk = chunk
@@ -427,7 +427,7 @@ def arith_convert(left, right, il_code):
     return set_type(left, ctype, il_code), set_type(right, ctype, il_code)
 
 
-def get_size(ctype, num, il_code):
+def get_size(ctype, num: "object", il_code):
     """Return ILValue representing total size of `num` objects of given ctype.
 
     ctype - CType of object to count
@@ -451,16 +451,17 @@ def get_size(ctype, num, il_code):
 def shift_into_range(val, ctype):
     """Shift a numerical value into range for given integral ctype."""
 
-    if ctype.signed:
-        max_val = 1 << (ctype.size * 8 - 1)
-        range = 2 * max_val
-    else:
-        max_val = 1 << ctype.size * 8
-        range = max_val
-
-    val = val % range
-    if val >= max_val:
-        val -= range
+    bits = ctype.size * 8
+    # Use bitwise masking rather than `val % 2**bits`. For a 64-bit type 2**bits
+    # overflows to 0 in the transpiled compiler, which would turn the modulo
+    # into `val % 0` and collapse every wrapped value to 0; the mask `2**bits-1`
+    # instead becomes all-ones (0 - 1) there, so `val & mask` is the identity
+    # that a 64-bit two's-complement value already satisfies. Under CPython the
+    # same expression is exact (e.g. -4 as unsigned long -> 2**64 - 4).
+    mask = (2 ** bits) - 1
+    val = val & mask
+    if ctype.signed and (val & (2 ** (bits - 1))):
+        val = val - (2 ** bits)
 
     return val
 
