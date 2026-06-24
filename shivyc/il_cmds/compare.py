@@ -123,7 +123,7 @@ class _GeneralCmp(ILCommand):
             return self.unsigned_neg_cmd if unsigned else self.signed_neg_cmd
         return self.unsigned_cmp_cmd if unsigned else self.signed_cmp_cmd
 
-    def make_asm(self, spotmap, home_spots, get_reg, asm_code):  # noqa D102
+    def make_asm(self, spotmap, home_spots, get_reg, asm_code: "asm_gen.ASMCode"):  # noqa D102
         if self.arg1.ctype.is_floating() or self.arg2.ctype.is_floating():
             return self._make_float_asm(spotmap, get_reg, asm_code)
         regs = []

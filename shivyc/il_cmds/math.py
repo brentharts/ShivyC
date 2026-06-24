@@ -31,7 +31,7 @@ class _AddMult(ILCommand):
     def rel_spot_pref(self): # noqa D102
         return {self.output: [self.arg1, self.arg2]}
 
-    def make_asm(self, spotmap, home_spots, get_reg, asm_code): # noqa D102
+    def make_asm(self, spotmap, home_spots, get_reg, asm_code: "asm_gen.ASMCode"): # noqa D102
         """Make the ASM for ADD, MULT, and SUB."""
         if self.output.ctype.is_floating():
             return self._make_float_asm(spotmap, asm_code)
@@ -170,7 +170,7 @@ class _BitShiftCmd(ILCommand):
     def rel_spot_pref(self): # noqa D102
         return {self.output: [self.arg1]}
 
-    def make_asm(self, spotmap, home_spots, get_reg, asm_code): # noqa D102
+    def make_asm(self, spotmap, home_spots, get_reg, asm_code: "asm_gen.ASMCode"): # noqa D102
         arg1_spot = spotmap[self.arg1]
         arg1_size = self.arg1.ctype.size
         arg2_spot = spotmap[self.arg2]
@@ -254,7 +254,7 @@ class _DivMod(ILCommand):
     FInst_d = None
     FInst_s = None
 
-    def make_asm(self, spotmap, home_spots, get_reg, asm_code): # noqa D102
+    def make_asm(self, spotmap, home_spots, get_reg, asm_code: "asm_gen.ASMCode"): # noqa D102
         if self.output.ctype.is_floating():
             from shivyc.spots import XMM0
             size = self.output.ctype.size
@@ -351,7 +351,7 @@ class _NegNot(ILCommand):
     def rel_spot_pref(self):  # noqa D102
         return {self.output: [self.arg]}
 
-    def make_asm(self, spotmap, home_spots, get_reg, asm_code): # noqa D102
+    def make_asm(self, spotmap, home_spots, get_reg, asm_code: "asm_gen.ASMCode"): # noqa D102
         size = self.arg.ctype.size
 
         output_spot = spotmap[self.output]

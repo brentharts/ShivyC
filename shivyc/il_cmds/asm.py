@@ -260,7 +260,7 @@ class InlineAsm(ILCommand):
             pending = [(d, (temp if s == src0 else s), sz)
                        for (d, s, sz) in pending]
 
-    def make_asm(self, spotmap, home_spots, get_reg, asm_code):
+    def make_asm(self, spotmap, home_spots, get_reg, asm_code: "asm_gen.ASMCode"):
         name_to_spot = self._NAME_TO_SPOT
         ops, slots = self._assign()
         operand_strs = []
