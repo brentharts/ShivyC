@@ -91,8 +91,12 @@ class Token:
     """
 
     r: "Range"        # token source range (errors.Range)
+    # `content` is polymorphic: a string for identifier/number tokens, but a
+    # list of character codes for string-literal tokens. Pin it to obj so the
+    # list is not coerced to a char* (which mangled string-literal data).
+    content: "object"
 
-    def __init__(self, kind, content="", rep="", r=None):
+    def __init__(self, kind, content: "object" = "", rep="", r=None):
         """Initialize this token."""
         self.kind = kind
 
