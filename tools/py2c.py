@@ -2206,15 +2206,27 @@ class ClassInfo:
         # base referenced through its module alias): the bare base name is what
         # the hierarchy and POD logic key on.
         self.base_attr = None       # module alias when base is `mod.Base`
+        # Secondary (multiple-inheritance) bases. The first base is the layout
+        # base (its fields form the struct prefix); any further bases are
+        # recorded here so their methods can still resolve to direct calls.
+        # This is sound for stateless mixin bases (whose methods don't read
+        # instance fields through the secondary-base layout), which is the MI
+        # pattern used in the tree node hierarchy.
+        self.extra_base_names = []
+        self.extra_bases = []
         for b in node.bases:
             if isinstance(b, ast.Name):
-                self.base_name = b.id
-                break
-            if isinstance(b, ast.Attribute):
-                self.base_name = b.attr
-                if isinstance(b.value, ast.Name):
-                    self.base_attr = b.value.id
-                break
+                bn, battr = b.id, None
+            elif isinstance(b, ast.Attribute):
+                bn = b.attr
+                battr = b.value.id if isinstance(b.value, ast.Name) else None
+            else:
+                continue
+            if self.base_name is None:
+                self.base_name = bn
+                self.base_attr = battr
+            else:
+                self.extra_base_names.append(bn)
 
     def root(self):
         c = self
@@ -2244,6 +2256,26 @@ class ClassInfo:
         while c:
             if mname in c.methods:
                 return c
+            c = c.base
+        return None
+
+    def find_method_owner_mi(self, mname):
+        """Like find_method_owner, but also searches secondary (MI) bases.
+
+        Walks the primary base chain first; if the method is not found, it
+        searches each class on that chain's secondary bases (and their own
+        primary chains). Used to resolve a method inherited from a non-primary
+        base to a direct call instead of a broken closure-field call.
+        """
+        owner = self.find_method_owner(mname)
+        if owner:
+            return owner
+        c = self
+        while c:
+            for b in c.extra_bases:
+                o = b.find_method_owner(mname)
+                if o:
+                    return o
             c = c.base
         return None
 
@@ -2645,6 +2677,9 @@ def collect_classes(tree):
     for ci in order:
         if ci.base_name in classes:
             ci.base = classes[ci.base_name]
+        for bn in ci.extra_base_names:
+            if bn in classes:
+                ci.extra_bases.append(classes[bn])
     for ci in order:
         for item in ci.node.body:
             if isinstance(item, ast.FunctionDef):
@@ -5303,6 +5338,11 @@ class Transpiler:
             if ci.base is None and ci.base_name in self.xclasses \
                     and ci.base_name not in self.classes:
                 ci.base = self.xclasses[ci.base_name][0]
+            # link any imported secondary (MI) bases not resolved locally
+            for bn in ci.extra_base_names:
+                if not any(b.name == bn for b in ci.extra_bases) \
+                        and bn in self.xclasses:
+                    ci.extra_bases.append(self.xclasses[bn][0])
         for cn, (ci, _m) in self.xclasses.items():   # transitive imported links
             if ci.base is None and ci.base_name in self.xclasses:
                 ci.base = self.xclasses[ci.base_name][0]
@@ -10799,7 +10839,7 @@ class Transpiler:
             bt = self.value_ctype(func.value)
             if bt and bt.endswith("*") and bt != OBJ and bt[:-1] in self.classes:
                 ci = self.classes[bt[:-1]]
-                owner = ci.find_method_owner(func.attr)
+                owner = ci.find_method_owner_mi(func.attr)
                 if owner:
                     m = owner.methods.get(func.attr)
                     if m is not None:
