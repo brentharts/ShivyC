@@ -3936,6 +3936,149 @@ class Transpiler:
 
     # ---- driver ----------------------------------------------------------
 
+    # ---- object-model report (--show-object-model) ----------------------
+    _SCALAR_CTYPES = {"int", "long", "short", "char", "char*", "str",
+                      "bool", "double", "float"}
+
+    def _objmodel_kind(self, ctype):
+        """Return ('obj'|'POD', field-tag-code) for a field/var C type."""
+        code = self._field_tc(ctype)
+        return ("obj" if code in ("o", "p") else "POD"), code
+
+    def object_model_report(self, tree):
+        """A human-readable table of how every class field and function
+        parameter was typed: as a plain C scalar/struct (POD, copied by value)
+        or as the boxed object model (arena-allocated, Obj header + vtable).
+
+        This makes the translator's type-inference decisions visible, which is
+        the quickest way to spot a value that was meant to be an object but got
+        inferred as a scalar (or vice versa) before it crashes at runtime."""
+        L = []
+        order = list(self.class_order)
+        pod = [ci for ci in order if ci.csym in self._pod_set]
+        obj = [ci for ci in order if ci.csym not in self._pod_set]
+        L.append("=" * 72)
+        L.append("OBJECT MODEL  --  %s" % (self.src_name or self.modname))
+        L.append("  POD     plain C struct/scalar: no header, copied by value")
+        L.append("  object  boxed: arena-allocated, Obj header + per-class vtable")
+        L.append("  tag     i/l int  b bool  d/f float  s char*  o obj  p ptr")
+        L.append("-" * 72)
+        L.append("classes: %d total  (%d POD struct, %d object-model)"
+                 % (len(order), len(pod), len(obj)))
+        for ci in order:
+            is_pod = ci.csym in self._pod_set
+            base = (" : %s" % ci.base_name) if ci.base_name else ""
+            L.append("")
+            L.append("  class %s%s   [%s]"
+                     % (ci.name, base, "POD struct" if is_pod else "object-model"))
+            ff = ci.full_fields()
+            if not ff:
+                L.append("      (no fields)")
+            for fn, ft in ff:
+                kind, code = self._objmodel_kind(ft)
+                L.append("      %-22s %-10s %s   %s" % (fn, ft, code, kind))
+        funcs = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+        if funcs:
+            L.append("")
+            L.append("-" * 72)
+            L.append("functions: parameter typing  (name:ctype [kind/source])")
+            for fn in sorted(funcs, key=lambda f: f.name):
+                params = []
+                for a in (list(getattr(fn.args, "posonlyargs", [])) +
+                          list(fn.args.args)):
+                    if a.arg == "self":
+                        continue
+                    t = (ann_to_ctype(a.annotation)
+                         or infer_from_name(a.arg) or OBJ)
+                    kind, _ = self._objmodel_kind(t)
+                    src = ("ann" if a.annotation is not None
+                           else ("name" if infer_from_name(a.arg) else "obj"))
+                    params.append("%s:%s[%s/%s]" % (a.arg, t, kind, src))
+                if params:
+                    L.append("  %-24s %s" % (fn.name, "  ".join(params)))
+        nfields = sum(len(ci.full_fields()) for ci in order)
+        nobj = sum(1 for ci in order for _, ft in ci.full_fields()
+                   if self._field_tc(ft) in ("o", "p"))
+        # REVIEW: every field/param given a narrow C scalar SOLELY because its
+        # name matched the int/str/bool/float heuristic. These are exactly the
+        # spots where an actual object value would be silently truncated to a
+        # C scalar -- the dominant self-hosting bug class. Legitimate scalars
+        # show up here too; the point is to make every name-based guess visible
+        # so a human can confirm each one really is POD.
+        review = []
+        for ci in order:
+            for fn, ft in ci.full_fields():
+                if ft in self._SCALAR_CTYPES and infer_from_name(fn) == ft:
+                    review.append("field  %s.%s -> %s" % (ci.name, fn, ft))
+        for fn in sorted((n for n in ast.walk(tree)
+                          if isinstance(n, ast.FunctionDef)),
+                         key=lambda f: f.name):
+            for a in (list(getattr(fn.args, "posonlyargs", [])) +
+                      list(fn.args.args)):
+                if a.arg == "self" or a.annotation is not None:
+                    continue
+                g = infer_from_name(a.arg)
+                if g in self._SCALAR_CTYPES:
+                    review.append("param  %s(%s) -> %s" % (fn.name, a.arg, g))
+        L.append("")
+        L.append("-" * 72)
+        if review:
+            L.append("REVIEW: %d typing(s) inferred from a name (would truncate "
+                     "an object):" % len(review))
+            for r in review:
+                L.append("    %s   annotate as \"object\"/\"ILValue\" if it "
+                         "holds one" % r)
+        else:
+            L.append("REVIEW: no scalar typings were guessed from names")
+        L.append("")
+        L.append("summary: %d field(s)  (%d object/ptr, %d POD scalar)"
+                 % (nfields, nobj, nfields - nobj))
+        L.append("=" * 72)
+        return "\n".join(L)
+
+    def object_model_warnings(self, tree):
+        """High-precision diagnostics for the 'object stored in a scalar' bug
+        class that dominated self-hosting: a field given a narrow C scalar type
+        that is nonetheless assigned an object-typed constructor parameter, so
+        the 64-bit object is silently truncated to int/char*. Returns a list of
+        warning strings (empty when nothing looks risky)."""
+        warns = []
+        for ci in self.class_order:
+            init = ci.methods.get("__init__")
+            if init is None:
+                continue
+            ptypes = {}
+            for a in (list(getattr(init.args, "posonlyargs", [])) +
+                      list(init.args.args)):
+                if a.arg == "self":
+                    continue
+                ptypes[a.arg] = (ann_to_ctype(a.annotation)
+                                 or infer_from_name(a.arg) or OBJ)
+            ftypes = dict(ci.full_fields())
+            for st in ast.walk(init):
+                if not (isinstance(st, ast.Assign)
+                        and isinstance(st.value, ast.Name)
+                        and st.value.id in ptypes
+                        and ptypes[st.value.id] == OBJ):
+                    continue
+                for tgt in st.targets:
+                    if (isinstance(tgt, ast.Attribute)
+                            and isinstance(tgt.value, ast.Name)
+                            and tgt.value.id == "self"
+                            and ftypes.get(tgt.attr) in self._SCALAR_CTYPES
+                            and infer_from_name(tgt.attr) == ftypes.get(tgt.attr)):
+                        # Only when the field's scalar type was itself guessed
+                        # from its name (not an explicit `x: str` annotation,
+                        # which is the author declaring intent): an obj param
+                        # stored into a name-guessed scalar field truncates.
+                        warns.append(
+                            "%s.%s: C `%s` field (typed from its name) is "
+                            "assigned object-typed parameter `%s` -- the object "
+                            "is truncated. Annotate the field as `%s: \"object\"`."
+                            % (ci.name, tgt.attr, ftypes[tgt.attr],
+                               st.value.id, tgt.attr))
+        return warns
+
     def run(self, tree):
         global KNOWN_CLASSES, VTABLE_METHODS
         rewrite_class_lambdas(tree)
@@ -12452,6 +12595,9 @@ def _stdlib_context(path, stdlib_dir=None):
     return os.path.splitext(os.path.basename(path))[0], os.path.dirname(ap), None
 
 
+SHOW_OBJECT_MODEL = False
+
+
 def transpile_file(path, out_dir, stdlib_dir=None):
     # Profile-guided auto-typing: when RPY_PROFILE_GENERATE is set, profile the
     # user's script and compile an auto-annotated copy instead. Single user
@@ -12494,6 +12640,17 @@ def transpile_file(path, out_dir, stdlib_dir=None):
     out_path = os.path.join(out_dir, modname + ".c")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(out)
+    # Always surface the high-precision "object stored in a scalar field"
+    # diagnostics (these indicate a real truncation bug). The full POD/object
+    # table is opt-in via --show-object-model.
+    try:
+        for _w in _t.object_model_warnings(tree):
+            print("  WARNING: %s" % _w, file=sys.stderr)
+        if SHOW_OBJECT_MODEL:
+            print(_t.object_model_report(tree))
+    except Exception as _e:
+        if SHOW_OBJECT_MODEL:
+            print("  (object-model report unavailable: %s)" % _e)
     return out_path, None
 
 
@@ -12589,6 +12746,11 @@ def main(argv):
         if a == "--report":
             report_path = argv[i + 1]
             i += 2
+            continue
+        if a in ("--show-object-model", "--show-objmodel"):
+            global SHOW_OBJECT_MODEL
+            SHOW_OBJECT_MODEL = True
+            i += 1
             continue
         if a in ("--conventions", "-c"):
             print_conventions()

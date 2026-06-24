@@ -62,19 +62,23 @@ TOKEN_DEMO_C = r'''
 #include <string.h>
 typedef struct Range Range;                 /* opaque (errors.Range) */
 typedef struct Token {                       /* matches generated tokens.c */
-    Obj _hdr; Range* r; obj kind; char* content; char* rep; bool wide;
+    Obj _hdr; Range* r; obj content; obj kind; char* rep; bool wide;
     obj logical_line;
 } Token;
-Token* Token_new(obj kind, char* content, char* rep, obj r);
+Token* Token_new(obj kind, obj content, char* rep, obj r);
 
 int main(void) {
-    Token* a = Token_new(OBJ_STR("identifier"), "myvar", "", OBJ_NONE);
-    printf("token.content = %s (expect myvar)\n", a->content);
-    Token* b = Token_new(OBJ_STR("kw_int"), NULL, "", OBJ_NONE);
-    printf("default content = %s (expect kw_int)\n", b->content);
+    /* `content` is polymorphic (a string for identifiers, a char-code list for
+       string literals), so it is an `obj`, not a char*. Pass and read it boxed. */
+    Token* a = Token_new(OBJ_STR("identifier"), OBJ_STR("myvar"), "", OBJ_NONE);
+    printf("token.content = %s (expect myvar)\n", AS_STR(a->content));
+    /* Empty content is falsy, so __init__ falls back to str(self.kind). */
+    Token* b = Token_new(OBJ_STR("kw_int"), OBJ_STR(""), "", OBJ_NONE);
+    printf("default content = %s (expect kw_int)\n", AS_STR(b->content));
     printf("wide=%d logical_line_is_none=%d\n",
            (int)a->wide, a->logical_line.tag == T_NONE);
-    int ok = !strcmp(a->content, "myvar") && !strcmp(b->content, "kw_int")
+    int ok = !strcmp(AS_STR(a->content), "myvar")
+             && !strcmp(AS_STR(b->content), "kw_int")
              && !a->wide && a->logical_line.tag == T_NONE;
     printf("%s\n", ok ? "ALL CHECKS PASS" : "FAIL");
     return ok ? 0 : 1;
@@ -90,18 +94,18 @@ TOKEN_BENCH_C = r'''
 #include <time.h>
 typedef struct Range Range;
 typedef struct Token {
-    Obj _hdr; Range* r; obj kind; char* content; char* rep; bool wide;
+    Obj _hdr; Range* r; obj content; obj kind; char* rep; bool wide;
     obj logical_line;
 } Token;
-Token* Token_new(obj kind, char* content, char* rep, obj r);
+Token* Token_new(obj kind, obj content, char* rep, obj r);
 
 int main(void) {
     const long N = 2000000;
-    volatile char* sink = 0;
+    volatile obj sink = OBJ_NONE;
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     for (long i = 0; i < N; i++) {
-        Token* t = Token_new(OBJ_STR("identifier"), "myvar", "", OBJ_NONE);
+        Token* t = Token_new(OBJ_STR("identifier"), OBJ_STR("myvar"), "", OBJ_NONE);
         sink = t->content;
         if ((i & 0xffff) == 0) arena_reset();   /* keep the arena bounded */
     }
@@ -203,19 +207,19 @@ WA_DEMO_C = r'''
 #include <string.h>
 typedef struct Range Range;
 typedef struct TokenKind TokenKind;
-typedef struct Token { Obj _hdr; Range* r; obj kind; char* content;
+typedef struct Token { Obj _hdr; Range* r; obj content; obj kind;
                        char* rep; bool wide; obj logical_line; } Token;
 extern TokenKind* identifier;            /* token_kinds singleton */
 void   token_kinds_init(void);
-Token* Token_new(obj kind, char* content, char* rep, obj r);
+Token* Token_new(obj kind, obj content, char* rep, obj r);
 obj    _ident(Token* t);                 /* weak_alias */
 
 int main(void) {
     token_kinds_init();
-    Token* id = Token_new(OBJ_OBJ(identifier), "myalias", "", OBJ_NONE);
+    Token* id = Token_new(OBJ_OBJ(identifier), OBJ_STR("myalias"), "", OBJ_NONE);
     obj a = _ident(id);
     printf("_ident(identifier 'myalias') = %s (expect myalias)\n", pystr(a));
-    Token* other = Token_new(OBJ_INT(0), "nope", "", OBJ_NONE);
+    Token* other = Token_new(OBJ_INT(0), OBJ_STR("nope"), "", OBJ_NONE);
     obj b = _ident(other);
     printf("_ident(non-identifier) is_none = %d (expect 1)\n", b.tag == T_NONE);
     int ok = a.tag == T_STR && !strcmp(AS_STR(a), "myalias") && b.tag == T_NONE;
