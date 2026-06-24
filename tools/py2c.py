@@ -210,6 +210,7 @@ typedef struct TypeInfoHdr {
     const struct TypeInfoHdr* base;
     const FieldDesc* fields;
     obj (*tostr)(Obj*);
+    bool (*eq)(Obj*, obj);
 } TypeInfoHdr;
 
 static inline bool isinstance_of(Obj* o, const void* t) {
@@ -1030,7 +1031,19 @@ bool obj_eq(obj a, obj b) {
             }
             return true;
         }
-        default:     return a.u.o == b.u.o;
+        default: {
+            /* Honor a user-defined __eq__ (populated into the type's `eq`
+               slot); otherwise fall back to pointer identity. Without this,
+               classes whose semantics rely on value equality (e.g. Spot in the
+               register allocator) would compare unequal across distinct but
+               equivalent instances, since dicts/sets/`in` all route through
+               obj_eq. */
+            if (a.u.o && b.u.o) {
+                const TypeInfoHdr* _t = (const TypeInfoHdr*)((Obj*)a.u.o)->type;
+                if (_t && _t->eq) return _t->eq((Obj*)a.u.o, b);
+            }
+            return a.u.o == b.u.o;
+        }
     }
 }
 bool pycontains(obj container, obj v) {
@@ -1978,6 +1991,65 @@ def infer_type(name, ann=None):
     return ann_to_ctype(ann) or infer_from_name(name) or OBJ
 
 
+def _const_numeric_ctype(node):
+    """ctype ("int"/"double") of a numeric literal class-constant value, or
+    None. bool excluded (bool is an int subclass); str/None/containers return
+    None and keep their existing inference. A leading unary +/- is allowed."""
+    n = node
+    if isinstance(n, ast.UnaryOp) and isinstance(n.op, (ast.USub, ast.UAdd)) \
+            and isinstance(n.operand, ast.Constant):
+        n = n.operand
+    if isinstance(n, ast.Constant):
+        v = n.value
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, int):
+            return "int"
+        if isinstance(v, float):
+            return "double"
+    return None
+
+
+def _class_attr_is_mutated(classnode, attr):
+    """True if `attr` is ever an assignment target (`x.attr = ...` /
+    `x.attr += ...`) inside `classnode`. A mutated class attribute is a real
+    storage slot (e.g. a `_counter += 1` class counter), not an inlinable
+    constant, so its field must not be narrowed to a literal scalar type."""
+    for sub in ast.walk(classnode):
+        tgts = []
+        if isinstance(sub, ast.Assign):
+            tgts = sub.targets
+        elif isinstance(sub, (ast.AugAssign, ast.AnnAssign)):
+            tgts = [sub.target]
+        for t in tgts:
+            for tt in (t.elts if isinstance(t, (ast.Tuple, ast.List)) else [t]):
+                if isinstance(tt, ast.Attribute) and tt.attr == attr:
+                    return True
+    return False
+
+
+def _attr_mutated_via_classname(classnode, attr):
+    """True if `attr` is assigned through the class's OWN name inside the class
+    (e.g. `ASMCode.label_num += 1` inside class ASMCode). Such an attribute is a
+    shared class-level counter that needs real global storage: treating it as a
+    per-instance scalar default would inline its initial literal at every read
+    and turn the mutation into a no-op (`OBJ_INT(0) = OBJ_INT(0)+1`)."""
+    cls_name = getattr(classnode, "name", None)
+    if not cls_name:
+        return False
+    for sub in ast.walk(classnode):
+        tgts = []
+        if isinstance(sub, ast.Assign):
+            tgts = sub.targets
+        elif isinstance(sub, (ast.AugAssign, ast.AnnAssign)):
+            tgts = [sub.target]
+        for t in tgts:
+            if isinstance(t, ast.Attribute) and t.attr == attr \
+                    and isinstance(t.value, ast.Name) and t.value.id == cls_name:
+                return True
+    return False
+
+
 def optional_param_names(fn):
     """Params with a literal `None` default and no annotation are Optional,
     hence must be boxed as `obj` (None has to be representable)."""
@@ -2589,6 +2661,12 @@ def collect_classes(tree):
                     pass  # method alias, e.g. __rmul__ = __mul__
                 elif nm.startswith("__") and nm.endswith("__"):
                     pass  # dunder method names are not instance fields
+                elif _attr_mutated_via_classname(ci.node, nm):
+                    # A scalar mutated through the class name (e.g.
+                    # `ASMCode.label_num += 1`) is a shared class counter, not a
+                    # per-instance default: give it real global storage instead
+                    # of inlining the initial literal at every read.
+                    ci.class_statics[nm] = val
                 else:
                     # class-level scalar (e.g. `comm = False`, `name = "add"`,
                     # `FInst_s = None`): a per-class default, possibly overridden
@@ -2596,7 +2674,21 @@ def collect_classes(tree):
                     ci.class_attrs[nm] = val
         ci.own_fields = discover_fields(ci.node, set(ci.methods))
         for nm in ci.class_attrs:           # ensure they get a struct slot
-            if not any(f == nm for f, _ in ci.own_fields):
+            # A class constant assigned a numeric literal (e.g. `DEFINED = 3`)
+            # is typed from its VALUE, not a name heuristic: otherwise an int
+            # enum whose name collides with BOOL_NAMES ("defined") is mistyped
+            # bool and 3 is stored as true(1). int keeps integer enums
+            # comparable/maxable as integers (def_state bookkeeping). Only do
+            # this when the attribute is never mutated, so a mutable class
+            # counter (`_counter += 1`) stays a real slot, not an inlined
+            # literal.
+            lit_ct = _const_numeric_ctype(ci.class_attrs[nm])
+            if lit_ct is not None and not _class_attr_is_mutated(ci.node, nm):
+                ci.own_fields = [(f, lit_ct if f == nm else t)
+                                 for (f, t) in ci.own_fields]
+                if not any(f == nm for f, _ in ci.own_fields):
+                    ci.own_fields.append((nm, lit_ct))
+            elif not any(f == nm for f, _ in ci.own_fields):
                 ci.own_fields.append((nm, OBJ))
         for nm in ci.class_statics:         # class statics accessed as self.X
             if not any(f == nm for f, _ in ci.own_fields):
@@ -3915,6 +4007,7 @@ class Transpiler:
         self.xtype_externs = set()  # imported TypeInfo singletons (Cls_type)
         self.xvtable_impls = set()  # (clsname, method) imported vtable slot impls
         self._tostr_externs = set()  # csyms of imported classes whose __str__ we reference
+        self._eq_externs = set()     # csyms of imported classes whose __eq__ we reference
         self.xconstdict_externs = set()  # (clsname, dict) imported const-dict fns
         self.xclass_module = {}     # imported class name -> its module
         for cn, (ci, mod) in self.xclasses.items():
@@ -4251,7 +4344,7 @@ class Transpiler:
         if not (classes or funcs or singles or globs or self.used_xmethods or
                 self.xvt_needed or self.xtype_externs or self.xvtable_impls or
                 self.xconstdict_externs or self.xshadow_td or
-                self._tostr_externs):
+                self._tostr_externs or self._eq_externs):
             return []
         out = ["/* ---- cross-module imports (extern declarations) ---- */"]
         emitted_td = set()
@@ -4324,6 +4417,8 @@ class Transpiler:
             out.append("extern const TypeInfo %s_type;" % self.xcsym(cls))
         for cs in sorted(self._tostr_externs):           # imported __str__ impls
             out.append("extern obj %s___str__(Obj*);" % cs)
+        for cs in sorted(self._eq_externs):              # imported __eq__ impls
+            out.append("extern bool %s___eq__(Obj*, obj);" % cs)
         for (cls, d) in sorted(self.xconstdict_externs):  # imported const-dicts
             out.append("extern str %s_%s();" % (self.xcsym(cls), d))
             out.append("extern obj %s_%s_items();" % (self.xcsym(cls), d))
@@ -4337,6 +4432,7 @@ class Transpiler:
             out.append("    const struct %s* base;" % vt)
             out.append("    const FieldDesc* fields;")
             out.append("    obj (*tostr)(Obj*);")
+            out.append("    bool (*eq)(Obj*, obj);")
             for m in sorted(reg["vt"]):
                 ret, params = self.ximported_method_sig(mod, m)
                 out.append("    %s (*%s)(%s);" % (
@@ -4366,6 +4462,9 @@ class Transpiler:
             for mname, fn in ci.methods.items():
                 if mname == "__str__" and mname not in ci.static_methods:
                     protos.append("obj %s___str__(Obj* self_);" % ci.csym)
+                    continue
+                if mname == "__eq__" and mname not in ci.static_methods:
+                    protos.append("bool %s___eq__(Obj* self_, obj);" % ci.csym)
                     continue
                 if mname.startswith("__") and mname.endswith("__") \
                         and mname not in ("__init__", "__enter__", "__exit__"):
@@ -5614,6 +5713,7 @@ class Transpiler:
         self.emit("const struct TypeInfo* base;")
         self.emit("const FieldDesc* fields;")
         self.emit("obj (*tostr)(Obj*);")
+        self.emit("bool (*eq)(Obj*, obj);")
         for m in sorted(VTABLE_METHODS):
             self.emit(self.vslot_signature(m) + ";")
         self.indent -= 1
@@ -5880,6 +5980,9 @@ class Transpiler:
                 continue
             if mname == "__str__" and mname not in ci.static_methods:
                 self.emit_tostr_method(ci, fn)
+                continue
+            if mname == "__eq__" and mname not in ci.static_methods:
+                self.emit_eq_method(ci, fn)
                 continue
             if mname.startswith("__") and mname.endswith("__"):
                 if mname not in ("__enter__", "__exit__"):
@@ -6272,6 +6375,23 @@ class Transpiler:
         self.emit("}")
         self.emit()
 
+    def emit_eq_method(self, ci, fn):
+        """Lower `__eq__` to a standalone `bool <Class>___eq__(Obj*, obj)` so
+        obj_eq can dispatch value-equality through the TypeInfo `eq` slot. Like
+        __str__, __eq__ is otherwise an unlowered dunder; without this, `==`,
+        `in`, dict/set keys on such objects fall back to pointer identity."""
+        other = fn.args.args[1].arg if len(fn.args.args) > 1 else "other"
+        self.enter_scope(fn, skip_self=True)
+        self.cur_ret = "bool"
+        self.emit("bool %s___eq__(Obj* self_, obj %s) {" % (ci.csym, cname(other)))
+        self.indent += 1
+        self.emit("%s* self = (%s*)self_;" % (ci.csym, ci.csym))
+        self.emit("(void)self;")
+        self.emit_hoisted_body(fn.body)
+        self.indent -= 1
+        self.emit("}")
+        self.emit()
+
     def emit_vtable(self, ci):
         if ci.csym in self._pod_set:
             return                          # POD class: no TypeInfo / vtable
@@ -6296,10 +6416,18 @@ class Transpiler:
                 self._tostr_externs.add(str_owner.csym)
         else:
             tostr = "NULL"
+        eq_owner = ci.find_method_owner("__eq__")
+        if eq_owner and "__eq__" not in eq_owner.static_methods:
+            eqfn = "%s___eq__" % eq_owner.csym
+            if eq_owner.name not in self.classes:       # imported __eq__ impl
+                self._eq_externs.add(eq_owner.csym)
+        else:
+            eqfn = "NULL"
         init = ", ".join([".name = %s" % c_string(ci.name),
                           ".base = (const struct TypeInfo*)%s" % base,
                           ".fields = %s__fields" % ci.csym,
-                          ".tostr = %s" % tostr] + slots)
+                          ".tostr = %s" % tostr,
+                          ".eq = %s" % eqfn] + slots)
         self.emit("const TypeInfo %s_type = { %s };" % (ci.csym, init))
         self.emit()
 
@@ -6902,7 +7030,7 @@ class Transpiler:
             self.cur_class = ci
             for nm, val in ci.class_statics.items():
                 self.emit("%s_%s = %s;" % (ci.csym, cname(nm),
-                                           self.expr(val)))
+                                           self.coerce_to(OBJ, val, self.expr(val))))
             self.cur_class = prev
         for stmt in getattr(self, "mod_init_stmts", []):  # deferred top-level
             for ln in self.stmt(stmt):
@@ -7678,7 +7806,22 @@ class Transpiler:
                         lines.append("subscript_set(%s, %s, %s);" % (
                             self.expr(el.value), self.wrap_obj(el.slice), src))
                     elif isinstance(el, ast.Attribute):
-                        lines.append(self._emit_attr_assign(el, node.value))
+                        # Unpack the i-th element into this attribute. Must use
+                        # `src` (index_obj(tmp, i)), NOT the whole RHS node:
+                        # passing node.value here assigned the entire tuple to
+                        # every attribute target (e.g. `self.a, self.b = x, y`
+                        # set both a and b to the list [x, y]).
+                        if self._attr_is_property(el) or \
+                                self._attr_assign_needs_setattr(el):
+                            lines.append(
+                                'mp_call_import("builtins", "setattr", 3, '
+                                '%s, %s, %s);' % (
+                                    self.wrap_obj(el.value),
+                                    "OBJ_STR(%s)" % c_string(el.attr), src))
+                        else:
+                            t = self.target_ctype(el) or OBJ
+                            lines.append("%s = %s;" % (
+                                self.expr(el), self.unwrap_obj(t, src)))
                     else:
                         t = self.target_ctype(el) or OBJ
                         lines.append("%s = %s;" % (self.expr(el),
@@ -7909,6 +8052,8 @@ class Transpiler:
                     return "double"
                 if "float" in (lt, rt):
                     return "float"
+                if isinstance(node.op, ast.Pow):
+                    return "long"            # ipow() returns a 64-bit long
                 if "long" in (lt, rt):       # long widens int/short/char
                     return "long"
                 return "int"
@@ -11214,6 +11359,8 @@ class Transpiler:
                 return s
         if t == "int":
             return "OBJ_INT(%s)" % s
+        if t == "long":
+            return "OBJ_INT(%s)" % s    # obj stores its integer payload as long
         if t == "char*":
             return "OBJ_STR(%s)" % s
         if t == "bool":
@@ -11325,6 +11472,17 @@ class Transpiler:
                 sci = self.classes.get(bn) or (self.xclasses[bn][0]
                                                if bn in self.xclasses else None)
                 if sci is not None and self.static_owner(sci, node.attr):
+                    return OBJ
+                # A class-name access to a value-typed numeric class constant
+                # (`DeclInfo.STATIC`) is inlined by ex_Attribute as
+                # wrap_obj(literal) -> an obj. Report obj here so a surrounding
+                # obj context does not re-box the already-boxed literal
+                # (OBJ_INT(OBJ_INT(3))). Instance access (self.X / obj.X) still
+                # reads the typed int field via the field_ctype paths below.
+                _lcci = self.classes.get(bn)
+                if _lcci is not None \
+                        and node.attr in getattr(_lcci, "class_attrs", {}) \
+                        and _lcci.field_ctype(node.attr) in ("int", "double"):
                     return OBJ
                 # alias.ClassName used as a value -> a constructor closure (obj)
                 if bn in self.import_alias:
