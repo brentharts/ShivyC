@@ -4114,6 +4114,55 @@ class Transpiler:
                                st.value.id, tgt.attr))
         return warns
 
+    def _project_uses_copy_module(self):
+        """True if any project module uses the stdlib `copy` module via
+        copy.copy() or `from copy import copy`. Cached; purely advisory."""
+        cached = getattr(self, "_copy_mod_used_cache", None)
+        if cached is not None:
+            return cached
+        used = False
+        base = self.base_dir
+        if base and os.path.isdir(base):
+            for root, _dirs, fnames in os.walk(base):
+                for fn in fnames:
+                    if not fn.endswith(".py"):
+                        continue
+                    try:
+                        src = open(os.path.join(root, fn),
+                                   encoding="utf-8").read()
+                    except Exception:
+                        continue
+                    if "copy.copy(" in src or "from copy import copy" in src:
+                        used = True
+                        break
+                if used:
+                    break
+        self._copy_mod_used_cache = used
+        return used
+
+    def copy_shadow_warnings(self, tree):
+        """rpython style advisory. A user method named `copy` collides with the
+        stdlib `copy` module (copy.copy()) and the builtin container `.copy()`:
+        at an untyped-obj `.copy()` call site the transpiler cannot always tell
+        the user method from a list/dict/set shallow copy, so when a project
+        both uses copy.copy() and defines `copy` methods the dispatch is only
+        partially supported. Returns a warning for any class in THIS module that
+        defines `copy` under that condition (rename it, e.g. copy_node /
+        copy_code / copy_state). Empty when the pattern is absent."""
+        warns = []
+        if not self._project_uses_copy_module():
+            return warns
+        for ci in self.class_order:
+            if "copy" not in ci.methods:
+                continue
+            warns.append(
+                "%s defines a method named `copy`, but this project also uses "
+                "the stdlib `copy` module / copy.copy(); `.copy()` on an "
+                "untyped obj is then ambiguous with a container shallow copy. "
+                "Rename the method (e.g. copy_node / copy_code / copy_state) "
+                "for full rpython support." % ci.name)
+        return warns
+
     def run(self, tree):
         global KNOWN_CLASSES, VTABLE_METHODS
         rewrite_class_lambdas(tree)
@@ -12709,6 +12758,8 @@ def transpile_file(path, out_dir, stdlib_dir=None):
     # table is opt-in via --show-object-model.
     try:
         for _w in _t.object_model_warnings(tree):
+            print("  WARNING: %s" % _w, file=sys.stderr)
+        for _w in _t.copy_shadow_warnings(tree):
             print("  WARNING: %s" % _w, file=sys.stderr)
         if SHOW_OBJECT_MODEL:
             print(_t.object_model_report(tree))
