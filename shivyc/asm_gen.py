@@ -304,7 +304,7 @@ class NodeGraph:
         """Return all nodes in this graph, including pseudonodes."""
         return self._all_nodes
 
-    def copy(self) -> "NodeGraph":
+    def copy_node(self) -> "NodeGraph":
         """Return a deep copy of this graph, but with same ILValue objects."""
         g = NodeGraph()
 
@@ -598,7 +598,7 @@ class ASMGen:
         spilled_nodes = []
 
         while True:
-            g = g_bak.copy()
+            g = g_bak.copy_node()
 
             # Remove all nodes that have been spilled for this iteration
             for n in spilled_nodes:
