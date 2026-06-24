@@ -708,10 +708,139 @@ def cmd_compiler(build_root, args):
     return 0
 
 
+# Small C programs exercising the features the self-hosted native compiler
+# currently supports, each with a known exit code. `bootstrap` compiles and runs
+# each with the freshly built native binary to validate it end to end.
+SMOKE_PROGRAMS = [
+    ("const",      "int main(void){ return 42; }", 42),
+    ("arith",      "int main(void){ return 3*4 + 10/2 - 1; }", 16),
+    ("if_else",    "int main(void){ int x=5; if(x>3) return 7; else return 2; }", 7),
+    ("while",      "int main(void){ int i=0,s=0; while(i<5){s+=i;i++;} return s; }", 10),
+    ("for",        "int main(void){ int s=0; for(int i=1;i<=4;i++) s+=i; return s; }", 10),
+    ("recursion",  "int f(int n){return n<=1?1:n*f(n-1);} int main(void){return f(5);}", 120),
+    ("pointer",    "int main(void){ int x=9; int*p=&x; return *p; }", 9),
+    ("array",      "int main(void){ int a[3]; a[0]=1;a[1]=2;a[2]=3; return a[0]+a[1]+a[2]; }", 6),
+    ("ptr_arith",  "int main(void){ int a[3]; a[0]=10;a[1]=20; int*p=a; return *(p+1); }", 20),
+    ("string_idx", 'int main(void){ char*s="ABC"; return s[1]; }', 66),
+]
+
+
+def _native_smoke(exe, quiet=False):
+    """Compile+run each smoke program with `exe`; return (passed, total)."""
+    passed = 0
+    for name, src, want in SMOKE_PROGRAMS:
+        d = tempfile.mkdtemp(prefix="shivyc-smoke-")
+        cp = os.path.join(d, "p.c")
+        op = os.path.join(d, "p.out")
+        open(cp, "w").write(src)
+        run([exe, cp, "-o", op])
+        if os.path.exists(op):
+            got = subprocess.run([op]).returncode
+            ok = (got == want)
+        else:
+            got, ok = "compile-error", False
+        log(quiet, "  %-4s %-11s -> %s (want %s)"
+            % ("ok" if ok else "FAIL", name, got, want))
+        passed += 1 if ok else 0
+        shutil.rmtree(d, ignore_errors=True)
+    return passed, len(SMOKE_PROGRAMS)
+
+
+def cmd_bootstrap(build_root, args):
+    """Stage 1: build the native self-hosted compiler (py2c -> gcc), smoke-test
+    it, then benchmark its compile speed against gcc."""
+    out = args.build_dir or os.path.join(build_root, "bootstrap")
+    args.build_dir = out
+    print("== bootstrap stage 1: building the native compiler ==")
+    if cmd_compiler(build_root, args) != 0:
+        return 1
+    exe = os.path.join(out, "shivyc_native")
+
+    print("\n== smoke test (native binary) ==")
+    p, t = _native_smoke(exe, args.quiet)
+    print("smoke: %d/%d passed" % (p, t))
+    if p != t:
+        print("bootstrap: native binary failed the smoke test")
+        return 1
+
+    print("\n== compile-speed benchmark: native shivyc vs gcc ==")
+    bench = os.path.join(REPO, "benchmarks", "compile_speed",
+                         "bench_compile_speed.py")
+    env = dict(os.environ, SHIVYC=exe)
+    subprocess.run([sys.executable, bench, "-n", "3"], cwd=REPO, env=env)
+
+    print("\nbootstrap stage 1 complete -> %s" % exe)
+    print("next: `make bootstrap2` (self-compile) then `make install`")
+    return 0
+
+
+def cmd_bootstrap2(build_root, args):
+    """Stage 2: feed the compiler's own generated C back through the stage-1
+    native binary, producing the final `shivycx`.
+
+    A full stage-2 self-compile is the bootstrap milestone we are working
+    toward; until the native compiler accepts every C construct it emits for its
+    own source, this reports how many of the generated modules it can already
+    compile (a concrete progress gauge) and the first blocker. When all modules
+    self-compile it links `shivycx` and runs the full test suite against it."""
+    out = args.build_dir or os.path.join(build_root, "bootstrap")
+    exe = os.path.join(out, "shivyc_native")
+    if not os.path.exists(exe):
+        print("no stage-1 compiler at %s -- run `make bootstrap` first" % exe)
+        return 1
+    cfiles = sorted(f for f in os.listdir(out)
+                    if f.endswith(".c") and not f.endswith(".s2.c"))
+    print("== bootstrap stage 2: self-compiling %d generated modules =="
+          % len(cfiles))
+    objs, fails, first_err = [], [], None
+    for c in cfiles:
+        oo = os.path.join(out, c[:-2] + ".s2.o")
+        if os.path.exists(oo):
+            os.remove(oo)
+        r = run([exe, os.path.join(out, c), "-c", "-o", oo], cwd=out)
+        if os.path.exists(oo):
+            objs.append(oo)
+        else:
+            fails.append(c)
+            if first_err is None:
+                msg = (r.stdout + r.stderr).strip().splitlines()
+                first_err = (c, msg[0] if msg else "(no diagnostic)")
+    print("self-compiled %d/%d modules" % (len(objs), len(cfiles)))
+    if fails:
+        print("\n%d module(s) the native compiler cannot yet compile."
+              % len(fails))
+        if first_err:
+            print("first blocker: %s\n  %s" % first_err)
+        print("\nThe native compiler does not yet accept all of its own "
+              "generated C\n(the current bootstrap frontier -- see "
+              "tools/SELFHOST_STATUS.md).")
+        return 1
+
+    shivycx = os.path.join(out, "shivycx")
+    fl = run(["gcc"] + objs + ["-o", shivycx, "-lm",
+              "-Wl,--allow-multiple-definition"])
+    if fl.returncode != 0:
+        print("stage-2 link failed:\n" + fl.stderr[:1500])
+        return 1
+    print("built final self-compiled compiler -> %s" % shivycx)
+
+    print("\n== full test suite against shivycx ==")
+    bindir = os.path.join(REPO, "bin")
+    os.makedirs(bindir, exist_ok=True)
+    shim = os.path.join(bindir, "shivyc")
+    open(shim, "w").write('#!/bin/sh\nexec %s "$@"\n' % shivycx)
+    os.chmod(shim, 0o755)
+    env = dict(os.environ, PATH=bindir + ":" + os.environ.get("PATH", ""))
+    r = subprocess.run([sys.executable, "-m", "pytest", "tests/", "-q"],
+                       cwd=REPO, env=env)
+    return r.returncode
+
+
 def main():
     ap = argparse.ArgumentParser(description="ShivyCX self-host build/test")
     ap.add_argument("cmd", choices=["list", "test", "bench", "coverage",
-                                    "link", "compiler"])
+                                    "link", "compiler", "bootstrap",
+                                    "bootstrap2"])
     ap.add_argument("names", nargs="*", help="target name(s)")
     ap.add_argument("--musl", action="store_true",
                     help="compile transpiled C against packaged musl headers")
@@ -750,6 +879,10 @@ def main():
             rc = cmd_link(build_root, args)
         elif args.cmd == "compiler":
             rc = cmd_compiler(build_root, args)
+        elif args.cmd == "bootstrap":
+            rc = cmd_bootstrap(build_root, args)
+        elif args.cmd == "bootstrap2":
+            rc = cmd_bootstrap2(build_root, args)
     finally:
         if args.keep:
             print("build dir:", build_root)
