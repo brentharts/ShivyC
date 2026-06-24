@@ -227,7 +227,7 @@ class DeclInfo:
             if self.init is None or isinstance(self.init, decl_nodes.InitList):
                 err = "__auto_type declaration requires a scalar initializer"
                 raise CompilerError(err, self.range)
-            probe_il = il_code.copy()
+            probe_il = il_code.copy_code()
             init_val = self.init.make_il(probe_il, symbol_table, c)
             self.ctype = init_val.ctype
 
@@ -1199,7 +1199,7 @@ class Declaration(Node):
         elif any(isinstance(s, decl_nodes.TypeofSpec) for s in specs):
             ts = [s for s in specs
                   if isinstance(s, decl_nodes.TypeofSpec)][0]
-            probe_il = self.il_code.copy()
+            probe_il = self.il_code.copy_code()
             val = ts.expr.make_il(probe_il, self.symbol_table, self.c)
             base_type = val.ctype
 
@@ -1328,7 +1328,7 @@ class Declaration(Node):
                     # folds to a literal and emits nothing, while a
                     # non-constant one is reported cleanly rather than crashing
                     # (e.g. at file scope where there is no current function).
-                    dummy = self.il_code.copy()
+                    dummy = self.il_code.copy_code()
                     literal = None
                     try:
                         val_il = value_expr.make_il(
