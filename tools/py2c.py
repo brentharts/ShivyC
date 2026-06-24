@@ -1623,7 +1623,8 @@ obj rt_getattr(obj recv, const char* name, obj dflt) {
                 case 'f': return OBJ_FLOAT(*(float*)a);
                 case 's': return OBJ_STR(*(str*)a);
                 case 'o': return *(obj*)a;
-                case 'p': return OBJ_OBJ(*(void**)a);
+                case 'p': { void* _pp = *(void**)a;
+                            return _pp ? OBJ_OBJ(_pp) : OBJ_NONE; }
                 default:  return dflt;
             }
         }
@@ -5253,6 +5254,95 @@ class Transpiler:
             if n > bestn:
                 bestn, best = n, fn
         return best
+
+    def _box_expr_to_obj(self, expr, ct):
+        """Box a rendered C expression of ctype `ct` into a tagged `obj`."""
+        if ct == OBJ:
+            return expr
+        if ct == "int":
+            return "OBJ_INT(%s)" % expr
+        if ct == "bool":
+            return "OBJ_BOOL(%s)" % expr
+        if ct == "char*":
+            return "OBJ_STR(%s)" % expr
+        if ct in ("double", "float"):
+            return "OBJ_FLOAT(%s)" % expr
+        if isinstance(ct, str) and ct.endswith("*"):
+            return "OBJ_OBJ(%s)" % expr
+        return expr
+
+    def _obj_ambiguous_dispatch(self, recv_node, mname, arg_nodes):
+        """Dispatch `recv.mname(...)` on an untyped obj receiver when `mname` is
+        defined in two or more UNRELATED, NON-polymorphic classes (each a root
+        with no project-wide subclasses), e.g. ILCode.add / ErrorCollector.add /
+        ASMCode.add.
+
+        A single representative-vtable cast is wrong here: each class lives in
+        its own module and the shared method name sits at a DIFFERENT vtable
+        slot offset per module, so casting (say) an ILCode through the errors
+        vtable reads a bogus slot and calls a null/incorrect pointer. Instead we
+        emit a runtime type-switch keyed on the receiver's actual TypeInfo and
+        call each class's own method directly. Returns a C expression, or None
+        if the pattern does not apply (leaving existing resolution untouched)."""
+        if not self.base_dir and not _LOCAL_MODULE_DIRS:
+            return None
+        defs = project_method_owners(self.base_dir).get(mname, set())
+        if len(defs) < 2:
+            return None
+        try:
+            classes_h, _byname = project_class_hierarchy(self.base_dir)
+        except Exception:
+            return None
+        # any class named as a base => it has subclasses (exact-type match would
+        # miss instances of those subclasses, so the pattern is unsafe)
+        has_sub = {info.get("base") for info in classes_h.values()
+                   if info.get("base")}
+        definers = []
+        for (modname, classname) in sorted(defs):
+            info = classes_h.get((modname, classname))
+            if info is None or info.get("base") is not None:
+                return None                      # unknown or non-root: bail
+            if classname in has_sub:
+                return None                      # polymorphic: bail
+            kind, ci = self.xref(classname, modname)
+            if kind != "class" or ci is None or mname not in ci.methods:
+                return None
+            if mname in getattr(ci, "static_methods", ()):
+                return None                      # static: receiver type irrelevant
+            definers.append(ci)
+        if len(definers) < 2:
+            return None
+        branches = []
+        for ci in definers:
+            m = ci.methods[mname]
+            pct = [arg_ctype(m, a) for a in m.args.args[1:]]
+            cargs = self.coerce_args(pct, arg_nodes, self.defaults_for(m, True))
+            ret = self._c_ret(m)
+            self.used_xmethods[(ci.name, mname)] = ret
+            self._ref_xclass(ci, body=True, typeinfo=True)
+            call = "%s_%s((Obj*)AS_OBJ(_d)%s)" % (
+                ci.csym, mname, (", " + ", ".join(cargs)) if cargs else "")
+            if ret == "void":
+                body = "%s; _dv = OBJ_NONE;" % call
+            else:
+                body = "_dv = %s;" % self._box_expr_to_obj(call, ret)
+            branches.append(
+                "if (_dt == (const TypeInfoHdr*)&%s_type) { %s }"
+                % (ci.csym, body))
+        chain = " else ".join(branches)
+        # genuine set receivers reach here too (an untyped `.add` site that is
+        # sometimes a class method and sometimes set.add): a real set/list is
+        # tagged T_SET/T_LIST (not T_OBJ), so none of the type branches match;
+        # fall back to the builtin set add in that case.
+        tail = ""
+        if mname == "add" and len(arg_nodes) == 1:
+            tail = " else if (_d.tag == T_SET || _d.tag == T_LIST) { " \
+                   "set_add(_d, %s); }" % self.wrap_obj(arg_nodes[0])
+        return ("({ obj _d = %s; const TypeInfoHdr* _dt = "
+                "(_d.tag == T_OBJ && _d.u.o) ? "
+                "(const TypeInfoHdr*)_d.u.o->type : (const TypeInfoHdr*)0; "
+                "obj _dv = OBJ_NONE; %s%s _dv; })" % (self.wrap_obj(recv_node),
+                                                      chain, tail))
 
     def xvcall(self, mod, recv_node, mname, arg_nodes):
         """Cross-module virtual call: index the defining module's TypeInfo
@@ -9521,10 +9611,24 @@ class Transpiler:
                 if f.attr == "close":
                     self._io_used.add("fclose")
                     return "fclose(%s)" % fe
-                if f.attr in ("read", "readline"):
+                if f.attr == "readline":
                     self._io_used.update(("malloc", "fgets"))
                     return ("({ char* _b = malloc(4096); "
                             "if (!fgets(_b, 4096, %s)) _b[0] = 0; _b; })" % fe)
+                if f.attr == "read":
+                    # Read the ENTIRE stream (not a single line). A growing
+                    # fread loop works on non-seekable streams too, and unlike
+                    # fgets it does not stop at the first newline -- the latter
+                    # silently truncated multi-line files to their first line.
+                    self._io_used.update(("malloc", "realloc", "fread"))
+                    return ("({ FILE* _f = (FILE*)(%s); "
+                            "size_t _cap = 65536, _len = 0; "
+                            "char* _b = (char*)malloc(_cap); "
+                            "if (_f) { size_t _r; "
+                            "while ((_r = fread(_b + _len, 1, _cap - _len, _f)) "
+                            "> 0) { _len += _r; if (_len == _cap) { "
+                            "_cap *= 2; _b = (char*)realloc(_b, _cap); } } } "
+                            "_b[_len] = 0; _b; })" % fe)
         if isinstance(f, ast.Name):
             if f.id == "open" and node.args:
                 self._io_used.add("fopen")
@@ -10136,6 +10240,15 @@ class Transpiler:
             if func.attr == "add" and len(node.args) == 1 and \
                     func.attr not in self.method_owners and \
                     func.attr not in self.xmethod_owners:
+                # `add` is also ILCode/ASMCode/ErrorCollector.add; when the
+                # receiver is one of those classes (passed as an untyped obj,
+                # e.g. asm_code in a make_asm vtable body) a flat set_add reads
+                # the wrong object layout. Dispatch on the receiver's real type;
+                # the helper falls back to set_add for genuine set receivers.
+                amb = self._obj_ambiguous_dispatch(
+                    func.value, func.attr, node.args)
+                if amb is not None:
+                    return amb
                 return "set_add(%s, %s)" % (self.wrap_obj(func.value),
                                             self.wrap_obj(node.args[0]))
             if func.attr == "clear" and not node.args and \
@@ -10302,6 +10415,14 @@ class Transpiler:
             if func.attr in self.hierarchy_method and \
                     not self._local_method_accepts_argc(func.attr,
                                                          len(node.args)):
+                # ambiguous name across unrelated non-polymorphic classes
+                # (e.g. ILCode.add): the per-module vtable slot offsets differ,
+                # so dispatch on the receiver's real type rather than casting
+                # through one module's (wrong) vtable.
+                amb = self._obj_ambiguous_dispatch(
+                    func.value, func.attr, node.args)
+                if amb is not None:
+                    return amb
                 _nmod = self._narrowed_recv_vt_module(func)
                 if _nmod is not None:
                     return self.xvcall(_nmod, func.value, func.attr, node.args)
@@ -10429,6 +10550,14 @@ class Transpiler:
                 xmod = self.resolve_xvirtual(func.attr)
                 if xmod:
                     return self.xvcall(xmod, func.value, func.attr, node.args)
+                # ambiguous name across unrelated non-polymorphic classes
+                # (e.g. ILCode.add vs ErrorCollector.add): a single vtable cast
+                # would read the wrong per-module slot offset, so dispatch on
+                # the receiver's real type.
+                amb = self._obj_ambiguous_dispatch(
+                    func.value, func.attr, node.args)
+                if amb is not None:
+                    return amb
                 # method belonging to an imported hierarchy whose root spans
                 # modules: dispatch through the root module's canonical vtable
                 if func.attr in self.hierarchy_method:
