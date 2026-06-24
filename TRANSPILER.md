@@ -425,7 +425,41 @@ always better to leave a construct uncompiled than to pass the compile-clean
 count while quietly failing a behavior harness.
 
 
-## 8. Layout and running it
+## 8. Style guide: don't shadow `copy` / `copy.copy()`
+
+The transpiler lowers `x.copy()` differently depending on what `x` is. On a
+builtin container it is a shallow copy (`pycopy`, i.e. `list`/`dict`/`set`
+`.copy()`); on a class instance it is a method call. At an **untyped-obj**
+call site the static type is `obj`, so the only way to tell the two apart is a
+runtime type-switch on the receiver's `TypeInfo`. That switch is reliable only
+when `copy` names exactly one thing across the project.
+
+So the rule is: **if your project imports the stdlib `copy` module and calls
+`copy.copy()`, do not also define a method named `copy` on your classes.** The
+two meanings collide, and an untyped `recv.copy()` can no longer be
+disambiguated with full confidence — this pattern is only partially supported.
+It is most likely to bite when the `copy`-defining classes are roots of
+separate, unrelated hierarchies (each in its own module, so the shared name
+sits at a different vtable slot per module).
+
+The fix is a one-line rename to an unambiguous, intention-revealing name, after
+which every remaining `.copy()` in the project is unambiguously a container
+shallow copy:
+
+```python
+class NodeGraph:    def copy_node(self)  -> "NodeGraph": ...
+class ILCode:       def copy_code(self)  -> "ILCode":    ...
+class State:        def copy_state(self) -> "State":     ...
+```
+
+The transpiler detects the offending combination — a project that uses
+`copy.copy()` *and* defines one or more `copy` methods — and prints a stderr
+advisory naming each offending class (e.g. `WARNING: ILCode defines a method
+named 'copy', but this project also uses the stdlib 'copy' module ...`). The
+advisory never changes the generated code; it only points at the classes to
+rename.
+
+## 9. Layout and running it
 
 The transpiler is a single file, `tools/py2c.py`. Run from `tools/`:
 
