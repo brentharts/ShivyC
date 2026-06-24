@@ -167,7 +167,7 @@ def reject_long_double(ctype, range, il_code=None, c=None):
     dead-code elimination -- this tolerates the unused `static inline` long
     double helpers that musl's headers define but most files never call.
     """
-    if not getattr(ctype, "long_double", False):
+    if not (ctype.is_floating() and getattr(ctype, "long_double", False)):
         return
     if (il_code is not None and c is not None and not c.is_global
             and getattr(il_code, "cur_func", None) is not None):
@@ -947,7 +947,7 @@ class DeclInfo:
         else:
             return symbol_table.DEFINED
 
-    def get_storage(self, defined, linkage, symbol_table):
+    def get_storage(self, defined: int, linkage, symbol_table):
         """Determine the storage duration."""
         if defined == symbol_table.UNDEFINED or not self.ctype.is_object():
             storage = None

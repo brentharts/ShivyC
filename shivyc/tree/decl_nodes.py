@@ -94,7 +94,7 @@ class Array(DeclNode):
 
     """
 
-    def __init__(self, n, child):
+    def __init__(self, n: "object", child):
         """Generate array node."""
         self.n = n
         self.child = child
