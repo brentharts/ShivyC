@@ -157,14 +157,18 @@ class Mult(_AddMult):
 class _BitShiftCmd(ILCommand):
     """Base class for bitwise shift commands."""
 
-    # The ASM instruction to generate for this command. Override this value
-    # in subclasses.
-    Inst = None
-
     def __init__(self, output, arg1, arg2): # noqa D102
         self.output = output
         self.arg1 = arg1
         self.arg2 = arg2
+
+    def inst_class(self):
+        """Return the asm command class to emit for this shift.
+
+        Overridden per subclass; dispatched virtually (a plain method, not a
+        @property, so a base-class `self.inst_class()` call resolves to the
+        concrete subclass at runtime)."""
+        raise NotImplementedError
 
     def inputs(self): # noqa D102
         return [self.arg1, self.arg2]
@@ -200,14 +204,15 @@ class _BitShiftCmd(ILCommand):
             asm_code.add(asm_cmds.Mov(spots.RCX, arg2_spot, arg2_size))
             arg2_spot = spots.RCX
 
+        Inst = self.inst_class()
         if spotmap[self.output] == arg1_spot:
-            asm_code.add(self.Inst(arg1_spot, arg2_spot, arg1_size, 1))
+            asm_code.add(Inst(arg1_spot, arg2_spot, arg1_size, 1))
         else:
             out_spot = spotmap[self.output]
             temp_spot = get_reg([out_spot, arg1_spot], [arg2_spot])
             if arg1_spot != temp_spot:
                 asm_code.add(asm_cmds.Mov(temp_spot, arg1_spot, arg1_size))
-            asm_code.add(self.Inst(temp_spot, arg2_spot, arg1_size, 1))
+            asm_code.add(Inst(temp_spot, arg2_spot, arg1_size, 1))
             if temp_spot != out_spot:
                 asm_code.add(asm_cmds.Mov(out_spot, temp_spot, arg1_size))
 
@@ -218,8 +223,7 @@ class RBitShift(_BitShiftCmd):
     indicated by right operand. Signed operands shift arithmetically (sar),
     unsigned operands shift logically (shr)."""
 
-    @property
-    def Inst(self):
+    def inst_class(self):
         if getattr(self.arg1.ctype, "signed", True):
             return asm_cmds.Sar
         return asm_cmds.Shr
@@ -230,7 +234,8 @@ class LBitShift(_BitShiftCmd):
     Shifts each bit in IL value left operand to the left by position
     indicated by right operand."""
 
-    Inst = asm_cmds.Sal
+    def inst_class(self):
+        return asm_cmds.Sal
 
 
 class _DivMod(ILCommand):
