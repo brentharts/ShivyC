@@ -40,7 +40,7 @@ class ILCode:
         # Defaults to {} to match readers' getattr(il_code, ..., {}).
         self.stackless_info = {}
 
-    def copy(self):
+    def copy_code(self) -> "ILCode":
         """Make copy of this object.
 
         Preserves identity of all ILValues stored within, but modifying the
