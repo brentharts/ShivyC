@@ -160,6 +160,20 @@ def hoist_loop_invariants(commands, il_code):
             start_idx = labels[back_labels[0]]
             body = commands[start_idx:back_idx + 1]
 
+            # The hoisted commands are inserted immediately before start_idx, so
+            # they only run if control falls through into that slot from the
+            # preceding instruction. If that instruction is an unconditional
+            # jump or a return, the preheader slot is unreachable -- this is the
+            # case for a switch dispatch, whose backward case-match branch
+            # (JumpZero -> case label) looks like a loop back-edge but whose
+            # header label is preceded by the initial `jmp dispatch`. Hoisting
+            # there would drop the computation entirely (a miscompile), so
+            # require fall-through reachability into the preheader.
+            if start_idx == 0 or isinstance(
+                    commands[start_idx - 1],
+                    (control_cmds.Jump, control_cmds.Return)):
+                continue
+
             # Require a clean loop and a single jump-entry (the back-edge).
             if any(_has_side_effects(b) for b in body):
                 continue
@@ -173,6 +187,25 @@ def hoist_loop_invariants(commands, il_code):
                     if ti is not None and ti < j and not (j == back_idx):
                         nested = True
             if nested:
+                continue
+
+            # Hoisting is only sound when each hoisted command executes on every
+            # iteration -- i.e. dominates the back-edge. That is guaranteed only
+            # if the loop body is a single basic block. If the body contains
+            # internal control flow (a forward branch or an inner label between
+            # the header and the back-edge), a "pure invariant" can sit on a
+            # conditional path; moving it to the preheader runs it
+            # unconditionally, and if its result is live after the loop (e.g. a
+            # flag assigned only on the taken branch) the program's result
+            # changes. Require a single-block body (the back-edge jump itself,
+            # at back_idx, is excluded from this scan).
+            internal_cf = False
+            for j in range(start_idx + 1, back_idx):
+                b = commands[j]
+                if b.label_name() or b.targets():
+                    internal_cf = True
+                    break
+            if internal_cf:
                 continue
 
             defined_in_loop = set()
@@ -390,6 +423,22 @@ def strength_reduce_ivs(commands, il_code):
 
                 # Unique chain indices in program order.
                 chain_idxs = sorted(set(chain))
+
+                # The address chain is moved to the preheader, where it sees the
+                # IV's loop-entry value, and the pointer is advanced at the loop
+                # bottom. That is sound only if, within the body, the address is
+                # computed BEFORE the IV is updated -- i.e. it uses the value
+                # carried in from the previous iteration. If the IV is updated
+                # first (as in a `v = *area; area += 8` va_arg fetch, where the
+                # area pointer is bumped at the top of the body and the read
+                # address is then derived from it), the loop-entry value is one
+                # stride too low and the first iteration reads the wrong slot.
+                # Require every chain command to precede the IV's in-loop update.
+                iv_update_idx = def_of.get(iv)
+                if iv_update_idx is None or (chain_idxs
+                                             and max(chain_idxs) >= iv_update_idx):
+                    continue
+
                 chain_outputs = set()
                 for ci in chain_idxs:
                     for o in commands[ci].outputs():
