@@ -313,6 +313,41 @@ testfast:
 	if [ $$fail = 0 ]; then echo "testfast: PASS"; \
 	else echo "testfast: FAIL"; fi; exit $$fail
 
+# Native self-host regression check, three ways: compile
+# tests/fast/selfhost_regressions.c with the native self-hosted binary, with
+# gcc, and with the CPython oracle, and require all three exit codes to agree.
+# That .c file pins the native-codegen bugs fixed while bootstrapping the
+# self-host compiler (array-size deduction, unsigned / suffixed integer
+# literals, unsigned comparison operand sizing, pointer compound assignment,
+# function-like macros) so none of them can silently regress. Add a new case to
+# the file whenever another self-hosting bug is fixed.
+#
+# Reuses a cached native build in $(SELFHOST_NATIVE_DIR) if present; otherwise
+# builds it first (slow, a few minutes).
+#     make testfast_native
+NATIVE_REG := $(FAST)/selfhost_regressions.c
+testfast_native: $(NATIVE_REG)
+	@nat="$(SELFHOST_NATIVE_DIR)/shivyc_native"; \
+	if [ ! -x "$$nat" ]; then \
+	  echo "building native self-host compiler -> $(SELFHOST_NATIVE_DIR) (slow) ..."; \
+	  python3 tools/selfhost.py compiler --build-dir $(SELFHOST_NATIVE_DIR) || exit 1; \
+	fi; \
+	mkdir -p $(FASTBIN); cp $(NATIVE_REG) $(FASTBIN)/reg.c; \
+	fail=0; \
+	gcc -std=c99 -O0 $(FASTBIN)/reg.c -o $(FASTBIN)/reg_gcc 2>/dev/null \
+	  && $(FASTBIN)/reg_gcc >/dev/null 2>&1; gc=$$?; \
+	"$$nat" $(FASTBIN)/reg.c -o $(FASTBIN)/reg_native >/dev/null 2>&1 \
+	  && $(FASTBIN)/reg_native >/dev/null 2>&1; nt=$$?; \
+	python3 -m shivyc.main --no-cache $(FASTBIN)/reg.c -o $(FASTBIN)/reg_oracle >/dev/null 2>&1 \
+	  && $(FASTBIN)/reg_oracle >/dev/null 2>&1; oc=$$?; \
+	if [ "$$nt" = "$$gc" ] && [ "$$oc" = "$$gc" ]; then \
+	  echo "  ok    selfhost_regressions (gcc=$$gc native=$$nt oracle=$$oc)"; \
+	else \
+	  echo "  FAIL  selfhost_regressions (gcc=$$gc native=$$nt oracle=$$oc)"; fail=1; \
+	fi; \
+	if [ $$fail = 0 ]; then echo "testfast_native: PASS"; \
+	else echo "testfast_native: FAIL"; fi; exit $$fail
+
 # ---------------------------------------------------------------------------
 # Promotion behavior-preservation check: compile a set of container-heavy
 # programs with PY2C_PROMOTE_CONTAINERS=1 (auto-promote inferred containers to
@@ -594,7 +629,7 @@ run-irq: baremetal-irq
 self:
 	cd tools && pypy3 py2c.py
 
-.PHONY: default test testfast testpromote testpgo testfuse testtorch shim install install_deps clean baremetal baremetal-hello \
+.PHONY: default test testfast testfast_native testpromote testpgo testfuse testtorch shim install install_deps clean baremetal baremetal-hello \
         bootstrap bootstrap2 \
         selfhost selfhost_objcore selfhost_bench selfhost_coverage \
         selfhost_coverage_musl selfhost_link selfhost_build selfhost_compiler \
