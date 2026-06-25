@@ -1175,10 +1175,14 @@ obj obj_add(obj a, obj b) {
         for (int i = 0; i < lb->len; i++) list_append(r, lb->data[i]);
         return r;
     }
+    if (a.tag == T_FLOAT || b.tag == T_FLOAT)
+        return OBJ_FLOAT(as_dbl(a) + as_dbl(b));
     return OBJ_INT(as_num(a) + as_num(b));
 }
 obj obj_sub(obj a, obj b) {
     if (a.tag == T_SET && b.tag == T_SET) return set_diff(a, b);
+    if (a.tag == T_FLOAT || b.tag == T_FLOAT)
+        return OBJ_FLOAT(as_dbl(a) - as_dbl(b));
     return OBJ_INT(as_num(a) - as_num(b));
 }
 obj obj_mul(obj a, obj b) {
@@ -1197,9 +1201,15 @@ obj obj_mul(obj a, obj b) {
             for (int i = 0; i < l->len; i++) list_append(r, l->data[i]);
         return r;
     }
+    if (a.tag == T_FLOAT || b.tag == T_FLOAT)
+        return OBJ_FLOAT(as_dbl(a) * as_dbl(b));
     return OBJ_INT(as_num(a) * as_num(b));
 }
-obj obj_fdiv(obj a, obj b) { long d = as_num(b); return OBJ_INT(d ? as_num(a) / d : 0); }
+obj obj_fdiv(obj a, obj b) {
+    if (a.tag == T_FLOAT || b.tag == T_FLOAT) {
+        double d = as_dbl(b); return OBJ_FLOAT(d != 0.0 ? as_dbl(a) / d : 0.0);
+    }
+    long d = as_num(b); return OBJ_INT(d ? as_num(a) / d : 0); }
 obj obj_mod(obj a, obj b) { long d = as_num(b); return OBJ_INT(d ? as_num(a) % d : 0); }
 str str_mod(const char* fmt, obj* args, int n) {
     /* Python `fmt % args` (printf-style). args already collected into an array
@@ -1244,7 +1254,7 @@ str str_mod(const char* fmt, obj* args, int n) {
     out[len] = 0;
     return out;
 }
-obj obj_neg(obj a) { return OBJ_INT(-as_num(a)); }
+obj obj_neg(obj a) { if (a.tag == T_FLOAT) return OBJ_FLOAT(-a.u.d); return OBJ_INT(-as_num(a)); }
 obj obj_invert(obj a) { return OBJ_INT(~as_num(a)); }
 long ipow(long base, long exp) {
     long r = 1;
