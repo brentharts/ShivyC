@@ -4,6 +4,10 @@ import shivyc.asm_cmds as asm_cmds
 from shivyc.il_cmds.base import ILCommand
 from shivyc.spots import MemSpot, LiteralSpot
 
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from shivyc.ctypes import CType   # the transpiler reads this statically
+
 
 class _GeneralCmp(ILCommand):
     """_GeneralCmp - base class for the comparison commands.
@@ -51,6 +55,19 @@ class _GeneralCmp(ILCommand):
     def rel_spot_conf(self):  # noqa D102
         return {self.output: [self.arg1, self.arg2]}
 
+    def _ctype_size(self, ctype: "CType") -> int:
+        """Return the byte size of a C type.
+
+        Typing the parameter as CType makes the transpiler resolve `.size`
+        against CType, rather than mis-resolving it against another class that
+        also defines a `size` field (e.g. _ASMCommand). Reading the operands'
+        `.size` directly via `self.argN.ctype.size` hit that mis-resolution in
+        the native compiler, yielding a `cmp` with no operand size -- an
+        "ambiguous operand size" assembler error, and wrong results in the
+        cases that did assemble.
+        """
+        return ctype.size
+
     def _fix_both_literal_or_mem(self, arg1_spot, arg2_spot, regs,
                                  get_reg, asm_code):
         """Fix arguments if both are literal or memory.
@@ -68,7 +85,7 @@ class _GeneralCmp(ILCommand):
             # in this case both are literal/memory.
             r = get_reg([], regs)
             regs.append(r)
-            asm_code.add(asm_cmds.Mov(r, arg1_spot, self.arg1.ctype.size))
+            asm_code.add(asm_cmds.Mov(r, arg1_spot, self._ctype_size(self.arg1.ctype)))
             return r, arg2_spot
         else:
             return arg1_spot, arg2_spot
@@ -78,7 +95,7 @@ class _GeneralCmp(ILCommand):
         """Move any 64-bit immediate operands to register."""
 
         if self._is_imm64(arg1_spot):
-            size = self.arg1.ctype.size
+            size = self._ctype_size(self.arg1.ctype)
             new_arg1_spot = get_reg([], regs + [arg2_spot])
             asm_code.add(asm_cmds.Mov(new_arg1_spot, arg1_spot, size))
             return new_arg1_spot, arg2_spot
@@ -86,7 +103,7 @@ class _GeneralCmp(ILCommand):
         # We cannot have both cases because _fix_both_literal is called
         # before this.
         elif self._is_imm64(arg2_spot):
-            size = self.arg2.ctype.size
+            size = self._ctype_size(self.arg2.ctype)
             new_arg2_spot = get_reg([], regs + [arg1_spot])
             asm_code.add(asm_cmds.Mov(new_arg2_spot, arg2_spot, size))
             return arg1_spot, new_arg2_spot
@@ -139,7 +156,7 @@ class _GeneralCmp(ILCommand):
                 arg1_spot, arg2_spot, regs, get_reg, asm_code)
             arg1_spot, arg2_spot, swapped = self._fix_literal_wrong_order(
                 arg1_spot, arg2_spot)
-            arg_size = self.arg1.ctype.size
+            arg_size = self._ctype_size(self.arg1.ctype)
             asm_code.add(asm_cmds.Cmp(arg1_spot, arg2_spot, arg_size))
             asm_code.add(self._select_jump(swapped, negate)(label))
             return
@@ -148,7 +165,7 @@ class _GeneralCmp(ILCommand):
                          [spotmap[self.arg1], spotmap[self.arg2]])
         regs.append(result)
 
-        out_size = self.output.ctype.size
+        out_size = self._ctype_size(self.output.ctype)
         eq_val_spot = LiteralSpot(1)
         asm_code.add(asm_cmds.Mov(result, eq_val_spot, out_size))
 
@@ -159,7 +176,7 @@ class _GeneralCmp(ILCommand):
         arg1_spot, arg2_spot, swapped = self._fix_literal_wrong_order(
             arg1_spot, arg2_spot)
 
-        arg_size = self.arg1.ctype.size
+        arg_size = self._ctype_size(self.arg1.ctype)
         neq_val_spot = LiteralSpot(0)
         label = asm_code.get_label()
 
@@ -193,10 +210,10 @@ class _GeneralCmp(ILCommand):
     def _make_float_asm(self, spotmap, get_reg, asm_code):
         """Emit a floating comparison via ucomisd/ucomiss into a 0/1 result."""
         from shivyc.spots import XMM0
-        size = self.arg1.ctype.size
+        size = self._ctype_size(self.arg1.ctype)
         fmov = asm_cmds.Movss if size == 4 else asm_cmds.Movsd
         ucomi = asm_cmds.Ucomiss if size == 4 else asm_cmds.Ucomisd
-        out_size = self.output.ctype.size
+        out_size = self._ctype_size(self.output.ctype)
         result = get_reg([spotmap[self.output]], [])
         a1, a2 = spotmap[self.arg1], spotmap[self.arg2]
         one, zero = LiteralSpot(1), LiteralSpot(0)
