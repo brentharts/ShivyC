@@ -11,11 +11,25 @@
  *   - pointer compound assignment                 (p += N on a complete pointee)
  *   - pointer equality / inequality between variables  (p == q, p != q)
  *   - 64-bit immediate stored to memory           (mov mem, imm64 via register)
+ *   - C11 anonymous struct/union members           (promoted into enclosing type)
  *   - function-like macros                        (column-adjacency handling)
  */
 
 #define ADD(a, b) ((a) + (b))
 #define SUM3(a, b, c) ((a) + (b) + (c))
+
+/* C11 anonymous struct/union members: the inner members are accessible
+ * directly on the enclosing object. */
+struct AnonHost {
+    int tag;
+    union {
+        int i;
+        char c;
+    };
+    struct {
+        int a, b;
+    };
+};
 
 int main(void) {
     int total = 0;
@@ -68,6 +82,16 @@ int main(void) {
     /* function-like macros */
     if (ADD(3, 4) == 7)          total += 16;
     if (SUM3(1, 2, 3) == 6)      total += 32;
+
+    /* C11 anonymous struct/union members promoted into the enclosing struct */
+    struct AnonHost h;
+    h.tag = 1;
+    h.i = 65;                                   /* anonymous union member  */
+    h.a = 10;                                   /* anonymous struct member */
+    h.b = 20;
+    if (h.c == 65)               total += 64;   /* union alias of i (LE)   */
+    if (h.a + h.b == 30)         total += 128;
+    if (sizeof(struct AnonHost) >= 12) total += 1;  /* members occupy space */
 
     return total & 0xFF;
 }
