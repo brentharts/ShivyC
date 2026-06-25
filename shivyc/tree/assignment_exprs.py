@@ -72,16 +72,22 @@ class _CompoundPlusMinus(_RExprNode):
             and right.ctype.is_integral()
              and self.accept_pointer):
 
-            if not lvalue.ctype().arg.is_complete():
-                err = "invalid arithmetic on pointer to incomplete type"
-                raise CompilerError(err, self.op.r)
-
             # Because of caching requirement of make_il and lvalue functions,
             # we know this call won't regenerate code for the left expression
             # beyond just what's needed to get the value stored at the lvalue.
             # This is important in cases like ``*func() += 10`` where func()
             # may have side effects if called twice.
             left = self.left.make_il(il_code, symbol_table, c)
+
+            # Bind the pointed-to type through left.ctype (an ILValue's type,
+            # statically resolved to PointerCType) rather than lvalue.ctype()
+            # (only known to be a CType): the latter would read `.arg` through
+            # a mismatched class layout. The local binding is an assignment
+            # context, where `.arg` resolves to PointerCType.arg (a CType).
+            pointee = left.ctype.arg
+            if not pointee.is_complete():
+                err = "invalid arithmetic on pointer to incomplete type"
+                raise CompilerError(err, self.op.r)
 
             out = ILValue(left.ctype)
             shift = get_size(left.ctype.arg, right, il_code)
