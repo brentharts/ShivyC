@@ -12,6 +12,8 @@
  *   - pointer equality / inequality between variables  (p == q, p != q)
  *   - 64-bit immediate stored to memory           (mov mem, imm64 via register)
  *   - C11 anonymous struct/union members           (promoted into enclosing type)
+ *   - floating-point constant folding              (+,-,*,/ and unary - on doubles)
+ *   - floating-point function arguments            (doubles passed in xmm regs)
  *   - function-like macros                        (column-adjacency handling)
  */
 
@@ -30,6 +32,11 @@ struct AnonHost {
         int a, b;
     };
 };
+
+/* floating-point arguments travel in xmm registers; mixed with integer args
+ * each class is counted independently. */
+static double fadd2(double a, double b) { return a + b; }
+static double fmix(int a, double b, int c, double d) { return a + b + c + d; }
 
 int main(void) {
     int total = 0;
@@ -92,6 +99,19 @@ int main(void) {
     if (h.c == 65)               total += 64;   /* union alias of i (LE)   */
     if (h.a + h.b == 30)         total += 128;
     if (sizeof(struct AnonHost) >= 12) total += 1;  /* members occupy space */
+
+    /* floating-point constant folding: +,-,*,/ on two double constants, and
+     * unary minus on a double constant, must not collapse to zero. */
+    if ((int)(2.0 + 3.0) == 5)   total += 2;
+    if ((int)(6.0 / 2.0) == 3)   total += 4;
+    if ((int)(3.0 * 4.0) == 12)  total += 8;
+    if ((int)(7.0 - 2.0) == 5)   total += 16;
+    if ((int)(-2.5) == -2)       total += 32;
+
+    /* floating-point arguments passed in xmm registers, including mixed with
+     * integer arguments (each ABI sequence counted independently). */
+    if ((int)fadd2(1.5, 2.5) == 4)         total += 64;
+    if ((int)fmix(1, 2.0, 3, 4.0) == 10)   total += 128;
 
     return total & 0xFF;
 }
