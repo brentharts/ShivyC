@@ -9,6 +9,7 @@
  *   - unsigned / suffixed integer literals       (u, U, UL, unsigned hex)
  *   - unsigned integer comparison operand sizing  (var/var, var/lit, ==)
  *   - pointer compound assignment                 (p += N on a complete pointee)
+ *   - pointer equality / inequality between variables  (p == q, p != q)
  *   - function-like macros                        (column-adjacency handling)
  *
  * NB: deliberately avoids 64-bit *immediate* operands (e.g. 0xFFFFFFFFFFUL),
@@ -50,6 +51,14 @@ int main(void) {
     int *p = pa;
     p += 2;
     if (*p == 7)                 total += 8;
+
+    /* pointer equality / inequality between two pointer variables (distinct
+     * from comparison against a null/literal, which always worked) */
+    int *pe = pa;
+    int *pf = pa + 1;
+    if (pe == pa)                total += 1;    /* p == q  (true)  */
+    if (pe != pf)                total += 2;    /* p != q  (true)  */
+    if (!(pe == pf))             total += 4;    /* p == q  (false) */
 
     /* function-like macros */
     if (ADD(3, 4) == 7)          total += 16;
