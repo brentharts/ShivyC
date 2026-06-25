@@ -1023,8 +1023,13 @@ class Declaration(Node):
         # declarator and no tag introduces its members into the enclosing
         # struct/union. Represent it as a nameless DeclInfo so the member
         # collection can lay it out and promote its members.
+        #
+        # Test the tag with `not base_type.tag` rather than `is None`: the
+        # self-host runtime stores an absent tag as a null char* (a falsy
+        # string), not as None, so `base_type.tag is None` would never hold
+        # natively and anonymous members would be silently dropped.
         if (in_struct and not out and not any_dec
-                and base_type.is_struct_union() and base_type.tag is None):
+                and base_type.is_struct_union() and not base_type.tag):
             spec_range = node.specs[0].r + node.specs[-1].r
             di = DeclInfo(None, base_type, spec_range, storage, None,
                           self.body, [])
@@ -1405,7 +1410,13 @@ class Declaration(Node):
         for member in node.members:
             decl_infos = []  # needed in case get_decl_infos below fails
             with report_err():
-                decl_infos = self.get_decl_infos(member, in_struct=True)
+                # NB: pass in_struct positionally. The self-host transpiler
+                # drops a keyword argument that follows a defaulted positional
+                # parameter, so `in_struct=True` would arrive as the default
+                # False -- which skips the C11 anonymous-member path in
+                # get_decl_infos and silently drops anonymous struct/union
+                # members from the enclosing type.
+                decl_infos = self.get_decl_infos(member, True)
 
             for decl_info in decl_infos:
                 with report_err():
