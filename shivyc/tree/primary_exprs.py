@@ -1,5 +1,6 @@
 """Primary expression nodes in the AST."""
 
+import sys
 import shivyc.ctypes as ctypes
 import shivyc.lexer as lexer
 import shivyc.tree.general_nodes as general_nodes
@@ -76,12 +77,19 @@ class Number(_RExprNode):
         is_decimal = (body[:2].lower() not in ("0x", "0b")
                       and not (len(body) > 1 and body[0] == "0"))
 
-        UINT_MAX = 4294967295
-        ULONG_MAX = 18446744073709551615
         I = (ctypes.integer, ctypes.int_min, ctypes.int_max)
-        UI = (ctypes.unsig_int, 0, UINT_MAX)
+        UI = (ctypes.unsig_int, 0, ctypes.uint_max)
         L = (ctypes.longint, ctypes.long_min, ctypes.long_max)
-        UL = (ctypes.unsig_longint, 0, ULONG_MAX)
+        # The self-host runtime represents integers as signed 64-bit, so the
+        # true unsigned-long maximum (2**64 - 1) is not representable. Clamp the
+        # bound to the largest representable value there; a literal beyond it
+        # could not be represented natively in any case. The translator folds
+        # this guard at translation time and emits only the live branch, so the
+        # unrepresentable ctypes.ulong_max is never referenced in native code.
+        if sys.implementation.name == "shivyc":
+            UL = (ctypes.unsig_longint, 0, ctypes.long_max)
+        else:
+            UL = (ctypes.unsig_longint, 0, ctypes.ulong_max)
         if has_u:
             candidates = [UL] if has_l else [UI, UL]
         elif is_decimal:
