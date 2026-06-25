@@ -803,7 +803,7 @@ class DeclInfo:
         iter = zip(self.ctype.args, self.param_names, range(num_params))
         int_i, flt_i, stack_i = 0, 0, 0
         vstack_i = 0    # running eightbyte slot index for the all-stack variadic ABI
-        int_regs = value_cmds.LoadArg.arg_regs
+        int_regs = spots.int_arg_regs
         xmm_regs = spots.xmm_arg_regs
 
         # SysV AMD64: a function returning a struct larger than 16 bytes
@@ -815,7 +815,13 @@ class DeclInfo:
         if (not variadic and ret_ctype.is_struct_union()
                 and ret_ctype.size > 16):
             sret_ptr = ILValue(PointerCType(ret_ctype))
-            il_code.add(value_cmds.LoadArg(sret_ptr, 0, reg=int_regs[0]))
+            # LoadArg args are passed positionally: the self-host transpiler
+            # drops keyword arguments that follow a defaulted positional
+            # parameter, which would otherwise null out `reg`/`is_float`/
+            # `stack_index` and misroute arguments (notably floating arguments,
+            # which would then be read from an integer register instead of xmm).
+            # Signature: (output, arg_num, all_stack, reg, is_float, stack_index)
+            il_code.add(value_cmds.LoadArg(sret_ptr, 0, False, int_regs[0]))
             int_i = 1
             c = c.set_sret_ptr(sret_ptr)
 
@@ -833,7 +839,7 @@ class DeclInfo:
                     vstack_i += n
                 else:
                     il_code.add(value_cmds.LoadArg(
-                        arg, vstack_i, all_stack=True))
+                        arg, vstack_i, True))
                     vstack_i += 1
                 continue
             if (ctype.is_struct_union() and ctype.size > 8):
@@ -853,13 +859,13 @@ class DeclInfo:
                 continue
             if ctype.is_floating() and flt_i < len(xmm_regs):
                 il_code.add(value_cmds.LoadArg(
-                    arg, i, reg=xmm_regs[flt_i], is_float=True))
+                    arg, i, False, xmm_regs[flt_i], True))
                 flt_i += 1
             elif not ctype.is_floating() and int_i < len(int_regs):
-                il_code.add(value_cmds.LoadArg(arg, i, reg=int_regs[int_i]))
+                il_code.add(value_cmds.LoadArg(arg, i, False, int_regs[int_i]))
                 int_i += 1
             else:
-                il_code.add(value_cmds.LoadArg(arg, i, stack_index=stack_i))
+                il_code.add(value_cmds.LoadArg(arg, i, False, None, False, stack_i))
                 stack_i += 1
 
         self.body.make_il(il_code, symbol_table, c, no_scope=True)
