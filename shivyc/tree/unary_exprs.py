@@ -120,7 +120,7 @@ class _ArithUnOp(_RExprNode):
             out = ILValue(expr.ctype)
             # perform constant folding
             if expr.literal:
-                val = self._arith_const(expr.literal.val, expr.ctype)
+                val = self._unary_const(expr.literal.val, expr.ctype)
                 if expr.ctype.is_floating():
                     il_code.register_float_literal(out, float(val))
                 else:
@@ -140,7 +140,7 @@ class _ArithUnOp(_RExprNode):
         """
         return expr.ctype.is_arith()
 
-    def _arith_const(self, expr, ctype):
+    def _unary_const(self, expr, ctype):
         """Return the result on compile-time constant operand."""
         raise NotImplementedError
 
@@ -157,7 +157,7 @@ class UnaryMinus(_ArithUnOp):
     descrip = "unary minus"
     cmd = math_cmds.Neg
 
-    def _arith_const(self, expr, ctype):
+    def _unary_const(self, expr, ctype):
         if ctype.is_floating():
             return -expr
         return -shift_into_range(expr, ctype)
@@ -173,5 +173,5 @@ class Compl(_ArithUnOp):
     def _check_type(self, expr):
         return expr.ctype.is_integral()
 
-    def _arith_const(self, expr, ctype):
+    def _unary_const(self, expr, ctype):
         return ~shift_into_range(expr, ctype)
