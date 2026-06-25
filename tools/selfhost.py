@@ -62,7 +62,7 @@ TOKEN_DEMO_C = r'''
 #include <string.h>
 typedef struct Range Range;                 /* opaque (errors.Range) */
 typedef struct Token {                       /* matches generated tokens.c */
-    Obj _hdr; Range* r; obj content; obj kind; char* rep; bool wide;
+    Obj _hdr; obj r; obj content; obj kind; char* rep; bool wide;
     obj logical_line;
 } Token;
 Token* Token_new(obj kind, obj content, char* rep, obj r);
