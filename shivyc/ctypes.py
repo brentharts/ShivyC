@@ -277,7 +277,13 @@ class ArrayCType(CType):
 
     """
 
-    def __init__(self, el, n):
+    # obj-typed so the incomplete-array sentinel `None` is representable and
+    # stays distinct from `0` (a GNU zero-length array). As a plain int, None
+    # would collapse to 0, making is_complete() always true and defeating
+    # array-length deduction from an initializer (`T a[] = {...}`).
+    n: "object"
+
+    def __init__(self, el, n: "object"):
         """Initialize type."""
         self.el = el
         self.n = n
