@@ -266,6 +266,11 @@ RSI = RegSpot("rsi")
 RDI = RegSpot("rdi")
 R8 = RegSpot("r8")
 R9 = RegSpot("r9")
+# SysV AMD64 integer/pointer argument registers, in order. Exposed as a
+# module-level list (like xmm_arg_regs) so call sites can read it directly;
+# reading it as a class attribute (LoadArg.arg_regs) does not survive the
+# self-host runtime, which cannot fetch a class attribute through the type.
+int_arg_regs = [RDI, RSI, RDX, RCX, R8, R9]
 R10 = RegSpot("r10")
 R11 = RegSpot("r11")
 
