@@ -211,6 +211,7 @@ typedef struct TypeInfoHdr {
     const FieldDesc* fields;
     obj (*tostr)(Obj*);
     bool (*eq)(Obj*, obj);
+    unsigned long objsize;   /* sizeof the concrete struct; for shallow copy */
 } TypeInfoHdr;
 
 static inline bool isinstance_of(Obj* o, const void* t) {
@@ -4668,6 +4669,7 @@ class Transpiler:
             out.append("    const FieldDesc* fields;")
             out.append("    obj (*tostr)(Obj*);")
             out.append("    bool (*eq)(Obj*, obj);")
+            out.append("    unsigned long objsize;")
             for m in sorted(reg["vt"]):
                 ret, params = self.ximported_method_sig(mod, m)
                 out.append("    %s (*%s)(%s);" % (
@@ -5912,8 +5914,16 @@ class Transpiler:
         if ct and ct.endswith("*") and ct not in ("char*", "void*", OBJ):
             struct = ct[:-1].strip()
             e = self.expr(node.args[0])
-            return ("({ %s _cp = aalloc(sizeof(%s)); *_cp = *(%s); _cp; })"
-                    % (ct, struct, e))
+            # Copy the *runtime* object: `self` may be statically the base
+            # class but dynamically a larger subclass, so sizeof(static type)
+            # would truncate it (dropping subclass fields). The concrete size
+            # is recorded on each TypeInfo as objsize.
+            return ("({ %s _src = (%s); "
+                    "const TypeInfoHdr* _ti = (const TypeInfoHdr*)"
+                    "((Obj*)_src)->type; "
+                    "unsigned long _sz = _ti ? _ti->objsize : sizeof(%s); "
+                    "%s _cp = aalloc(_sz); memcpy(_cp, _src, _sz); _cp; })"
+                    % (ct, e, struct, ct))
         return None
 
     def _mp_import_call(self, mod, attr, node):
@@ -5960,6 +5970,7 @@ class Transpiler:
         self.emit("const FieldDesc* fields;")
         self.emit("obj (*tostr)(Obj*);")
         self.emit("bool (*eq)(Obj*, obj);")
+        self.emit("unsigned long objsize;")
         for m in sorted(VTABLE_METHODS):
             self.emit(self.vslot_signature(m) + ";")
         self.indent -= 1
@@ -6673,7 +6684,8 @@ class Transpiler:
                           ".base = (const struct TypeInfo*)%s" % base,
                           ".fields = %s__fields" % ci.csym,
                           ".tostr = %s" % tostr,
-                          ".eq = %s" % eqfn] + slots)
+                          ".eq = %s" % eqfn,
+                          ".objsize = sizeof(%s)" % ci.csym] + slots)
         self.emit("const TypeInfo %s_type = { %s };" % (ci.csym, init))
         self.emit()
 
