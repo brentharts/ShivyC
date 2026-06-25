@@ -388,8 +388,16 @@ def arith_conversion_type(type1, type2):
     # unsigned integer types, the operand with the type of lesser integer
     # conversion rank is converted to the type of the operand with greater
     # rank.
+    #
+    # NB: pick the wider type explicitly rather than via
+    # `max(..., key=lambda t: t.size)`. The self-host transpiler ignores the
+    # `key` argument to max(), which would make this return the left operand's
+    # type regardless of width -- so `int + long` would wrongly compute as int
+    # (truncating, and giving sizeof == 4).
     elif type1_promo.signed == type2_promo.signed:
-        return max([type1_promo, type2_promo], key=lambda t: t.size)
+        if type1_promo.size >= type2_promo.size:
+            return type1_promo
+        return type2_promo
 
     # Otherwise, if the operand that has unsigned integer type has rank
     # greater or equal to the rank of the type of the other operand, then
