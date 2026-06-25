@@ -382,13 +382,15 @@ class Set(_ValueCmd):
             size = self.output.ctype.size
             # x86-64 can move only a sign-extended 32-bit immediate straight
             # to memory; a wider immediate (e.g. an immortal refcount) must go
-            # through a register first.
-            try:
-                lit = int(arg_spot.value)
-            except (TypeError, ValueError):
-                lit = 0
+            # through a register first. Test the literal value directly: routing
+            # it through an `int()` local truncates it to 32 bits under the
+            # self-host runtime (a 64-bit value like 10000000000 would wrap into
+            # the 32-bit range and wrongly take the direct-to-memory path,
+            # emitting an unencodable `mov mem, imm64`).
+            val = arg_spot.value
             if (isinstance(out_spot, MemSpot) and size == 8
-                    and not (-2**31 <= lit < 2**31)):
+                    and isinstance(val, int)
+                    and not (-2**31 <= val < 2**31)):
                 r = get_reg()
                 asm_code.add(asm_cmds.Mov(r, arg_spot, size))
                 asm_code.add(asm_cmds.Mov(out_spot, r, size))
