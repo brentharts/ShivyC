@@ -1,6 +1,7 @@
 """This module defines all of the C types recognized by the compiler."""
 
 import copy
+import sys
 
 import shivyc.token_kinds as token_kinds
 
@@ -562,6 +563,16 @@ longint = IntegerCType(8, True)
 unsig_longint = IntegerCType(8, False)
 long_max = 9223372036854775807
 long_min = -9223372036854775808
+
+# Upper bounds for the unsigned integer types, used when choosing the type of
+# an integer literal. These are module-level constants (not function locals) so
+# the self-host translator constant-folds them into correctly-sized literals; a
+# local would be typed as a 32-bit int and truncate (e.g. uint_max -> -1).
+# uint_max fits in 64 bits; ulong_max (2**64 - 1) does not and is only used on
+# CPython (see primary_exprs, which clamps to long_max under the self-host
+# runtime, whose integers are signed 64-bit).
+uint_max = 4294967295
+ulong_max = 18446744073709551615
 
 
 flt = FloatCType(4)
