@@ -207,8 +207,8 @@ def tokenize_line(line: list, in_comment):
                 raise CompilerError(descrip, line[chunk_end].r)
 
             filename, end = read_include_filename(line, chunk_end)
-            tokens.append(Token(token_kinds.include_file, filename,
-                                r=Range(line[chunk_end].p, line[end].p)))
+            tokens.append(Token(token_kinds.include_file, filename, "",
+                                Range(line[chunk_end].p, line[end].p)))
 
             chunk_start = end + 1
             chunk_end = chunk_start
@@ -245,7 +245,7 @@ def tokenize_line(line: list, in_comment):
             # `# error C 'size_t' size should be ...`), which the lexer scans
             # before the preprocessor discards the inactive group.
 
-            tok = Token(kind, chars, rep, r=r)
+            tok = Token(kind, chars, rep, r)
             tok.wide = wide
             tokens.append(tok)
 
@@ -263,7 +263,7 @@ def tokenize_line(line: list, in_comment):
             symbol_end_index = chunk_end + len(symbol_kind.text_repr) - 1
 
             r = Range(line[symbol_start_index].p, line[symbol_end_index].p)
-            symbol_token = Token(symbol_kind, r=r)
+            symbol_token = Token(symbol_kind, "", "", r)
 
             add_chunk(line[chunk_start:chunk_end], tokens)
             tokens.append(symbol_token)
@@ -468,18 +468,18 @@ def add_chunk(chunk: list, tokens):
 
         keyword_kind = match_keyword_kind(chunk)
         if keyword_kind:
-            tokens.append(Token(keyword_kind, r=range))
+            tokens.append(Token(keyword_kind, "", "", range))
             return
 
         number_string = match_number_string(chunk)
         if number_string:
-            tokens.append(Token(token_kinds.number, number_string, r=range))
+            tokens.append(Token(token_kinds.number, number_string, "", range))
             return
 
         identifier_name = match_identifier_name(chunk)
         if identifier_name:
             tokens.append(Token(
-                token_kinds.identifier, identifier_name, r=range))
+                token_kinds.identifier, identifier_name, "", range))
             return
 
         # No keyword/number/identifier matched. Rather than failing now, emit
@@ -487,7 +487,7 @@ def add_chunk(chunk: list, tokens):
         # it in dead branches and renders it in #error messages; if it reaches
         # the parser in live code, the parser reports it then.
         tokens.append(Token(
-            token_kinds.unrecognized, chunk_to_str(chunk), r=range))
+            token_kinds.unrecognized, chunk_to_str(chunk), "", range))
 
 
 def match_keyword_kind(token_repr):

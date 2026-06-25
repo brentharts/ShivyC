@@ -240,7 +240,7 @@ class State:
         self.freed = dict(freed or {})      # alloc_id -> 'a'|'mf'|'f'
         self.escaped = set(escaped or ())   # alloc_id
 
-    def copy(self):
+    def copy_state(self):
         return State(self.pt, self.freed, self.escaped)
 
     def __eq__(self, o):
@@ -248,7 +248,7 @@ class State:
                 and self.escaped == o.escaped)
 
     def merge(self, o):
-        out = self.copy()
+        out = self.copy_state()
         for v, a in o.pt.items():
             out.pt[v] = out.pt.get(v, frozenset()) | a
         for al, s in o.freed.items():
@@ -395,7 +395,7 @@ class Analyzer:
         worklist = [0]
         while worklist:
             b = worklist.pop()
-            s = in_state[b].copy()
+            s = in_state[b].copy_state()
             start, end = cfg.blocks[b]
             for i in range(start, end):
                 self._transfer(cmds[i], i, s, ctx)

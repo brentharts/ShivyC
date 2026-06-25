@@ -90,7 +90,9 @@ class Token:
 
     """
 
-    r: "Range"        # token source range (errors.Range)
+    r: "object"      # token source range (errors.Range); obj-typed so its
+                     # representation matches every other class's `r` field
+                     # (all 'o'), letting a mis-resolved x.r cast stay sound
     # `content` is polymorphic: a string for identifier/number tokens, but a
     # list of character codes for string-literal tokens. Pin it to obj so the
     # list is not coerced to a char* (which mangled string-literal data).
