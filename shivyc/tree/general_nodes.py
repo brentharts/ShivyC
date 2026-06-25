@@ -1375,7 +1375,11 @@ class Declaration(Node):
             tag = str(node.tag)
             ctype = self.symbol_table.lookup_struct_union(tag)
 
-            if ctype and not isinstance(ctype, ctype_req):
+            if node.kind == token_kinds.struct_kw:
+                wrong_kind = ctype and not isinstance(ctype, StructCType)
+            else:
+                wrong_kind = ctype and not isinstance(ctype, UnionCType)
+            if wrong_kind:
                 err = f"defined as wrong kind of tag '{node.kind} {tag}'"
                 raise CompilerError(err, node.r)
 

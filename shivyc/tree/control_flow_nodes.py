@@ -47,20 +47,26 @@ class Return(Node):
 class _BreakContinue(Node):
     """Node for a break or continue statement."""
 
-    # Function which accepts a dummy variable and Context and returns the label
-    # to which to jump when this statement is encountered.
-    get_label = lambda _, c: None
-    # "break" if this is a break statement, or "continue" if this is a continue
-    # statement
+    # "break" if this is a break statement, or "continue" if this is a
+    # continue statement
     descrip = None
 
     def __init__(self):
         """Initialize node."""
         super().__init__()
 
+    def break_target(self, c):
+        """Return the label to jump to for this statement, or None if there is
+        no enclosing break/continue target.
+
+        Overridden per subclass; dispatched virtually (a plain method, not a
+        lambda class attribute, so a base-class `self.break_target(c)` call
+        resolves to the concrete subclass at runtime)."""
+        return None
+
     def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Make IL code for returning this value."""
-        label = self.get_label(c)
+        label = self.break_target(c)
         if label:
             il_code.add(control_cmds.Jump(label))
         else:
@@ -72,15 +78,19 @@ class _BreakContinue(Node):
 class Break(_BreakContinue):
     """Node for a break statement."""
 
-    get_label = lambda _, c: c.break_label
     descrip = "break"
+
+    def break_target(self, c):
+        return c.break_label
 
 
 class Continue(_BreakContinue):
     """Node for a continue statement."""
 
-    get_label = lambda _, c: c.continue_label
     descrip = "continue"
+
+    def break_target(self, c):
+        return c.continue_label
 
 
 class IfStatement(Node):

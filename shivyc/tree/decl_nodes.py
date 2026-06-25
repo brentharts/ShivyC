@@ -135,7 +135,7 @@ class _StructUnion(DeclNode):
     r (Range) - range that the specifier covers
     """
 
-    def __init__(self, tag, members, r):
+    def __init__(self, tag: "object", members, r):
         self.tag = tag
         self.members = members
 
@@ -151,7 +151,7 @@ class _StructUnion(DeclNode):
 class Struct(_StructUnion):
     """Represents a struct C type."""
 
-    def __init__(self, tag, members, r):
+    def __init__(self, tag: "object", members, r):
         self.kind = token_kinds.struct_kw
         super().__init__(tag, members, r)
 
@@ -159,7 +159,7 @@ class Struct(_StructUnion):
 class Union(_StructUnion):
     """Represents a union C type."""
 
-    def __init__(self, tag, members, r):
+    def __init__(self, tag: "object", members, r):
         self.kind = token_kinds.union_kw
         super().__init__(tag, members, r)
 
@@ -187,7 +187,7 @@ class Enum(DeclNode):
     r (Range) - range that the specifier covers.
     """
 
-    def __init__(self, tag, enumerators, r):
+    def __init__(self, tag: "object", enumerators, r):
         self.tag = tag
         self.enumerators = enumerators
         # `kind` lets make_specs_ctype treat this like a type-specifier token.

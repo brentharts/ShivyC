@@ -50,7 +50,7 @@ class SizeofExpr(_SizeofNode):
     def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
         """Return a compile-time integer literal as the expression size."""
 
-        dummy_il_code = il_code.copy()
+        dummy_il_code = il_code.copy_code()
         expr = self.expr.make_il_raw(dummy_il_code, symbol_table, c)
         return self.sizeof_ctype(expr.ctype, self.expr.r, il_code)
 
@@ -109,7 +109,7 @@ class AlignofExpr(_AlignofNode):
         self.expr = expr
 
     def make_il(self, il_code: "il_gen.ILCode", symbol_table: "il_gen.SymbolTable", c):
-        dummy_il_code = il_code.copy()
+        dummy_il_code = il_code.copy_code()
         expr = self.expr.make_il_raw(dummy_il_code, symbol_table, c)
         return self.alignof_ctype(expr.ctype, self.expr.r, il_code)
 
@@ -170,7 +170,7 @@ class OffsetofType(Declaration, _RExprNode):
                 if not ctype.is_array():
                     err = "subscripted value in offsetof is not an array"
                     raise CompilerError(err, self.r)
-                idx = val.make_il(il_code.copy(), symbol_table, c)
+                idx = val.make_il(il_code.copy_code(), symbol_table, c)
                 if not idx.literal:
                     err = "offsetof array index must be a compile-time constant"
                     raise CompilerError(err, self.r)
