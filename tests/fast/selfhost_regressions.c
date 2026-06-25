@@ -10,11 +10,8 @@
  *   - unsigned integer comparison operand sizing  (var/var, var/lit, ==)
  *   - pointer compound assignment                 (p += N on a complete pointee)
  *   - pointer equality / inequality between variables  (p == q, p != q)
+ *   - 64-bit immediate stored to memory           (mov mem, imm64 via register)
  *   - function-like macros                        (column-adjacency handling)
- *
- * NB: deliberately avoids 64-bit *immediate* operands (e.g. 0xFFFFFFFFFFUL),
- * which trip a separate, still-open codegen bug; UL coverage uses a shift so
- * the wide value lives in a register, not an immediate.
  */
 
 #define ADD(a, b) ((a) + (b))
@@ -59,6 +56,14 @@ int main(void) {
     if (pe == pa)                total += 1;    /* p == q  (true)  */
     if (pe != pf)                total += 2;    /* p != q  (true)  */
     if (!(pe == pf))             total += 4;    /* p == q  (false) */
+
+    /* 64-bit immediate stored to memory then used: `mov mem, imm64` is not
+     * encodable, so the value must route through a register. A value > 32 bits
+     * must not wrap into the 32-bit range. */
+    long w = 10000000000L;                      /* 10^10, needs 34 bits */
+    if (w > 5000000000L)         total += 8;
+    if (w == 10000000000L)       total += 16;
+    if ((w >> 33) == 1L)         total += 32;
 
     /* function-like macros */
     if (ADD(3, 4) == 7)          total += 16;
