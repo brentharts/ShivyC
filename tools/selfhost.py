@@ -750,6 +750,40 @@ def _native_smoke(exe, quiet=False):
     return passed, len(SMOKE_PROGRAMS)
 
 
+# Larger single-file feature-regression programs that pin native-codegen bugs
+# fixed while bootstrapping the self-host compiler. Unlike SMOKE_PROGRAMS, these
+# are validated against gcc (the C oracle) rather than a hardcoded exit code, so
+# they stay robust as the programs grow. Add a new file here whenever a
+# self-hosting bug is fixed (and a matching case to the file).
+NATIVE_REGRESSION_FILES = [
+    os.path.join(REPO, "tests", "fast", "selfhost_regressions.c"),
+]
+
+
+def _native_regressions(exe, quiet=False):
+    """Compile+run each regression file with `exe` and with gcc; require the two
+    exit codes to agree. Returns (passed, total)."""
+    passed = 0
+    for src in NATIVE_REGRESSION_FILES:
+        name = os.path.basename(src)
+        d = tempfile.mkdtemp(prefix="shivyc-reg-")
+        cp = os.path.join(d, "p.c")
+        shutil.copyfile(src, cp)
+        gbin = os.path.join(d, "p.gcc")
+        rg = run(["gcc", "-std=c99", "-O0", cp, "-o", gbin])
+        want = subprocess.run([gbin]).returncode if rg.returncode == 0 else None
+        nbin = os.path.join(d, "p.native")
+        run([exe, cp, "-o", nbin])
+        got = (subprocess.run([nbin]).returncode
+               if os.path.exists(nbin) else "compile-error")
+        ok = (want is not None and got == want)
+        log(quiet, "  %-4s %-24s -> %s (gcc %s)"
+            % ("ok" if ok else "FAIL", name, got, want))
+        passed += 1 if ok else 0
+        shutil.rmtree(d, ignore_errors=True)
+    return passed, len(NATIVE_REGRESSION_FILES)
+
+
 def cmd_bootstrap(build_root, args):
     """Stage 1: build the native self-hosted compiler (py2c -> gcc), smoke-test
     it, then benchmark its compile speed against gcc."""
@@ -765,6 +799,13 @@ def cmd_bootstrap(build_root, args):
     print("smoke: %d/%d passed" % (p, t))
     if p != t:
         print("bootstrap: native binary failed the smoke test")
+        return 1
+
+    print("\n== feature regressions (native vs gcc) ==")
+    rp, rt = _native_regressions(exe, args.quiet)
+    print("regressions: %d/%d passed" % (rp, rt))
+    if rp != rt:
+        print("bootstrap: native binary failed a feature regression")
         return 1
 
     print("\n== compile-speed benchmark: native shivyc vs gcc ==")
