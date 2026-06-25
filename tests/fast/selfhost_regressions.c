@@ -14,6 +14,7 @@
  *   - C11 anonymous struct/union members           (promoted into enclosing type)
  *   - floating-point constant folding              (+,-,*,/ and unary - on doubles)
  *   - floating-point function arguments            (doubles passed in xmm regs)
+ *   - usual arithmetic conversions int (op) long   (widen to long, no truncation)
  *   - function-like macros                        (column-adjacency handling)
  */
 
@@ -112,6 +113,17 @@ int main(void) {
      * integer arguments (each ABI sequence counted independently). */
     if ((int)fadd2(1.5, 2.5) == 4)         total += 64;
     if ((int)fmix(1, 2.0, 3, 4.0) == 10)   total += 128;
+
+    /* usual arithmetic conversions: `int (op) long` must widen to long, even
+     * when the int operand is on the left. Computing as int would truncate
+     * (and give the wrong sizeof). */
+    if (sizeof(1 + 1L) == 8)               total += 1;
+    if (sizeof(1 * 1L) == 8)               total += 2;
+    {
+        int i = 100000;
+        long prod = i * 100000L;           /* 10^10: overflows a 32-bit int */
+        if (prod == 10000000000L)          total += 4;
+    }
 
     return total & 0xFF;
 }
