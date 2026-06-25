@@ -39,12 +39,15 @@ class _Equality(_ArithBinOp):
         right_obj = right.addr_of
 
         # If either operand is a null pointer constant, cast it to the
-        # other's pointer type.
-        if (left.ctype.is_pointer()
-             and getattr(right.literal, "val", None) == 0):
+        # other's pointer type. Guard `.literal is not None` before reading
+        # `.val`: a non-literal operand (e.g. a pointer variable) has
+        # `literal is None`, and the transpiler lowers the typed `.literal`
+        # field read unconditionally, so an unguarded read dereferences null.
+        if (left.ctype.is_pointer() and right.literal is not None
+                and right.literal.val == 0):
             right = set_type(right, left.ctype, il_code)
-        elif (right.ctype.is_pointer()
-              and getattr(left.literal, "val", None) == 0):
+        elif (right.ctype.is_pointer() and left.literal is not None
+                and left.literal.val == 0):
             left = set_type(left, right.ctype, il_code)
 
         # If both operands are not pointer types, quit now
