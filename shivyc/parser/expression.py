@@ -7,13 +7,28 @@ import shivyc.tree.decl_nodes as decl_nodes
 from shivyc.parser.utils import (add_range, match_token, token_is, ParserError,
                                  raise_error, log_error, token_in)
 
+# Operator-separator tables for parse_series, hoisted to module scope so the
+# expression-precedence cascade does not rebuild these constant dicts on every
+# (recursive) sub-expression -- a dominant source of parser arena churn.
+_SEP_COMMA = {token_kinds.comma: tree.MultiExpr}
+_SEP_LOGOR = {token_kinds.bool_or: tree.BoolOr}
+_SEP_LOGAND = {token_kinds.bool_and: tree.BoolAnd}
+_SEP_BITOR = {token_kinds.bitor: tree.BitOr}
+_SEP_BITXOR = {token_kinds.bitxor: tree.BitXor}
+_SEP_BITAND = {token_kinds.amp: tree.BitAnd}
+_SEP_EQUALITY = {token_kinds.twoequals: tree.Equality, token_kinds.notequal: tree.Inequality}
+_SEP_RELATIONAL = {token_kinds.lt: tree.LessThan, token_kinds.gt: tree.GreaterThan, token_kinds.ltoe: tree.LessThanOrEq, token_kinds.gtoe: tree.GreaterThanOrEq}
+_SEP_BITWISE = {token_kinds.lbitshift: tree.LBitShift, token_kinds.rbitshift: tree.RBitShift}
+_SEP_ADDITIVE = {token_kinds.plus: tree.Plus, token_kinds.minus: tree.Minus}
+_SEP_MULTIPLICATIVE = {token_kinds.star: tree.Mult, token_kinds.slash: tree.Div, token_kinds.mod: tree.Mod}
+
 
 @add_range
 def parse_expression(index):
     """Parse expression."""
     return parse_series(
         index, parse_assignment,
-        {token_kinds.comma: tree.MultiExpr})
+        _SEP_COMMA)
 
 
 @add_range
@@ -77,7 +92,7 @@ def parse_logical_or(index):
     """Parse logical or expression."""
     return parse_series(
         index, parse_logical_and,
-        {token_kinds.bool_or: tree.BoolOr})
+        _SEP_LOGOR)
 
 
 @add_range
@@ -85,7 +100,7 @@ def parse_logical_and(index):
     """Parse logical and expression."""
     return parse_series(
         index, parse_bit_or,
-        {token_kinds.bool_and: tree.BoolAnd})
+        _SEP_LOGAND)
 
 
 @add_range
@@ -93,7 +108,7 @@ def parse_bit_or(index):
     """Parse bitwise or (|) expression."""
     return parse_series(
         index, parse_bit_xor,
-        {token_kinds.bitor: tree.BitOr})
+        _SEP_BITOR)
 
 
 @add_range
@@ -101,7 +116,7 @@ def parse_bit_xor(index):
     """Parse bitwise xor (^) expression."""
     return parse_series(
         index, parse_bit_and,
-        {token_kinds.bitxor: tree.BitXor})
+        _SEP_BITXOR)
 
 
 @add_range
@@ -109,7 +124,7 @@ def parse_bit_and(index):
     """Parse bitwise and (&) expression."""
     return parse_series(
         index, parse_equality,
-        {token_kinds.amp: tree.BitAnd})
+        _SEP_BITAND)
 
 
 @add_range
@@ -118,8 +133,7 @@ def parse_equality(index):
     # TODO: Implement relational and shift expressions here.
     return parse_series(
         index, parse_relational,
-        {token_kinds.twoequals: tree.Equality,
-         token_kinds.notequal: tree.Inequality})
+        _SEP_EQUALITY)
 
 
 @add_range
@@ -127,18 +141,14 @@ def parse_relational(index):
     """Parse relational expression."""
     return parse_series(
         index, parse_bitwise,
-        {token_kinds.lt: tree.LessThan,
-         token_kinds.gt: tree.GreaterThan,
-         token_kinds.ltoe: tree.LessThanOrEq,
-         token_kinds.gtoe: tree.GreaterThanOrEq})
+        _SEP_RELATIONAL)
 
 
 @add_range
 def parse_bitwise(index):
     return parse_series(
         index, parse_additive,
-        {token_kinds.lbitshift: tree.LBitShift,
-         token_kinds.rbitshift: tree.RBitShift})
+        _SEP_BITWISE)
 
 
 @add_range
@@ -146,8 +156,7 @@ def parse_additive(index):
     """Parse additive expression."""
     return parse_series(
         index, parse_multiplicative,
-        {token_kinds.plus: tree.Plus,
-         token_kinds.minus: tree.Minus})
+        _SEP_ADDITIVE)
 
 
 @add_range
@@ -155,9 +164,7 @@ def parse_multiplicative(index):
     """Parse multiplicative expression."""
     return parse_series(
         index, parse_cast,
-        {token_kinds.star: tree.Mult,
-         token_kinds.slash: tree.Div,
-         token_kinds.mod: tree.Mod})
+        _SEP_MULTIPLICATIVE)
 
 
 @add_range
