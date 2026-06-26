@@ -53,6 +53,25 @@ static int rstress(int a, int b, int c, int d) {
     return s + t + (a * b - c * d);
 }
 
+/* Parser symbol-table snapshot/restore: a typedef name shadowed by a variable
+ * in an inner scope must be restored to its typedef meaning when the scope
+ * ends. Inside the inner scope `T * 2` is multiplication (T is a value); after
+ * it, `T b` is again a declaration (T is a type). Getting this right depends on
+ * the parser's scope push/pop and symbol add/undo being exact. */
+typedef int RegT;
+static int psr_check(void) {
+    RegT a = 5;
+    int acc = a;            /* 5 */
+    {
+        int RegT = 3;       /* shadows the typedef with a value */
+        acc += RegT;        /* 5 + 3 = 8 */
+        acc += RegT * 2;    /* multiplication, not a declaration: 8 + 6 = 14 */
+    }
+    RegT b = 4;             /* typedef meaning restored: declares b */
+    acc += b;               /* 14 + 4 = 18 */
+    return acc;
+}
+
 int main(void) {
     int total = 0;
 
@@ -148,6 +167,9 @@ int main(void) {
         }
         if (acc == 1472)                   total += 8;
     }
+
+    /* parser typedef-shadow snapshot/restore */
+    if (psr_check() == 18)                 total += 16;
 
     return total & 0xFF;
 }
