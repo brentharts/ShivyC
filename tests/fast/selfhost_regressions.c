@@ -16,6 +16,7 @@
  *   - floating-point function arguments            (doubles passed in xmm regs)
  *   - usual arithmetic conversions int (op) long   (widen to long, no truncation)
  *   - function-like macros                        (column-adjacency handling)
+ *   - register-allocation coalescing / spill path  (incremental conflict cache)
  */
 
 #define ADD(a, b) ((a) + (b))
@@ -38,6 +39,19 @@ struct AnonHost {
  * each class is counted independently. */
 static double fadd2(double a, double b) { return a + b; }
 static double fmix(int a, double b, int c, double d) { return a + b + c + d; }
+
+/* register-allocation stress: many simultaneously-live values and copy chains
+ * (preference edges) drive the conflict-graph coalescing pass whose per-node
+ * conflict cache is now built once per pass and maintained incrementally. The
+ * register/spill choices differ from gcc, but the computed result must not. */
+static int rstress(int a, int b, int c, int d) {
+    int x0 = a, x1 = b, x2 = c, x3 = d;
+    int y0 = x0 + x1, y1 = x1 + x2, y2 = x2 + x3, y3 = x3 + x0;
+    int z0 = y0 * 2, z1 = y1 * 3, z2 = y2 * 4, z3 = y3 * 5;
+    int s = z0 + z1 + z2 + z3;
+    int t = x0 + x1 + x2 + x3 + y0 + y1 + y2 + y3;
+    return s + t + (a * b - c * d);
+}
 
 int main(void) {
     int total = 0;
@@ -123,6 +137,16 @@ int main(void) {
         int i = 100000;
         long prod = i * 100000L;           /* 10^10: overflows a 32-bit int */
         if (prod == 10000000000L)          total += 4;
+    }
+
+    /* register-allocation coalescing / spill path: accumulate a function with
+     * heavy copy and live-range pressure across a loop. */
+    {
+        int acc = 0;
+        for (int i = 0; i < 8; i++) {
+            acc += rstress(i, i + 1, i + 2, i + 3);
+        }
+        if (acc == 1472)                   total += 8;
     }
 
     return total & 0xFF;
