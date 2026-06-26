@@ -876,6 +876,7 @@ void list_append(obj lst, obj v) {
         int nc = l->cap * 2;
         obj* nd = aalloc(sizeof(obj) * nc);
         memcpy(nd, l->data, sizeof(obj) * l->len);
+        afree(l->data, sizeof(obj) * l->cap);  /* old backing is now dead */
         l->data = nd; l->cap = nc;
     }
     l->data[l->len++] = v;
@@ -889,6 +890,7 @@ void list_insert(obj lst, long i, obj v) {
         int nc = l->cap ? l->cap * 2 : 4;
         obj* nd = aalloc(sizeof(obj) * nc);
         memcpy(nd, l->data, sizeof(obj) * l->len);
+        if (l->cap) afree(l->data, sizeof(obj) * l->cap);  /* old backing dead */
         l->data = nd; l->cap = nc;
     }
     for (long j = l->len; j > i; j--)
@@ -1084,7 +1086,9 @@ void dict_set(obj dd, obj k, obj v) {
     if (i >= 0) { d->e[i].val = v; return; }
     if (d->len == d->cap) {
         int nc = d->cap * 2; DEnt* ne = aalloc(sizeof(DEnt) * nc);
-        memcpy(ne, d->e, sizeof(DEnt) * d->len); d->e = ne; d->cap = nc;
+        memcpy(ne, d->e, sizeof(DEnt) * d->len);
+        afree(d->e, sizeof(DEnt) * d->cap);  /* old backing is now dead */
+        d->e = ne; d->cap = nc;
     }
     d->e[d->len].key = k; d->e[d->len].val = v; d->len++;
 }
