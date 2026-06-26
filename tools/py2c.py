@@ -688,7 +688,32 @@ void package(const char* name) { (void)name; }
 
 /* ---- first-class function support ---- */
 static const TypeInfoHdr CLOSURE_TYPE = { "function", NULL };
+/* A closure with no captured environment (env is None) is fully determined by
+ * its function pointer, so it is a singleton: every `make_closure(&f, None)`
+ * yields an equivalent object. Referencing a bare function as a value is
+ * common in hot paths (sort keys, dispatch tables, method values), so without
+ * caching the compiler re-allocates hundreds of thousands of identical
+ * closures per compile. Cache them, allocated with libc malloc so they live
+ * outside the arena -- arena_reset and the scratch-scope arena_release must
+ * never reclaim a cached object (that would dangle the cache entry). */
+#define CLOSURE_CACHE_MAX 1024
+static ClosureFn g_cc_fn[CLOSURE_CACHE_MAX];
+static obj       g_cc_obj[CLOSURE_CACHE_MAX];
+static int       g_cc_n;
 obj make_closure(ClosureFn fn, obj env) {
+    if (IS_NONE(env)) {
+        for (int i = 0; i < g_cc_n; i++)
+            if (g_cc_fn[i] == fn) return g_cc_obj[i];
+        if (g_cc_n < CLOSURE_CACHE_MAX) {
+            Closure* c = (Closure*)malloc(sizeof(Closure));  /* permanent singleton */
+            c->_hdr.type = &CLOSURE_TYPE;
+            c->fn = fn; c->env = env;
+            obj r = (obj){T_FUNC, {.o = (Obj*)c}};
+            g_cc_fn[g_cc_n] = fn; g_cc_obj[g_cc_n] = r; g_cc_n++;
+            return r;
+        }
+        /* cache full (improbable): fall through to an arena allocation */
+    }
     Closure* c = (Closure*)aalloc(sizeof(Closure));
     c->_hdr.type = &CLOSURE_TYPE;
     c->fn = fn; c->env = env;
