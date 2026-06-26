@@ -49,7 +49,11 @@ def tokenize(code, filename) -> "list[Token]":
                 # tag the logical line for the preprocessor's directive
                 # grouping.
                 t.logical_line = logical_line
-            tokens += line_tokens
+                # Append in place. Using `tokens += line_tokens` here built a
+                # brand-new concatenated list on every source line, recopying
+                # all tokens seen so far -- O(lines^2) time and arena memory,
+                # the dominant peak-memory cost of lexing large files.
+                tokens.append(t)
         except CompilerError as e:
             error_collector.add(e)
 
