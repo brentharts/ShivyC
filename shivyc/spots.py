@@ -140,6 +140,23 @@ class RegSpot(Spot):
 
         return self.reg_map[self.name][i]
 
+    def name_variants(self):
+        """Return this register's name spellings (64/32/16/8-bit) as a list.
+
+        Built by indexing reg_map[self.name][i] one element at a time. The
+        self-hosting transpiler only supports the double-subscript form
+        reg_map[key][i] (it lowers reg_map to an indexed accessor function);
+        a bare class-level reg_map[key] that returns the whole list is
+        mis-lowered to a field read off a bogus object and yields garbage.
+        Callers that need the variant list must go through here.
+        """
+        variants = []
+        i = 0
+        while i < 4:
+            variants.append(self.reg_map[self.name][i])
+            i += 1
+        return variants
+
 
 class MemSpot(Spot):
     """Spot representing a region in memory, like on stack or .data section.

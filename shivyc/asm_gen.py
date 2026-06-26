@@ -189,7 +189,16 @@ class NodeGraph:
         """Initialize NodeGraph."""
         self._real_nodes = nodes or []
         self._all_nodes = self._real_nodes[:]
-        self._conf = {n: [] for n in self._all_nodes}
+        # Conflict neighbours are stored as dicts-used-as-sets ({neighbour: 1})
+        # so membership and removal are O(1). The register allocator queries
+        # conflict membership extremely heavily during coalescing; with lists it
+        # had to rebuild a separate dict-of-sets cache on every coalesce pass
+        # (O(V+E) each, thousands of times per large function), which dominated
+        # the allocator's peak arena memory. Holding the graph's own conflict
+        # neighbours as sets removes that cache entirely.
+        self._conf = {}
+        for n in self._all_nodes:
+            self._conf[n] = {}
         self._pref = {n: [] for n in self._all_nodes}
 
     def is_node(self, n: "object"):
@@ -199,7 +208,7 @@ class NodeGraph:
     def add_dummy_node(self, v: "object"):
         """Add a dummy node to graph."""
         self._all_nodes.append(v)
-        self._conf[v] = []
+        self._conf[v] = {}
         self._pref[v] = []
 
         # Dummy nodes must mutually conflict
@@ -209,10 +218,8 @@ class NodeGraph:
 
     def add_conflict(self, n1: "object", n2: "object"):
         """Add a conflict edge between n1 and n2."""
-        if n2 not in self._conf[n1]:
-            self._conf[n1].append(n2)
-        if n1 not in self._conf[n2]:
-            self._conf[n2].append(n1)
+        self._conf[n1][n2] = 1
+        self._conf[n2][n1] = 1
 
     def add_pref(self, n1: "object", n2: "object"):
         """Add a preference edge between n1 and n2."""
@@ -225,14 +232,40 @@ class NodeGraph:
         """Remove and return node n from this graph."""
         del self._conf[n]
         del self._pref[n]
-
         if n in self._real_nodes:
             self._real_nodes.remove(n)
         self._all_nodes.remove(n)
 
         for v in self._conf:
             if n in self._conf[v]:
-                self._conf[v].remove(n)
+                del self._conf[v][n]
+        for v in self._pref:
+            if n in self._pref[v]:
+                self._pref[v].remove(n)
+        return n
+
+    def remove_node(self, n: "object"):
+        """Remove and return node n from this graph.
+
+        This is an exact duplicate of pop(). It exists under a non-builtin
+        name so that callers holding the graph in a plain (un-inferred)
+        parameter -- e.g. _simplify_once(self, nodes, g) -- dispatch through
+        the vtable to this method. The self-hosting transpiler lowers a bare
+        `.pop(x)` call to a dict pop when it cannot infer that the receiver is
+        a NodeGraph; on a NodeGraph that dict pop is a silent no-op, so the
+        node is never actually removed. Simplification then removes nothing and
+        every low-degree node it should have eliminated is spilled instead --
+        the dominant cost of register allocation on large functions.
+        """
+        del self._conf[n]
+        del self._pref[n]
+        if n in self._real_nodes:
+            self._real_nodes.remove(n)
+        self._all_nodes.remove(n)
+
+        for v in self._conf:
+            if n in self._conf[v]:
+                del self._conf[v][n]
         for v in self._pref:
             if n in self._pref[v]:
                 self._pref[v].remove(n)
@@ -246,20 +279,16 @@ class NodeGraph:
         that n2 previously had.
         """
 
-        # Merge conflict lists
-        total_conf = self._conf[n1][:]
+        # Merge conflict sets: n1 gains all of n2's conflict neighbours.
         for c in self._conf[n2]:
-            if c not in total_conf:
-                total_conf.append(c)
+            self._conf[n1][c] = 1
 
-        self._conf[n1] = total_conf
-
-        # Restore symmetric invariant
+        # Restore the symmetric invariant: every node that conflicted with
+        # n2 (now folded into n1's set) records the conflict against n1.
         for c in self._conf[n1]:
             if n2 in self._conf[c]:
-                self._conf[c].remove(n2)
-            if n1 not in self._conf[c]:
-                self._conf[c].append(n1)
+                del self._conf[c][n2]
+            self._conf[c][n1] = 1
 
         # Merge preference lists
         total_pref = self._pref[n1][:]
@@ -311,7 +340,10 @@ class NodeGraph:
         g._real_nodes = self._real_nodes[:]
         g._all_nodes = self._all_nodes[:]
         for n in self._all_nodes:
-            g._conf[n] = self._conf[n][:]
+            n_conf = {}
+            for k in self._conf[n]:
+                n_conf[k] = 1
+            g._conf[n] = n_conf
             g._pref[n] = self._pref[n][:]
 
         return g
@@ -638,7 +670,25 @@ class ASMGen:
                 # will never be a merged node because we merge nodes
                 # conservatively, so any recently merged node can be
                 # simplified immediately.
-                n = max(g.nodes(), key=lambda n: len(g.confs(n)))
+                #
+                # This is written as an explicit scan rather than
+                # max(..., key=lambda n: len(g.confs(n))): the self-hosting
+                # transpiler drops the key= argument, so max() would instead
+                # pick a node by default ordering -- an essentially arbitrary
+                # node, often low-degree. Spilling a low-degree node barely
+                # relieves register pressure, so the allocator spills again and
+                # again, copying and re-coalescing the whole interference graph
+                # each time. That single dropped key= was the dominant cost of
+                # assembly generation on large functions (e.g. ~600 needless
+                # spills and a 50x blow-up in coalesce work on an 1800-line
+                # benchmark, versus zero spills under CPython).
+                n = None
+                n_deg = -1
+                for cand in g.nodes():
+                    cand_deg = len(g.confs(cand))
+                    if cand_deg > n_deg:
+                        n_deg = cand_deg
+                        n = cand
                 spilled_nodes.append(n)
 
         # Move any remaining nodes from graph into removed_nodes
@@ -971,9 +1021,12 @@ class ASMGen:
     def _simplify_once(self, nodes, g: "NodeGraph"):
         """Remove and return a node in nodes if it has low conflict degree."""
         for v in nodes:
-            # If the node has low conflict degree remove it from the graph
+            # If the node has low conflict degree remove it from the graph.
+            # Use remove_node (not pop): see NodeGraph.remove_node -- a bare
+            # g.pop(v) here is mis-lowered to a dict pop because g is an
+            # un-inferred parameter, which silently fails to remove the node.
             if len(g.confs(v)) < len(self.alloc_registers):
-                return g.pop(v)
+                return g.remove_node(v)
 
     def _coalesce_all(self, merged_nodes, g: "NodeGraph"):
         """Repeat the coalesce step until no more can be done.
@@ -985,77 +1038,47 @@ class ASMGen:
         """
         did_something = False
         nreg = len(self.alloc_registers)
-        # Cache each node's conflict set ONCE for this coalesce pass and
-        # maintain it across the pass's merges. Previously _coalesce_once
-        # rebuilt this whole O(V+E) structure on every call (i.e. once per
-        # merge), which the bump arena never reclaims -- it was by far the
-        # dominant peak-memory cost of register allocation on large functions
-        # (e.g. ~225 MB of a 233 MB spill phase on one benchmark).
-        #
-        # Each conflict set is stored as a dict-used-as-a-set ({node: 1}) so it
-        # can be extended in place with subscript assignment. A plain set's
-        # .add() can't be used here: the receiver comes from a subscript and is
-        # dynamically typed, so .add() would dispatch through a vtable slot the
-        # set type does not have (a null call).
-        confs_set = {}
-        for nd in g.all_nodes():
-            nd_conf = {}
-            for x in g.confs(nd):
-                nd_conf[x] = 1
-            confs_set[nd] = nd_conf
+        # The graph now holds each node's conflict neighbours as a set, so the
+        # coalesce step queries g.confs() directly. This replaces a per-pass
+        # rebuild of a separate dict-of-sets conflict cache: _coalesce_all is
+        # called thousands of times inside the simplify/coalesce/freeze fixpoint
+        # on a large function, and rebuilding that O(V+E) cache on every call
+        # was by far the dominant peak-arena cost of register allocation (e.g.
+        # ~550 MB of a 660 MB assembly phase on a 1800-line benchmark).
         while True:
-            merge = self._coalesce_once(g, confs_set, nreg)
+            merge = self._coalesce_once(g, nreg)
             if merge:
                 if merge[0] not in merged_nodes:
                     merged_nodes[merge[0]] = []
 
                 merged_nodes[merge[0]].append(merge[1])
                 did_something = True
-
-                # g.merge has already updated the graph's conflict lists. Mirror
-                # that in the cache cheaply (O(degree), not a full rebuild): the
-                # kept node's conflicts become exactly its post-merge graph
-                # conflicts, and every node that now conflicts with the kept
-                # node records it. The removed node is left as a harmless stale
-                # entry -- it is no longer a graph node, so it is never examined
-                # as a candidate, and a lingering reference only inflates a
-                # degree, making coalescing strictly more conservative.
-                keep = merge[0]
-                if keep in confs_set:
-                    keep_conf = {}
-                    for x in g.confs(keep):
-                        keep_conf[x] = 1
-                    confs_set[keep] = keep_conf
-                    for c in g.confs(keep):
-                        if c in confs_set:
-                            confs_set[c][keep] = 1
             else:
                 break
 
         return did_something
 
-    def _coalesce_once(self, g: "NodeGraph", confs_set, nreg):
+    def _coalesce_once(self, g: "NodeGraph", nreg):
         """Perform one iteration of the coalesce step.
 
         Returns the merged pair if a merge was successfully completed. The
         first element is the preserved node, and the second element is the
         removed node.
 
-        confs_set - per-node conflict-set cache, built and maintained by
-        _coalesce_all for the whole pass.
         nreg - number of allocatable registers.
         """
         for v1 in g.nodes():
             for v2 in g.prefs(v1):
                 # If the two nodes conflict, automatically continue.
-                if v2 in confs_set[v1]:
+                if v2 in g.confs(v1):
                     continue
 
-                # Size of the merged conflict set (confs_set values are
+                # Size of the merged conflict set (g.confs values are
                 # dicts-used-as-sets, so count the union of their keys).
-                total_confs = len(confs_set[v1])
-                for x in confs_set[v2]:
-                    if x not in confs_set[v1]:
+                v1_confs = g.confs(v1)
+                total_confs = len(v1_confs)
+                for x in g.confs(v2):
+                    if x not in v1_confs:
                         total_confs += 1
 
                 # If one is a spot, use a special heuristic.
@@ -1063,10 +1086,10 @@ class ASMGen:
                 if isinstance(v1, Spot):
                     v1, v2 = v2, v1
                 if isinstance(v2, Spot):
-                    for T in confs_set[v1]:
-                        if v2 in confs_set[T]:
+                    for T in g.confs(v1):
+                        if v2 in g.confs(T):
                             continue
-                        if len(confs_set[T]) < nreg:
+                        if len(g.confs(T)) < nreg:
                             continue
                         break
                     else:
@@ -1087,21 +1110,29 @@ class ASMGen:
         is removed from the graph. Returns false iff nothing is done.
         """
 
-        # Rank nodes by conflict degree (low first).
-        nodes = sorted(g.all_nodes(), key=lambda nd: len(g.confs(nd)))
-        pos = {nd: i for i, nd in enumerate(nodes)}
+        # Conflict degree of each node. The freeze step prefers to remove
+        # preference edges between low-degree nodes. The original code obtained
+        # a low-to-high *rank* via sorted(..., key=lambda nd: len(g.confs(nd)))
+        # and ranked edges by that. The self-hosting transpiler drops the key=
+        # argument, so under self-host that sort ordered nodes arbitrarily and
+        # froze essentially random edges -- degrading coalescing and driving
+        # needless spills. Rank by the conflict degree directly (smaller is
+        # preferred), which captures the same intent without a keyed sort.
+        deg = {}
+        for nd in g.all_nodes():
+            deg[nd] = len(g.confs(nd))
 
         # Find the preference edge whose endpoints have the lowest combined
-        # rank, preferring to freeze edges between low-degree nodes. Iterate
+        # degree, preferring to freeze edges between low-degree nodes. Iterate
         # preference edges directly rather than enumerating and sorting all
         # O(V^2) node pairs (which made this step cubic in the graph size and
         # dominated compile time on large functions).
         best = None
         best_key = None
-        for na in nodes:
-            p1 = pos[na]
+        for na in g.all_nodes():
+            p1 = deg[na]
             for nb in g.prefs(na):
-                p2 = pos[nb]
+                p2 = deg[nb]
                 key = (p1 + p2, min(p1, p2), max(p1, p2))
                 if best_key is None or key < best_key:
                     best_key = key
@@ -1121,16 +1152,30 @@ class ASMGen:
         # names are inferred as C int by the transpiler's name heuristic, which
         # would corrupt the graph-node objects passed through them.)
         def get_conflicts(node):
-            conflicts = set(g.confs(node))
+            # Collect conflicting nodes into a dict-used-as-a-set. A real set
+            # with .add() can't be used here: get_conflicts is a nested
+            # function, so the transpiler does not track `conflicts` as a
+            # statically-typed set and lowers .add() to a vtable dispatch
+            # (TYPE(conflicts)->add) -- but the underlying object has no add
+            # slot, so the call jumps through a null pointer and segfaults.
+            # Subscript assignment (conflicts[k] = 1) lowers to a plain dict
+            # set and is always safe.
+            conflicts = {}
+            for k in g.confs(node):
+                conflicts[k] = 1
             for sub in merged_nodes.get(node, []):
-                conflicts |= get_conflicts(sub)
+                for c in get_conflicts(sub):
+                    conflicts[c] = 1
             return conflicts
 
         # Get a set of nodes which are merged into `node`
         def get_merged(node):
-            merged = {node}
+            # Dict-used-as-a-set, for the same reason as get_conflicts.
+            merged = {}
+            merged[node] = 1
             for sub in merged_nodes.get(node, []):
-                merged |= get_merged(sub)
+                for m in get_merged(sub):
+                    merged[m] = 1
             return merged
 
         # Build up spotmap
@@ -1174,18 +1219,22 @@ class ASMGen:
         callee_saved = spots.callee_saved_registers
         name_to_reg = {}
         for reg in callee_saved:
-            for variant in spots.RegSpot.reg_map[reg.name]:
+            for variant in reg.name_variants():
                 if variant:
                     name_to_reg[variant] = reg
 
         def used_callee_saved(cmds):
             used = []
-            seen = set()
+            # Dict-used-as-a-set: this is a nested function, so the transpiler
+            # does not track `seen` as a statically-typed set and would lower
+            # seen.add(...) to a null vtable dispatch (segfault). Subscript
+            # assignment is always safe.
+            seen = {}
             for c in cmds:
                 for field in (getattr(c, "dest", None), getattr(c, "source", None)):
                     reg = name_to_reg.get(field)
                     if reg is not None and reg not in seen:
-                        seen.add(reg)
+                        seen[reg] = 1
                         used.append(reg)
             return used
 
