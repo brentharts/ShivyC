@@ -474,12 +474,15 @@ class ASMGen:
                 cmds = self.il_code.commands[func]
                 if not getattr(self.arguments, "no_peephole", False):
                     import shivyc.peephole as peephole
+                    # Reset the literal-registration log, run the peephole, then
+                    # give a spot only to the literals it actually introduced
+                    # (e.g. an induction-variable stride). Rescanning the whole
+                    # program's literals here instead was O(functions x
+                    # literals) -- the dominant quadratic cost in asm generation.
+                    self.il_code.new_literals = []
                     cmds = peephole.optimize(cmds, self.il_code)
                     self.il_code.commands[func] = cmds
-                    # The peephole may introduce new literals (e.g. an IV
-                    # stride); ensure each gets a LiteralSpot, since the global
-                    # spotmap was built before this pass ran.
-                    for v in self.il_code.literals:
+                    for v in self.il_code.new_literals:
                         if v not in global_spotmap:
                             global_spotmap[v] = LiteralSpot(
                                 self.il_code.literals[v])
@@ -583,11 +586,16 @@ class ASMGen:
         # Address-taken locals must keep their normal stack layout: their
         # addresses are observable (and some programs do pointer arithmetic
         # across them), so they are never relocated to near-function scratch.
+        # Track the per-function spots we fold into the shared global_spotmap
+        # so they can be removed again after this function is emitted (keeping
+        # the shared map globals-only and constant-size across functions).
+        local_keys: List["ILValue"] = []
         for v in move_to_mem:
             if v in free_values:
                 self.offset += v.ctype.size
                 global_spotmap[v] = MemSpot(spots.RBP, -self.offset)
                 free_values.remove(v)
+                local_keys.append(v)
 
         # Perform liveliness analysis
         live_vars = self._get_live_vars(commands, free_values)
@@ -646,9 +654,16 @@ class ASMGen:
         for v in spilled_nodes:
             spotmap[v] = self._alloc_stack_slot(v.ctype.size)
 
-        # Merge global spotmap into this spotmap
-        for v in global_spotmap:
-            spotmap[v] = global_spotmap[v]
+        # Fold this function's spots into the shared global spotmap and emit
+        # against it directly. Copying the whole global spotmap into a fresh
+        # per-function dict here was O(functions x globals) -- the dominant
+        # quadratic in both time and peak memory of asm generation, since the
+        # global spotmap holds every literal/static in the program. The folded
+        # keys (regalloc results, spills, and the address-taken locals above)
+        # are removed after emit so the shared map stays constant-size.
+        for v in spotmap:
+            global_spotmap[v] = spotmap[v]
+            local_keys.append(v)
 
         if self.arguments.show_reg_alloc_perf:  # pragma: no cover
             total_prefs = 0
@@ -670,8 +685,18 @@ class ASMGen:
             print("total ILValues", len(g_bak.nodes()))
             print("register ILValues", len(g_bak.nodes()) - len(spilled_nodes))
 
-        # Generate assembly code
-        self._generate_asm(commands, live_vars, spotmap)
+        # Generate assembly code. Pass the spots that belong to THIS function
+        # (their keys are exactly local_keys) so frame-size and callee-saved
+        # detection scan only the function's spots, not the whole program's
+        # globals/literals held in the shared map.
+        func_spots = [global_spotmap[v] for v in local_keys]
+        self._generate_asm(commands, live_vars, global_spotmap, func_spots)
+
+        # Remove this function's spots from the shared map so it does not grow
+        # with the program (the source of the asm-gen quadratic).
+        for v in local_keys:
+            if v in global_spotmap:
+                del global_spotmap[v]
 
     def _get_global_spotmap(self):
         """Generate global spotmap and add global values to ASM.
@@ -959,38 +984,79 @@ class ASMGen:
         list of nodes has been merged into the key node.
         """
         did_something = False
+        nreg = len(self.alloc_registers)
+        # Cache each node's conflict set ONCE for this coalesce pass and
+        # maintain it across the pass's merges. Previously _coalesce_once
+        # rebuilt this whole O(V+E) structure on every call (i.e. once per
+        # merge), which the bump arena never reclaims -- it was by far the
+        # dominant peak-memory cost of register allocation on large functions
+        # (e.g. ~225 MB of a 233 MB spill phase on one benchmark).
+        #
+        # Each conflict set is stored as a dict-used-as-a-set ({node: 1}) so it
+        # can be extended in place with subscript assignment. A plain set's
+        # .add() can't be used here: the receiver comes from a subscript and is
+        # dynamically typed, so .add() would dispatch through a vtable slot the
+        # set type does not have (a null call).
+        confs_set = {}
+        for nd in g.all_nodes():
+            nd_conf = {}
+            for x in g.confs(nd):
+                nd_conf[x] = 1
+            confs_set[nd] = nd_conf
         while True:
-            merge = self._coalesce_once(g)
+            merge = self._coalesce_once(g, confs_set, nreg)
             if merge:
                 if merge[0] not in merged_nodes:
                     merged_nodes[merge[0]] = []
 
                 merged_nodes[merge[0]].append(merge[1])
                 did_something = True
+
+                # g.merge has already updated the graph's conflict lists. Mirror
+                # that in the cache cheaply (O(degree), not a full rebuild): the
+                # kept node's conflicts become exactly its post-merge graph
+                # conflicts, and every node that now conflicts with the kept
+                # node records it. The removed node is left as a harmless stale
+                # entry -- it is no longer a graph node, so it is never examined
+                # as a candidate, and a lingering reference only inflates a
+                # degree, making coalescing strictly more conservative.
+                keep = merge[0]
+                if keep in confs_set:
+                    keep_conf = {}
+                    for x in g.confs(keep):
+                        keep_conf[x] = 1
+                    confs_set[keep] = keep_conf
+                    for c in g.confs(keep):
+                        if c in confs_set:
+                            confs_set[c][keep] = 1
             else:
                 break
 
         return did_something
 
-    def _coalesce_once(self, g: "NodeGraph"):
+    def _coalesce_once(self, g: "NodeGraph", confs_set, nreg):
         """Perform one iteration of the coalesce step.
 
         Returns the merged pair if a merge was successfully completed. The
         first element is the preserved node, and the second element is the
         removed node.
+
+        confs_set - per-node conflict-set cache, built and maintained by
+        _coalesce_all for the whole pass.
+        nreg - number of allocatable registers.
         """
-        # Cache each node's conflict set once for this pass: membership tests
-        # and unions below are otherwise linear scans of conflict lists, which
-        # dominated compile time on large functions.
-        confs_set = {nd: set(g.confs(nd)) for nd in g.all_nodes()}
-        nreg = len(self.alloc_registers)
         for v1 in g.nodes():
             for v2 in g.prefs(v1):
                 # If the two nodes conflict, automatically continue.
                 if v2 in confs_set[v1]:
                     continue
 
-                total_confs = len(confs_set[v1] | confs_set[v2])
+                # Size of the merged conflict set (confs_set values are
+                # dicts-used-as-sets, so count the union of their keys).
+                total_confs = len(confs_set[v1])
+                for x in confs_set[v2]:
+                    if x not in confs_set[v1]:
+                        total_confs += 1
 
                 # If one is a spot, use a special heuristic.
                 # (described on section 6, page 311 of George & Appel)
@@ -1099,7 +1165,7 @@ class ASMGen:
 
         return spotmap
 
-    def _generate_asm(self, commands, live_vars, spotmap):
+    def _generate_asm(self, commands, live_vars, spotmap, func_spots):
         """Generate assembly code."""
 
         # Map every size variant (rbx/ebx/bx/bl, r12/r12d/...) of each
@@ -1125,7 +1191,16 @@ class ASMGen:
 
 
         # This is kinda hacky...
-        max_offset = max(spot.rbp_offset() for spot in spotmap.values())
+        # Frame size is the deepest rbp-relative slot among this function's own
+        # spots. Globals/literals are never rbp-relative (rbp_offset() == 0), so
+        # scanning them -- the whole program's worth, once per function -- was a
+        # quadratic no-op; iterate only this function's spots. (max(..., default)
+        # is unavailable here, so fold manually to stay safe when empty.)
+        max_offset = 0
+        for spot in func_spots:
+            off = spot.rbp_offset()
+            if off > max_offset:
+                max_offset = off
 
         # Decide framelessness BEFORE generating the body: a function with no
         # stack-resident locals and no non-tail call needs no rbp frame at all.
@@ -1143,8 +1218,13 @@ class ASMGen:
         # A function that allocates a callee-saved register must save/restore it
         # in a real prologue/epilogue, so it cannot be frameless.
         callee_saved_set = set(callee_saved)
-        spotmap_callee_saved = any(s in callee_saved_set
-                                   for s in spotmap.values())
+        # Only this function's spots can be callee-saved registers; globals are
+        # memory/literal spots. Scan func_spots, not the whole program's map.
+        spotmap_callee_saved = False
+        for s in func_spots:
+            if s in callee_saved_set:
+                spotmap_callee_saved = True
+                break
         if fn_info is not None:
             frameless = (base_offset == 0
                          and fn_info.get("no_regular_call", False)
