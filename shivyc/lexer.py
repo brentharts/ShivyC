@@ -11,6 +11,21 @@ from shivyc.tokens import Token
 from shivyc.token_kinds import symbol_kinds, keyword_kinds
 
 
+# Scratch-arena primitives. Under self-hosting these are provided directly by
+# the transpiler runtime (see arena_mark / arena_release in py2c's RUNTIME_C);
+# they are listed in py2c's RUNTIME_INTRINSICS so these Python `def`s are not
+# transpiled and calls lower to the runtime functions. Under CPython (the
+# reference compiler) memory is managed by the host, so they are no-ops.
+def arena_mark():
+    """Snapshot the runtime arena bump pointer (no-op under CPython)."""
+    return 0
+
+
+def arena_release(mark):
+    """Rewind the runtime arena to `mark` (no-op under CPython)."""
+    return None
+
+
 class Tagged:
     """Class representing tagged characters.
 
@@ -146,8 +161,17 @@ def tokenize_line(line: list, in_comment):
     computed_include = False
 
     while chunk_end < len(line):
+        # match_symbol_kind_at scans every symbol spelling character-by-
+        # character against the line, boxing a transient one-character string
+        # for each comparison. Across a whole file that is millions of tiny,
+        # immediately-dead allocations -- the single largest source of lexer
+        # arena use. Nothing it allocates escapes (it returns a pre-existing
+        # token-kind or None), so bracket both calls in a scratch scope: the
+        # boxed characters are reclaimed the instant the matcher returns.
+        _scratch = arena_mark()
         symbol_kind = match_symbol_kind_at(line, chunk_end)
         next_symbol_kind = match_symbol_kind_at(line, chunk_end + 1)
+        arena_release(_scratch)
 
         # Comment delimiters must be recognized from the raw characters, not
         # from matched symbol kinds: match_symbol_kind_at is greedy, so e.g.
