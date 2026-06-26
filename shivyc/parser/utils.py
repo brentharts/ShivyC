@@ -29,16 +29,36 @@ class SimpleSymbolTable:
     """
     def __init__(self) -> None:
         self.symbols: list = []
+        # Undo journal of mutations since program start. snapshot() records a
+        # position in this journal and restore() replays the entries logged
+        # after it, in reverse. This makes a speculative-parse backup O(1) and
+        # its rollback O(changes), rather than copying the whole symbol table
+        # (whose file scope grows with every top-level declaration) on every
+        # speculative parse -- which was quadratic in the number of
+        # declarations and dominated parser peak memory on large inputs.
+        self.journal: list = []
         self.new_scope()
 
     def new_scope(self) -> None:
         self.symbols.append({})
+        self.journal.append(["s", None, None, False, False])
 
     def end_scope(self) -> None:
-        self.symbols.pop()
+        popped = self.symbols.pop()
+        self.journal.append(["e", popped, None, False, False])
 
     def add_symbol(self, identifier, is_typedef: bool) -> None:
-        self.symbols[-1][identifier.content] = is_typedef
+        scope = self.symbols[-1]
+        # Use identifier.content inline (as an object) rather than via a local:
+        # the transpiler would type a `key = identifier.content` local as a C
+        # string and convert a None content to a null pointer, which then
+        # crashes string comparison. Inline, a None content stays a None object
+        # and simply never matches a real key (as in the pre-journal code).
+        existed: bool = identifier.content in scope
+        old_val = scope[identifier.content] if existed else False
+        self.journal.append(
+            ["a", scope, identifier.content, existed, old_val])
+        scope[identifier.content] = is_typedef
 
     def is_typedef(self, identifier) -> bool:
         name: str = identifier.content
@@ -48,25 +68,38 @@ class SimpleSymbolTable:
         return False
 
     def snapshot(self) -> list:
-        """Return a cheap, restorable copy of the table state.
+        """Return a cheap, restorable mark of the current table state.
 
-        Each scope maps an identifier name (str) to a typedef flag (bool);
-        both keys and values are immutable, so a shallow per-scope dict copy
-        is a fully correct backup. This deliberately avoids copy.deepcopy,
-        whose recursive object cloning dominated parse time and has no direct
-        C equivalent -- this explicit snapshot/restore does (a future
-        source-to-C transpiler can emit a plain loop of map copies).
+        The mark is the current length of the undo journal (boxed in a
+        one-element list so the self-hosting transpiler tracks it as an object
+        consistently). Restoring to it replays and discards every mutation
+        logged since -- avoiding the former whole-table copy, whose file scope
+        grows with the program, on every speculative parse.
         """
-        return [dict(scope) for scope in self.symbols]
+        return [len(self.journal)]
 
     def restore(self, snap: list) -> None:
-        """Restore table state from a snapshot, in place.
+        """Restore table state to a snapshot mark, in place.
 
-        The live object identity is preserved (no rebinding of the global),
-        which is also friendlier to a transpiler that fixes each variable's
-        type and identity.
+        Undo every mutation logged after the mark, most recent first. Symbol
+        additions are keyed to the scope dict object they touched, so they undo
+        correctly regardless of intervening scope pushes/pops.
         """
-        self.symbols = [dict(scope) for scope in snap]
+        mark = snap[0]
+        while len(self.journal) > mark:
+            entry = self.journal.pop()
+            op = entry[0]
+            if op == "a":
+                scope = entry[1]
+                key = entry[2]
+                if entry[3]:
+                    scope[key] = entry[4]
+                else:
+                    del scope[key]
+            elif op == "s":
+                self.symbols.pop()
+            else:
+                self.symbols.append(entry[1])
 
 
 symbols = SimpleSymbolTable()
