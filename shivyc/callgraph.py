@@ -14,6 +14,7 @@ affect the output of an ordinary single-file compile.
 """
 
 import re
+import sys
 
 import shivyc.il_cmds.control as control_cmds
 import shivyc.il_cmds.value as value_cmds

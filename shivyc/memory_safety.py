@@ -19,6 +19,7 @@ The analysis works on ShivyCX's IL (the same `Call.direct_name` / `Set` /
 aliasing as it actually flows through the generated code.
 """
 
+import sys
 import shivyc.il_cmds.control as control_cmds
 import shivyc.il_cmds.value as value_cmds
 

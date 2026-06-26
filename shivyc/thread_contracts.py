@@ -28,6 +28,7 @@ generation is constrained to each thread's budget, making the disjointness --
 and therefore the minimal switcher -- a guarantee rather than an observation.
 """
 
+import sys
 import shivyc.spots as spots
 
 # GP allocation pool, in the allocator's preferred order.
