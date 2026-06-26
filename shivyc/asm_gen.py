@@ -883,6 +883,16 @@ class ASMGen:
         # This iteration of live variables
         live_vars = [([], []) for i in range(len(commands))]
 
+        # inputs(), outputs() and targets() depend only on the command, not on
+        # the liveness state, yet the fixpoint below revisits every command on
+        # every iteration. Each call rebuilds a fresh list, so recomputing them
+        # in the loop allocated K x M transient lists (K = iterations to
+        # converge, M = commands) -- a dominant source of asm-gen arena churn
+        # and time on large functions. Compute each once, up front.
+        cmd_inputs = [c.inputs() for c in commands]
+        cmd_outputs = [c.outputs() for c in commands]
+        cmd_targets = [c.targets() for c in commands]
+
         while live_vars != prev_live_vars:
             prev_live_vars = live_vars[:]
 
@@ -893,7 +903,7 @@ class ASMGen:
             for i, command in list(enumerate(commands))[::-1]:
                 # If current command is a jump, add the live inputs of all
                 # possible targets to the current live list.
-                for label in command.targets():
+                for label in cmd_targets[i]:
                     i2 = labels[label]
                     for v in prev_live_vars[i2][0]:
                         if v not in cur_live:
@@ -903,12 +913,12 @@ class ASMGen:
                 out_live = cur_live[:]
 
                 # Add variables used in this command to current live variables
-                for v in command.inputs():
+                for v in cmd_inputs[i]:
                     if v in free_values and v not in cur_live:
                         cur_live.append(v)
 
                 # Remove variables defined in this command to live variables
-                for v in command.outputs():
+                for v in cmd_outputs[i]:
                     if v in free_values:
                         if v in cur_live:
                             cur_live.remove(v)
