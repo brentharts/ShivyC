@@ -635,18 +635,22 @@ class ASMGen:
         # Generate conflict and preference graph
         g_bak = self._generate_graph(commands, free_values, live_vars)
 
-        spilled_nodes = []
+        # Optimistic (Briggs) colouring. The previous allocator removed a node,
+        # then rebuilt and re-ran the entire simplify/coalesce/freeze allocation
+        # from a fresh graph copy and retried -- O(spills) full allocations,
+        # which made assembly generation super-linear on high-register-pressure
+        # functions (e.g. ~30 full restarts on a 40-live-variable function).
+        # Instead, build the graph once and, whenever simplification stalls,
+        # push the highest-degree "potential spill" node straight onto the
+        # colouring stack and carry on in the same pass. When the node is popped
+        # in _generate_spotmap it is coloured normally if any register is free
+        # (optimism frequently succeeds, because its neighbours often share
+        # colours) and only becomes a real stack spill otherwise.
+        g = g_bak.copy_node()
+        removed_nodes = []
+        merged_nodes = {}
 
         while True:
-            g = g_bak.copy_node()
-
-            # Remove all nodes that have been spilled for this iteration
-            for n in spilled_nodes:
-                g.pop(n)
-
-            removed_nodes = []
-            merged_nodes = {}
-
             # Repeat simplification, coalescing, and freeze until freeze
             # does not work.
             while True:
@@ -661,35 +665,25 @@ class ASMGen:
                 if not self._freeze(g):
                     break
 
-            # If no nodes remain, we are done
+            # If no real nodes remain, the graph is fully reduced.
             if not g.nodes():
                 break
-            # If nodes do remain, spill one of them and retry
-            else:
-                # Spill node with highest number of conflicts. This node
-                # will never be a merged node because we merge nodes
-                # conservatively, so any recently merged node can be
-                # simplified immediately.
-                #
-                # This is written as an explicit scan rather than
-                # max(..., key=lambda n: len(g.confs(n))): the self-hosting
-                # transpiler drops the key= argument, so max() would instead
-                # pick a node by default ordering -- an essentially arbitrary
-                # node, often low-degree. Spilling a low-degree node barely
-                # relieves register pressure, so the allocator spills again and
-                # again, copying and re-coalescing the whole interference graph
-                # each time. That single dropped key= was the dominant cost of
-                # assembly generation on large functions (e.g. ~600 needless
-                # spills and a 50x blow-up in coalesce work on an 1800-line
-                # benchmark, versus zero spills under CPython).
-                n = None
-                n_deg = -1
-                for cand in g.nodes():
-                    cand_deg = len(g.confs(cand))
-                    if cand_deg > n_deg:
-                        n_deg = cand_deg
-                        n = cand
-                spilled_nodes.append(n)
+
+            # Otherwise optimistically remove the highest-degree node onto the
+            # colouring stack and continue (removing it lowers its neighbours'
+            # degrees and usually unblocks further simplification). Highest
+            # degree is the spill heuristic; it is an explicit scan rather than
+            # max(..., key=lambda n: len(g.confs(n))) because the self-hosting
+            # transpiler drops the key= argument, which would pick an arbitrary,
+            # often low-degree node.
+            spill_node = None
+            spill_deg = -1
+            for cand in g.nodes():
+                cand_deg = len(g.confs(cand))
+                if cand_deg > spill_deg:
+                    spill_deg = cand_deg
+                    spill_node = cand
+            removed_nodes.append(g.remove_node(spill_node))
 
         # Move any remaining nodes from graph into removed_nodes
         # This accounts for pseudonodes which cannot be removed in the
@@ -697,12 +691,12 @@ class ASMGen:
         while g.all_nodes():
             removed_nodes.append(g.pop(g.all_nodes()[0]))
 
-        # Pop values off the stack to generate spot assignments.
-        spotmap = self._generate_spotmap(removed_nodes, merged_nodes, g_bak)
-
-        # Assign stack values to the spilled nodes
-        for v in spilled_nodes:
-            spotmap[v] = self._alloc_stack_slot(v.ctype.size)
+        # Pop values off the stack to generate spot assignments. A node that
+        # finds no free register when it is popped is spilled to a stack slot
+        # there and recorded in spilled_nodes.
+        spilled_nodes = []
+        spotmap = self._generate_spotmap(removed_nodes, merged_nodes, g_bak,
+                                         spilled_nodes)
 
         # Fold this function's spots into the shared global spotmap and emit
         # against it directly. Copying the whole global spotmap into a fresh
@@ -1048,69 +1042,81 @@ class ASMGen:
         """
         did_something = False
         nreg = len(self.alloc_registers)
-        # The graph now holds each node's conflict neighbours as a set, so the
-        # coalesce step queries g.confs() directly. This replaces a per-pass
-        # rebuild of a separate dict-of-sets conflict cache: _coalesce_all is
-        # called thousands of times inside the simplify/coalesce/freeze fixpoint
-        # on a large function, and rebuilding that O(V+E) cache on every call
-        # was by far the dominant peak-arena cost of register allocation (e.g.
-        # ~550 MB of a 660 MB assembly phase on a 1800-line benchmark).
+        # The graph holds each node's conflict neighbours as a set, so the
+        # coalesce step queries g.confs() directly (no separate cache to rebuild
+        # each pass).
+        #
+        # Coalescing runs in full passes: each pass walks every node once and
+        # merges it with a preference neighbour where the conservative
+        # (Briggs/George) criterion allows, repeating until a whole pass merges
+        # nothing. The earlier formulation restarted the scan from the first
+        # node after every single merge, so M merges cost M full O(V*E) scans --
+        # which, once optimistic colouring removed the spill-retry loop, became
+        # the dominant time cost of register allocation on large functions. A
+        # pass merges many independent pairs at once, cutting the number of
+        # full scans to the few rounds needed to converge.
         while True:
-            merge = self._coalesce_once(g, nreg)
-            if merge:
-                if merge[0] not in merged_nodes:
-                    merged_nodes[merge[0]] = []
-
-                merged_nodes[merge[0]].append(merge[1])
-                did_something = True
-            else:
+            merged_any = False
+            for v1 in list(g.nodes()):
+                # v1 may have been merged away earlier in this same pass.
+                if not g.is_node(v1):
+                    continue
+                merge = self._coalesce_node(g, v1, nreg)
+                if merge:
+                    if merge[0] not in merged_nodes:
+                        merged_nodes[merge[0]] = []
+                    merged_nodes[merge[0]].append(merge[1])
+                    merged_any = True
+                    did_something = True
+            if not merged_any:
                 break
 
         return did_something
 
-    def _coalesce_once(self, g: "NodeGraph", nreg):
-        """Perform one iteration of the coalesce step.
+    def _coalesce_node(self, g: "NodeGraph", v1, nreg):
+        """Try to coalesce v1 with one of its preference neighbours.
 
-        Returns the merged pair if a merge was successfully completed. The
-        first element is the preserved node, and the second element is the
-        removed node.
-
-        nreg - number of allocatable registers.
+        Returns the merged pair (preserved, removed) if a merge was completed,
+        else None. The conservative criterion is unchanged: George's heuristic
+        when one node is a precolored Spot, Briggs's combined-degree heuristic
+        otherwise.
         """
-        for v1 in g.nodes():
-            for v2 in g.prefs(v1):
-                # If the two nodes conflict, automatically continue.
-                if v2 in g.confs(v1):
-                    continue
+        for v2 in list(g.prefs(v1)):
+            # If the two nodes conflict, they can never be coalesced.
+            if v2 in g.confs(v1):
+                continue
 
-                # Size of the merged conflict set (g.confs values are
-                # dicts-used-as-sets, so count the union of their keys).
-                v1_confs = g.confs(v1)
-                total_confs = len(v1_confs)
-                for x in g.confs(v2):
-                    if x not in v1_confs:
-                        total_confs += 1
+            # Size of the merged conflict set (g.confs values are
+            # dicts-used-as-sets, so count the union of their keys). The union
+            # is symmetric, so this is independent of the spot swap below.
+            v1_confs = g.confs(v1)
+            total_confs = len(v1_confs)
+            for x in g.confs(v2):
+                if x not in v1_confs:
+                    total_confs += 1
 
-                # If one is a spot, use a special heuristic.
-                # (described on section 6, page 311 of George & Appel)
-                if isinstance(v1, Spot):
-                    v1, v2 = v2, v1
-                if isinstance(v2, Spot):
-                    for T in g.confs(v1):
-                        if v2 in g.confs(T):
-                            continue
-                        if len(g.confs(T)) < nreg:
-                            continue
-                        break
-                    else:
-                        # We can merge v1 into v2.
-                        g.merge(v2, v1)
-                        return v2, v1
+            # If one is a spot, use a special heuristic.
+            # (described on section 6, page 311 of George & Appel)
+            a, b = v1, v2
+            if isinstance(a, Spot):
+                a, b = b, a
+            if isinstance(b, Spot):
+                for T in g.confs(a):
+                    if b in g.confs(T):
+                        continue
+                    if len(g.confs(T)) < nreg:
+                        continue
+                    break
+                else:
+                    # We can merge a into b.
+                    g.merge(b, a)
+                    return b, a
 
-                # Otherwise, apply regular merging rules.
-                elif total_confs < nreg:
-                    g.merge(v1, v2)
-                    return v1, v2
+            # Otherwise, apply regular merging rules.
+            elif total_confs < nreg:
+                g.merge(a, b)
+                return a, b
+        return None
 
     def _freeze(self, g: "NodeGraph"):
         """Remove one preference edge.
@@ -1154,8 +1160,14 @@ class ASMGen:
 
         return False
 
-    def _generate_spotmap(self, removed_nodes, merged_nodes, g: "NodeGraph"):
-        """Pop values off stack to generate spot assignments."""
+    def _generate_spotmap(self, removed_nodes, merged_nodes, g: "NodeGraph",
+                          spilled_nodes):
+        """Pop values off stack to generate spot assignments.
+
+        Nodes optimistically pushed onto the colouring stack that find no free
+        register when popped are assigned a fresh stack slot (a real spill) and
+        appended to spilled_nodes.
+        """
 
         # Get a set of nodes which interfere with `node` or anything merged
         # into it. (Node variables are deliberately *not* named n/n1/n2: those
@@ -1202,6 +1214,8 @@ class ASMGen:
             # register.
             if cur in regs:
                 reg = cur
+                for other in get_merged(cur):
+                    spotmap[other] = reg
             else:
                 # Don't chose any conflicting spots
                 for other in get_conflicts(cur):
@@ -1211,12 +1225,19 @@ class ASMGen:
                     if other in spotmap and spotmap[other] in regs:
                         regs.remove(spotmap[other])
 
-                # Based on algorithm, there should always be register remaining
-                reg = regs.pop()
-
-            # Assign this register to every node merged into cur
-            for other in get_merged(cur):
-                spotmap[other] = reg
+                if regs:
+                    reg = regs.pop()
+                    # Assign this register to every node merged into cur
+                    for other in get_merged(cur):
+                        spotmap[other] = reg
+                else:
+                    # Optimism failed: no register is free for this node, so it
+                    # is a real spill. Give it (and everything merged into it) a
+                    # stack slot.
+                    slot = self._alloc_stack_slot(cur.ctype.size)
+                    for other in get_merged(cur):
+                        spotmap[other] = slot
+                    spilled_nodes.append(cur)
 
         return spotmap
 
