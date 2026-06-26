@@ -247,6 +247,8 @@ obj  call_obj_a(obj f, obj* a, int n);         /* varargs-free call_obj         
 /* ---- arena: bump-allocate; free the whole compile at once (no refcount) -- */
 void* aalloc(size_t n);
 void  afree(void* p, size_t n);   /* manual reclaim for Python `del` (see .c) */
+obj   arena_mark(void);           /* snapshot arena bump pointer (scratch scope) */
+void  arena_release(obj mark);    /* free everything bump-allocated since mark   */
 void  arena_reset(void);
 
 /* micropython-lib manifest.py packaging metadata (no runtime effect in C) */
@@ -648,6 +650,20 @@ void afree(void* p, size_t n) {
 }
 
 void arena_reset(void) { g_ap = 0; memset(g_free, 0, sizeof g_free); }
+
+/* Scratch scope: arena_mark() snapshots the bump pointer; arena_release(mark)
+ * rewinds it, reclaiming everything bump-allocated since the mark in one O(1)
+ * step. This is the classic region discipline -- it is sound ONLY when nothing
+ * allocated after the mark escapes the scope, and when no afree() ran in the
+ * scope (an afree would push a block above the mark onto a free list, which the
+ * rewind cannot account for). The lexer uses it around match_symbol_kind_at,
+ * which allocates only short-lived boxed characters for comparison and returns
+ * a pre-existing token-kind, so both conditions hold. */
+obj arena_mark(void) { return OBJ_INT((long)g_ap); }
+void arena_release(obj mark) {
+    size_t m = (size_t)AS_INT(mark);
+    if (m <= g_ap) g_ap = m;
+}
 
 /* ---- exceptions: setjmp/longjmp. An uncaught raise prints the exception and
  * exits (the native compiler reports the first error and stops; the Python
@@ -2972,7 +2988,7 @@ RUNTIME_API_NAMES = {
 # Module-level helper functions whose Python body is not transpilable (they use
 # the stdlib `struct` module) but which the runtime provides directly. Their
 # `def` is skipped and calls are lowered to the runtime function.
-RUNTIME_INTRINSICS = {"_float_to_bits"}
+RUNTIME_INTRINSICS = {"_float_to_bits", "arena_mark", "arena_release"}
 
 SOCKET_PRELUDE = r"""/* ---- rpython socket support: BSD sockets, fds are opaque int ---- */
 int socket(int, int, int);
