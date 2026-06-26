@@ -271,6 +271,7 @@ typedef struct { obj* data; int len; int cap; } List;
 obj  list_new(void);
 obj  list_of(int n, ...);          /* [a, b, c] literal                       */
 obj  list_from(obj* a, int n);     /* varargs-free list build (stack array)    */
+obj  list_copy(obj src);           /* copy a (possibly stack-backed) list to heap */
 obj  set_from(obj* a, int n);      /* like list_from, de-duplicated (sets)     */
 obj  varg_list(int n, va_list ap); /* collect C varargs (obj) into a list     */
 void list_append(obj lst, obj v);
@@ -735,9 +736,25 @@ obj call_obj(obj f, int n, ...) {
     return call_closure(f, args);
 }
 obj call_obj_a(obj f, obj* a, int n) {    /* varargs-free call_obj */
-    obj args = list_new();
-    for (int i = 0; i < n; i++) list_append(args, a[i]);
-    return call_closure(f, args);
+    /* The caller already has the arguments in a stack array `a`. Wrap it in a
+     * stack-allocated List header rather than copying into a fresh heap list:
+     * a closure call is by far the most common dynamic operation, and the heap
+     * arg list was pure transient churn. `args` is only read to unpack the
+     * parameters (and is valid for the duration of this call), so this is safe
+     * for every closure target -- EXCEPT one that stores its *args, which is
+     * why the vararg trampolines copy `args` to the heap before keeping it. */
+    Closure* c = (Closure*)f.u.o;
+    List tmp; tmp.data = a; tmp.len = n; tmp.cap = n;
+    obj args; args.tag = T_LIST; args.u.o = (Obj*)&tmp;
+    return c->fn(c->env, args);
+}
+/* Copy a (possibly stack-backed) list into a fresh heap list. Used by vararg
+ * trampolines, whose *args parameter may outlive the call. */
+obj list_copy(obj src) {
+    List* s = (List*)src.u.o;
+    obj r = list_new();
+    for (int i = 0; i < s->len; i++) list_append(r, s->data[i]);
+    return r;
 }
 
 
@@ -7167,7 +7184,7 @@ class Transpiler:
             self.emit("(void)env;")
             self.emit("%s* self = aalloc(sizeof *self);" % ci.csym)
             self.emit("((Obj*)self)->type = &%s_type;" % ci.csym)
-            self.emit("%s___init__(self, args);" % ci.csym)
+            self.emit("%s___init__(self, list_copy(args));" % ci.csym)
             self.emit_class_attr_init(ci)
             self.emit_class_static_instance_init(ci)
             self.emit("return OBJ_OBJ(self);")
@@ -7214,7 +7231,7 @@ class Transpiler:
             if node.args.kwarg:
                 parts.append("dict_new()")
             if node.args.vararg:
-                parts.append("args")
+                parts.append("list_copy(args)")
             call = "%s(%s)" % (self.fnsym(mangled), ", ".join(parts))
             self.emit("static obj %s__tramp(obj env, obj args) {" %
                       cname(mangled))
