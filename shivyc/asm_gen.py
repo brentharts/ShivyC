@@ -576,10 +576,12 @@ class ASMGen:
         self._arm64_gemit = {}
         self._arm64_gaddr = {}
         self._arm64_freg = {}
-        self._arm64_nfreg = 0
-        self._arm64_fpbase = 16
         self._arm64_fltlit = {}
         self._arm64_fltlit_n = 0
+        self._arm64_saved_int = []
+        self._arm64_saved_fp = []
+        self._arm64_int_save_off = {}
+        self._arm64_fp_save_off = {}
         for func in self.il_code.commands:
             self._arm64_function(func, self.il_code.commands[func])
 
@@ -696,10 +698,18 @@ class ASMGen:
 
         # Copy coalescing: a `Set(out, tmp)` whose source is a single-use, single-
         # def temporary can share `out`'s home, so the defining op writes `out`
-        # directly and the copy disappears. Recorded now; honored in allocation.
+        # directly and the copy disappears. Only safe when `out`'s prior value is
+        # not needed between tmp's definition and the copy (else, e.g., a swap
+        # `t=a+b; a=b; b=t` would clobber b early); checked straight-line below.
         import shivyc.il_cmds.compare as cmp_cmds
+        defidx = {}
+        for idx in range(len(cmds)):
+            for v in cmds[idx].outputs():
+                if v is not None:
+                    defidx[v] = idx
         coalesce = {}                      # tmp -> out (candidates)
-        for c in cmds:
+        for k in range(len(cmds)):
+            c = cmds[k]
             if isinstance(c, value_cmds.Set):
                 arg = c.arg
                 out = c.output
@@ -712,7 +722,9 @@ class ASMGen:
                         and not out.ctype.is_array() \
                         and out.ctype.size <= 8 \
                         and out.ctype.size == arg.ctype.size \
-                        and out.ctype.is_floating() == arg.ctype.is_floating():
+                        and out.ctype.is_floating() == arg.ctype.is_floating() \
+                        and self._arm64_coalesce_safe(
+                            cmds, defidx.get(arg, -1), k, out):
                     coalesce[arg] = out
 
         # Compare+branch fusion: a comparison whose result feeds only the next
@@ -740,83 +752,238 @@ class ASMGen:
                         skip[idx + 1] = 1
                         fused_out[out] = 1
 
-        # Assign homes: register-eligible values (scalar, not address-taken, not
-        # global, not a coalesced temp, not a fused-away compare result) take
-        # x19.. first; the rest spill.
-        NUM_REGS = 10                      # x19 .. x28 (callee-saved)
-        reg_of = {}
-        nreg = 0
-        # Cache addresses of globals used >= 2 times (up to a small cap, leaving
-        # registers for values) in callee-saved registers loaded once at entry.
-        self._arm64_gaddr = {}
-        GCACHE_CAP = 3
-        for v in values:
-            if v in glob and gaccess.get(v, 0) >= 2 and nreg < NUM_REGS - 2 \
-                    and len(self._arm64_gaddr) < GCACHE_CAP:
-                self._arm64_gaddr[v] = 19 + nreg
-                nreg += 1
-        for v in values:
-            if v not in coalesce and v not in fused_out and v not in forced \
-                    and v not in glob and not v.ctype.is_floating() \
-                    and v.ctype.size <= 8 and nreg < NUM_REGS:
-                reg_of[v] = 19 + nreg
-                nreg += 1
-        # Floating-point values use a parallel file: callee-saved d8..d15 as
-        # homes, float spill slots otherwise. (Scratch is v16/v17, args v0..v7.)
-        FP_NUM_REGS = 8                    # d8 .. d15 (callee-saved)
-        freg_of = {}
-        nfreg = 0
-        for v in values:
-            if v.ctype.is_floating() and v not in forced and v not in glob \
-                    and nfreg < FP_NUM_REGS:
-                freg_of[v] = 8 + nfreg
-                nfreg += 1
-        self._arm64_freg = freg_of
-        # A coalesced temp inherits its target's register (only if the target got
-        # one); otherwise the coalescing is dropped and the copy stays.
-        coalesced = {}
-        for arg in coalesce:
-            out = coalesce[arg]
-            if out in reg_of:
-                reg_of[arg] = reg_of[out]
-                coalesced[arg] = 1
+        # ---- Liveness-based linear-scan allocation -------------------------
+        # Per-index use/def lists over register-allocatable, copy-coalesced
+        # values (literals, globals, address-taken/aggregate values, and
+        # fused-away compare results never occupy a general register).
+        uses = []
+        defs = []
         for idx in range(n):
             c = cmds[idx]
-            if isinstance(c, value_cmds.Set) and c.arg in coalesced:
-                skip[idx] = 1
-        # Frame: saved {x29,x30} (16) + int callee regs (nreg*8) + fp callee regs
-        # (nfreg*8) + spills.
-        fpbase = 16 + nreg * 8
-        self._arm64_fpbase = fpbase
-        self._arm64_nfreg = nfreg
-        off = fpbase + nfreg * 8
+            u = []
+            d = []
+            for v in c.inputs():
+                if v is not None and getattr(v, "literal", None) is None \
+                        and v not in forced and v not in glob \
+                        and v not in fused_out:
+                    u.append(self._arm64_canon(v, coalesce))
+            for v in c.outputs():
+                if v is not None and getattr(v, "literal", None) is None \
+                        and v not in forced and v not in glob \
+                        and v not in fused_out:
+                    d.append(self._arm64_canon(v, coalesce))
+            uses.append(u)
+            defs.append(d)
+        live_in, live_out = self._arm64_liveness(cmds, n, uses, defs)
+
+        # Live interval [start, end] per value (conservative min/max live index),
+        # and whether it is live across any call (=> needs a callee-saved home).
+        start = {}
+        end = {}
+        crosses = {}
+        for idx in range(n):
+            here = []
+            for v in live_in[idx]:
+                here.append(v)
+            for v in live_out[idx]:
+                here.append(v)
+            for v in defs[idx]:
+                here.append(v)
+            for v in uses[idx]:
+                here.append(v)
+            for v in here:
+                if v not in start or idx < start[v]:
+                    start[v] = idx
+                if v not in end or idx > end[v]:
+                    end[v] = idx
+            if isinstance(cmds[idx], control.Call):
+                for v in live_out[idx]:
+                    if v in live_in[idx]:
+                        crosses[v] = 1
+
+        # Argument set-up for a call writes only x0..x<gp_max-1> / v0..v<fp_max-1>,
+        # and incoming parameters arrive in x0..x<agp-1> / v0..v<afp-1>; caller-
+        # saved homes are placed above both so neither shuffle can clobber them.
+        gp_max = 0
+        fp_max = 0
+        for c in cmds:
+            if isinstance(c, control.Call):
+                g = 0
+                fcnt = 0
+                for a in c.args:
+                    if a.ctype.is_floating():
+                        fcnt += 1
+                    else:
+                        g += 1
+                if g > gp_max:
+                    gp_max = g
+                if fcnt > fp_max:
+                    fp_max = fcnt
+        cs = gp_max
+        if agp > cs:
+            cs = agp
+        if cs < 1:
+            cs = 1
+        int_caller = []
+        rr = cs
+        while rr <= 7:
+            int_caller.append(rr)
+            rr += 1
+        int_callee = []
+        rr = 19
+        while rr <= 28:
+            int_callee.append(rr)
+            rr += 1
+        fp_caller = []
+        rr = 18                              # v18..v31: caller-saved, never args
+        while rr <= 31:
+            fp_caller.append(rr)
+            rr += 1
+        fp_callee = []
+        rr = 8
+        while rr <= 15:
+            fp_callee.append(rr)
+            rr += 1
+
+        # Cached global addresses live the whole function and cross calls, so they
+        # claim callee-saved registers first.
+        self._arm64_gaddr = {}
+        busy_int = {}
+        busy_fp = {}
+        used_int_callee = {}
+        used_fp_callee = {}
+        GCACHE_CAP = 3
+        for v in values:
+            if v in glob and gaccess.get(v, 0) >= 2 \
+                    and len(self._arm64_gaddr) < GCACHE_CAP \
+                    and len(int_callee) > 2:
+                r = int_callee.pop(0)
+                self._arm64_gaddr[v] = r
+                busy_int[r] = n
+                used_int_callee[r] = 1
+
+        # Scan representative values in interval-start order; reuse a register
+        # once its previous occupant's interval has ended.
+        reps = {}
+        order = []
+        for v in values:
+            cv = self._arm64_canon(v, coalesce)
+            if cv is None or getattr(cv, "literal", None) is not None \
+                    or cv in forced or cv in glob or cv in fused_out \
+                    or cv in reps:
+                continue
+            reps[cv] = 1
+            order.append(cv)
+        order.sort(key=lambda vv: start.get(vv, 0))
+
+        reg_of = {}
+        freg_of = {}
+        spill = {}
+        for v in order:
+            s = start.get(v, 0)
+            e = end.get(v, s)
+            if v.ctype.is_floating():
+                if v in crosses:
+                    r = self._arm64_pick(fp_callee, busy_fp, s)
+                    if r >= 0:
+                        used_fp_callee[r] = 1
+                else:
+                    r = self._arm64_pick(fp_caller, busy_fp, s)
+                    if r < 0:
+                        r = self._arm64_pick(fp_callee, busy_fp, s)
+                        if r >= 0:
+                            used_fp_callee[r] = 1
+                if r >= 0:
+                    freg_of[v] = r
+                    busy_fp[r] = e
+                else:
+                    spill[v] = 1
+            else:
+                if v in crosses:
+                    r = self._arm64_pick(int_callee, busy_int, s)
+                    if r >= 0:
+                        used_int_callee[r] = 1
+                else:
+                    r = self._arm64_pick(int_caller, busy_int, s)
+                    if r < 0:
+                        r = self._arm64_pick(int_callee, busy_int, s)
+                        if r >= 0:
+                            used_int_callee[r] = 1
+                if r >= 0:
+                    reg_of[v] = r
+                    busy_int[r] = e
+                else:
+                    spill[v] = 1
+        self._arm64_freg = freg_of
+
+        # Lay out the saved-register area, then spill slots for everything left
+        # in memory (spilled values, address-taken locals, aggregates).
+        saved_int = []
+        for r in range(19, 29):
+            if r in used_int_callee:
+                saved_int.append(r)
+        saved_fp = []
+        for r in range(8, 16):
+            if r in used_fp_callee:
+                saved_fp.append(r)
+        off = 16
+        int_save_off = {}
+        for r in saved_int:
+            int_save_off[r] = off
+            off += 8
+        fp_save_off = {}
+        for r in saved_fp:
+            fp_save_off[r] = off
+            off += 8
         slot_of = {}
         for v in values:
-            if v not in reg_of and v not in freg_of and v not in glob \
-                    and v not in fused_out:
-                sz = v.ctype.size
+            cv = self._arm64_canon(v, coalesce)
+            if cv in reg_of or cv in freg_of or v in glob or v in fused_out:
+                continue
+            if cv not in slot_of:
+                sz = cv.ctype.size
                 if sz < 8:
                     sz = 8
                 sz = sz + (-sz % 8)        # round each slot up to 8 bytes
-                slot_of[v] = off
+                slot_of[cv] = off
                 off += sz
+            if v is not cv:
+                slot_of[v] = slot_of[cv]
+        # Coalesced temps share their target's home; their copy is elided.
+        for arg in coalesce:
+            o = self._arm64_canon(arg, coalesce)
+            if o in reg_of:
+                reg_of[arg] = reg_of[o]
+            if o in freg_of:
+                freg_of[arg] = freg_of[o]
+            if o in slot_of:
+                slot_of[arg] = slot_of[o]
+        for idx in range(n):
+            c = cmds[idx]
+            if isinstance(c, value_cmds.Set) and c.arg in coalesce:
+                skip[idx] = 1
+
         frame = 0
-        if nreg > 0 or nfreg > 0 or len(slot_of) > 0 or has_call:
+        if len(saved_int) > 0 or len(saved_fp) > 0 or len(slot_of) > 0 \
+                or has_call:
             frame = off + (-off % 16)      # 16-byte align
+        self._arm64_saved_int = saved_int
+        self._arm64_saved_fp = saved_fp
+        self._arm64_int_save_off = int_save_off
+        self._arm64_fp_save_off = fp_save_off
 
         self.asm_code.add(asm_cmds.AsmLabel(func))
         if frame:
             self.asm_code.add(asm_cmds.Raw(
                 "stp\tx29, x30, [sp, #-%d]!" % frame))
             self.asm_code.add(asm_cmds.Raw("mov\tx29, sp"))
-            for i in range(nreg):
+            for r in saved_int:
                 self.asm_code.add(asm_cmds.Raw(
-                    "str\tx%d, [x29, #%d]" % (19 + i, 16 + i * 8)))
-            for i in range(nfreg):
+                    "str\tx%d, [x29, #%d]" % (r, int_save_off[r])))
+            for r in saved_fp:
                 self.asm_code.add(asm_cmds.Raw(
-                    "str\td%d, [x29, #%d]" % (8 + i, fpbase + i * 8)))
-        # Load cached global addresses once (their registers are callee-saved
-        # above, so they survive calls and every access just uses [xR]).
+                    "str\td%d, [x29, #%d]" % (r, fp_save_off[r])))
+        # Load cached global addresses once (callee-saved, so they survive calls).
         for v in values:
             if v in self._arm64_gaddr:
                 r = self._arm64_gaddr[v]
@@ -829,16 +996,126 @@ class ASMGen:
             if idx in skip:
                 continue
             self._lower_arm64(cmds[idx], idx, func, reg_of, slot_of,
-                              nreg, frame, addrof_name)
+                              0, frame, addrof_name)
+
+    def _arm64_coalesce_safe(self, cmds, dk, k, out):
+        """True if coalescing the copy at index k into `out` is safe: tmp is
+        defined at index dk, dk..k is one straight-line block, and `out` is not
+        referenced in [dk, k) (so out's prior value is dead and the defining op
+        may write out directly). Prevents miscompiling swaps like
+        `t=a+b; a=b; b=t`."""
+        import shivyc.il_cmds.control as control
+        if dk < 0 or dk > k:
+            return False
+        j = dk
+        while j < k:
+            cj = cmds[j]
+            if isinstance(cj, control.Label) or isinstance(cj, control.Jump) \
+                    or isinstance(cj, control.JumpZero) \
+                    or isinstance(cj, control.JumpNotZero) \
+                    or isinstance(cj, control.Return):
+                return False
+            for v in cj.inputs():
+                if v is out:
+                    return False
+            for v in cj.outputs():
+                if v is out:
+                    return False
+            j += 1
+        return True
+
+    def _arm64_canon(self, v, coalesce):
+        """Follow the copy-coalescing chain v -> ... so coalesced temps resolve
+        to the value whose home they share."""
+        seen = {}
+        while v in coalesce and v not in seen:
+            seen[v] = 1
+            v = coalesce[v]
+        return v
+
+    def _arm64_pick(self, pool, busy, s):
+        """First register in `pool` free at index `s` (its last occupant ended
+        before s), or -1 if none is free."""
+        for rr in pool:
+            if busy.get(rr, -1) < s:
+                return rr
+        return -1
+
+    def _arm64_liveness(self, cmds, n, uses, defs):
+        """Backward live-variable fixpoint over the per-index `uses`/`defs`
+        value lists. Returns (live_in, live_out), each a list of {value: 1}."""
+        import shivyc.il_cmds.control as control
+        labelidx = {}
+        for i in range(n):
+            c = cmds[i]
+            if isinstance(c, control.Label):
+                labelidx[c.label] = i
+        succ = []
+        for i in range(n):
+            c = cmds[i]
+            s = []
+            if isinstance(c, control.Return):
+                pass                          # no successors
+            elif isinstance(c, control.Jump):
+                t = labelidx.get(c.label, -1)
+                if t >= 0:
+                    s = [t]
+            elif isinstance(c, control.JumpZero) \
+                    or isinstance(c, control.JumpNotZero):
+                if i + 1 < n:
+                    s.append(i + 1)
+                t = labelidx.get(c.label, -1)
+                if t >= 0:
+                    s.append(t)
+            else:
+                if i + 1 < n:
+                    s = [i + 1]
+            succ.append(s)
+        live_in = []
+        live_out = []
+        for i in range(n):
+            live_in.append({})
+            live_out.append({})
+        changed = True
+        while changed:
+            changed = False
+            for i in range(n - 1, -1, -1):
+                lo = {}
+                for sidx in succ[i]:
+                    for v in live_in[sidx]:
+                        lo[v] = 1
+                li = {}
+                for v in lo:
+                    li[v] = 1
+                for v in defs[i]:
+                    if v in li:
+                        del li[v]
+                for v in uses[i]:
+                    li[v] = 1
+                if len(li) != len(live_in[i]) or len(lo) != len(live_out[i]):
+                    changed = True
+                else:
+                    for v in li:
+                        if v not in live_in[i]:
+                            changed = True
+                            break
+                    for v in lo:
+                        if v not in live_out[i]:
+                            changed = True
+                            break
+                live_in[i] = li
+                live_out[i] = lo
+        return live_in, live_out
 
     def _arm64_epilogue(self, nreg, frame):
-        """Restore saved callee registers, tear down the frame, and return."""
-        for i in range(nreg):
+        """Restore the callee-saved registers this function actually used, tear
+        down the frame, and return."""
+        for r in self._arm64_saved_int:
             self.asm_code.add(asm_cmds.Raw(
-                "ldr\tx%d, [x29, #%d]" % (19 + i, 16 + i * 8)))
-        for i in range(self._arm64_nfreg):
+                "ldr\tx%d, [x29, #%d]" % (r, self._arm64_int_save_off[r])))
+        for r in self._arm64_saved_fp:
             self.asm_code.add(asm_cmds.Raw(
-                "ldr\td%d, [x29, #%d]" % (8 + i, self._arm64_fpbase + i * 8)))
+                "ldr\td%d, [x29, #%d]" % (r, self._arm64_fp_save_off[r])))
         if frame:
             self.asm_code.add(asm_cmds.Raw(
                 "ldp\tx29, x30, [sp], #%d" % frame))
