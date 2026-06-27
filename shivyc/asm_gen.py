@@ -649,21 +649,87 @@ class ASMGen:
                 self._arm64_glob[v] = glob[v]
                 self._arm64_emit_global_storage(v)
 
+        # Use/def counts drive two peephole optimizations below.
+        usecount = {}
+        defcount = {}
+        for c in cmds:
+            for v in c.inputs():
+                if v is not None:
+                    usecount[v] = usecount.get(v, 0) + 1
+            for v in c.outputs():
+                if v is not None:
+                    defcount[v] = defcount.get(v, 0) + 1
+
+        # Copy coalescing: a `Set(out, tmp)` whose source is a single-use, single-
+        # def temporary can share `out`'s home, so the defining op writes `out`
+        # directly and the copy disappears. Recorded now; honored in allocation.
+        import shivyc.il_cmds.compare as cmp_cmds
+        coalesce = {}                      # tmp -> out (candidates)
+        for c in cmds:
+            if isinstance(c, value_cmds.Set):
+                arg = c.arg
+                out = c.output
+                if getattr(arg, "literal", None) is None \
+                        and usecount.get(arg, 0) == 1 \
+                        and defcount.get(arg, 0) == 1 \
+                        and arg not in forced and out not in forced \
+                        and arg not in glob and out not in glob \
+                        and not out.ctype.is_struct_union() \
+                        and not out.ctype.is_array() \
+                        and out.ctype.size <= 8:
+                    coalesce[arg] = out
+
+        # Compare+branch fusion: a comparison whose result feeds only the next
+        # JumpZero/JumpNotZero becomes `cmp ; b.<cc>` (no cset/cbz). Computed
+        # before allocation so the never-materialized result gets no register.
+        self._arm64_fuse = {}
+        skip = {}
+        fused_out = {}
+        n = len(cmds)
+        for idx in range(n):
+            c = cmds[idx]
+            if isinstance(c, cmp_cmds._GeneralCmp) and idx + 1 < n:
+                out = c.outputs()[0]
+                if usecount.get(out, 0) == 1:
+                    nxt = cmds[idx + 1]
+                    if isinstance(nxt, control.JumpZero) and nxt.cond is out:
+                        self._arm64_fuse[idx] = (nxt.label, False)
+                        skip[idx + 1] = 1
+                        fused_out[out] = 1
+                    elif isinstance(nxt, control.JumpNotZero) \
+                            and nxt.cond is out:
+                        self._arm64_fuse[idx] = (nxt.label, True)
+                        skip[idx + 1] = 1
+                        fused_out[out] = 1
+
         # Assign homes: register-eligible values (scalar, not address-taken, not
-        # global) take x19.. first; everything else spills to frame slots.
+        # global, not a coalesced temp, not a fused-away compare result) take
+        # x19.. first; the rest spill.
         NUM_REGS = 10                      # x19 .. x28 (callee-saved)
         reg_of = {}
         nreg = 0
         for v in values:
-            if v not in forced and v not in glob and v.ctype.size <= 8 \
-                    and nreg < NUM_REGS:
+            if v not in coalesce and v not in fused_out and v not in forced \
+                    and v not in glob and v.ctype.size <= 8 and nreg < NUM_REGS:
                 reg_of[v] = 19 + nreg
                 nreg += 1
+        # A coalesced temp inherits its target's register (only if the target got
+        # one); otherwise the coalescing is dropped and the copy stays.
+        coalesced = {}
+        for arg in coalesce:
+            out = coalesce[arg]
+            if out in reg_of:
+                reg_of[arg] = reg_of[out]
+                coalesced[arg] = 1
+        for idx in range(n):
+            c = cmds[idx]
+            if isinstance(c, value_cmds.Set) and c.arg in coalesced:
+                skip[idx] = 1
         # Frame: saved {x29,x30} (16) + saved callee regs (nreg*8) + spills.
         off = 16 + nreg * 8
         slot_of = {}
         for v in values:
-            if v not in reg_of and v not in glob:
+            if v not in reg_of and v not in glob and v not in fused_out:
                 sz = v.ctype.size
                 if sz < 8:
                     sz = 8
@@ -683,8 +749,11 @@ class ASMGen:
                 self.asm_code.add(asm_cmds.Raw(
                     "str\tx%d, [x29, #%d]" % (19 + i, 16 + i * 8)))
         addrof_name = {}
-        for c in cmds:
-            self._lower_arm64(c, func, reg_of, slot_of, nreg, frame, addrof_name)
+        for idx in range(n):
+            if idx in skip:
+                continue
+            self._lower_arm64(cmds[idx], idx, func, reg_of, slot_of,
+                              nreg, frame, addrof_name)
 
     def _arm64_epilogue(self, nreg, frame):
         """Restore saved callee registers, tear down the frame, and return."""
@@ -723,7 +792,7 @@ class ASMGen:
         lit = getattr(value, "literal", None)
         if lit is not None:
             name = self._arm64_rn(scratch, value)
-            self.asm_code.add(asm_cmds.Raw("mov\t%s, %d" % (name, lit.val)))
+            self._arm64_mov_imm(name, lit.val, value.ctype.size)
             return name
         r = reg_of.get(value, -1)
         if r >= 0:
@@ -758,7 +827,7 @@ class ASMGen:
         name = self._arm64_rn(n, value)
         lit = getattr(value, "literal", None)
         if lit is not None:
-            self.asm_code.add(asm_cmds.Raw("mov\t%s, %d" % (name, lit.val)))
+            self._arm64_mov_imm(name, lit.val, value.ctype.size)
             return
         r = reg_of.get(value, -1)
         if r >= 0:
@@ -923,6 +992,46 @@ class ASMGen:
                 "add\t%s, %s, %s, lsl #%d" % (addr, addr, ci, sh)))
         return addr
 
+    def _arm64_mov_imm(self, dest, val, size):
+        """Materialize integer literal `val` into register `dest`. AArch64 cannot
+        move an arbitrary wide immediate in one instruction, so values outside a
+        single mov's range are built with movz + movk over 16-bit chunks (sign
+        bits fall out of the masked shifts for negatives)."""
+        if -65536 <= val <= 65535:
+            self.asm_code.add(asm_cmds.Raw("mov\t%s, #%d" % (dest, val)))
+            return
+        self.asm_code.add(asm_cmds.Raw(
+            "movz\t%s, #%d" % (dest, val & 0xffff)))
+        if size <= 4:
+            hi = (val >> 16) & 0xffff
+            if hi != 0:
+                self.asm_code.add(asm_cmds.Raw(
+                    "movk\t%s, #%d, lsl #16" % (dest, hi)))
+        else:
+            sh = 16
+            while sh < 64:
+                part = (val >> sh) & 0xffff
+                if part != 0:
+                    self.asm_code.add(asm_cmds.Raw(
+                        "movk\t%s, #%d, lsl #%d" % (dest, part, sh)))
+                sh += 16
+
+    def _arm64_imm(self, value):
+        """The literal value of `value` if it fits an AArch64 add/sub/cmp 12-bit
+        unsigned immediate (so it can be folded as `#imm`), else -1."""
+        lit = getattr(value, "literal", None)
+        if lit is not None and 0 <= lit.val <= 4095:
+            return lit.val
+        return -1
+
+    def _arm64_invert_cc(self, cc):
+        """The opposite AArch64 condition code (for fusing a comparison whose
+        negation is the branch condition)."""
+        pairs = {"eq": "ne", "ne": "eq", "lt": "ge", "ge": "lt",
+                 "gt": "le", "le": "gt", "lo": "hs", "hs": "lo",
+                 "hi": "ls", "ls": "hi"}
+        return pairs[cc]
+
     def _arm64_cmp_cc(self, cmd, signed):
         """AArch64 condition code (for `cset`) implementing comparison `cmd`."""
         import shivyc.il_cmds.compare as cmp_cmds
@@ -940,7 +1049,8 @@ class ASMGen:
             return "ge" if signed else "hs"
         return "eq"
 
-    def _lower_arm64(self, cmd, func, reg_of, slot_of, nreg, frame, addrof_name):
+    def _lower_arm64(self, cmd, idx, func, reg_of, slot_of, nreg, frame,
+                     addrof_name):
         """Lower a single IL command to AArch64 (register-allocated)."""
         import shivyc.il_cmds.control as control
         import shivyc.il_cmds.value as value_cmds
@@ -1084,8 +1194,8 @@ class ASMGen:
             r = reg_of.get(out, -1)
             lit = getattr(arg, "literal", None)
             if lit is not None and r >= 0:
-                self.asm_code.add(asm_cmds.Raw(
-                    "mov\t%s, %d" % (self._arm64_rn(r, out), lit.val)))
+                self._arm64_mov_imm(self._arm64_rn(r, out), lit.val,
+                                    out.ctype.size)
                 return
             src = self._arm64_use(arg, 9, reg_of, slot_of)
             ds = out.ctype.size
@@ -1123,14 +1233,38 @@ class ASMGen:
                 or isinstance(cmd, math_cmds.Mult):
             ins = cmd.inputs()
             out = cmd.outputs()[0]
-            ra = self._arm64_use(ins[0], 9, reg_of, slot_of)
-            rb = self._arm64_use(ins[1], 10, reg_of, slot_of)
             if isinstance(cmd, math_cmds.Add):
                 op = "add"
             elif isinstance(cmd, math_cmds.Subtr):
                 op = "sub"
             else:
                 op = "mul"
+            # Fold a small literal operand into an `add/sub #imm` (add is
+            # commutative; sub only takes the immediate on its right).
+            if op == "add":
+                imm = self._arm64_imm(ins[1])
+                other = ins[0]
+                if imm < 0:
+                    imm = self._arm64_imm(ins[0])
+                    other = ins[1]
+                if imm >= 0:
+                    ra = self._arm64_use(other, 9, reg_of, slot_of)
+                    rd = self._arm64_defreg(out, 9, reg_of)
+                    self.asm_code.add(asm_cmds.Raw(
+                        "add\t%s, %s, #%d" % (rd, ra, imm)))
+                    self._arm64_wb(out, 9, reg_of, slot_of)
+                    return
+            elif op == "sub":
+                imm = self._arm64_imm(ins[1])
+                if imm >= 0:
+                    ra = self._arm64_use(ins[0], 9, reg_of, slot_of)
+                    rd = self._arm64_defreg(out, 9, reg_of)
+                    self.asm_code.add(asm_cmds.Raw(
+                        "sub\t%s, %s, #%d" % (rd, ra, imm)))
+                    self._arm64_wb(out, 9, reg_of, slot_of)
+                    return
+            ra = self._arm64_use(ins[0], 9, reg_of, slot_of)
+            rb = self._arm64_use(ins[1], 10, reg_of, slot_of)
             rd = self._arm64_defreg(out, 9, reg_of)
             self.asm_code.add(asm_cmds.Raw(
                 "%s\t%s, %s, %s" % (op, rd, ra, rb)))
@@ -1161,13 +1295,28 @@ class ASMGen:
             ins = cmd.inputs()
             out = cmd.outputs()[0]
             ra = self._arm64_use(ins[0], 9, reg_of, slot_of)
-            rb = self._arm64_use(ins[1], 10, reg_of, slot_of)
-            self.asm_code.add(asm_cmds.Raw("cmp\t%s, %s" % (ra, rb)))
+            imm = self._arm64_imm(ins[1])
+            if imm >= 0:
+                self.asm_code.add(asm_cmds.Raw("cmp\t%s, #%d" % (ra, imm)))
+            else:
+                rb = self._arm64_use(ins[1], 10, reg_of, slot_of)
+                self.asm_code.add(asm_cmds.Raw("cmp\t%s, %s" % (ra, rb)))
             ct = ins[0].ctype
             signed = not (ct.is_pointer() or (ct.is_integral() and not ct.signed))
+            cc = self._arm64_cmp_cc(cmd, signed)
+            fz = self._arm64_fuse.get(idx)
+            if fz is not None:
+                # Fused with the following branch: jump directly on the (possibly
+                # inverted) condition instead of materializing a 0/1 and testing.
+                label = fz[0]
+                on_true = fz[1]
+                if not on_true:
+                    cc = self._arm64_invert_cc(cc)
+                self.asm_code.add(asm_cmds.Raw(
+                    "b.%s\t%s" % (cc, spots.mangle_symbol(label))))
+                return
             rd = self._arm64_defreg(out, 9, reg_of)
-            self.asm_code.add(asm_cmds.Raw(
-                "cset\t%s, %s" % (rd, self._arm64_cmp_cc(cmd, signed))))
+            self.asm_code.add(asm_cmds.Raw("cset\t%s, %s" % (rd, cc)))
             self._arm64_wb(out, 9, reg_of, slot_of)
             return
         if isinstance(cmd, control.Return):
