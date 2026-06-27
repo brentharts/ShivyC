@@ -59,22 +59,42 @@ class Arm64Target(Target):
         self.asm_syntax_epilogue = []
 
 
+class RiscV64Target(Target):
+    """RV64 (riscv64) bare-metal cross target, lp64 ABI. Shares the entire
+    target-neutral middle end -- IL, liveness, and the linear-scan register
+    allocator -- with the other back ends; only instruction selection, the
+    register file (x0..x31 / a0-a7 / s0-s11 / t0-t6), and the ABI differ.
+    Brought up after aarch64 to validate that the seam makes a second ISA
+    cheap: the allocator is reused verbatim and only lowering is new."""
+
+    def __init__(self):
+        Target.__init__(self)
+        self.name = "riscv64"
+        self.triple = "riscv64-unknown-elf"
+        # RISC-V GAS has one native syntax; no intel/att toggle is emitted.
+        self.asm_syntax_prologue = []
+        self.asm_syntax_epilogue = []
+
+
 # Canonical name plus accepted aliases -> constructor.
 def get_target(name):
     """Return a fresh Target instance for `name` (default x86-64). Aliases:
-    amd64->x86_64, aarch64->arm64. An unknown name falls back to x86-64 so the
-    compiler stays usable; front ends should validate the name explicitly."""
+    amd64->x86_64, aarch64->arm64, rv64->riscv64. An unknown name falls back to
+    x86-64 so the compiler stays usable; front ends should validate the name
+    explicitly."""
     n = name if name else "x86_64"
     if n == "x86_64" or n == "amd64":
         return X86_64Target()
     if n == "arm64" or n == "aarch64":
         return Arm64Target()
+    if n == "riscv64" or n == "rv64":
+        return RiscV64Target()
     return X86_64Target()
 
 
 def is_known_target(name):
     """True if `name` is a recognized target or alias."""
-    return name in ("x86_64", "amd64", "arm64", "aarch64")
+    return name in ("x86_64", "amd64", "arm64", "aarch64", "riscv64", "rv64")
 
 
 DEFAULT_TARGET = "x86_64"
