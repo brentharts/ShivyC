@@ -34,6 +34,23 @@ STAGE2 = [
     ("two_funcs", "long f(){return 100;} int main(){return 42;}"),
 ]
 
+# Stage 3: locals, add/sub/mul/div/mod, comparisons, if/while.
+STAGE3 = [
+    ("if_gt", "int main(){int a=7,b=3; if(a>b) return a; return b;}"),
+    ("if_ge_false", "int main(){int a=3,b=8; if(a>=b) return 1; return 0;}"),
+    ("if_eq", "int main(){int a=5,b=5; if(a==b) return 42; return 0;}"),
+    ("if_ne", "int main(){int a=5,b=6; if(a!=b) return 9; return 0;}"),
+    ("while_sum", "int main(){int x=0,i=0; while(i<10){x=x+i; i=i+1;} return x;}"),
+    ("sum_1_10", "int main(){int s=0,i=1; while(i<=10){s=s+i; i=i+1;} return s;}"),
+    ("factorial5", "int main(){int n=5,f=1; while(n>1){f=f*n; n=n-1;} return f;}"),
+    ("sub_chain", "int main(){int a=100,b=30,c=8; return a-b-c;}"),
+    ("div", "int main(){int a=84,b=2; return a/b;}"),
+    ("mod", "int main(){int a=200,b=7; return a%b;}"),
+    ("mul_add", "int main(){int a=6,b=7; return a*b+0;}"),
+    ("nested_if", "int main(){int x=5; if(x>0){ if(x<10) return 3; } return 9;}"),
+    ("countdown", "int main(){int n=10,c=0; while(n>0){c=c+2; n=n-1;} return c;}"),
+]
+
 
 def _run(cmd):
     p = subprocess.run(cmd, capture_output=True, text=True)
@@ -102,7 +119,7 @@ def main(argv):
             with open(path) as f:
                 progs.append((os.path.basename(path), f.read()))
     else:
-        progs = STAGE2
+        progs = STAGE2 + STAGE3
 
     workdir = tempfile.mkdtemp(prefix="arm64diff-")
     counts = {"PASS": 0, "FAIL": 0, "SKIP": 0, "ERROR": 0}
