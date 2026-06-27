@@ -575,12 +575,16 @@ class ASMGen:
 
     def _arm64_function(self, func, cmds):
         """Assign frame slots, emit prologue, lower each IL command, per func."""
+        import shivyc.il_cmds.control as control
         # Pass 1: give every written/read non-literal IL value a frame slot.
         # Slots sit above the saved {x29,x30} pair (offsets 0 and 8), so the
         # first local is at [x29, #16].
         slots = {}
         off = 16
+        has_call = False
         for c in cmds:
+            if isinstance(c, control.Call):
+                has_call = True
             for v in c.inputs():
                 if v is not None and getattr(v, "literal", None) is None \
                         and v not in slots:
@@ -592,9 +596,11 @@ class ASMGen:
                     slots[v] = off
                     off += 8
         # frame == 0 means a frameless leaf (e.g. `return <literal>`): no slots,
-        # so no prologue/epilogue is needed and we keep the Stage-2 shape.
+        # so no prologue/epilogue is needed and we keep the Stage-2 shape. A
+        # function that makes a call must keep a frame even with no locals, so
+        # the saved x30 (clobbered by `bl`) is restored before its own `ret`.
         frame = 0
-        if off > 16:
+        if off > 16 or has_call:
             frame = off + (-off % 16)   # 16-byte align (incl. saved pair)
 
         self.asm_code.add(asm_cmds.AsmLabel(func))
@@ -604,8 +610,11 @@ class ASMGen:
             self.asm_code.add(asm_cmds.Raw(
                 "stp\tx29, x30, [sp, #-%d]!" % frame))
             self.asm_code.add(asm_cmds.Raw("mov\tx29, sp"))
+        # Maps an AddrOf output value -> the function name it addresses, so a
+        # following Call lowers to a direct `bl <name>`.
+        addrof_name = {}
         for c in cmds:
-            self._lower_arm64(c, func, slots, frame)
+            self._lower_arm64(c, func, slots, frame, addrof_name)
 
     def _arm64_wreg(self, value, n):
         """Scratch register name of the right width for `value` (w<n> for <=4
@@ -648,13 +657,51 @@ class ASMGen:
             return "ge" if signed else "hs"
         return "eq"
 
-    def _lower_arm64(self, cmd, func, slots, frame):
+    def _lower_arm64(self, cmd, func, slots, frame, addrof_name):
         """Lower a single IL command to AArch64 (Stage 3 subset)."""
         import shivyc.il_cmds.control as control
         import shivyc.il_cmds.value as value_cmds
         import shivyc.il_cmds.math as math_cmds
         import shivyc.il_cmds.compare as cmp_cmds
 
+        if isinstance(cmd, value_cmds.LoadArg):
+            # The arg_num-th integer parameter arrives in w/x<arg_num> (AAPCS64);
+            # spill it to its slot at entry, before any call clobbers x0-x7.
+            out = cmd.output
+            self.asm_code.add(asm_cmds.Raw(
+                "str\t%s, [x29, #%d]"
+                % (self._arm64_wreg(out, cmd.arg_num), slots[out])))
+            return
+        if isinstance(cmd, value_cmds.AddrOf):
+            # Address of a function -> remember the name for a following Call
+            # (direct `bl`). Taking the address of a variable (general pointers)
+            # is a later feature.
+            name = self.symbol_table.names.get(cmd.var)
+            if name is not None and cmd.var.ctype.is_function():
+                addrof_name[cmd.output] = name
+                return
+            raise NotImplementedError(
+                "arm64 back end: AddrOf of a non-function is not implemented yet")
+        if isinstance(cmd, control.Call):
+            name = addrof_name.get(cmd.func)
+            if name is None:
+                raise NotImplementedError(
+                    "arm64 back end: only direct calls are implemented yet")
+            if len(cmd.args) > 8:
+                raise NotImplementedError(
+                    "arm64 back end: >8 arguments (stack args) not implemented")
+            # Load each argument into its AAPCS64 register w/x<i>.
+            i = 0
+            for a in cmd.args:
+                self._arm64_load(a, i, slots)
+                i += 1
+            self.asm_code.add(asm_cmds.Raw("bl\t%s" % spots.mangle_symbol(name)))
+            if not cmd.void_return:
+                # Return value comes back in w0/x0.
+                self.asm_code.add(asm_cmds.Raw(
+                    "str\t%s, [x29, #%d]"
+                    % (self._arm64_wreg(cmd.ret, 0), slots[cmd.ret])))
+            return
         if isinstance(cmd, control.Label):
             self.asm_code.add(asm_cmds.AsmLabel(cmd.label))
             return
