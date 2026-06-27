@@ -4,6 +4,7 @@ import shivyc.parser.utils as p
 import shivyc.token_kinds as token_kinds
 import shivyc.tree as tree
 import shivyc.tree.decl_nodes as decl_nodes
+import shivyc.tree.general_nodes as general_nodes
 from shivyc.parser.utils import (add_range, match_token, token_is, ParserError,
                                  raise_error, log_error, token_in)
 
