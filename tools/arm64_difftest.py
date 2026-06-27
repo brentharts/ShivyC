@@ -243,6 +243,59 @@ STAGE12 = [
     ("f_ptr", "int main(){float f=5.5; float *p=&f; *p=*p+1.0; return (int)f;}"),
 ]
 
+# Stage 13: liveness-based linear-scan allocation with caller/callee split.
+# These exercise register reuse, spills, cross-call liveness (callee-saved),
+# leaf/frameless functions (caller-saved homes), and the coalescing safety
+# check (swaps), all validated against the gcc-arm64 oracle.
+STAGE13 = [
+    # leaf functions: should be frameless with zero callee-saves
+    ("ra_leaf_sq", "int sq(int x){return x*x;} int main(){return sq(12);}"),
+    ("ra_leaf_poly", "int f(int a,int b,int c){return a*a+b*b+c*c;}"
+                     " int main(){return f(2,3,4);}"),
+    ("ra_leaf_loop", "int main(){int s=0,i=0; while(i<20){s=s+i*i; i=i+1;}"
+                     " return s%256;}"),
+    # register pressure forcing spills
+    ("ra_pressure", "int main(){int a=1,b=2,c=3,d=4,e=5,f=6,g=7,h=8,i=9,j=10,"
+                    "k=11,l=12,m=13,n=14,o=15,p=16; return a+b+c+d+e+f+g+h+i+j+"
+                    "k+l+m+n+o+p+a*b+c*d+e*f;}"),
+    ("ra_pressure_mix", "int main(){int s=0; int a=1,b=2,c=3,d=4,e=5,f=6,g=7,"
+                        "h=8,j=9,k=10,l=11,m=12; s=a*b+c*d+e*f+g*h+j*k+l*m;"
+                        " int x=a+b+c+d+e+f+g+h+j+k+l+m; return s+x;}"),
+    # coalescing safety: swaps and rotates must not clobber early
+    ("ra_swap", "int main(){int a=3,b=7; int t=a; a=b; b=t; return a*10+b;}"),
+    ("ra_fib_iter", "int main(){int a=0,b=1,i=0; while(i<10){int t=a+b; a=b;"
+                    " b=t; i=i+1;} return b;}"),
+    ("ra_rotate3", "int main(){int a=1,b=2,c=3; int t=a; a=b; b=c; c=t;"
+                   " return a*100+b*10+c;}"),
+    # cross-call liveness: values live across a call need callee-saved homes
+    ("ra_cross_call", "int sq(int x){return x*x;} int main(){int a=1,b=2,c=3,"
+                      "d=4,e=5,f=6,g=7,h=8,i=9,j=10,k=11,l=12; int s=sq(a);"
+                      " return s+a+b+c+d+e+f+g+h+i+j+k+l;}"),
+    ("ra_args_after_call", "int h(int a,int b,int c){return a*100+b*10+c;}"
+                           " int main(){int p=2,q=3,r=4; int s=h(p,q,r);"
+                           " return s+p+q+r;}"),
+    ("ra_nested_calls", "int f(int x){return x+1;} int g(int x){return x*2;}"
+                        " int main(){return f(g(f(g(5))));}"),
+    ("ra_seq_calls", "int add(int a,int b){return a+b;} int main(){"
+                     "int x=add(1,2); int y=add(3,4); int z=add(5,6);"
+                     " return add(add(x,y),z);}"),
+    # mixed int/float pressure and float loop-carry
+    ("ra_mixed", "int main(){int i=0; float fs=0.0; while(i<10){fs=fs+1.5;"
+                 " i=i+1;} int isum=0,k=0; while(k<5){isum=isum+k; k=k+1;}"
+                 " return isum+(int)fs;}"),
+    ("ra_float_swap", "int main(){float a=1.0,b=1.0; int n=0; while(n<10){"
+                      "float t=a+b; a=b; b=t; n=n+1;} return (int)b;}"),
+    ("ra_float_cross", "double f(double x){return x*1.5;} int main(){"
+                       "double acc=1.0; int i=0; while(i<8){acc=f(acc);"
+                       " i=i+1;} return (int)acc;}"),
+    # recursion and deep call trees
+    ("ra_tailrec", "int rec(int n,int acc){if(n==0)return acc;"
+                   " return rec(n-1,acc+n);} int main(){return rec(10,0);}"),
+    ("ra_call_tree", "int a(int x){return x+1;} int b(int x){return a(x)+"
+                     "a(x+1);} int c(int x){return b(x)+b(x+1);}"
+                     " int main(){return c(3);}"),
+]
+
 
 def _run(cmd):
     p = subprocess.run(cmd, capture_output=True, text=True)
@@ -311,7 +364,7 @@ def main(argv):
             with open(path) as f:
                 progs.append((os.path.basename(path), f.read()))
     else:
-        progs = STAGE2 + STAGE3 + STAGE4 + STAGE6 + STAGE7 + STAGE8 + STAGE9 + STAGE10 + STAGE11 + STAGE12
+        progs = STAGE2 + STAGE3 + STAGE4 + STAGE6 + STAGE7 + STAGE8 + STAGE9 + STAGE10 + STAGE11 + STAGE12 + STAGE13
 
     workdir = tempfile.mkdtemp(prefix="arm64diff-")
     counts = {"PASS": 0, "FAIL": 0, "SKIP": 0, "ERROR": 0}
