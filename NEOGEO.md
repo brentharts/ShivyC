@@ -134,3 +134,67 @@ These steps build on the working integer core, in roughly increasing effort:
 - [`shivyc/asm_gen.py`](shivyc/asm_gen.py) — `_make_asm_m68k`, `_m68_function`,
   `_lower_m68k`, the `_m68_*` lowering helpers, and the shared `_il_*` allocator.
 - [`tools/m68k_difftest.py`](tools/m68k_difftest.py) — the differential tester.
+
+## ASCII art → Neo-Geo pixel art (the `neogeo` rpython library)
+
+On top of the back end there is a small rpython graphics library,
+[`tools/rpy_lib/neogeo.py`](tools/rpy_lib/neogeo.py), that turns multi-line ASCII
+art into Neo-Geo pixel art. A loading screen is four lines:
+
+```python
+import neogeo
+a = neogeo.background.asciiart(".... multi-line ascii ....")
+b = neogeo.sprite.asciiart(".... multi-line ascii ....")
+neogeo.scene.add_background(a)
+neogeo.scene.add_sprite(b)
+```
+
+Each character is one pixel, and its case is the intensity:
+
+| char | colour | | char | colour | | char | colour |
+|------|--------|-|------|--------|-|------|--------|
+| `R`/`r` | red | | `C`/`c` | cyan | | `O`/`o` | orange |
+| `G`/`g` | green | | `M`/`m` | magenta | | `W`/`w` | white/grey |
+| `B`/`b` | blue | | `Y`/`y` | yellow | | `K` | black |
+
+`'.'` and `' '` are transparent. Each layer becomes a deduplicated palette of
+Neo-Geo 16-bit colour words (index 0 transparent) plus an index buffer; the colour
+packing is the hardware's (white is `0x7FFF`, black `0x0000`).
+
+### Specialisation: baking the art at translate time
+
+Because the art is a string *constant*, `import neogeo` specialises the
+translator. Rather than transpile the declarative API to the console, py2c runs
+the ASCII→pixel conversion **at translate time** and emits the finished palette
+and pixel data as static C arrays plus a tiny driver — so the on-target program is
+just data and a copy loop, which is what makes it reachable on a small target. The
+hook lives in [`tools/rpy_neogeo_integration.py`](tools/rpy_neogeo_integration.py)
+(`bake_source` → `scene_to_c`), wired into `transpile_file`.
+
+The demo [`examples/rpython2c/neogeo/loadscreen.py`](examples/rpython2c/neogeo/loadscreen.py)
+draws a cyan frame, a white title bar, a starfield, and a rocket sprite. Run it
+through the pipeline:
+
+```sh
+python3 -c "import sys;sys.path.insert(0,'tools');import py2c;\
+py2c.write_runtime('/tmp/ng');print(py2c.transpile_file(\
+'examples/rpython2c/neogeo/loadscreen.py','/tmp/ng'))"
+#   neogeo: baked 2 layer(s) from ASCII art -> /tmp/ng/loadscreen.c
+gcc /tmp/ng/loadscreen.c -o /tmp/load && /tmp/load    # or: python3 -m shivyc.main …
+#   layer 0: background 32x13, 5 colors, tile 8
+#   layer 1: sprite 9x8, 6 colors, tile 16
+#   scene: 2 layers, 177 lit pixels, palette checksum 0x4508
+```
+
+The generated `main` is a portable stand-in for the VRAM/palette upload: it walks
+the baked scene and returns the lit-pixel count (mod 256) as the exit code, so the
+whole rpython→C→native path is runnable and deterministically checkable off the
+console (it matches the CPython oracle exactly). The baked C compiles with gcc and
+with ShivyC's own x86 back end.
+
+**Honest status.** The baked data is colour-correct Neo-Geo palette + indexed
+pixels, and the conversion/specialisation is real and tested. What is *not* here
+yet: the C-ROM/fix-ROM **bitplane tile packing**, the VRAM/palette MMIO upload
+(which needs the m68k back end's pointer/array/global support — see the roadmap
+above), and ngdevkit ROM packaging. Those are the steps from "correct pixel data
+baked at translate time" to "pixels on a Neo-Geo screen."

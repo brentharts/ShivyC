@@ -225,6 +225,17 @@ register file, and `link`/`unlk` frame/ABI are new. It already compiles locals,
 recursion. See **[NEOGEO.md](NEOGEO.md)** for the architecture notes and the
 roadmap to bare-metal Neo-Geo ROMs.
 
+On top of the back end, a small rpython library
+([`tools/rpy_lib/neogeo.py`](tools/rpy_lib/neogeo.py)) turns multi-line ASCII art
+into Neo-Geo pixel art — a colour palette in the console's native 16-bit format
+plus an index buffer — with a four-line API (`neogeo.background.asciiart(...)`,
+`neogeo.sprite.asciiart(...)`, `neogeo.scene.add_*`). Because the art is a string
+constant, `import neogeo` *specialises* the translator: py2c runs the conversion at
+translate time and bakes the finished palette/tile data into the generated C, so
+the on-target code is just data plus a copy loop. The demo
+[`examples/rpython2c/neogeo/loadscreen.py`](examples/rpython2c/neogeo/loadscreen.py)
+draws a framed loading screen with a rocket sprite.
+
 Differential test harnesses live alongside the compiler:
 [`tools/arm64_difftest.py`](tools/arm64_difftest.py) (130 cases),
 [`tools/riscv64_difftest.py`](tools/riscv64_difftest.py), and
