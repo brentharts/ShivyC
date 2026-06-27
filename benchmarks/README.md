@@ -54,7 +54,9 @@ Runtime in seconds, with peak RSS; compile is the C-compiler step:
 | `binary_trees` (alloc) | 0.754 s | 0.386 s | 0.073 s | 0.071 s | 1.0 / 3.4 s |
 | `matmul` (boxed nested lists) | 0.061 s | 0.041 s | 0.014 s | 0.112 s | 1.0 / 3.4 s |
 | `sieve` (boxed bool list) | 1.22 s | 0.34 s | 0.317 s | 1.61 s | 1.0 / 3.4 s |
-
+| `stats` (float reduction + sort) | 0.487 s | 0.039 s | 0.007 s | 0.021 s | 0.9 / 2.8 s |
+| `svgplot` (string `%`-formatting) | 0.049 s | 0.054 s | 0.034 s | 0.040 s | 1.0 / 3.0 s |
+ 
 Reported honestly: the self-hosted compiler beats **both interpreters** on the
 compute-bound, allocation-light programs (`fib`, `mandelbrot`, `binary_trees`)
 and trails them on the two benchmarks dominated by boxed-list element access
