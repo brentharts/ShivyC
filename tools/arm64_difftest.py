@@ -139,6 +139,31 @@ STAGE9 = [
     ("g_char_array", "char m[6]={72,105,0,0,0,0}; int main(){return m[0]+m[1];}"),
 ]
 
+# Stage 10: codegen polish (immediate operands, compare+branch fusion, copy
+# coalescing) plus a wide-immediate materialization fix. These lock in
+# correctness of the optimized paths across comparison forms and literal sizes.
+STAGE10 = [
+    ("all_cmp_if", "int main(){int x=5; int r=0; if(x==5)r=r+1; if(x!=3)r=r+2;"
+                   " if(x<9)r=r+4; if(x>2)r=r+8; if(x<=5)r=r+16; if(x>=5)r=r+32;"
+                   " return r;}"),
+    ("while_ne", "int main(){int i=0,c=0; while(i!=5){c=c+i;i=i+1;} return c;}"),
+    ("while_gt", "int main(){int i=10,c=0; while(i>0){c=c+1;i=i-1;} return c;}"),
+    ("nested_and", "int main(){int a=3,b=7; if(a<b && b<10){ if(a>0)"
+                   " return 42; } return 0;}"),
+    ("or_cond", "int main(){int x=0; if(x==0 || x==9) return 5; return 1;}"),
+    ("coalesce_chain", "int main(){int a=2,b=3,c=4; int r=a*b+c; r=r-1; r=r*2;"
+                       " return r;}"),
+    ("imm_boundary", "int main(){int x=4095; int y=5000; if(x==4095 && y==5000)"
+                     " return x+y-9000; return 0;}"),
+    ("unsigned_bignum", "int f(){unsigned int a=4000000000u; unsigned int b=5;"
+                        " if(a>b) return 1; return 0;} int main(){return f();}"),
+    ("big_neg_lit", "int main(){int x=-100000; return x+100007;}"),
+    ("long_bignum", "long f(){long x=10000000000; return x/100000000;}"
+                    " int main(){return f();}"),
+    ("long_max", "long f(){return 9223372036854775807L;}"
+                 " int main(){long x=f(); if(x>0) return 1; return 0;}"),
+]
+
 
 def _run(cmd):
     p = subprocess.run(cmd, capture_output=True, text=True)
@@ -207,7 +232,7 @@ def main(argv):
             with open(path) as f:
                 progs.append((os.path.basename(path), f.read()))
     else:
-        progs = STAGE2 + STAGE3 + STAGE4 + STAGE6 + STAGE7 + STAGE8 + STAGE9
+        progs = STAGE2 + STAGE3 + STAGE4 + STAGE6 + STAGE7 + STAGE8 + STAGE9 + STAGE10
 
     workdir = tempfile.mkdtemp(prefix="arm64diff-")
     counts = {"PASS": 0, "FAIL": 0, "SKIP": 0, "ERROR": 0}
