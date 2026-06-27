@@ -82,6 +82,12 @@ class ExprStatement(Node):
         """Make code for this expression, and ignore the resulting ILValue."""
         self.expr.make_il(il_code, symbol_table, c)
 
+    def stmt_expr_value(self, il_code, symbol_table, c):
+        """Value of a statement expression ending in this statement: the
+        contained expression's value (see Node.stmt_expr_value). `self.expr` is
+        a direct field read here because `self` is statically typed."""
+        return self.expr.make_il(il_code, symbol_table, c)
+
 
 class InlineAsm(Node):
     """Node for a (narrow subset of) GCC inline assembly statement.

@@ -29,3 +29,18 @@ class Node:
         (and thus a vtable slot) for the expression-node hierarchy.
         """
         raise NotImplementedError
+
+    def stmt_expr_value(self, il_code, symbol_table, c):
+        """Run this statement and return its value as a GCC statement-expression
+        result: the contained expression's value for an expression statement,
+        and None for any other statement.
+
+        Declared on the root so it is dispatched virtually by the self-hosted
+        compiler. StmtExpr calls this on its trailing item *outside* any
+        report_err() frame, because a value assigned inside that frame's
+        setjmp/longjmp scope is not reliably preserved once control leaves it.
+        Doing the access through this override also keeps `self.expr` a direct,
+        statically-typed field read rather than a dynamic attribute lookup.
+        """
+        self.make_il(il_code, symbol_table, c)
+        return None

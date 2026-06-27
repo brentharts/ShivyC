@@ -8,7 +8,7 @@ from shivyc.ctypes import ArrayCType
 from shivyc.errors import CompilerError
 from shivyc.il_gen import ILValue
 from shivyc.tree.expr_base import _RExprNode, _LExprNode
-from shivyc.tree.utils import DirectLValue
+from shivyc.tree.utils import DirectLValue, report_err
 from shivyc.tokens import parse_c_int, Token
 
 
@@ -217,17 +217,38 @@ class StmtExpr(_RExprNode):
         symbol_table.new_scope()
         c = c.set_global(False)
 
+        # Linear new_scope/end_scope with a per-item report_err(), matching the
+        # idiom used by Compound and the loop nodes. The previous version used
+        # try/finally purely to guarantee end_scope(); that rides py2c's
+        # exception-frame machinery, which the self-hosted (native) compiler did
+        # not lower faithfully here -- the trailing expression's value was lost
+        # and the whole statement-expression came out as void, so assigning it
+        # (e.g. `int x = ({ ...; e; });`) failed with "invalid conversion". The
+        # report_err() context already swallows a CompilerError from any item,
+        # so control always reaches end_scope() without try/finally.
+        # Linear new_scope/end_scope. The trailing item's value must be read
+        # OUTSIDE a report_err() frame: report_err lowers to a setjmp/longjmp
+        # exception frame, and a value assigned to `result` inside that frame
+        # is not reliably preserved after control leaves it in the self-hosted
+        # (native) compiler -- the trailing expression's value was lost and the
+        # whole statement-expression came out as void, so `int x = ({...; e;})`
+        # failed with "invalid conversion". Non-final statements still run under
+        # report_err so a CompilerError in them is collected, not fatal.
         result = None
-        try:
-            for i, item in enumerate(self.items):
-                last = (i == len(self.items) - 1)
-                if last and isinstance(item, general_nodes.ExprStatement):
-                    # The value of the statement expression is this expression.
-                    result = item.expr.make_il(il_code, symbol_table, c)
-                else:
+        n = len(self.items)
+        i = 0
+        while i < n:
+            item = self.items[i]
+            if i == n - 1:
+                # stmt_expr_value runs the statement and returns its value (the
+                # contained expression's value for an expression statement, else
+                # None), dispatched virtually -- no isinstance, no dynamic attr.
+                result = item.stmt_expr_value(il_code, symbol_table, c)
+            else:
+                with report_err():
                     item.make_il(il_code, symbol_table, c)
-        finally:
-            symbol_table.end_scope()
+            i = i + 1
+        symbol_table.end_scope()
 
         if result is None:
             # No trailing expression: the statement expression has type void.
