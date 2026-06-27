@@ -1926,7 +1926,10 @@ def _tlist_prelude(et):
         "    }\n"
         "    l->data[l->len++] = v;\n"
         "}\n"
-        % (tl, et, tl, tl, tl, tl, et, tl, tl, et, et))
+        "static %s %s_pop(%s* l) {\n"
+        "    return l->data[--l->len];\n"
+        "}\n"
+        % (tl, et, tl, tl, tl, tl, et, tl, tl, et, et, et, tl, tl))
 
 
 KNOWN_CLASSES = {}      # name -> ClassInfo
@@ -4585,12 +4588,12 @@ class Transpiler:
             elif kind == "func" and name not in self.func_params:
                 _pcts = []
                 try:
-                    _pcts = [arg_ctype(info, a) or OBJ
+                    _pcts = [self._imported_arg_ctype(info, a) or OBJ
                              for a in info.args.args]
                 except Exception:
                     _pcts = []
                 funcs[func_csym(name, mod, self.ambiguous_funcs)] = \
-                    (ann_to_ctype(info.returns) or OBJ, _pcts)
+                    (self._imported_ret_ctype(info), _pcts)
             elif kind == "singleton":
                 singles[name] = info
                 if info not in self.classes:
@@ -5124,10 +5127,93 @@ class Transpiler:
                 return t
         return arg_ctype(fn, arg)
 
+    def _imported_arg_ctype(self, fn, arg):
+        """Parameter C type for a function imported from another module.
+
+        Like `arg_ctype`, but first resolves rpython typed-list / typed-dict
+        annotations (`list[float]`, `dict[str, int]`, ...) to their unboxed
+        runtime-free pointer types -- exactly as `ann_ctype` does for local
+        params. Without this, the module-level `arg_ctype` runs the annotation
+        through `ann_text_to_ctype`, which collapses every `list[...]`/`dict[...]`
+        to the boxed `obj`. That made an imported function's extern prototype and
+        every call site disagree with the callee's *definition* (which is typed
+        locally and so really takes a `_tlist_T*`): the caller boxed the typed
+        list into a 16-byte `obj` and passed it where a pointer was expected, so
+        the callee dereferenced a tagged union as a struct -> segfault.
+
+        Registering the typed list/dict here also ensures the importing module
+        emits the matching struct prelude, so the two translation units share an
+        identical layout. Any annotation that is not a scalar typed container
+        falls through to the unchanged `arg_ctype`, so no other case is affected.
+        """
+        ann = arg.annotation
+        if ann is not None and getattr(self, "_pod_enabled", False):
+            _el = ann_elem_ctype(ann)
+            if _el is not None and _el in _SCALAR_CTYPES:
+                self._typed_lists.add(_el)
+                return _tlist_name(_el) + "*"
+            _kv = ann_dict_kv(ann)
+            if _kv is not None and _kv[1] in _SCALAR_CTYPES and \
+                    (_kv[0] in _SCALAR_CTYPES or _kv[0] == "char*"):
+                self._typed_dicts.add(_kv)
+                self._tdict_by_name[_tdict_name(_kv[0], _kv[1])] = _kv
+                return _tdict_name(_kv[0], _kv[1]) + "*"
+        return arg_ctype(fn, arg)
+
+    def _imported_ret_ctype(self, info):
+        """Return C type for a function imported from another module.
+
+        The mirror of `_imported_arg_ctype` for the *return* annotation: an
+        imported function declared `-> "list[float]"` really returns a
+        `_tlist_double*` (its definition is typed locally), but `ann_to_ctype`
+        would report the boxed `obj`. That made the extern prototype and the
+        call-result type disagree with the definition -- the caller stored a
+        16-byte `obj` where the callee returned a pointer (ABI mismatch), then
+        unboxed garbage and dereferenced it -> segfault. Resolve scalar typed
+        containers here (registering them so the prelude is emitted); everything
+        else falls through to the unchanged `ann_to_ctype(...) or OBJ`.
+        """
+        ret = getattr(info, "returns", None)
+        if ret is not None and getattr(self, "_pod_enabled", False):
+            _el = ann_elem_ctype(ret)
+            if _el is not None and _el in _SCALAR_CTYPES:
+                self._typed_lists.add(_el)
+                return _tlist_name(_el) + "*"
+            _kv = ann_dict_kv(ret)
+            if _kv is not None and _kv[1] in _SCALAR_CTYPES and \
+                    (_kv[0] in _SCALAR_CTYPES or _kv[0] == "char*"):
+                self._typed_dicts.add(_kv)
+                self._tdict_by_name[_tdict_name(_kv[0], _kv[1])] = _kv
+                return _tdict_name(_kv[0], _kv[1]) + "*"
+        return ann_to_ctype(ret) or OBJ
+
     def _is_class_ptr(self, ct):
         """True if `ct` is a pointer to a (local or imported) class struct."""
         return bool(ct) and ct.endswith("*") and ct != OBJ \
             and (ct[:-1] in self.classes or ct[:-1] in self.xclasses)
+
+    def _typed_container_ret(self, returns):
+        """If a return annotation is a scalar typed list/dict (`list[float]`,
+        `dict[str,int]`, ...), return its unboxed pointer ctype (registering it
+        so the prelude is emitted); else None. Shared by `_c_ret` (the ABI
+        return) and `_logical_ret` (the typing return) so a method that returns
+        such a container is seen identically at its definition and every call
+        site -- otherwise the definition returns a `_tlist_T*` while callers
+        believe it returns `obj`, and the boxed/pointer mismatch corrupts the
+        value (the method analog of `_imported_ret_ctype`)."""
+        if returns is None or not getattr(self, "_pod_enabled", False):
+            return None
+        _el = ann_elem_ctype(returns)
+        if _el is not None and _el in _SCALAR_CTYPES:
+            self._typed_lists.add(_el)
+            return _tlist_name(_el) + "*"
+        _kv = ann_dict_kv(returns)
+        if _kv is not None and _kv[1] in _SCALAR_CTYPES and \
+                (_kv[0] in _SCALAR_CTYPES or _kv[0] == "char*"):
+            self._typed_dicts.add(_kv)
+            self._tdict_by_name[_tdict_name(_kv[0], _kv[1])] = _kv
+            return _tdict_name(_kv[0], _kv[1]) + "*"
+        return None
 
     def _logical_ret(self, fn):
         """Logical (typing) return type of a method's call result. A class
@@ -5135,6 +5221,9 @@ class Transpiler:
         (no subclasses) -- a non-leaf base could be any subclass at runtime, so
         statically typing the result to the base would make subclass-field
         access unsound; those stay obj. Scalars/char* pass through unchanged."""
+        _tc = self._typed_container_ret(fn.returns) if fn is not None else None
+        if _tc is not None:
+            return _tc
         rt = (ann_to_ctype(fn.returns) or OBJ) if fn is not None else OBJ
         if rt and rt != OBJ and rt.endswith("*") and rt[0].isupper():
             cls = rt[:-1]
@@ -5152,6 +5241,9 @@ class Transpiler:
         shares one uniform ABI -- even when the class is not imported in this
         module. The typed pointer is recovered at the call site via
         `_logical_ret` + an AS_OBJ cast (see ex_Call)."""
+        _tc = self._typed_container_ret(fn.returns) if fn is not None else None
+        if _tc is not None:
+            return _tc
         rt = (ann_to_ctype(fn.returns) or OBJ) if fn is not None else OBJ
         if rt and rt != OBJ and rt.endswith("*") and rt[0].isupper():
             return OBJ
@@ -8523,6 +8615,16 @@ class Transpiler:
                 if f.id == "bool":
                     return "bool"
                 if f.id == "float":
+                    # float(x) lowers to a plain `(double)x` cast when x is
+                    # already a concrete numeric (see ex_Call's fast path), and
+                    # only to a Tier-2 `pyfloat(...)` obj otherwise. Mirror that
+                    # here so a coercion of the result doesn't wrap a real double
+                    # in pyfloat (which expects an obj) -> a C type error.
+                    if node.args:
+                        _at = self.value_ctype(node.args[0])
+                        if _at in ("int", "bool", "double", "float", "long",
+                                   "short", "char"):
+                            return "double"
                     return OBJ          # pyfloat(...) yields a Tier-2 obj
                 if f.id in ("range", "sorted", "list", "dict", "set",
                             "reversed", "enumerate", "max", "min", "sum",
@@ -8548,7 +8650,7 @@ class Transpiler:
                             return cs + "*"
                         return cname(f.id) + "*"
                     if kind == "func":
-                        return ann_to_ctype(info.returns) or OBJ
+                        return self._imported_ret_ctype(info)
             if isinstance(f, ast.Attribute):
                 # float.fromhex("0x..") -> a Tier-2 float obj
                 if f.attr == "fromhex" and isinstance(f.value, ast.Name) \
@@ -8593,7 +8695,7 @@ class Transpiler:
                             return cs + "*"
                         return cname(f.attr) + "*"
                     if kind == "func":
-                        return ann_to_ctype(info.returns) or OBJ
+                        return self._imported_ret_ctype(info)
                     if kind == "global":
                         return OBJ
                     if self.stdlib_root:
@@ -8608,6 +8710,27 @@ class Transpiler:
                     return "char*"
                 if f.attr in VTABLE_METHODS:
                     return self._logical_ret(self.method_proto(f.attr)[2])
+                # A concrete class instance whose class actually defines this
+                # method must use the method's real return type, never the
+                # string/dict-method *name* heuristics below: a user method
+                # named `get`/`split`/`pop`/... (local or imported) would
+                # otherwise be mistyped, so a scalar/typed-list return is lost.
+                _rbt = self.value_ctype(f.value)
+                if _rbt and _rbt.endswith("*") and _rbt != OBJ \
+                        and not _rbt.startswith("_tlist_"):
+                    _rcls = _rbt[:-1]
+                    _rci = self.classes.get(_rcls) or \
+                        (self.xclasses[_rcls][0]
+                         if _rcls in self.xclasses else None)
+                    if _rci is not None:
+                        _rowner = _rci.find_method_owner(f.attr)
+                        if _rowner and _rowner.methods.get(f.attr):
+                            return self._logical_ret(_rowner.methods[f.attr])
+                # `xs.pop()` on an unboxed typed list yields its element scalar.
+                if f.attr == "pop" and not node.args:
+                    _tl = self._typed_list_ct(f.value)
+                    if _tl is not None:
+                        return _tl[len("_tlist_"):-1]
                 if f.attr not in self.method_owners:
                     if f.attr in ("startswith", "endswith", "isdigit",
                                   "isalpha", "isspace", "isalnum"):
@@ -8662,6 +8785,19 @@ class Transpiler:
     def st_AnnAssign(self, node, toplevel=False):
         ctype = self._local_ann_ctype(
             getattr(node.target, "id", "x"), node.annotation)
+        # `self.x: T = ...` is a *field* initializer: the storage is the struct
+        # member, whose ctype was fixed at class discovery. List/dict fields are
+        # currently kept as the boxed `obj`, but the annotation re-resolves here
+        # to an unboxed `_tlist_T*` / `_tdict_*`; assigning that to an `obj`
+        # member is a C type error. Honor the field's declared type so the
+        # initializer is built boxed to match the member (a correct, if boxed,
+        # field). Drop this once fields carry unboxed typed-container storage.
+        if isinstance(node.target, ast.Attribute) and \
+                isinstance(node.target.value, ast.Name) and \
+                node.target.value.id == "self" and self.cur_class is not None:
+            fct = self.cur_class.field_ctype(node.target.attr)
+            if fct and fct != ctype:
+                ctype = fct
         if isinstance(node.target, ast.Name):
             et = ann_elem_ctype(node.annotation)
             if not et:
@@ -10340,6 +10476,15 @@ class Transpiler:
             if fn == "reversed" and node.args:
                 return "pyreversed(%s)" % self.wrap_obj(node.args[0])
             if fn in ("max", "min"):
+                # A single unboxed typed-list argument (`min(xs)` where xs is a
+                # `list[float]`) cannot go through pymin/pymax: those iterate a
+                # boxed list, but a typed list is a raw `_tlist_T` struct. Reduce
+                # it with a direct C loop over ->data[], boxing the scalar result
+                # so the value stays a Tier-2 obj (matching value_ctype).
+                if len(node.args) == 1 and not node.keywords:
+                    tlct = self._typed_list_ct(node.args[0])
+                    if tlct:
+                        return self._typed_list_minmax(fn, tlct, node.args[0])
                 kw = {k.arg: k.value for k in node.keywords}
                 if "default" in kw:
                     dflt, has = self.wrap_obj(kw["default"]), "true"
@@ -10595,7 +10740,8 @@ class Transpiler:
                     cargs = self._pad_ctor_kwargs(init, cargs)
                     return "%s_new(%s)" % (info.csym, ", ".join(cargs))
                 if kind == "func":
-                    pct = [arg_ctype(info, a) for a in info.args.args]
+                    pct = [self._imported_arg_ctype(info, a)
+                           for a in info.args.args]
                     defs = self.defaults_for(info, False)
                     merged = self._merge_keyword_args(info, node.args,
                                                       node.keywords) \
@@ -10714,6 +10860,15 @@ class Transpiler:
                                        self.expr(node.args[0])))
                 return "list_append(%s, %s)" % (self.expr(func.value),
                                                 self.wrap_obj(node.args[0]))
+            if func.attr == "pop" and len(node.args) == 0:
+                # `xs.pop()` on an unboxed typed list removes and returns the
+                # last element directly (the boxed list_pop would reinterpret
+                # the _tlist_T struct as a boxed list and corrupt both the value
+                # and the length). value_ctype reports the element scalar so the
+                # result types like a subscript read.
+                tlct = self._typed_list_ct(func.value)
+                if tlct is not None:
+                    return "%s_pop(%s)" % (tlct[:-1], self.expr(func.value))
             if func.attr == "extend" and len(node.args) == 1 and \
                     func.attr not in self.method_owners:
                 return "list_extend(%s, %s)" % (self.wrap_obj(func.value),
@@ -10848,7 +11003,8 @@ class Transpiler:
                     cargs = self._pad_ctor_kwargs(init, cargs)
                     return "%s_new(%s)" % (info.csym, ", ".join(cargs))
                 if kind == "func":
-                    pct = [arg_ctype(info, a) for a in info.args.args]
+                    pct = [self._imported_arg_ctype(info, a)
+                           for a in info.args.args]
                     defs = self.defaults_for(info, False)
                     merged = self._merge_keyword_args(info, node.args,
                                                       node.keywords) \
@@ -11330,7 +11486,7 @@ class Transpiler:
             else:
                 self.used_xmethods.setdefault((owner.name, m.name), self._c_ret(m))
         recv = self._class_ptr_expr(recv_node, owner.csym)
-        pct = [arg_ctype(m, a) for a in m.args.args[1:]]
+        pct = [self._imported_arg_ctype(m, a) for a in m.args.args[1:]]
         n_named = len(pct)
         if m.args.vararg and m.name in VTABLE_METHODS:
             extra = arg_nodes[n_named:]
@@ -11396,7 +11552,20 @@ class Transpiler:
         init = self._resolve_init(ci)
         if not init:
             return []
-        return [arg_ctype(init, a) for a in init.args.args[1:]]
+        # Mirror `_init_param_list`'s per-arg type decision exactly, so a
+        # constructor *call* coerces each argument to the same C type the
+        # constructor *definition* declares. Using the bare `arg_ctype` here
+        # collapsed `list[float]` / `dict[...]` params to the boxed `obj`, so a
+        # call boxed a typed list (`Line_new(OBJ_OBJ(xs), ...)`) into a param
+        # the definition typed as `_tlist_double*` -> a pointer/obj ABI clash.
+        out = []
+        for a in init.args.args[1:]:
+            ct = self.arg_ctype_q(init, a)
+            if init.name in VTABLE_METHODS and self._is_class_ptr(ct) \
+                    and id(init) not in self._pod_method_nodes:
+                ct = OBJ
+            out.append(ct)
+        return out
 
     def coerce_args(self, param_ctypes, arg_nodes, default_nodes=None):
         out = []
@@ -11638,6 +11807,17 @@ class Transpiler:
         """Coerce `rendered` (an expr for value_node) to the `target` C type."""
         if not target:
             return rendered
+        # A list literal whose target is an unboxed typed list must be *built*
+        # as that typed list, not boxed via list_from and pointer-cast: a boxed
+        # list stores 16-byte tagged elements, so reinterpreting it as a
+        # `_tlist_T*` reads the doubles/ints out of tag memory (garbage). This
+        # covers `return [a, b]` from a `-> list[float]` function, a typed-list
+        # default/argument given as a literal, etc. An empty `[]` builds an
+        # empty typed list, which is also the correct unboxed value.
+        if isinstance(value_node, ast.List) and \
+                isinstance(target, str) and \
+                target.startswith("_tlist_") and target.endswith("*"):
+            return self._typed_list_literal(target, value_node)
         vt = self.value_ctype(value_node)
         if target == vt:
             return rendered
@@ -12530,6 +12710,21 @@ class Transpiler:
             return ct
         return None
 
+    def _typed_list_minmax(self, fn, ct, listnode):
+        """Reduce an unboxed typed list to its min/max with a direct C loop,
+        returning the scalar boxed as an obj (so value_ctype stays OBJ). `fn` is
+        'min' or 'max'; `ct` is the list's ctype (e.g. '_tlist_double*')."""
+        elem = ct[:-1][len("_tlist_"):]       # '_tlist_double*' -> 'double'
+        box = "OBJ_FLOAT" if elem in ("double", "float") else "OBJ_INT"
+        cmp = "<" if fn == "min" else ">"
+        self._list_tmp = getattr(self, "_list_tmp", 0) + 1
+        v = "_mm%d" % self._list_tmp
+        expr = self.expr(listnode)
+        return ("({ %s %s = %s; %s _r = %s->data[0]; long _i; "
+                "for (_i = 1; _i < %s->len; _i++) "
+                "if (%s->data[_i] %s _r) _r = %s->data[_i]; %s(_r); })") % (
+            ct, v, expr, elem, v, v, v, cmp, v, box)
+
     def _typed_list_literal(self, ct, listnode):
         """Build a typed list from a list literal as a statement-expression:
         ({ _tlist_T* _t = _tlist_T_new(n); _tlist_T_push(_t, e0); ...; _t; })."""
@@ -12982,6 +13177,28 @@ def main(argv):
     try:
         import rpy_torch as _rpy_torch
         files = _rpy_torch.bundle(files)
+    except Exception:
+        pass
+    # Auto-bundle the rpy_plot (matplotlib-style) and rpy_stats (statistics)
+    # mini-libraries on import, same mechanism as rpy_torch above.
+    try:
+        import rpy_plot_integration as _rpy_plot
+        files = _rpy_plot.bundle(files)
+    except Exception:
+        pass
+    try:
+        import rpy_stats_integration as _rpy_stats
+        files = _rpy_stats.bundle(files)
+    except Exception:
+        pass
+    try:
+        import rpy_bisect_integration as _rpy_bisect
+        files = _rpy_bisect.bundle(files)
+    except Exception:
+        pass
+    try:
+        import rpy_heapq_integration as _rpy_heapq
+        files = _rpy_heapq.bundle(files)
     except Exception:
         pass
     # First-class Wayland / PyQt: bundle rpy_lib/{rwayland,rpyqt}.py and emit the
