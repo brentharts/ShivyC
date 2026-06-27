@@ -440,6 +440,8 @@ class ASMGen:
             return self._make_asm_arm64()
         if self.asm_code.target.name == "riscv64":
             return self._make_asm_riscv64()
+        if self.asm_code.target.name == "m68k":
+            return self._make_asm_m68k()
 
         global_spotmap = self._get_global_spotmap()
 
@@ -2460,6 +2462,357 @@ class ASMGen:
             return
         raise NotImplementedError(
             "riscv64 back end: IL command '%s' not implemented yet"
+            % type(cmd).__name__)
+
+    # ================= Motorola 68000 (m68k / NeoGeo) back end =================
+    # The Neo-Geo's main CPU is a Motorola 68000; ngdevkit cross-compiles C to
+    # m68k with gcc. This back end is the first step toward that target and is a
+    # real stress test of the seam, because the 68000 is unlike every back end so
+    # far: it is CISC and big-endian, has two register files (data d0-d7,
+    # address a0-a7), two-address instructions (dst OP= src), .b/.w/.l operation
+    # sizes, and a fully stack-based calling convention (no register arguments).
+    #
+    # Despite all that it reuses the architecture-neutral middle end verbatim --
+    # copy-coalescing safety, liveness, live intervals, and the linear-scan
+    # allocator (the _il_* methods). Only instruction selection, the register
+    # file, and the m68k frame/ABI below are new. Scope is the integer core
+    # (locals, + - * / %, the six comparisons, if/while, stack-argument calls,
+    # recursion); unsupported IL raises rather than miscompile.
+    #
+    # Model: values live in data registers d2-d7 (callee-saved), spilling to
+    # fp-relative frame slots; d0/d1 are the compute scratch. Each binop computes
+    # in d0 and stores to the home, the simplest correct lowering of a two-address
+    # CISC ISA. Frames use a6 as frame pointer via link/unlk; arguments are read
+    # at 8(%fp)+4*k and pushed in reverse for calls (caller cleans the stack).
+    # Note: muls.l / divsl.l are 68020+; a real 68000 (Neo-Geo) needs 16-bit
+    # multiply/divide or libgcc helpers -- a later step. Validated under qemu-m68k
+    # against m68k-linux-gnu-gcc, which (like aarch64-linux for bare-metal arm64)
+    # is the practical oracle for the same instruction set.
+
+    def _make_asm_m68k(self):
+        """m68k (Neo-Geo main CPU) lowering. Runs only under `--target m68k`."""
+        EXTERNAL = self.symbol_table.EXTERNAL
+        DEFINED = self.symbol_table.DEFINED
+        for v in self.symbol_table.linkages[EXTERNAL].values():
+            if self.symbol_table.def_state.get(v) == DEFINED:
+                self.asm_code.add_global(self.symbol_table.names[v])
+        for func in self.il_code.commands:
+            self._m68_function(func, self.il_code.commands[func])
+
+    def _m68_src(self, value, reg_of, slot_of):
+        """Source operand string for `value`: immediate, data register, or its
+        fp-relative spill slot."""
+        lit = getattr(value, "literal", None)
+        if lit is not None:
+            return "#%s" % lit.val
+        r = reg_of.get(value, -1)
+        if r >= 0:
+            return "%%d%d" % r
+        return "%d(%%fp)" % slot_of[value]
+
+    def _m68_store(self, value, from_dreg, reg_of, slot_of):
+        """Store data register d<from> into `value`'s home (register or slot)."""
+        r = reg_of.get(value, -1)
+        if r >= 0:
+            if r != from_dreg:
+                self.asm_code.add(asm_cmds.Raw(
+                    "move.l %%d%d,%%d%d" % (from_dreg, r)))
+        else:
+            self.asm_code.add(asm_cmds.Raw(
+                "move.l %%d%d,%d(%%fp)" % (from_dreg, slot_of[value])))
+
+    def _m68_epilogue(self, use_fp):
+        for r in reversed(self._m68_saved):
+            self.asm_code.add(asm_cmds.Raw("move.l (%%sp)+,%%d%d" % r))
+        if use_fp:
+            self.asm_code.add(asm_cmds.Raw("unlk %fp"))
+        self.asm_code.add(asm_cmds.Raw("rts"))
+
+    def _m68_function(self, func, cmds):
+        import shivyc.il_cmds.control as control
+        import shivyc.il_cmds.value as value_cmds
+        import shivyc.il_cmds.math as math_cmds
+        import shivyc.il_cmds.compare as cmp_cmds
+        n = len(cmds)
+        # Function-call targets (AddrOf of a function) are resolved at compile
+        # time via addrof_name and never occupy a register; collect them so the
+        # integer-core check below does not reject their pointer type.
+        funcptr = {}
+        for c in cmds:
+            if isinstance(c, value_cmds.AddrOf) and c.var.ctype.is_function():
+                funcptr[c.output] = 1
+        values = []
+        seen = {}
+        has_call = False
+        has_arg = False
+        STATIC = self.symbol_table.STATIC
+        for c in cmds:
+            if isinstance(c, control.Call):
+                has_call = True
+            if isinstance(c, value_cmds.LoadArg):
+                has_arg = True
+            for v in c.inputs() + c.outputs():
+                if v is None or getattr(v, "literal", None) is not None \
+                        or v in funcptr:
+                    continue
+                if self.symbol_table.storage.get(v) == STATIC:
+                    raise NotImplementedError(
+                        "m68k back end: globals not implemented yet")
+                if v.ctype.is_floating() or v.ctype.is_array() \
+                        or v.ctype.is_struct_union() or v.ctype.is_pointer() \
+                        or v.ctype.size > 4:
+                    raise NotImplementedError(
+                        "m68k back end: only the 32-bit integer core is"
+                        " implemented")
+                if v not in seen:
+                    seen[v] = 1
+                    values.append(v)
+
+        forced = {}
+        glob = {}
+        fused_out = {}
+        usecount = {}
+        defcount = {}
+        for c in cmds:
+            for v in c.inputs():
+                if v is not None:
+                    usecount[v] = usecount.get(v, 0) + 1
+            for v in c.outputs():
+                if v is not None:
+                    defcount[v] = defcount.get(v, 0) + 1
+
+        defidx = {}
+        for idx in range(n):
+            for v in cmds[idx].outputs():
+                if v is not None:
+                    defidx[v] = idx
+        coalesce = {}
+        skip = {}
+        for k in range(n):
+            c = cmds[k]
+            if isinstance(c, value_cmds.Set):
+                arg = c.arg
+                out = c.output
+                if getattr(arg, "literal", None) is None \
+                        and usecount.get(arg, 0) == 1 \
+                        and defcount.get(arg, 0) == 1 \
+                        and out.ctype.size == arg.ctype.size \
+                        and self._il_coalesce_safe(
+                            cmds, defidx.get(arg, -1), k, out):
+                    coalesce[arg] = out
+
+        uses = []
+        defs = []
+        for idx in range(n):
+            c = cmds[idx]
+            u = []
+            d = []
+            for v in c.inputs():
+                if v is not None and getattr(v, "literal", None) is None \
+                        and v not in funcptr:
+                    u.append(self._il_canon(v, coalesce))
+            for v in c.outputs():
+                if v is not None and getattr(v, "literal", None) is None \
+                        and v not in funcptr:
+                    d.append(self._il_canon(v, coalesce))
+            uses.append(u)
+            defs.append(d)
+        live_in, live_out = self._il_liveness(cmds, n, uses, defs)
+        start, end, crosses = self._il_intervals(
+            cmds, n, live_in, live_out, uses, defs)
+
+        # Homes are the callee-saved data registers d2-d7; d0/d1 are scratch, so
+        # the caller-saved pool is empty and every value home is callee-saved.
+        int_callee = [2, 3, 4, 5, 6, 7]
+        busy_int = {}
+        busy_fp = {}
+        used_int_callee = {}
+        used_fp_callee = {}
+        reps = {}
+        order = []
+        for v in values:
+            cv = self._il_canon(v, coalesce)
+            if cv in reps:
+                continue
+            reps[cv] = 1
+            order.append(cv)
+        order.sort(key=lambda vv: start.get(vv, 0))
+        reg_of, freg_of, spill = self._il_linear_scan(
+            order, start, end, crosses, [], int_callee, [], [],
+            busy_int, busy_fp, used_int_callee, used_fp_callee)
+
+        saved = []
+        for r in range(2, 8):
+            if r in used_int_callee:
+                saved.append(r)
+        self._m68_saved = saved
+        # Spill slots: fp-relative negative offsets (the link reserves them).
+        slot_of = {}
+        off = 0
+        for v in values:
+            cv = self._il_canon(v, coalesce)
+            if cv in reg_of:
+                continue
+            if cv not in slot_of:
+                off += 4
+                slot_of[cv] = -off
+            if v is not cv:
+                slot_of[v] = slot_of[cv]
+        for arg in coalesce:
+            o = self._il_canon(arg, coalesce)
+            if o in reg_of:
+                reg_of[arg] = reg_of[o]
+            if o in slot_of:
+                slot_of[arg] = slot_of[o]
+        for idx in range(n):
+            c = cmds[idx]
+            if isinstance(c, value_cmds.Set) and c.arg in coalesce:
+                skip[idx] = 1
+
+        spillsize = off + (off % 2)          # keep the frame even
+        use_fp = (len(slot_of) > 0) or has_arg or has_call
+
+        self.asm_code.add(asm_cmds.AsmLabel(func))
+        if use_fp:
+            self.asm_code.add(asm_cmds.Raw("link.w %%fp,#-%d" % spillsize))
+        for r in saved:
+            self.asm_code.add(asm_cmds.Raw("move.l %%d%d,-(%%sp)" % r))
+        addrof_name = {}
+        for idx in range(n):
+            if idx in skip:
+                continue
+            self._lower_m68k(cmds[idx], idx, func, reg_of, slot_of,
+                             use_fp, addrof_name)
+
+    def _lower_m68k(self, cmd, idx, func, reg_of, slot_of, use_fp, addrof_name):
+        import shivyc.il_cmds.control as control
+        import shivyc.il_cmds.value as value_cmds
+        import shivyc.il_cmds.math as math_cmds
+        import shivyc.il_cmds.compare as cmp_cmds
+
+        if isinstance(cmd, value_cmds.Set):
+            out = cmd.output
+            src = self._m68_src(cmd.arg, reg_of, slot_of)
+            self.asm_code.add(asm_cmds.Raw("move.l %s,%%d0" % src))
+            self._m68_store(out, 0, reg_of, slot_of)
+            return
+
+        if isinstance(cmd, math_cmds.Add) or isinstance(cmd, math_cmds.Subtr) \
+                or isinstance(cmd, math_cmds.Mult):
+            ins = cmd.inputs()
+            out = cmd.outputs()[0]
+            a = self._m68_src(ins[0], reg_of, slot_of)
+            b = self._m68_src(ins[1], reg_of, slot_of)
+            self.asm_code.add(asm_cmds.Raw("move.l %s,%%d0" % a))
+            if isinstance(cmd, math_cmds.Add):
+                op = "add.l"
+            elif isinstance(cmd, math_cmds.Subtr):
+                op = "sub.l"
+            else:
+                op = "muls.l"
+            self.asm_code.add(asm_cmds.Raw("%s %s,%%d0" % (op, b)))
+            self._m68_store(out, 0, reg_of, slot_of)
+            return
+
+        if isinstance(cmd, math_cmds.Div) or isinstance(cmd, math_cmds.Mod):
+            ins = cmd.inputs()
+            out = cmd.outputs()[0]
+            a = self._m68_src(ins[0], reg_of, slot_of)
+            b = self._m68_src(ins[1], reg_of, slot_of)
+            sg = not (out.ctype.is_integral() and not out.ctype.signed)
+            self.asm_code.add(asm_cmds.Raw("move.l %s,%%d0" % a))
+            op = "divsl.l" if sg else "divul.l"
+            # quotient -> d0, remainder -> d1
+            self.asm_code.add(asm_cmds.Raw("%s %s,%%d1:%%d0" % (op, b)))
+            res = 1 if isinstance(cmd, math_cmds.Mod) else 0
+            self._m68_store(out, res, reg_of, slot_of)
+            return
+
+        if isinstance(cmd, cmp_cmds._GeneralCmp):
+            ins = cmd.inputs()
+            out = cmd.outputs()[0]
+            a = self._m68_src(ins[0], reg_of, slot_of)
+            b = self._m68_src(ins[1], reg_of, slot_of)
+            self.asm_code.add(asm_cmds.Raw("move.l %s,%%d0" % a))
+            self.asm_code.add(asm_cmds.Raw("cmp.l %s,%%d0" % b))  # d0 - b
+            if isinstance(cmd, cmp_cmds.EqualCmp):
+                sc = "seq"
+            elif isinstance(cmd, cmp_cmds.NotEqualCmp):
+                sc = "sne"
+            elif isinstance(cmd, cmp_cmds.LessCmp):
+                sc = "slt"
+            elif isinstance(cmd, cmp_cmds.GreaterCmp):
+                sc = "sgt"
+            elif isinstance(cmd, cmp_cmds.LessOrEqCmp):
+                sc = "sle"
+            else:
+                sc = "sge"
+            self.asm_code.add(asm_cmds.Raw("%s %%d0" % sc))
+            self.asm_code.add(asm_cmds.Raw("and.l #1,%d0"))
+            self._m68_store(out, 0, reg_of, slot_of)
+            return
+
+        if isinstance(cmd, control.Label):
+            self.asm_code.add(asm_cmds.AsmLabel(cmd.label))
+            return
+        if isinstance(cmd, control.Jump):
+            self.asm_code.add(asm_cmds.Raw(
+                "jra %s" % spots.mangle_symbol(cmd.label)))
+            return
+        if isinstance(cmd, control.JumpZero):
+            src = self._m68_src(cmd.cond, reg_of, slot_of)
+            self.asm_code.add(asm_cmds.Raw("move.l %s,%%d0" % src))
+            self.asm_code.add(asm_cmds.Raw("tst.l %d0"))
+            self.asm_code.add(asm_cmds.Raw(
+                "jeq %s" % spots.mangle_symbol(cmd.label)))
+            return
+        if isinstance(cmd, control.JumpNotZero):
+            src = self._m68_src(cmd.cond, reg_of, slot_of)
+            self.asm_code.add(asm_cmds.Raw("move.l %s,%%d0" % src))
+            self.asm_code.add(asm_cmds.Raw("tst.l %d0"))
+            self.asm_code.add(asm_cmds.Raw(
+                "jne %s" % spots.mangle_symbol(cmd.label)))
+            return
+
+        if isinstance(cmd, value_cmds.LoadArg):
+            # Argument k arrives on the stack at 8(%fp)+4*k.
+            off = 8 + 4 * cmd.arg_num
+            self.asm_code.add(asm_cmds.Raw("move.l %d(%%fp),%%d0" % off))
+            self._m68_store(cmd.output, 0, reg_of, slot_of)
+            return
+        if isinstance(cmd, value_cmds.AddrOf):
+            name = self.symbol_table.names.get(cmd.var)
+            if name is not None and cmd.var.ctype.is_function():
+                addrof_name[cmd.output] = name
+                return
+            raise NotImplementedError(
+                "m68k back end: address-of a variable not implemented yet")
+        if isinstance(cmd, control.Call):
+            name = addrof_name.get(cmd.func)
+            if name is None:
+                raise NotImplementedError(
+                    "m68k back end: only direct calls are implemented")
+            i = len(cmd.args) - 1
+            while i >= 0:                    # push arguments right-to-left
+                src = self._m68_src(cmd.args[i], reg_of, slot_of)
+                self.asm_code.add(asm_cmds.Raw("move.l %s,-(%%sp)" % src))
+                i -= 1
+            self.asm_code.add(asm_cmds.Raw(
+                "jsr %s" % spots.mangle_symbol(name)))
+            if len(cmd.args) > 0:            # caller cleans the stack
+                self.asm_code.add(asm_cmds.Raw(
+                    "lea (%d,%%sp),%%sp" % (4 * len(cmd.args))))
+            if not cmd.void_return:
+                self._m68_store(cmd.ret, 0, reg_of, slot_of)  # result in d0
+            return
+        if isinstance(cmd, control.Return):
+            if cmd.arg is not None:
+                src = self._m68_src(cmd.arg, reg_of, slot_of)
+                self.asm_code.add(asm_cmds.Raw("move.l %s,%%d0" % src))
+            self._m68_epilogue(use_fp)
+            return
+        raise NotImplementedError(
+            "m68k back end: IL command '%s' not implemented yet"
             % type(cmd).__name__)
 
     def _apply_thread_budget(self, func):
