@@ -574,6 +574,7 @@ class ASMGen:
         # and a dedup set so each global's storage is emitted once.
         self._arm64_glob = {}
         self._arm64_gemit = {}
+        self._arm64_gaddr = {}
         for func in self.il_code.commands:
             self._arm64_function(func, self.il_code.commands[func])
 
@@ -648,6 +649,17 @@ class ASMGen:
                 glob[v] = self.symbol_table.asm_name(v)
                 self._arm64_glob[v] = glob[v]
                 self._arm64_emit_global_storage(v)
+        # Count how often each global is referenced; frequently-used ones get
+        # their (link-time-invariant) address cached in a register for the whole
+        # function instead of recomputing adrp/add at every access.
+        gaccess = {}
+        for c in cmds:
+            for v in c.inputs():
+                if v is not None and v in glob:
+                    gaccess[v] = gaccess.get(v, 0) + 1
+            for v in c.outputs():
+                if v is not None and v in glob:
+                    gaccess[v] = gaccess.get(v, 0) + 1
 
         # Use/def counts drive two peephole optimizations below.
         usecount = {}
@@ -708,6 +720,15 @@ class ASMGen:
         NUM_REGS = 10                      # x19 .. x28 (callee-saved)
         reg_of = {}
         nreg = 0
+        # Cache addresses of globals used >= 2 times (up to a small cap, leaving
+        # registers for values) in callee-saved registers loaded once at entry.
+        self._arm64_gaddr = {}
+        GCACHE_CAP = 3
+        for v in values:
+            if v in glob and gaccess.get(v, 0) >= 2 and nreg < NUM_REGS - 2 \
+                    and len(self._arm64_gaddr) < GCACHE_CAP:
+                self._arm64_gaddr[v] = 19 + nreg
+                nreg += 1
         for v in values:
             if v not in coalesce and v not in fused_out and v not in forced \
                     and v not in glob and v.ctype.size <= 8 and nreg < NUM_REGS:
@@ -748,6 +769,15 @@ class ASMGen:
             for i in range(nreg):
                 self.asm_code.add(asm_cmds.Raw(
                     "str\tx%d, [x29, #%d]" % (19 + i, 16 + i * 8)))
+        # Load cached global addresses once (their registers are callee-saved
+        # above, so they survive calls and every access just uses [xR]).
+        for v in values:
+            if v in self._arm64_gaddr:
+                r = self._arm64_gaddr[v]
+                name = glob[v]
+                self.asm_code.add(asm_cmds.Raw("adrp\tx%d, %s" % (r, name)))
+                self.asm_code.add(asm_cmds.Raw(
+                    "add\tx%d, x%d, :lo12:%s" % (r, r, name)))
         addrof_name = {}
         for idx in range(n):
             if idx in skip:
@@ -778,6 +808,9 @@ class ASMGen:
         symbol into x<areg> and returns `[x<areg>]`."""
         name = self._arm64_glob.get(value)
         if name is not None:
+            cr = self._arm64_gaddr.get(value, -1)
+            if cr >= 0:
+                return "[x%d]" % cr      # address cached in a register
             a = "x%d" % areg
             self.asm_code.add(asm_cmds.Raw("adrp\t%s, %s" % (a, name)))
             self.asm_code.add(asm_cmds.Raw(
@@ -860,6 +893,14 @@ class ASMGen:
             return "w" + name[1:]
         return name
 
+    def _arm64_xname(self, name):
+        """The 64-bit (x) form of a register name (w12 -> x12); used for a shift
+        amount of a 64-bit value (only the low bits matter, so reading the wide
+        register is safe)."""
+        if name and name[0] == "w":
+            return "x" + name[1:]
+        return name
+
     def _arm64_pow2_log(self, n):
         """log2(n) if n is a power of two in 1..16, else -1 (the lsl shift amount
         for scaling an array index by the element size)."""
@@ -904,6 +945,7 @@ class ASMGen:
         address is x29 + slot) or a pointer value."""
         base_is_mem = base.ctype.is_array() or base.ctype.is_struct_union()
         gname = self._arm64_glob.get(base)
+        gcR = self._arm64_gaddr.get(base, -1)
         # Constant total offset? (no count -> fixed chunk byte offset; literal
         # count -> chunk*index).
         const_off = None
@@ -914,6 +956,10 @@ class ASMGen:
             if lit is not None:
                 const_off = chunk * lit.val
         if const_off is not None:
+            if gcR >= 0:
+                if const_off == 0:
+                    return "[x%d]" % gcR
+                return "[x%d, #%d]" % (gcR, const_off)
             if gname is not None:
                 a = "x%d" % an
                 self.asm_code.add(asm_cmds.Raw("adrp\t%s, %s" % (a, gname)))
@@ -928,17 +974,24 @@ class ASMGen:
             if const_off == 0:
                 return "[%s]" % rb
             return "[%s, #%d]" % (rb, const_off)
-        # Variable index: compute the effective address into x<an>.
+        # Variable index: compute the effective address into x<an>. `bsrc` is the
+        # base address; for a cached global it stays in its register (xR) and is
+        # not clobbered.
         addr = "x%d" % an
-        if gname is not None:
+        if gcR >= 0:
+            bsrc = "x%d" % gcR
+        elif gname is not None:
             self.asm_code.add(asm_cmds.Raw("adrp\t%s, %s" % (addr, gname)))
             self.asm_code.add(asm_cmds.Raw(
                 "add\t%s, %s, :lo12:%s" % (addr, addr, gname)))
+            bsrc = addr
         elif base_is_mem:
             self.asm_code.add(asm_cmds.Raw(
                 "add\t%s, x29, #%d" % (addr, slot_of[base])))
+            bsrc = addr
         else:
             self._arm64_into(base, an, reg_of, slot_of)   # pointer value -> x<an>
+            bsrc = addr
         sh = self._arm64_pow2_log(chunk)
         if sh < 0:
             raise NotImplementedError(
@@ -946,10 +999,10 @@ class ASMGen:
         ci = self._arm64_use(count, an + 1, reg_of, slot_of)
         if count.ctype.size <= 4:
             self.asm_code.add(asm_cmds.Raw(
-                "add\t%s, %s, %s, sxtw #%d" % (addr, addr, ci, sh)))
+                "add\t%s, %s, %s, sxtw #%d" % (addr, bsrc, ci, sh)))
         else:
             self.asm_code.add(asm_cmds.Raw(
-                "add\t%s, %s, %s, lsl #%d" % (addr, addr, ci, sh)))
+                "add\t%s, %s, %s, lsl #%d" % (addr, bsrc, ci, sh)))
         return "[%s]" % addr
 
     def _arm64_addr_into(self, base, chunk, count, an, reg_of, slot_of):
@@ -958,26 +1011,36 @@ class ASMGen:
         _arm64_rel_target but materializing the address (for AddrRel / &a[i])."""
         addr = "x%d" % an
         gname = self._arm64_glob.get(base)
-        if gname is not None:
+        gcR = self._arm64_gaddr.get(base, -1)
+        if gcR >= 0:
+            bsrc = "x%d" % gcR
+        elif gname is not None:
             self.asm_code.add(asm_cmds.Raw("adrp\t%s, %s" % (addr, gname)))
             self.asm_code.add(asm_cmds.Raw(
                 "add\t%s, %s, :lo12:%s" % (addr, addr, gname)))
+            bsrc = addr
         elif base.ctype.is_array() or base.ctype.is_struct_union():
             self.asm_code.add(asm_cmds.Raw(
                 "add\t%s, x29, #%d" % (addr, slot_of[base])))
+            bsrc = addr
         else:
             self._arm64_into(base, an, reg_of, slot_of)   # pointer value -> addr
+            bsrc = addr
         if count is None:
             if chunk:
                 self.asm_code.add(asm_cmds.Raw(
-                    "add\t%s, %s, #%d" % (addr, addr, chunk)))
+                    "add\t%s, %s, #%d" % (addr, bsrc, chunk)))
+            elif bsrc != addr:
+                self.asm_code.add(asm_cmds.Raw("mov\t%s, %s" % (addr, bsrc)))
             return addr
         lit = getattr(count, "literal", None)
         if lit is not None:
             off = chunk * lit.val
             if off:
                 self.asm_code.add(asm_cmds.Raw(
-                    "add\t%s, %s, #%d" % (addr, addr, off)))
+                    "add\t%s, %s, #%d" % (addr, bsrc, off)))
+            elif bsrc != addr:
+                self.asm_code.add(asm_cmds.Raw("mov\t%s, %s" % (addr, bsrc)))
             return addr
         sh = self._arm64_pow2_log(chunk)
         if sh < 0:
@@ -986,10 +1049,10 @@ class ASMGen:
         ci = self._arm64_use(count, an + 1, reg_of, slot_of)
         if count.ctype.size <= 4:
             self.asm_code.add(asm_cmds.Raw(
-                "add\t%s, %s, %s, sxtw #%d" % (addr, addr, ci, sh)))
+                "add\t%s, %s, %s, sxtw #%d" % (addr, bsrc, ci, sh)))
         else:
             self.asm_code.add(asm_cmds.Raw(
-                "add\t%s, %s, %s, lsl #%d" % (addr, addr, ci, sh)))
+                "add\t%s, %s, %s, lsl #%d" % (addr, bsrc, ci, sh)))
         return addr
 
     def _arm64_mov_imm(self, dest, val, size):
@@ -1086,11 +1149,16 @@ class ASMGen:
             gname = self._arm64_glob.get(cmd.var)
             if gname is not None:
                 # Address of a global: adrp/add of its symbol (pointers are
-                # 8-byte, so rd is an x-register).
+                # 8-byte, so rd is an x-register), or a copy from the cached
+                # address register if we have one.
                 rd = self._arm64_defreg(cmd.output, 9, reg_of)
-                self.asm_code.add(asm_cmds.Raw("adrp\t%s, %s" % (rd, gname)))
-                self.asm_code.add(asm_cmds.Raw(
-                    "add\t%s, %s, :lo12:%s" % (rd, rd, gname)))
+                cr = self._arm64_gaddr.get(cmd.var, -1)
+                if cr >= 0:
+                    self.asm_code.add(asm_cmds.Raw("mov\t%s, x%d" % (rd, cr)))
+                else:
+                    self.asm_code.add(asm_cmds.Raw("adrp\t%s, %s" % (rd, gname)))
+                    self.asm_code.add(asm_cmds.Raw(
+                        "add\t%s, %s, :lo12:%s" % (rd, rd, gname)))
                 self._arm64_wb(cmd.output, 9, reg_of, slot_of)
                 return
             # Address of a local: x29 + its frame slot. The variable was forced
@@ -1289,6 +1357,60 @@ class ASMGen:
                     "%s\t%s, %s, %s" % (divop, rq, ra, rb)))
                 self.asm_code.add(asm_cmds.Raw(
                     "msub\t%s, %s, %s, %s" % (rd, rq, rb, ra)))
+            self._arm64_wb(out, 9, reg_of, slot_of)
+            return
+        if isinstance(cmd, math_cmds.BitAnd) or isinstance(cmd, math_cmds.BitOr) \
+                or isinstance(cmd, math_cmds.BitXor):
+            ins = cmd.inputs()
+            out = cmd.outputs()[0]
+            ra = self._arm64_use(ins[0], 9, reg_of, slot_of)
+            rb = self._arm64_use(ins[1], 10, reg_of, slot_of)
+            if isinstance(cmd, math_cmds.BitAnd):
+                op = "and"
+            elif isinstance(cmd, math_cmds.BitOr):
+                op = "orr"
+            else:
+                op = "eor"
+            rd = self._arm64_defreg(out, 9, reg_of)
+            self.asm_code.add(asm_cmds.Raw(
+                "%s\t%s, %s, %s" % (op, rd, ra, rb)))
+            self._arm64_wb(out, 9, reg_of, slot_of)
+            return
+        if isinstance(cmd, math_cmds.LBitShift) \
+                or isinstance(cmd, math_cmds.RBitShift):
+            ins = cmd.inputs()
+            out = cmd.outputs()[0]
+            ra = self._arm64_use(ins[0], 9, reg_of, slot_of)
+            if isinstance(cmd, math_cmds.LBitShift):
+                op = "lsl"
+            else:
+                ct = ins[0].ctype
+                sg = not (ct.is_pointer() or (ct.is_integral() and not ct.signed))
+                op = "asr" if sg else "lsr"
+            rd = self._arm64_defreg(out, 9, reg_of)
+            lit = getattr(ins[1], "literal", None)
+            if lit is not None and 0 <= lit.val < 64:
+                self.asm_code.add(asm_cmds.Raw(
+                    "%s\t%s, %s, #%d" % (op, rd, ra, lit.val)))
+            else:
+                rb = self._arm64_use(ins[1], 10, reg_of, slot_of)
+                # Register-form shift takes the amount at the value's width
+                # (only the low bits are used).
+                if out.ctype.size > 4:
+                    rb = self._arm64_xname(rb)
+                else:
+                    rb = self._arm64_wname(rb)
+                self.asm_code.add(asm_cmds.Raw(
+                    "%s\t%s, %s, %s" % (op, rd, ra, rb)))
+            self._arm64_wb(out, 9, reg_of, slot_of)
+            return
+        if isinstance(cmd, math_cmds.Not) or isinstance(cmd, math_cmds.Neg):
+            ins = cmd.inputs()
+            out = cmd.outputs()[0]
+            ra = self._arm64_use(ins[0], 9, reg_of, slot_of)
+            op = "mvn" if isinstance(cmd, math_cmds.Not) else "neg"
+            rd = self._arm64_defreg(out, 9, reg_of)
+            self.asm_code.add(asm_cmds.Raw("%s\t%s, %s" % (op, rd, ra)))
             self._arm64_wb(out, 9, reg_of, slot_of)
             return
         if isinstance(cmd, cmp_cmds._GeneralCmp):
