@@ -1,0 +1,76 @@
+% ShivyCX rpython cross-runtime benchmark report.
+%
+% This is the static shell. The data-driven body (tables + figures) lives in
+% report_body.tex, which benchmarks/plot_rpython.py regenerates from the latest
+% results/rpython_results.json. Build it with `make benchmarks-report`, which
+% runs the harness, renders the figures, and invokes pdflatex in the figure
+% output directory (so report_body.tex and the *.pdf figures sit alongside).
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue}
+
+\title{ShivyCX: rpython cross-runtime benchmarks\\
+\large CPython vs.\ PyPy3 vs.\ py2c$+$gcc vs.\ the self-hosted compiler}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{What is measured}
+
+Each benchmark in \texttt{benchmarks/rpython/} is a single \emph{pure-Python}
+program. The same source is executed by four backends, which must all agree on
+the program's exit code (a differential-correctness check):
+
+\begin{itemize}
+  \item \textbf{CPython} --- the program run directly under \texttt{python3}.
+  \item \textbf{PyPy3} --- the same program under the PyPy3 JIT (omitted if PyPy3
+        is not installed).
+  \item \textbf{py2c$+$gcc} --- the program transpiled to C by
+        \texttt{tools/py2c.py} and compiled with \texttt{gcc -O2}.
+  \item \textbf{self-hosted} --- the \emph{same} transpiled C compiled by
+        \texttt{shivyc\_native}, the ShivyCX compiler built from its own
+        sources. This is the headline column: ShivyCX compiling the C that its
+        own \texttt{.py}$\rightarrow$C translator produced.
+\end{itemize}
+
+For every backend three quantities are recorded:
+
+\begin{itemize}
+  \item \textbf{Runtime} --- best of five wall-clock measurements of the program
+        proper.
+  \item \textbf{Peak memory} --- the exact maximum resident set size of the
+        process, read from the child's \texttt{rusage} (\texttt{ru\_maxrss}) by
+        a $\sim$1.5\,MB C probe, so the harness's own footprint does not inflate
+        it.
+  \item \textbf{Compile time} --- for the two compiled backends, the wall-clock
+        time the C compiler (gcc or \texttt{shivyc\_native}) spent on the py2c
+        output. The interpreters have no compile step.
+\end{itemize}
+
+ShivyCX emits unoptimised, \texttt{-O0}-class code, so the self-hosted runtime is
+expected to trail \texttt{gcc -O2}; the interesting questions are how it compares
+to the \emph{interpreters} (it beats them on compute-bound, allocation-light
+programs and trails them where boxed-list element access dominates) and how its
+compile speed and the resulting binary's memory footprint compare to gcc.
+
+\input{report_body.tex}
+
+\section{Reproducing}
+
+\begin{verbatim}
+make benchmarks-report      # harness -> figures -> this PDF
+\end{verbatim}
+
+\noindent
+The harness builds \texttt{shivyc\_native} once (or reuses one supplied via
+\texttt{\$SHIVYC\_NATIVE}); results land in
+\texttt{benchmarks/results/rpython\_results.json} and the figures in
+\texttt{\$BENCH\_PLOT\_DIR} (default \texttt{/tmp/shivyc\_benchmarks}).
+
+\end{document}
