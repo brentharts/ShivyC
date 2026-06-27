@@ -69,6 +69,36 @@ STAGE4 = [
                 "l=12; return a+b+c+d+e+f+g+h+i+j+k+l;}"),
 ]
 
+# Stage 6: general pointers (AddrOf of a variable, load/store through a pointer).
+STAGE6 = [
+    ("ptr_store", "int main(){int x=5; int *p=&x; *p=10; return x;}"),
+    ("ptr_load", "int main(){int x=5; int *p=&x; return *p;}"),
+    ("ptr_copy", "int main(){int x=3,y=4; int *p=&x,*q=&y; *p=*q+1; return x;}"),
+    ("ptr_param", "void inc(int *p){*p=*p+1;} int main(){int x=41; inc(&x);"
+                  " return x;}"),
+    ("double_ptr", "int main(){int x=7; int *p=&x; int **pp=&p; **pp=99;"
+                   " return x;}"),
+    ("swap", "void swap(int *a,int *b){int t=*a; *a=*b; *b=t;}"
+             " int main(){int x=10,y=3; swap(&x,&y); return x;}"),
+]
+
+# Stage 7: arrays and indexed access (ReadRel/SetRel; constant + variable index).
+STAGE7 = [
+    ("arr_const", "int main(){int a[3]; a[0]=7; a[1]=8; return a[0]+a[1];}"),
+    ("arr_var", "int main(){int a[5]; int i=2; a[i]=9; return a[i];}"),
+    ("arr_init", "int main(){int a[3]={1,2,3}; return a[0]+a[1]+a[2];}"),
+    ("char_arr", "int main(){char s[4]; s[0]=72; s[1]=105; s[2]=0;"
+                 " return s[0]+s[1];}"),
+    ("arr_sumsq", "int main(){int a[5]; int s=0,i=0; while(i<5){a[i]=i*i;"
+                  " i=i+1;} i=0; while(i<5){s=s+a[i]; i=i+1;} return s;}"),
+    ("ptr_index", "int sum(int *p,int n){int s=0,i=0; while(i<n){s=s+p[i];"
+                  " i=i+1;} return s;} int main(){int a[4]; a[0]=10;a[1]=20;"
+                  "a[2]=5;a[3]=7; return sum(a,4);}"),
+    ("fib_array", "int fib(int n){int f[20]; f[0]=0; f[1]=1; int i=2;"
+                  " while(i<=n){f[i]=f[i-1]+f[i-2]; i=i+1;} return f[n];}"
+                  " int main(){return fib(10);}"),
+]
+
 
 def _run(cmd):
     p = subprocess.run(cmd, capture_output=True, text=True)
@@ -137,7 +167,7 @@ def main(argv):
             with open(path) as f:
                 progs.append((os.path.basename(path), f.read()))
     else:
-        progs = STAGE2 + STAGE3 + STAGE4
+        progs = STAGE2 + STAGE3 + STAGE4 + STAGE6 + STAGE7
 
     workdir = tempfile.mkdtemp(prefix="arm64diff-")
     counts = {"PASS": 0, "FAIL": 0, "SKIP": 0, "ERROR": 0}
