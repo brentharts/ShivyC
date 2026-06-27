@@ -432,6 +432,13 @@ class ASMGen:
 
     def make_asm(self):
         """Generate ASM code."""
+        # Multi-target dispatch. The x86-64 path below is the original, fully
+        # featured back end. arm64 routes to a separate, minimal lowering so the
+        # x86 path stays byte-for-byte untouched while the aarch64 back end grows
+        # (Stage 2: return an integer literal; later stages add real codegen).
+        if self.asm_code.target.name == "arm64":
+            return self._make_asm_arm64()
+
         global_spotmap = self._get_global_spotmap()
 
         # If anything was packed, declare the memory mirror of the SIMD reg.
@@ -543,6 +550,54 @@ class ASMGen:
                 size = self._near_size + (-self._near_size % 16)  # 16-align
                 self.asm_code.add_comm(self._near_label, size, True)
             self._near_active = False
+
+    def _make_asm_arm64(self):
+        """Minimal AArch64 (arm64) lowering -- Stage 2.
+
+        Walks the same target-neutral IL the x86-64 back end consumes, but emits
+        AArch64. Only the small set of IL commands needed to compile an integer-
+        returning function is handled today; anything else raises a clear error
+        rather than emitting wrong code. Instructions are emitted as Raw lines
+        for now (a real AArch64 register/spot + asm_cmds model arrives with the
+        broader codegen in Stage 3).
+
+        AAPCS64 notes: the integer return value goes in w0/x0; a leaf that needs
+        no stack frame (like `return <literal>`) omits the prologue/epilogue, as
+        gcc -O0 itself does for this shape.
+        """
+        EXTERNAL = self.symbol_table.EXTERNAL
+        DEFINED = self.symbol_table.DEFINED
+        # External, defined functions get a .global directive -- same rule as the
+        # x86 path (see _get_global_spotmap).
+        for v in self.symbol_table.linkages[EXTERNAL].values():
+            if self.symbol_table.def_state.get(v) == DEFINED:
+                self.asm_code.add_global(self.symbol_table.names[v])
+
+        for func in self.il_code.commands:
+            self.asm_code.add(asm_cmds.AsmLabel(func))
+            for cmd in self.il_code.commands[func]:
+                self._lower_arm64(cmd, func)
+
+    def _lower_arm64(self, cmd, func):
+        """Lower a single IL command to AArch64 (Stage 2 subset)."""
+        from shivyc.il_cmds.control import Return
+        if isinstance(cmd, Return):
+            if cmd.arg is not None:
+                lit = getattr(cmd.arg, "literal", None)
+                if lit is None:
+                    raise NotImplementedError(
+                        "arm64 back end (Stage 2) can only return an integer "
+                        "literal so far; '%s' returns a computed value" % func)
+                size = cmd.arg.ctype.size
+                reg = "w0" if size <= 4 else "x0"
+                # `mov <reg>, #imm` -- fine for small immediates like a literal
+                # return; wider immediates need movz/movk and land in Stage 3.
+                self.asm_code.add(asm_cmds.Raw("mov\t%s, %d" % (reg, lit.val)))
+            self.asm_code.add(asm_cmds.Raw("ret"))
+            return
+        raise NotImplementedError(
+            "arm64 back end: IL command '%s' not implemented yet (Stage 2 "
+            "supports integer-literal return only)" % type(cmd).__name__)
 
     def _apply_thread_budget(self, func):
         """Restrict `alloc_registers`/`all_registers` for `func` to its thread
