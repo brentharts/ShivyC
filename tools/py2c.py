@@ -1986,6 +1986,16 @@ def ann_text_to_ctype(text):
             return base
         return None
 
+    # a bare C scalar name (`long`, `double`, `short`, `unsigned`, ...) used
+    # directly as an annotation -- not just inside an array/pointer form. The
+    # top-level `simple`/`dtypes` maps cover int/float/bool/str; route the rest
+    # through `_scalar` so e.g. `age: "long"` / `x: "double"` get a real C type
+    # instead of falling through to a boxed obj.
+    if "[" not in text and not text.endswith("*"):
+        s = _scalar(text)
+        if s:
+            return s
+
     # fixed-size array  T[N] / f32[N] -> pointer to element (count via
     # ann_array_size, used to infer SIMD-divisibility contracts).
     m = re.match(r"^([A-Za-z_][\w ]*?)\s*\[\s*\d+\s*\]$", text)
@@ -3035,6 +3045,98 @@ RUNTIME_API_NAMES = {
 # `def` is skipped and calls are lowered to the runtime function.
 RUNTIME_INTRINSICS = {"_float_to_bits", "arena_mark", "arena_release"}
 
+JSON_PRELUDE = r"""/* ---- rpython typed-json support: a single-pass cursor lexer. Each helper
+   takes a `const char* p` and returns the position after the value it read,
+   writing the parsed value through an out-pointer. Generated per-class decoders
+   (rpy.json.generate_decoder) dispatch keys with strcmp and write struct slots
+   directly -- no dict, no boxing, no Python object_hook callback. ---- */
+static const char* _json_ws(const char* p) {
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    return p;
+}
+static const char* _json_long(const char* p, long* out) {
+    char* e; *out = strtol(p, &e, 10); return e;
+}
+static const char* _json_double(const char* p, double* out) {
+    char* e; *out = strtod(p, &e); return e;
+}
+static const char* _json_bool(const char* p, int* out) {
+    if (*p == 't') { *out = 1; return p + 4; }   /* true  */
+    if (*p == 'f') { *out = 0; return p + 5; }   /* false */
+    if (*p == 'n') { *out = 0; return p + 4; }   /* null  */
+    return p;
+}
+/* decode one JSON escape char (after the backslash); \uXXXX is not decoded in
+   this subset and is passed through as its final char. */
+static char _json_esc(char e) {
+    switch (e) {
+        case 'n': return '\n'; case 't': return '\t'; case 'r': return '\r';
+        case 'b': return '\b'; case 'f': return '\f';
+        default:  return e;   /* '"' '\\' '/' and anything else: literal */
+    }
+}
+/* parse a quoted string, allocating a NUL-terminated C string into *out. */
+static const char* _json_str(const char* p, char** out) {
+    if (*p != '"') { *out = ""; return p; }
+    p++;
+    int len = 0; const char* q = p;
+    while (*q && *q != '"') { if (*q == '\\' && q[1]) q++; len++; q++; }
+    char* buf = (char*)malloc((unsigned long)len + 1);
+    int i = 0;
+    while (*p && *p != '"') {
+        char c = *p;
+        if (c == '\\' && p[1]) { p++; c = _json_esc(*p); }
+        buf[i++] = c; p++;
+    }
+    buf[i] = 0;
+    if (*p == '"') p++;
+    *out = buf;
+    return p;
+}
+/* parse a quoted string into a fixed buffer (used for object keys; no alloc). */
+static const char* _json_key(const char* p, char* buf, int cap) {
+    int i = 0;
+    if (*p != '"') { buf[0] = 0; return p; }
+    p++;
+    while (*p && *p != '"') {
+        char c = *p;
+        if (c == '\\' && p[1]) { p++; c = _json_esc(*p); }
+        if (i < cap - 1) buf[i++] = c;
+        p++;
+    }
+    buf[i] = 0;
+    if (*p == '"') p++;
+    return p;
+}
+static const char* _json_skip_str(const char* p) {
+    p++;
+    while (*p && *p != '"') { if (*p == '\\' && p[1]) p++; p++; }
+    if (*p == '"') p++;
+    return p;
+}
+/* skip any value (used for keys the target struct does not declare). */
+static const char* _json_skip(const char* p) {
+    p = _json_ws(p);
+    if (*p == '"') return _json_skip_str(p);
+    if (*p == '{' || *p == '[') {
+        char open = *p, close = (open == '{') ? '}' : ']';
+        int depth = 1; p++;
+        while (*p && depth) {
+            if (*p == '"') { p = _json_skip_str(p); continue; }
+            if (*p == open) depth++;
+            else if (*p == close) depth--;
+            p++;
+        }
+        return p;
+    }
+    while (*p && *p != ',' && *p != '}' && *p != ']'
+           && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
+    return p;
+}
+"""
+
+
+
 SOCKET_PRELUDE = r"""/* ---- rpython socket support: BSD sockets, fds are opaque int ---- */
 int socket(int, int, int);
 int connect(int, void*, unsigned int);
@@ -3984,6 +4086,9 @@ class Transpiler:
         self._regex_parsed = {}     # id -> parsed pattern struct
         self._ossys_used = False    # os.path/sys shim referenced
         self._struct_used = False    # struct.pack/unpack shim referenced
+        self._json_used = False     # typed-json lexer prelude referenced
+        self._json_decoders = []    # ClassInfos needing a generated decoder
+        self._json_hook_class = {}  # var name -> ClassInfo for a hoisted decoder
         self.import_alias = {}      # alias -> full dotted module name
         self.from_imports = {}      # imported name -> full dotted module name
         self.star_import_mods = []  # modules imported via `from X import *`
@@ -4258,6 +4363,16 @@ class Transpiler:
         self._compute_pod_set(tree)
         self.build_owner_maps()
         self.collect_imports(tree)
+        # json pre-pass: record every `name = rpy.json.generate_decoder(Cls)`
+        # binding up front, so a `json.loads(s, object_hook=name)` emitted before
+        # the binding is processed (or during type inference) already types the
+        # result as Cls* and lowers to the specialized decoder.
+        for _n in ast.walk(tree):
+            if isinstance(_n, ast.Assign) and len(_n.targets) == 1 \
+                    and isinstance(_n.targets[0], ast.Name):
+                _gci = self._decoder_gen_class(_n.value)
+                if _gci is not None:
+                    self._json_hook_class[_n.targets[0].id] = _gci
         # regex pre-pass: intern every static re.compile/search/match pattern
         # up front, so a function body emitted before the module-init (where a
         # module-global `_RE = re.compile(...)` lives) already knows the
@@ -4475,6 +4590,25 @@ class Transpiler:
         if self._struct_used:
             self.lines[self.extern_idx:self.extern_idx] = \
                 STRUCT_PRELUDE.splitlines()
+        if self._json_used:
+            # Generate decoder *definitions* first: a nested class-pointer field
+            # appends its class to _json_decoders during generation, and the
+            # index-based loop picks those up too (transitive closure). Then emit
+            # the lexer prelude + forward declarations (both the cursor `_at`
+            # form and the public wrapper) for every class discovered.
+            tail = []
+            i = 0
+            while i < len(self._json_decoders):
+                tail.extend(self._json_decoder_fn(self._json_decoders[i]))
+                i += 1
+            head = JSON_PRELUDE.splitlines()
+            for ci in self._json_decoders:
+                head.append("static %s* _json_decode_%s_at(const char**);"
+                            % (ci.csym, ci.csym))
+                head.append("static %s* _json_decode_%s(const char*);"
+                            % (ci.csym, ci.csym))
+            self.lines[self.extern_idx:self.extern_idx] = head
+            self.lines.extend(tail)
         if self._regex_ids:
             pre = REGEX_HELPER.splitlines()
             for pid in sorted(self._regex_parsed):
@@ -7216,7 +7350,7 @@ class Transpiler:
 
     def _ctortramp_new_args(self, init):
         """Build a ctor-trampoline argument list with defaults and **kwargs."""
-        pct = [arg_ctype(init, a) for a in init.args.args[1:]]
+        pct = [self.arg_ctype_q(init, a) for a in init.args.args[1:]]
         pos_defs = self.defaults_for(init, True)
         n_pos = len(pct)
         out = []
@@ -7228,7 +7362,8 @@ class Transpiler:
             else:
                 raw = "(pylen(args) > %d ? index_obj(args, %d) : OBJ_NONE)" % (
                     i, i)
-            if ct == "int":
+            if ct in ("int", "long", "short", "char", "unsigned",
+                      "unsigned char", "signed"):
                 raw = "AS_INT(%s)" % raw
             elif ct == "bool":
                 raw = "truthy(%s)" % raw
@@ -8201,6 +8336,17 @@ class Transpiler:
         return False
 
     def assign(self, node, toplevel=False):
+        # `hook = rpy.json.generate_decoder(Cls)` binds a decoder to a name so a
+        # hot loop can reuse it (`json.loads(s, object_hook=hook)`). The decoder
+        # has no runtime existence in compiled code -- the json.loads call is
+        # specialized directly -- so record the name->class mapping and emit
+        # nothing for the binding itself.
+        _gci = self._decoder_gen_class(node.value)
+        if _gci is not None and len(node.targets) == 1 \
+                and isinstance(node.targets[0], ast.Name):
+            self._json_hook_class[node.targets[0].id] = _gci
+            return ["/* %s = json decoder for %s (elided) */"
+                    % (node.targets[0].id, _gci.name)]
         fused = self._try_fused_array_store(node)
         if fused is not None:
             return fused
@@ -8406,6 +8552,9 @@ class Transpiler:
     def value_ctype(self, node):
         """Best-effort C type of an expression, when determinable."""
         if isinstance(node, ast.Call):
+            _jm = self._match_json_decode(node)
+            if _jm is not None:
+                return _jm[0].csym + "*"
             _sym = self.ctypes_call_symbol(node)
             if _sym is not None:
                 return self.ctypes_funcs.get(
@@ -10334,6 +10483,9 @@ class Transpiler:
         sym = self.ctypes_call_symbol(node)
         if sym is not None:
             return self._emit_ctypes_call(node, sym)
+        _jd = self._json_decode_call(node)
+        if _jd is not None:
+            return _jd
         f0 = node.func
         if isinstance(f0, ast.Attribute) and f0.attr in MATH_FUNCS and \
                 isinstance(f0.value, ast.Name) and \
@@ -12724,6 +12876,195 @@ class Transpiler:
                 "for (_i = 1; _i < %s->len; _i++) "
                 "if (%s->data[_i] %s _r) _r = %s->data[_i]; %s(_r); })") % (
             ct, v, expr, elem, v, v, v, cmp, v, box)
+
+    def _decoder_gen_class(self, node):
+        """If `node` is the call `rpy.json.generate_decoder(Cls)` with Cls a
+        known local class, return its ClassInfo; else None."""
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "generate_decoder"
+                and len(node.args) == 1
+                and isinstance(node.args[0], ast.Name)):
+            return None
+        hf = node.func.value           # expect rpy.json
+        if not (isinstance(hf, ast.Attribute) and hf.attr == "json"
+                and isinstance(hf.value, ast.Name)):
+            return None
+        rbase = hf.value.id
+        if not (rbase == "rpy" or self.import_alias.get(rbase) == "rpy"):
+            return None
+        return self.classes.get(node.args[0].id)
+
+    def _resolve_json_hook(self, hook):
+        """ClassInfo for an object_hook argument: either the inline call
+        `rpy.json.generate_decoder(Cls)`, or a Name bound to one earlier
+        (`hook = rpy.json.generate_decoder(Cls)` hoisted out of a loop)."""
+        ci = self._decoder_gen_class(hook)
+        if ci is not None:
+            return ci
+        if isinstance(hook, ast.Name):
+            return self._json_hook_class.get(hook.id)
+        return None
+
+    def _match_json_decode(self, node):
+        """If `node` is `json.loads(EXPR, object_hook=rpy.json.generate_decoder(Cls))`
+        (or the positional 2-arg form, or a hoisted hook variable), return
+        (ClassInfo, src_expr_node); else None. `import rpy` / `import json` are
+        never translated -- only this call shape is recognized, and only the
+        class argument is read."""
+        f = node.func
+        if not (isinstance(f, ast.Attribute) and f.attr == "loads"
+                and isinstance(f.value, ast.Name)):
+            return None
+        base = f.value.id
+        if not (base == "json" or self.import_alias.get(base) == "json"):
+            return None
+        if not node.args:
+            return None
+        hook = None
+        for kw in node.keywords:
+            if kw.arg == "object_hook":
+                hook = kw.value
+        if hook is None and len(node.args) >= 2:
+            hook = node.args[1]
+        if hook is None:
+            return None
+        ci = self._resolve_json_hook(hook)
+        if ci is None:
+            return None
+        return ci, node.args[0]
+
+    def _json_decode_call(self, node):
+        """Lower a recognized typed `json.loads(...)` to a direct call to the
+        generated per-class C decoder, registering the decoder + lexer prelude."""
+        m = self._match_json_decode(node)
+        if m is None:
+            return None
+        ci, src = m
+        self._json_used = True
+        if ci not in self._json_decoders:
+            self._json_decoders.append(ci)
+        return "_json_decode_%s(%s)" % (ci.csym, self.as_str(src))
+
+    _JSON_DEFAULTS = {"char*": '""', "int": "0", "long": "0", "short": "0",
+                      "double": "0.0", "float": "0.0f", "bool": "0",
+                      "char": "0", "obj": "OBJ_NONE"}
+
+    def _json_field_parse(self, ct, slot):
+        """C statements parsing one JSON value at `p` into struct slot `slot`
+        (typed `ct`), advancing `p`. A class-pointer field is decoded inline by
+        the nested class's cursor decoder (which is registered for emission).
+        Unknown/complex types skip the value."""
+        if ct == "char*":
+            return "p = _json_str(p, &%s);" % slot
+        if ct == "long":
+            return "p = _json_long(p, &%s);" % slot
+        if ct in ("int", "short", "char"):
+            return ("{ long _jv; p = _json_long(p, &_jv); %s = (%s)_jv; }"
+                    % (slot, ct))
+        if ct == "double":
+            return "p = _json_double(p, &%s);" % slot
+        if ct == "float":
+            return ("{ double _jv; p = _json_double(p, &_jv); %s = (float)_jv; }"
+                    % slot)
+        if ct == "bool":
+            return "{ int _jv; p = _json_bool(p, &_jv); %s = _jv; }" % slot
+        # nested object: a field typed as a known class pointer is built by that
+        # class's cursor decoder, which advances p past the sub-object.
+        if isinstance(ct, str) and ct.endswith("*"):
+            sub = self.classes.get(ct[:-1]) or self._ci_by_csym(ct[:-1])
+            if sub is not None:
+                if sub not in self._json_decoders:
+                    self._json_decoders.append(sub)
+                return "%s = _json_decode_%s_at(&p);" % (slot, sub.csym)
+        return "p = _json_skip(p);"
+
+    def _json_list_field_parse(self, elem_ct, slot):
+        """C block parsing a JSON array at `p` into a boxed list assigned to
+        `slot` (an obj field). Each element is parsed by its scalar type or, for
+        a class-pointer element, by the nested cursor decoder, then boxed."""
+        if elem_ct in ("double", "float"):
+            one = "double _ev; p = _json_double(p, &_ev); list_append(_l, OBJ_FLOAT(_ev));"
+        elif elem_ct == "char*":
+            one = "char* _ev; p = _json_str(p, &_ev); list_append(_l, OBJ_STR(_ev));"
+        elif elem_ct == "bool":
+            one = "int _ev; p = _json_bool(p, &_ev); list_append(_l, OBJ_BOOL(_ev));"
+        elif elem_ct and elem_ct.endswith("*") and \
+                (self.classes.get(elem_ct[:-1]) or self._ci_by_csym(elem_ct[:-1])):
+            sub = self.classes.get(elem_ct[:-1]) or self._ci_by_csym(elem_ct[:-1])
+            if sub not in self._json_decoders:
+                self._json_decoders.append(sub)
+            one = ("list_append(_l, OBJ_OBJ(_json_decode_%s_at(&p)));" % sub.csym)
+        else:                                  # int/long/short/char
+            one = "long _ev; p = _json_long(p, &_ev); list_append(_l, OBJ_INT(_ev));"
+        return ("obj _l = list_new(); p = _json_ws(p); "
+                "if (*p == '[') { p++; while (1) { p = _json_ws(p); "
+                "if (*p == ']' || !*p) { if (*p == ']') p++; break; } "
+                "{ %s } p = _json_ws(p); "
+                "if (*p == ',') { p++; continue; } "
+                "if (*p == ']') { p++; break; } break; } } "
+                "else { p = _json_skip(p); } %s = _l;" % (one, slot))
+
+    def _json_decoder_fn(self, ci):
+        """Emit the generated decoder for `ci`: a cursor form
+        `<Cls>* _json_decode_<Cls>_at(const char** pp)` that parses one object
+        starting at `*pp` and advances it (so a nested field can decode inline),
+        plus a thin public `<Cls>* _json_decode_<Cls>(const char*)` wrapper."""
+        fields = ci.full_fields()
+        cs = ci.csym
+        out = ["static %s* _json_decode_%s_at(const char** _pp) {" % (cs, cs)]
+        out.append("    %s* o = (%s*)malloc(sizeof *o);" % (cs, cs))
+        if cs not in self._pod_set:
+            out.append("    o->_hdr.type = &%s_type;" % cs)
+        for fn, ft in fields:
+            dflt = self._JSON_DEFAULTS.get(ft, "0")
+            out.append("    o->%s = %s;" % (self.fnsym(fn), dflt))
+        out.append("    const char* p = _json_ws(*_pp);")
+        out.append("    if (*p != '{') { *_pp = p; return o; }")
+        out.append("    p++;")
+        out.append("    while (1) {")
+        out.append("        p = _json_ws(p);")
+        out.append("        if (*p == '}' || !*p) { if (*p == '}') p++; break; }")
+        out.append("        char _k[128];")
+        out.append("        p = _json_key(p, _k, 128);")
+        out.append("        p = _json_ws(p); if (*p == ':') p++; p = _json_ws(p);")
+        # field name -> constructor annotation (to spot `list[...]` fields, whose
+        # struct ctype is the boxed obj and so loses the element type).
+        field_ann = {}
+        _init = ci.methods.get("__init__")
+        if _init is not None:
+            for _a in _init.args.args[1:]:
+                if _a.annotation is not None:
+                    field_ann[_a.arg] = _a.annotation
+        first = True
+        for fn, ft in fields:
+            kw = "if" if first else "else if"
+            first = False
+            slot = "o->%s" % self.fnsym(fn)
+            ann = field_ann.get(fn)
+            elem = ann_elem_ctype(ann) if ann is not None else None
+            if elem is not None:
+                body = self._json_list_field_parse(elem, slot)
+            else:
+                body = self._json_field_parse(ft, slot)
+            out.append('        %s (strcmp(_k, "%s") == 0) { %s }'
+                       % (kw, fn, body))
+        if not first:
+            out.append("        else { p = _json_skip(p); }")
+        else:
+            out.append("        p = _json_skip(p);")
+        out.append("        p = _json_ws(p);")
+        out.append("        if (*p == ',') { p++; continue; }")
+        out.append("        if (*p == '}') { p++; break; }")
+        out.append("        break;")
+        out.append("    }")
+        out.append("    *_pp = p;")
+        out.append("    return o;")
+        out.append("}")
+        out.append("static %s* _json_decode_%s(const char* s) {" % (cs, cs))
+        out.append("    const char* p = s; return _json_decode_%s_at(&p);" % cs)
+        out.append("}")
+        return out
 
     def _typed_list_literal(self, ct, listnode):
         """Build a typed list from a list literal as a statement-expression:
