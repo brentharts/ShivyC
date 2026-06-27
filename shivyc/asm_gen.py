@@ -585,6 +585,7 @@ class ASMGen:
         live-range reuse yet), but it keeps hot values in registers and removes
         the per-operation load/store churn of the earlier memory model."""
         import shivyc.il_cmds.control as control
+        import shivyc.il_cmds.value as value_cmds
         # Pass 1: ordered distinct non-literal values; note whether we call.
         values = []
         seen = {}
@@ -603,26 +604,40 @@ class ASMGen:
                     seen[v] = 1
                     values.append(v)
 
-        # Assign homes: first NUM_REGS values -> x19.., the rest -> spill slots.
+        # A value whose address is taken, or that is an aggregate (too big for a
+        # register), must live in memory so a real address exists / it fits.
+        forced = {}
+        for c in cmds:
+            if isinstance(c, value_cmds.AddrOf) \
+                    and not c.var.ctype.is_function():
+                forced[c.var] = 1
+        for v in values:
+            if v.ctype.is_array() or v.ctype.size > 8:
+                forced[v] = 1
+
+        # Assign homes: register-eligible values (scalar, not address-taken) take
+        # x19.. first; everything else spills to suitably-sized frame slots.
         NUM_REGS = 10                      # x19 .. x28 (callee-saved)
         reg_of = {}
-        slot_of = {}
         nreg = 0
         for v in values:
-            if nreg < NUM_REGS:
+            if v not in forced and v.ctype.size <= 8 and nreg < NUM_REGS:
                 reg_of[v] = 19 + nreg
                 nreg += 1
         # Frame: saved {x29,x30} (16) + saved callee regs (nreg*8) + spills.
-        spill_base = 16 + nreg * 8
-        nspill = 0
+        off = 16 + nreg * 8
+        slot_of = {}
         for v in values:
             if v not in reg_of:
-                slot_of[v] = spill_base + nspill * 8
-                nspill += 1
+                sz = v.ctype.size
+                if sz < 8:
+                    sz = 8
+                sz = sz + (-sz % 8)        # round each slot up to 8 bytes
+                slot_of[v] = off
+                off += sz
         frame = 0
-        if nreg > 0 or nspill > 0 or has_call:
-            raw = spill_base + nspill * 8
-            frame = raw + (-raw % 16)      # 16-byte align
+        if nreg > 0 or len(slot_of) > 0 or has_call:
+            frame = off + (-off % 16)      # 16-byte align
 
         self.asm_code.add(asm_cmds.AsmLabel(func))
         if frame:
@@ -715,6 +730,84 @@ class ASMGen:
             self.asm_code.add(asm_cmds.Raw(
                 "str\t%s, [x29, #%d]" % (src, slot_of[value])))
 
+    def _arm64_wname(self, name):
+        """The 32-bit (w) form of a register name (x12 -> w12); used when an
+        instruction needs the low word of a value (e.g. an sxtw source)."""
+        if name and name[0] == "x":
+            return "w" + name[1:]
+        return name
+
+    def _arm64_pow2_log(self, n):
+        """log2(n) if n is a power of two in 1..16, else -1 (the lsl shift amount
+        for scaling an array index by the element size)."""
+        i = 0
+        v = 1
+        while i <= 4:
+            if v == n:
+                return i
+            v = v * 2
+            i += 1
+        return -1
+
+    def _arm64_ldr_op(self, size, signed):
+        """Load mnemonic for a `size`-byte value (sign- or zero-extending the
+        sub-word forms)."""
+        if size == 1:
+            return "ldrsb" if signed else "ldrb"
+        if size == 2:
+            return "ldrsh" if signed else "ldrh"
+        return "ldr"
+
+    def _arm64_str_op(self, size):
+        """Store mnemonic for a `size`-byte value."""
+        if size == 1:
+            return "strb"
+        if size == 2:
+            return "strh"
+        return "str"
+
+    def _arm64_rel_target(self, base, chunk, count, an, reg_of, slot_of):
+        """Return an AArch64 memory operand `[...]` addressing base + chunk*count
+        (or base + chunk when count is None), emitting any address computation
+        into scratch registers x<an>.. . `base` is either array storage (its
+        address is x29 + slot) or a pointer value."""
+        base_is_mem = base.ctype.is_array()
+        # Constant total offset? (no count -> fixed chunk byte offset; literal
+        # count -> chunk*index).
+        const_off = None
+        if count is None:
+            const_off = chunk
+        else:
+            lit = getattr(count, "literal", None)
+            if lit is not None:
+                const_off = chunk * lit.val
+        if const_off is not None:
+            if base_is_mem:
+                return "[x29, #%d]" % (slot_of[base] + const_off)
+            rb = self._arm64_use(base, an, reg_of, slot_of)
+            if const_off == 0:
+                return "[%s]" % rb
+            return "[%s, #%d]" % (rb, const_off)
+        # Variable index: compute the effective address into x<an>.
+        addr = "x%d" % an
+        if base_is_mem:
+            self.asm_code.add(asm_cmds.Raw(
+                "add\t%s, x29, #%d" % (addr, slot_of[base])))
+        else:
+            self._arm64_into(base, an, reg_of, slot_of)   # pointer value -> x<an>
+        sh = self._arm64_pow2_log(chunk)
+        if sh < 0:
+            raise NotImplementedError(
+                "arm64 back end: variable index with non-power-of-2 element size")
+        ci = self._arm64_use(count, an + 1, reg_of, slot_of)
+        if count.ctype.size <= 4:
+            self.asm_code.add(asm_cmds.Raw(
+                "add\t%s, %s, %s, sxtw #%d" % (addr, addr, ci, sh)))
+        else:
+            self.asm_code.add(asm_cmds.Raw(
+                "add\t%s, %s, %s, lsl #%d" % (addr, addr, ci, sh)))
+        return "[%s]" % addr
+
     def _arm64_cmp_cc(self, cmd, signed):
         """AArch64 condition code (for `cset`) implementing comparison `cmd`."""
         import shivyc.il_cmds.compare as cmp_cmds
@@ -744,13 +837,6 @@ class ASMGen:
             # move/spill it to its home at entry, before any call clobbers x0-x7.
             self._arm64_from(cmd.arg_num, cmd.output, reg_of, slot_of)
             return
-        if isinstance(cmd, value_cmds.AddrOf):
-            name = self.symbol_table.names.get(cmd.var)
-            if name is not None and cmd.var.ctype.is_function():
-                addrof_name[cmd.output] = name
-                return
-            raise NotImplementedError(
-                "arm64 back end: AddrOf of a non-function is not implemented yet")
         if isinstance(cmd, control.Call):
             name = addrof_name.get(cmd.func)
             if name is None:
@@ -766,6 +852,47 @@ class ASMGen:
             self.asm_code.add(asm_cmds.Raw("bl\t%s" % spots.mangle_symbol(name)))
             if not cmd.void_return:
                 self._arm64_from(0, cmd.ret, reg_of, slot_of)  # w0/x0 -> ret home
+            return
+        if isinstance(cmd, value_cmds.AddrOf):
+            name = self.symbol_table.names.get(cmd.var)
+            if name is not None and cmd.var.ctype.is_function():
+                addrof_name[cmd.output] = name
+                return
+            # Address of a local: x29 + its frame slot. The variable was forced
+            # to memory in _arm64_function, so slot_of[var] exists.
+            rd = self._arm64_defreg(cmd.output, 9, reg_of)
+            self.asm_code.add(asm_cmds.Raw(
+                "add\t%s, x29, #%d" % (rd, slot_of[cmd.var])))
+            self._arm64_wb(cmd.output, 9, reg_of, slot_of)
+            return
+        if isinstance(cmd, value_cmds.ReadAt):
+            ra = self._arm64_use(cmd.addr, 9, reg_of, slot_of)
+            rd = self._arm64_defreg(cmd.output, 10, reg_of)
+            self.asm_code.add(asm_cmds.Raw("ldr\t%s, [%s]" % (rd, ra)))
+            self._arm64_wb(cmd.output, 10, reg_of, slot_of)
+            return
+        if isinstance(cmd, value_cmds.SetAt):
+            ra = self._arm64_use(cmd.addr, 9, reg_of, slot_of)
+            rv = self._arm64_use(cmd.val, 10, reg_of, slot_of)
+            self.asm_code.add(asm_cmds.Raw("str\t%s, [%s]" % (rv, ra)))
+            return
+        if isinstance(cmd, value_cmds.ReadRel):
+            # output = *(base + chunk*count)   (array / pointer indexed load)
+            target = self._arm64_rel_target(
+                cmd.base, cmd.chunk, cmd.count, 12, reg_of, slot_of)
+            out = cmd.output
+            rd = self._arm64_defreg(out, 9, reg_of)
+            op = self._arm64_ldr_op(out.ctype.size, out.ctype.signed)
+            self.asm_code.add(asm_cmds.Raw("%s\t%s, %s" % (op, rd, target)))
+            self._arm64_wb(out, 9, reg_of, slot_of)
+            return
+        if isinstance(cmd, value_cmds.SetRel):
+            # *(base + chunk*count) = val   (array / pointer indexed store)
+            target = self._arm64_rel_target(
+                cmd.base, cmd.chunk, cmd.count, 12, reg_of, slot_of)
+            rv = self._arm64_use(cmd.val, 9, reg_of, slot_of)
+            op = self._arm64_str_op(cmd.val.ctype.size)
+            self.asm_code.add(asm_cmds.Raw("%s\t%s, %s" % (op, rv, target)))
             return
         if isinstance(cmd, control.Label):
             self.asm_code.add(asm_cmds.AsmLabel(cmd.label))
@@ -786,21 +913,43 @@ class ASMGen:
             return
         if isinstance(cmd, value_cmds.Set):
             out = cmd.output
+            arg = cmd.arg
             r = reg_of.get(out, -1)
-            lit = getattr(cmd.arg, "literal", None)
+            lit = getattr(arg, "literal", None)
             if lit is not None and r >= 0:
-                # literal straight into the destination register
                 self.asm_code.add(asm_cmds.Raw(
                     "mov\t%s, %d" % (self._arm64_rn(r, out), lit.val)))
                 return
-            src = self._arm64_use(cmd.arg, 9, reg_of, slot_of)
+            src = self._arm64_use(arg, 9, reg_of, slot_of)
+            ds = out.ctype.size
+            ss = arg.ctype.size
+            widen = ds > 4 and ss <= 4    # 32-bit value into a 64-bit dest
             if r >= 0:
-                dst = self._arm64_rn(r, out)
-                if dst != src:
-                    self.asm_code.add(asm_cmds.Raw("mov\t%s, %s" % (dst, src)))
+                if widen:
+                    if arg.ctype.signed:
+                        self.asm_code.add(asm_cmds.Raw(
+                            "sxtw\tx%d, %s" % (r, self._arm64_wname(src))))
+                    else:   # writing the w-form zero-extends into the x-reg
+                        self.asm_code.add(asm_cmds.Raw(
+                            "mov\tw%d, %s" % (r, self._arm64_wname(src))))
+                else:
+                    dst = self._arm64_rn(r, out)
+                    if dst != src:
+                        self.asm_code.add(asm_cmds.Raw(
+                            "mov\t%s, %s" % (dst, src)))
             else:
+                stsrc = src
+                if widen:
+                    if arg.ctype.signed:
+                        self.asm_code.add(asm_cmds.Raw(
+                            "sxtw\tx9, %s" % self._arm64_wname(src)))
+                    else:
+                        self.asm_code.add(asm_cmds.Raw(
+                            "mov\tw9, %s" % self._arm64_wname(src)))
+                    stsrc = self._arm64_rn(9, out)
                 self.asm_code.add(asm_cmds.Raw(
-                    "str\t%s, [x29, #%d]" % (src, slot_of[out])))
+                    "%s\t%s, [x29, #%d]"
+                    % (self._arm64_str_op(ds), stsrc, slot_of[out])))
             return
         if isinstance(cmd, math_cmds.Add) or isinstance(cmd, math_cmds.Subtr) \
                 or isinstance(cmd, math_cmds.Mult):
