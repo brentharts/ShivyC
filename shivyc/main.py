@@ -50,6 +50,7 @@ def _concat_adjacent_strings(tokens):
         i += 1
     return out
 from shivyc.asm_gen import ASMCode, ASMGen
+from shivyc.targets import get_target
 
 
 def main():
@@ -827,7 +828,7 @@ def process_c_file(file, args):
             fn for fn in il_code.commands
             if fn not in addr_taken and _eligible(fn)}
 
-    asm_code = ASMCode()
+    asm_code = ASMCode(get_target(getattr(args, "target", "x86_64")))
     ASMGen(il_code, symbol_table, asm_code, args).make_asm()
 
     # Emit recorded weak aliases as assembler directives.
@@ -884,6 +885,7 @@ class Arguments:
         self.low_mem = False
         self.pointer_compression = False
         self.opt_level = 0
+        self.target = "x86_64"
         self.output_name = None
         self.include_dirs = []
         self.defines = []
@@ -948,6 +950,10 @@ def _parse_args_selfhost(argv):
             i += 1
             if i < n:
                 args.musl_dir = argv[i]
+        elif a == '--target':
+            i += 1
+            if i < n:
+                args.target = argv[i]
         elif a == '--no-cache':
             args.no_cache = True
         elif a == '--no-peephole':
@@ -1081,6 +1087,10 @@ def get_arguments(argv=None):
         parser.add_argument("-O", type=int, default=0,
                             help="optimization level (0-4); 4 needs writable .text",
                             dest="opt_level")
+        # Back-end architecture. x86-64 is the original, fully-supported target;
+        # arm64/aarch64 is the in-progress cross target (see shivyc/targets).
+        parser.add_argument("--target", dest="target", default="x86_64",
+                            help="back-end architecture: x86_64 (default), arm64")
         # Generate binary file with file name
         parser.add_argument(
             "-o",

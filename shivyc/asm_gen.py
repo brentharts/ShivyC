@@ -36,8 +36,13 @@ class ASMCode:
 
     """
 
-    def __init__(self):
+    def __init__(self, target=None):
         """Initialize ASMCode."""
+        from shivyc.targets import get_target
+        # The back-end target (architecture facts: syntax, and later the register
+        # file / calling convention / instruction selection). Defaults to x86-64
+        # so existing call sites and tests are unaffected.
+        self.target = target if target is not None else get_target("x86_64")
         self.lines = []
         self.comm = []
         self.globals = []
@@ -153,7 +158,7 @@ class ASMCode:
         assembling.
 
         """
-        header = ["\t.intel_syntax noprefix"]
+        header = list(self.target.asm_syntax_prologue)
         header += self.comm
         if self.string_literals or self.data:
             header += ["\t.section .data"]
@@ -166,7 +171,7 @@ class ASMCode:
         code = [str(line) for line in self.lines]
 
         footer = ["\t.section\t.note.GNU-stack,\"\",@progbits"]
-        footer += ["\t.att_syntax noprefix", ""]
+        footer += list(self.target.asm_syntax_epilogue) + [""]
 
         return "\n".join(header + code + footer)
 
