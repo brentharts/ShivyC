@@ -39,6 +39,13 @@ RPY_DIR = os.path.join(HERE, "rpython")
 RESULTS_DIR = os.path.join(HERE, "results")
 TOOLS = os.path.join(REPO, "tools")
 
+# Make `tools/` importable for the interpreted backends (CPython, PyPy3) so a
+# benchmark can `import rpy` for the typed-json oracle. The translator never
+# compiles `import rpy` -- it only pattern-matches rpy.json.generate_decoder --
+# so this affects only the interpreted runs, keeping benchmark files clean.
+os.environ["PYTHONPATH"] = (
+    TOOLS + os.pathsep + os.environ.get("PYTHONPATH", "")).rstrip(os.pathsep)
+
 REPS = 5                      # best-of-N for runtime
 DEVNULL = open(os.devnull, "wb")
 
@@ -248,6 +255,9 @@ BENCH_ARGS = {
     "sieve": ["4000000"],
     "matmul": ["95"],
     "binary_trees": ["15"],
+    "stats": ["6000"],
+    "svgplot": ["40000"],
+    "json_decode": ["200000"],
 }
 
 
