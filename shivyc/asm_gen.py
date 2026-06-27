@@ -612,7 +612,8 @@ class ASMGen:
                     and not c.var.ctype.is_function():
                 forced[c.var] = 1
         for v in values:
-            if v.ctype.is_array() or v.ctype.size > 8:
+            if v.ctype.is_array() or v.ctype.is_struct_union() \
+                    or v.ctype.size > 8:
                 forced[v] = 1
 
         # Assign homes: register-eligible values (scalar, not address-taken) take
@@ -771,7 +772,7 @@ class ASMGen:
         (or base + chunk when count is None), emitting any address computation
         into scratch registers x<an>.. . `base` is either array storage (its
         address is x29 + slot) or a pointer value."""
-        base_is_mem = base.ctype.is_array()
+        base_is_mem = base.ctype.is_array() or base.ctype.is_struct_union()
         # Constant total offset? (no count -> fixed chunk byte offset; literal
         # count -> chunk*index).
         const_off = None
@@ -807,6 +808,41 @@ class ASMGen:
             self.asm_code.add(asm_cmds.Raw(
                 "add\t%s, %s, %s, lsl #%d" % (addr, addr, ci, sh)))
         return "[%s]" % addr
+
+    def _arm64_addr_into(self, base, chunk, count, an, reg_of, slot_of):
+        """Compute the effective address base + chunk*count (or base + chunk when
+        count is None) into register x<an>, returning its name. Like
+        _arm64_rel_target but materializing the address (for AddrRel / &a[i])."""
+        addr = "x%d" % an
+        if base.ctype.is_array() or base.ctype.is_struct_union():
+            self.asm_code.add(asm_cmds.Raw(
+                "add\t%s, x29, #%d" % (addr, slot_of[base])))
+        else:
+            self._arm64_into(base, an, reg_of, slot_of)   # pointer value -> addr
+        if count is None:
+            if chunk:
+                self.asm_code.add(asm_cmds.Raw(
+                    "add\t%s, %s, #%d" % (addr, addr, chunk)))
+            return addr
+        lit = getattr(count, "literal", None)
+        if lit is not None:
+            off = chunk * lit.val
+            if off:
+                self.asm_code.add(asm_cmds.Raw(
+                    "add\t%s, %s, #%d" % (addr, addr, off)))
+            return addr
+        sh = self._arm64_pow2_log(chunk)
+        if sh < 0:
+            raise NotImplementedError(
+                "arm64 back end: variable index with non-power-of-2 element size")
+        ci = self._arm64_use(count, an + 1, reg_of, slot_of)
+        if count.ctype.size <= 4:
+            self.asm_code.add(asm_cmds.Raw(
+                "add\t%s, %s, %s, sxtw #%d" % (addr, addr, ci, sh)))
+        else:
+            self.asm_code.add(asm_cmds.Raw(
+                "add\t%s, %s, %s, lsl #%d" % (addr, addr, ci, sh)))
+        return addr
 
     def _arm64_cmp_cc(self, cmd, signed):
         """AArch64 condition code (for `cset`) implementing comparison `cmd`."""
@@ -894,6 +930,12 @@ class ASMGen:
             op = self._arm64_str_op(cmd.val.ctype.size)
             self.asm_code.add(asm_cmds.Raw("%s\t%s, %s" % (op, rv, target)))
             return
+        if isinstance(cmd, value_cmds.AddrRel):
+            # output = &(base + chunk*count)   (e.g. &a[i], &arr[i] for a struct)
+            self._arm64_addr_into(
+                cmd.base, cmd.chunk, cmd.count, 12, reg_of, slot_of)
+            self._arm64_from(12, cmd.output, reg_of, slot_of)
+            return
         if isinstance(cmd, control.Label):
             self.asm_code.add(asm_cmds.AsmLabel(cmd.label))
             return
@@ -914,6 +956,38 @@ class ASMGen:
         if isinstance(cmd, value_cmds.Set):
             out = cmd.output
             arg = cmd.arg
+            # Whole-aggregate copy (struct/array assignment): both operands are
+            # memory-homed; copy size bytes in 8/4/2/1-byte chunks via scratch.
+            if out.ctype.is_struct_union() or out.ctype.is_array():
+                oo = slot_of[out]
+                ao = slot_of[arg]
+                sz = out.ctype.size
+                done = 0
+                while sz - done >= 8:
+                    self.asm_code.add(asm_cmds.Raw(
+                        "ldr\tx9, [x29, #%d]" % (ao + done)))
+                    self.asm_code.add(asm_cmds.Raw(
+                        "str\tx9, [x29, #%d]" % (oo + done)))
+                    done += 8
+                while sz - done >= 4:
+                    self.asm_code.add(asm_cmds.Raw(
+                        "ldr\tw9, [x29, #%d]" % (ao + done)))
+                    self.asm_code.add(asm_cmds.Raw(
+                        "str\tw9, [x29, #%d]" % (oo + done)))
+                    done += 4
+                while sz - done >= 2:
+                    self.asm_code.add(asm_cmds.Raw(
+                        "ldrh\tw9, [x29, #%d]" % (ao + done)))
+                    self.asm_code.add(asm_cmds.Raw(
+                        "strh\tw9, [x29, #%d]" % (oo + done)))
+                    done += 2
+                while sz - done >= 1:
+                    self.asm_code.add(asm_cmds.Raw(
+                        "ldrb\tw9, [x29, #%d]" % (ao + done)))
+                    self.asm_code.add(asm_cmds.Raw(
+                        "strb\tw9, [x29, #%d]" % (oo + done)))
+                    done += 1
+                return
             r = reg_of.get(out, -1)
             lit = getattr(arg, "literal", None)
             if lit is not None and r >= 0:
