@@ -552,52 +552,202 @@ class ASMGen:
             self._near_active = False
 
     def _make_asm_arm64(self):
-        """Minimal AArch64 (arm64) lowering -- Stage 2.
+        """AArch64 (arm64) lowering -- Stage 3.
 
-        Walks the same target-neutral IL the x86-64 back end consumes, but emits
-        AArch64. Only the small set of IL commands needed to compile an integer-
-        returning function is handled today; anything else raises a clear error
-        rather than emitting wrong code. Instructions are emitted as Raw lines
-        for now (a real AArch64 register/spot + asm_cmds model arrives with the
-        broader codegen in Stage 3).
+        Walks the same target-neutral IL the x86-64 back end consumes and emits
+        AArch64 with a simple, correct memory/stack-machine model: every IL value
+        gets a frame slot, and each operation loads its operands into scratch
+        registers (w9/w10), computes, and stores the result back. This is naive
+        -O0-class codegen (no register allocation yet -- that, and a real
+        register/spot model, are a later optimization), but it is enough for
+        locals, add/sub/mul, comparisons, and conditional branches: real `if`
+        and `while`. Unsupported IL commands raise rather than miscompile.
 
-        AAPCS64 notes: the integer return value goes in w0/x0; a leaf that needs
-        no stack frame (like `return <literal>`) omits the prologue/epilogue, as
-        gcc -O0 itself does for this shape.
+        The x86-64 path is untouched; this runs only under `--target arm64`.
         """
         EXTERNAL = self.symbol_table.EXTERNAL
         DEFINED = self.symbol_table.DEFINED
-        # External, defined functions get a .global directive -- same rule as the
-        # x86 path (see _get_global_spotmap).
         for v in self.symbol_table.linkages[EXTERNAL].values():
             if self.symbol_table.def_state.get(v) == DEFINED:
                 self.asm_code.add_global(self.symbol_table.names[v])
-
         for func in self.il_code.commands:
-            self.asm_code.add(asm_cmds.AsmLabel(func))
-            for cmd in self.il_code.commands[func]:
-                self._lower_arm64(cmd, func)
+            self._arm64_function(func, self.il_code.commands[func])
 
-    def _lower_arm64(self, cmd, func):
-        """Lower a single IL command to AArch64 (Stage 2 subset)."""
-        from shivyc.il_cmds.control import Return
-        if isinstance(cmd, Return):
+    def _arm64_function(self, func, cmds):
+        """Assign frame slots, emit prologue, lower each IL command, per func."""
+        # Pass 1: give every written/read non-literal IL value a frame slot.
+        # Slots sit above the saved {x29,x30} pair (offsets 0 and 8), so the
+        # first local is at [x29, #16].
+        slots = {}
+        off = 16
+        for c in cmds:
+            for v in c.inputs():
+                if v is not None and getattr(v, "literal", None) is None \
+                        and v not in slots:
+                    slots[v] = off
+                    off += 8
+            for v in c.outputs():
+                if v is not None and getattr(v, "literal", None) is None \
+                        and v not in slots:
+                    slots[v] = off
+                    off += 8
+        # frame == 0 means a frameless leaf (e.g. `return <literal>`): no slots,
+        # so no prologue/epilogue is needed and we keep the Stage-2 shape.
+        frame = 0
+        if off > 16:
+            frame = off + (-off % 16)   # 16-byte align (incl. saved pair)
+
+        self.asm_code.add(asm_cmds.AsmLabel(func))
+        if frame:
+            # Frame immediate fits stp/ldp's scaled imm7 (<=504) for the small
+            # functions Stage 3 targets; larger frames need an explicit sub sp.
+            self.asm_code.add(asm_cmds.Raw(
+                "stp\tx29, x30, [sp, #-%d]!" % frame))
+            self.asm_code.add(asm_cmds.Raw("mov\tx29, sp"))
+        for c in cmds:
+            self._lower_arm64(c, func, slots, frame)
+
+    def _arm64_wreg(self, value, n):
+        """Scratch register name of the right width for `value` (w<n> for <=4
+        bytes, x<n> otherwise)."""
+        if value is not None and value.ctype.size > 4:
+            return "x%d" % n
+        return "w%d" % n
+
+    def _arm64_load(self, value, n, slots):
+        """Emit a load of `value` into scratch register <n>; return its name.
+        A literal materializes via `mov`; anything else loads from its slot."""
+        reg = self._arm64_wreg(value, n)
+        lit = getattr(value, "literal", None)
+        if lit is not None:
+            self.asm_code.add(asm_cmds.Raw("mov\t%s, %d" % (reg, lit.val)))
+        else:
+            self.asm_code.add(asm_cmds.Raw(
+                "ldr\t%s, [x29, #%d]" % (reg, slots[value])))
+        return reg
+
+    def _arm64_store(self, n, value, slots):
+        """Emit a store of scratch register <n> into `value`'s frame slot."""
+        self.asm_code.add(asm_cmds.Raw(
+            "str\t%s, [x29, #%d]" % (self._arm64_wreg(value, n), slots[value])))
+
+    def _arm64_cmp_cc(self, cmd, signed):
+        """AArch64 condition code (for `cset`) implementing comparison `cmd`."""
+        import shivyc.il_cmds.compare as cmp_cmds
+        if isinstance(cmd, cmp_cmds.EqualCmp):
+            return "eq"
+        if isinstance(cmd, cmp_cmds.NotEqualCmp):
+            return "ne"
+        if isinstance(cmd, cmp_cmds.LessCmp):
+            return "lt" if signed else "lo"
+        if isinstance(cmd, cmp_cmds.GreaterCmp):
+            return "gt" if signed else "hi"
+        if isinstance(cmd, cmp_cmds.LessOrEqCmp):
+            return "le" if signed else "ls"
+        if isinstance(cmd, cmp_cmds.GreaterOrEqCmp):
+            return "ge" if signed else "hs"
+        return "eq"
+
+    def _lower_arm64(self, cmd, func, slots, frame):
+        """Lower a single IL command to AArch64 (Stage 3 subset)."""
+        import shivyc.il_cmds.control as control
+        import shivyc.il_cmds.value as value_cmds
+        import shivyc.il_cmds.math as math_cmds
+        import shivyc.il_cmds.compare as cmp_cmds
+
+        if isinstance(cmd, control.Label):
+            self.asm_code.add(asm_cmds.AsmLabel(cmd.label))
+            return
+        if isinstance(cmd, control.Jump):
+            self.asm_code.add(asm_cmds.Raw(
+                "b\t%s" % spots.mangle_symbol(cmd.label)))
+            return
+        if isinstance(cmd, control.JumpZero):
+            reg = self._arm64_load(cmd.cond, 9, slots)
+            self.asm_code.add(asm_cmds.Raw(
+                "cbz\t%s, %s" % (reg, spots.mangle_symbol(cmd.label))))
+            return
+        if isinstance(cmd, control.JumpNotZero):
+            reg = self._arm64_load(cmd.cond, 9, slots)
+            self.asm_code.add(asm_cmds.Raw(
+                "cbnz\t%s, %s" % (reg, spots.mangle_symbol(cmd.label))))
+            return
+        if isinstance(cmd, value_cmds.Set):
+            self._arm64_load(cmd.arg, 9, slots)
+            # load used `arg`'s width; store using the destination's width so a
+            # narrowing/widening Set still writes the right number of bytes.
+            self.asm_code.add(asm_cmds.Raw(
+                "str\t%s, [x29, #%d]"
+                % (self._arm64_wreg(cmd.output, 9), slots[cmd.output])))
+            return
+        if isinstance(cmd, math_cmds.Add) or isinstance(cmd, math_cmds.Subtr) \
+                or isinstance(cmd, math_cmds.Mult):
+            ins = cmd.inputs()
+            out = cmd.outputs()[0]
+            self._arm64_load(ins[0], 9, slots)
+            self._arm64_load(ins[1], 10, slots)
+            if isinstance(cmd, math_cmds.Add):
+                op = "add"
+            elif isinstance(cmd, math_cmds.Subtr):
+                op = "sub"
+            else:
+                op = "mul"
+            rd = self._arm64_wreg(out, 9)
+            self.asm_code.add(asm_cmds.Raw(
+                "%s\t%s, %s, %s" % (op, rd, self._arm64_wreg(ins[0], 9),
+                                    self._arm64_wreg(ins[1], 10))))
+            self._arm64_store(9, out, slots)
+            return
+        if isinstance(cmd, math_cmds.Div) or isinstance(cmd, math_cmds.Mod):
+            ins = cmd.inputs()
+            out = cmd.outputs()[0]
+            self._arm64_load(ins[0], 9, slots)
+            self._arm64_load(ins[1], 10, slots)
+            ct = out.ctype
+            signed = not (ct.is_pointer() or (ct.is_integral() and not ct.signed))
+            divop = "sdiv" if signed else "udiv"
+            ra = self._arm64_wreg(ins[0], 9)
+            rb = self._arm64_wreg(ins[1], 10)
+            if isinstance(cmd, math_cmds.Div):
+                self.asm_code.add(asm_cmds.Raw(
+                    "%s\t%s, %s, %s" % (divop, self._arm64_wreg(out, 9),
+                                        ra, rb)))
+            else:
+                # mod: q = a / b  (in w11);  r = a - q*b  via msub
+                rq = self._arm64_wreg(out, 11)
+                self.asm_code.add(asm_cmds.Raw(
+                    "%s\t%s, %s, %s" % (divop, rq, ra, rb)))
+                self.asm_code.add(asm_cmds.Raw(
+                    "msub\t%s, %s, %s, %s"
+                    % (self._arm64_wreg(out, 9), rq, rb, ra)))
+            self._arm64_store(9, out, slots)
+            return
+        if isinstance(cmd, cmp_cmds._GeneralCmp):
+            ins = cmd.inputs()
+            out = cmd.outputs()[0]
+            self._arm64_load(ins[0], 9, slots)
+            self._arm64_load(ins[1], 10, slots)
+            self.asm_code.add(asm_cmds.Raw(
+                "cmp\t%s, %s" % (self._arm64_wreg(ins[0], 9),
+                                 self._arm64_wreg(ins[1], 10))))
+            ct = ins[0].ctype
+            signed = not (ct.is_pointer() or (ct.is_integral() and not ct.signed))
+            self.asm_code.add(asm_cmds.Raw(
+                "cset\t%s, %s" % (self._arm64_wreg(out, 9),
+                                  self._arm64_cmp_cc(cmd, signed))))
+            self._arm64_store(9, out, slots)
+            return
+        if isinstance(cmd, control.Return):
             if cmd.arg is not None:
-                lit = getattr(cmd.arg, "literal", None)
-                if lit is None:
-                    raise NotImplementedError(
-                        "arm64 back end (Stage 2) can only return an integer "
-                        "literal so far; '%s' returns a computed value" % func)
-                size = cmd.arg.ctype.size
-                reg = "w0" if size <= 4 else "x0"
-                # `mov <reg>, #imm` -- fine for small immediates like a literal
-                # return; wider immediates need movz/movk and land in Stage 3.
-                self.asm_code.add(asm_cmds.Raw("mov\t%s, %d" % (reg, lit.val)))
+                self._arm64_load(cmd.arg, 0, slots)   # return value -> w0/x0
+            if frame:
+                self.asm_code.add(asm_cmds.Raw(
+                    "ldp\tx29, x30, [sp], #%d" % frame))
             self.asm_code.add(asm_cmds.Raw("ret"))
             return
         raise NotImplementedError(
-            "arm64 back end: IL command '%s' not implemented yet (Stage 2 "
-            "supports integer-literal return only)" % type(cmd).__name__)
+            "arm64 back end: IL command '%s' not implemented yet"
+            % type(cmd).__name__)
 
     def _apply_thread_budget(self, func):
         """Restrict `alloc_registers`/`all_registers` for `func` to its thread
