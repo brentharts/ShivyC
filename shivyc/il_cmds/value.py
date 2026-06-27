@@ -11,6 +11,18 @@ if TYPE_CHECKING:                       # avoids an import cycle at runtime;
     from shivyc.il_gen import ILValue   # the transpiler reads this statically
 
 
+# Private monotonic counter for the single label Set._set_bool needs. We
+# deliberately do NOT use asm_code.get_label() there: get_label() is defined on
+# both il_gen.ILCode and asm_gen.ASMCode, and because this module imports il_gen
+# (for ILValue) the transpiler treats `asm_code.get_label()` as a cross-module
+# virtual call and dispatches it through il_gen's vtable -- a different slot than
+# ASMCode's -- so the self-hosted (native) compiler jumped through a garbage
+# function pointer and crashed on every conversion to _Bool. A module-local
+# counter with its own label prefix is unique, needs no cross-module dispatch,
+# and matches the host behaviour exactly.
+_set_bool_label_count = 0
+
+
 class _ValueCmd(ILCommand):
     """Abstract base class for value commands.
 
@@ -513,7 +525,9 @@ class Set(_ValueCmd):
         else:
             arg_spot = spotmap[self.arg]
 
-        label = asm_code.get_label()
+        global _set_bool_label_count
+        _set_bool_label_count = _set_bool_label_count + 1
+        label = "__shivyc_setbool_%d" % _set_bool_label_count
         output_spot = spotmap[self.output]
 
         zero = LiteralSpot("0")
