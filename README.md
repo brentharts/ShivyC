@@ -31,10 +31,11 @@ On top of standard C, ShivyCX adds:
 - **Bare-metal operation** — freestanding, bootable 64-bit images with an inlined
   mini-OS.
 - **Multiple back ends** — besides x86-64, an AArch64 (ARM64) cross target with a
-  liveness-based linear-scan register allocator, plus an integer-core RISC-V 64
-  target that reuses the same allocator; both validated differentially against the
-  GNU cross toolchains under qemu, and selected with `--target` (see
-  [ARM64.md](ARM64.md)).
+  liveness-based linear-scan register allocator, an integer-core RISC-V 64 target,
+  and the first steps of a Motorola 68000 / **Neo-Geo** target — all reusing the
+  same allocator, all validated differentially against the GNU cross toolchains
+  under qemu, and selected with `--target` (see [ARM64.md](ARM64.md) and
+  [NEOGEO.md](NEOGEO.md)).
 - **A Python→C transpiler** — toward compiling the front end with itself, which
   doubles as **rpython**: a fast, runtime-free Python subset (typed numpy-style
   arrays, auto-contract SIMD, libm, file/socket I/O) that `shivyc.main` compiles
@@ -163,7 +164,7 @@ ELF64 entry, symbol resolution) since this environment has no emulator. See
 
 ---
 
-## Multiple back ends: ARM64 and RISC-V (bare-metal cross targets)
+## Multiple back ends: ARM64, RISC-V, and Neo-Geo (m68k) cross targets
 
 The IL produced by `il_gen` is architecture-neutral; everything below it — the
 register file, the calling convention, instruction selection, and assembler
@@ -181,6 +182,10 @@ aarch64-linux-gnu-gcc -static prog.s -o prog && qemu-aarch64 ./prog
 # RISC-V 64: integer core (locals, arithmetic, control flow, calls, recursion)
 python3 -m shivyc.main prog.c -S -o prog.s --target riscv64
 riscv64-linux-gnu-gcc -static prog.s -o prog && qemu-riscv64 ./prog
+
+# Motorola 68000 / Neo-Geo: integer core (CISC, big-endian, stack-arg calls)
+python3 -m shivyc.main prog.c -S -o prog.s --target m68k
+m68k-linux-gnu-gcc -static prog.s -o prog && qemu-m68k ./prog
 ```
 
 **AArch64** is the more complete target: integer and floating-point arithmetic,
@@ -206,10 +211,25 @@ file, and the lp64 ABI are new. Standing up a working second ISA — locals,
 pressure with spills, and cross-call liveness — therefore took only a lowering
 pass, which is exactly the payoff of doing compiler work at the rpython level.
 
+**Motorola 68000 / Neo-Geo** is the first step toward the console's main CPU
+(the [ngdevkit](https://github.com/dciabrin/ngdevkit) toolchain cross-compiles C
+to m68k). It is the sharpest test of the seam so far, because the 68000 shares
+nothing structural with the RISC back ends: it is CISC and big-endian, has two
+register files (data `d0`-`d7` / address `a0`-`a7`), two-address ALU instructions
+(`dst OP= src`), `.b`/`.w`/`.l` operation sizes, and a fully **stack-based**
+calling convention with no register arguments. Even so, the integer-core back end
+**reuses the same `_il_*` allocator unchanged** — liveness, intervals, and
+linear scan don't care about instruction shape — and only the m68k lowering,
+register file, and `link`/`unlk` frame/ABI are new. It already compiles locals,
+`+ - * / %`, the six comparisons, `if`/`while`, stack-argument calls and
+recursion. See **[NEOGEO.md](NEOGEO.md)** for the architecture notes and the
+roadmap to bare-metal Neo-Geo ROMs.
+
 Differential test harnesses live alongside the compiler:
-[`tools/arm64_difftest.py`](tools/arm64_difftest.py) (130 cases) and
-[`tools/riscv64_difftest.py`](tools/riscv64_difftest.py) (integer-core cases);
-each compiles a corpus both ways and checks the exit codes match under qemu.
+[`tools/arm64_difftest.py`](tools/arm64_difftest.py) (130 cases),
+[`tools/riscv64_difftest.py`](tools/riscv64_difftest.py), and
+[`tools/m68k_difftest.py`](tools/m68k_difftest.py); each compiles a corpus both
+ways and checks the exit codes match under qemu.
 
 ---
 
@@ -244,10 +264,11 @@ whole-program pass in [`pack_args.py`](shivyc/pack_args.py), and loop
 register-promotion of `_Nbit` packed globals is an IL pass in
 [`simd_pack_promote.py`](shivyc/simd_pack_promote.py).
 
-The same IL feeds two cross targets selected with `--target`: an AArch64 back end
-(see [ARM64.md](ARM64.md)) and an integer-core RISC-V 64 back end, which share a
-target-neutral liveness-based linear-scan register allocator (the `_il_*` methods
-in [`asm_gen.py`](shivyc/asm_gen.py)).
+The same IL feeds three cross targets selected with `--target`: an AArch64 back
+end (see [ARM64.md](ARM64.md)), an integer-core RISC-V 64 back end, and the first
+steps of a Motorola 68000 / Neo-Geo back end (see [NEOGEO.md](NEOGEO.md)) — all
+sharing a target-neutral liveness-based linear-scan register allocator (the
+`_il_*` methods in [`asm_gen.py`](shivyc/asm_gen.py)).
 
 #### Whole-program call graph
 The driver can build and print the program-wide call graph
