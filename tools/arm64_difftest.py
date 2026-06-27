@@ -51,6 +51,21 @@ STAGE3 = [
     ("countdown", "int main(){int n=10,c=0; while(n>0){c=c+2; n=n-1;} return c;}"),
 ]
 
+# Stage 4: function calls and recursion (AAPCS64 args in x0-x7).
+STAGE4 = [
+    ("call_add", "int add(int a,int b){return a+b;} int main(){return add(40,2);}"),
+    ("fib10", "int fib(int n){if(n<2)return n; return fib(n-1)+fib(n-2);}"
+              " int main(){return fib(10);}"),
+    ("fact5", "int fact(int n){if(n<=1)return 1; return n*fact(n-1);}"
+              " int main(){return fact(5);}"),
+    ("nested_calls", "int sq(int x){return x*x;} int add3(int a,int b,int c)"
+                     "{return a+b+c;} int main(){return add3(sq(3),sq(4),0);}"),
+    ("five_args", "int g(int a,int b,int c,int d,int e){return a+b+c+d+e;}"
+                  " int main(){return g(1,2,3,4,5);}"),
+    ("eight_args", "int h(int a,int b,int c,int d,int e,int f,int g,int i)"
+                   "{return a+b+c+d+e+f+g+i;} int main(){return h(1,2,3,4,5,6,7,8);}"),
+]
+
 
 def _run(cmd):
     p = subprocess.run(cmd, capture_output=True, text=True)
@@ -119,7 +134,7 @@ def main(argv):
             with open(path) as f:
                 progs.append((os.path.basename(path), f.read()))
     else:
-        progs = STAGE2 + STAGE3
+        progs = STAGE2 + STAGE3 + STAGE4
 
     workdir = tempfile.mkdtemp(prefix="arm64diff-")
     counts = {"PASS": 0, "FAIL": 0, "SKIP": 0, "ERROR": 0}
