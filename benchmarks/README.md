@@ -8,6 +8,65 @@ feature is therefore **feature-ON vs feature-OFF on the same compiler** (codegen
 quality held constant, only the feature varies), with gcc -O0 shown alongside as
 the "ordinary unoptimizing C compiler" reference.
 
+---
+
+# rpython cross-runtime benchmarks (CPython / PyPy3 / py2c+gcc / self-hosted)
+
+A second, independent axis lives in `benchmarks/rpython/`. Each program there is
+a single **pure-Python** file that is run by four backends, which must all agree
+on the program's exit code:
+
+| Backend | How the same `.py` is executed |
+|---|---|
+| **CPython** | run directly under `python3` |
+| **PyPy3** | run directly under the PyPy3 JIT (skipped if PyPy3 is absent) |
+| **py2c+gcc** | transpiled to C by `tools/py2c.py`, compiled with `gcc -O2` |
+| **self-hosted** | the *same* transpiled C, compiled by `shivyc_native` — the ShivyCX compiler built from its own sources |
+
+The self-hosted column is the point of the exercise: ShivyCX compiling the C
+that its own `.py`→C translator produced. For every backend the harness records
+**runtime** (best of 5), **peak memory** (exact `ru_maxrss` via a ~1.5 MB C
+probe, so the harness's own footprint never inflates it), and, for the two
+compiled backends, **compile time** (the C-compiler step on the py2c output).
+
+```sh
+make benchmarks_rpython      # run the harness -> results/rpython_results.json
+make benchmarks_report       # harness + matplotlib figures + tools/benchmarks.tex -> PDF
+# or directly:
+python3 benchmarks/run_rpython_benchmarks.py
+python3 benchmarks/plot_rpython.py [out_dir]
+```
+
+The harness builds `shivyc_native` once (cached in
+`benchmarks/build_native_bench/`) or reuses one supplied via `$SHIVYC_NATIVE`
+(headers via `$SHIVYC_NATIVE_INC`). Figures and the report land in
+`$BENCH_PLOT_DIR` (default `/tmp/shivyc_benchmarks`); the report needs
+`pdflatex` (the figures are still produced without it).
+
+### Results at a glance (this machine; best-of-5, machine-dependent)
+
+Runtime in seconds, with peak RSS; compile is the C-compiler step:
+
+| Benchmark (stress) | CPython | PyPy3 | py2c+gcc | self-hosted | gcc / self compile |
+|---|---|---|---|---|---|
+| `fib` (recursion) | 0.306 s | 0.116 s | 0.005 s | 0.016 s | 1.0 / 3.3 s |
+| `mandelbrot` (float loops) | 0.103 s | 0.043 s | 0.005 s | 0.012 s | 1.0 / 3.3 s |
+| `binary_trees` (alloc) | 0.754 s | 0.386 s | 0.073 s | 0.071 s | 1.0 / 3.4 s |
+| `matmul` (boxed nested lists) | 0.061 s | 0.041 s | 0.014 s | 0.112 s | 1.0 / 3.4 s |
+| `sieve` (boxed bool list) | 1.22 s | 0.34 s | 0.317 s | 1.61 s | 1.0 / 3.4 s |
+
+Reported honestly: the self-hosted compiler beats **both interpreters** on the
+compute-bound, allocation-light programs (`fib`, `mandelbrot`, `binary_trees`)
+and trails them on the two benchmarks dominated by boxed-list element access
+(`matmul`, `sieve`), where its unoptimized `-O0`-class codegen pays full price
+per access. Compile time is a steady ~3.3 s vs gcc's ~1.0 s on the same input.
+
+These programs are deliberately math-library-free (no `math.sqrt` etc.) because
+that path currently mis-transpiles; they use only integers, floats, lists,
+classes, recursion, and loops — the subset the compiler's own sources rely on.
+
+---
+
 ## Running
 
 ```sh
@@ -172,6 +231,9 @@ report shows the Python-to-C-with-contracts translation directly.
 benchmarks/
   run_benchmarks.py                       harness (compile, correctness, timing, static metrics)
   plot_results.py                         renders results/benchmarks.png + benchmarks2.png
+  run_rpython_benchmarks.py               cross-runtime harness (CPython/PyPy3/gcc/self-hosted)
+  plot_rpython.py                         renders per-benchmark + summary figures, report_body.tex
+  rpython/fib.py mandelbrot.py sieve.py   pure-Python benchmarks (also matmul.py, binary_trees.py)
   nbit_globals/bench_nbit.c               hot handler reading five _Nbit flags
   contracts/bench_contracts.c             contract-bearing reduction (+ _baseline.c)
   stackless/bench_stackless.c             nested wrapper call chain
@@ -180,9 +242,14 @@ benchmarks/
   threads/bench_threads.c                 disjoint left/right worker threads
   (memory safety uses examples/memory/*.c in the repo root)
   results/results.json                    raw measurements
+  results/rpython_results.json            raw cross-runtime measurements
   results/benchmarks.png                  runtime chart (4 features)
   results/benchmarks2.png                 capability chart (member-elim, threads, mem-safety)
 ```
+
+The cross-runtime report shell is `tools/benchmarks.tex` (typeset by
+`make benchmarks_report`); its data-driven body, `report_body.tex`, is
+regenerated next to the figures on every run.
 
 ## Third peer: CCC
 
