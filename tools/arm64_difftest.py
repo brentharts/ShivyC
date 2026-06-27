@@ -99,6 +99,25 @@ STAGE7 = [
                   " int main(){return fib(10);}"),
 ]
 
+# Stage 8: structs (member access, pointer-to-struct, whole-struct copy,
+# arrays of structs).
+STAGE8 = [
+    ("struct_basic", "struct P{int x;int y;}; int main(){struct P p; p.x=3;"
+                     " p.y=4; return p.x+p.y;}"),
+    ("struct_ptr", "struct P{int x;int y;}; int d(struct P *p){return p->x+p->y;}"
+                   " int main(){struct P p; p.x=30; p.y=12; return d(&p);}"),
+    ("struct_copy", "struct R{int a;int b;int c;}; int main(){struct R r;"
+                    " r.a=1;r.b=2;r.c=3; struct R s; s=r; return s.a+s.b+s.c;}"),
+    ("struct_pad", "struct P{char a; int b;}; int main(){struct P p; p.a=5;"
+                   " p.b=37; return p.a+p.b;}"),
+    ("array_of_struct", "struct Pt{int x;int y;}; int main(){struct Pt a[3];"
+                        " a[0].x=1; a[1].x=10; a[2].x=100;"
+                        " return a[0].x+a[1].x+a[2].x;}"),
+    ("struct_loop", "struct Pt{int x;int y;}; int main(){struct Pt a[4]; int i=0;"
+                    " while(i<4){a[i].x=i; a[i].y=i*2; i=i+1;} int s=0; i=0;"
+                    " while(i<4){s=s+a[i].x+a[i].y; i=i+1;} return s;}"),
+]
+
 
 def _run(cmd):
     p = subprocess.run(cmd, capture_output=True, text=True)
@@ -167,7 +186,7 @@ def main(argv):
             with open(path) as f:
                 progs.append((os.path.basename(path), f.read()))
     else:
-        progs = STAGE2 + STAGE3 + STAGE4 + STAGE6 + STAGE7
+        progs = STAGE2 + STAGE3 + STAGE4 + STAGE6 + STAGE7 + STAGE8
 
     workdir = tempfile.mkdtemp(prefix="arm64diff-")
     counts = {"PASS": 0, "FAIL": 0, "SKIP": 0, "ERROR": 0}
