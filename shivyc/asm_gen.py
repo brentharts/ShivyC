@@ -575,6 +575,11 @@ class ASMGen:
         self._arm64_glob = {}
         self._arm64_gemit = {}
         self._arm64_gaddr = {}
+        self._arm64_freg = {}
+        self._arm64_nfreg = 0
+        self._arm64_fpbase = 16
+        self._arm64_fltlit = {}
+        self._arm64_fltlit_n = 0
         for func in self.il_code.commands:
             self._arm64_function(func, self.il_code.commands[func])
 
@@ -672,6 +677,23 @@ class ASMGen:
                 if v is not None:
                     defcount[v] = defcount.get(v, 0) + 1
 
+        # AAPCS64 splits parameters into separate integer (x0-x7) and FP (v0-v7)
+        # sequences; map each LoadArg's positional arg_num to its register index
+        # within the right file. (Walks LoadArgs in order; correct when params
+        # are dense, i.e. no unused param before a used one of the other class.)
+        self._arm64_arggp = {}
+        self._arm64_argfp = {}
+        agp = 0
+        afp = 0
+        for c in cmds:
+            if isinstance(c, value_cmds.LoadArg):
+                if c.output.ctype.is_floating():
+                    self._arm64_argfp[c.arg_num] = afp
+                    afp += 1
+                else:
+                    self._arm64_arggp[c.arg_num] = agp
+                    agp += 1
+
         # Copy coalescing: a `Set(out, tmp)` whose source is a single-use, single-
         # def temporary can share `out`'s home, so the defining op writes `out`
         # directly and the copy disappears. Recorded now; honored in allocation.
@@ -688,7 +710,9 @@ class ASMGen:
                         and arg not in glob and out not in glob \
                         and not out.ctype.is_struct_union() \
                         and not out.ctype.is_array() \
-                        and out.ctype.size <= 8:
+                        and out.ctype.size <= 8 \
+                        and out.ctype.size == arg.ctype.size \
+                        and out.ctype.is_floating() == arg.ctype.is_floating():
                     coalesce[arg] = out
 
         # Compare+branch fusion: a comparison whose result feeds only the next
@@ -702,7 +726,9 @@ class ASMGen:
             c = cmds[idx]
             if isinstance(c, cmp_cmds._GeneralCmp) and idx + 1 < n:
                 out = c.outputs()[0]
-                if usecount.get(out, 0) == 1:
+                cins = c.inputs()
+                if usecount.get(out, 0) == 1 \
+                        and not cins[0].ctype.is_floating():
                     nxt = cmds[idx + 1]
                     if isinstance(nxt, control.JumpZero) and nxt.cond is out:
                         self._arm64_fuse[idx] = (nxt.label, False)
@@ -731,9 +757,21 @@ class ASMGen:
                 nreg += 1
         for v in values:
             if v not in coalesce and v not in fused_out and v not in forced \
-                    and v not in glob and v.ctype.size <= 8 and nreg < NUM_REGS:
+                    and v not in glob and not v.ctype.is_floating() \
+                    and v.ctype.size <= 8 and nreg < NUM_REGS:
                 reg_of[v] = 19 + nreg
                 nreg += 1
+        # Floating-point values use a parallel file: callee-saved d8..d15 as
+        # homes, float spill slots otherwise. (Scratch is v16/v17, args v0..v7.)
+        FP_NUM_REGS = 8                    # d8 .. d15 (callee-saved)
+        freg_of = {}
+        nfreg = 0
+        for v in values:
+            if v.ctype.is_floating() and v not in forced and v not in glob \
+                    and nfreg < FP_NUM_REGS:
+                freg_of[v] = 8 + nfreg
+                nfreg += 1
+        self._arm64_freg = freg_of
         # A coalesced temp inherits its target's register (only if the target got
         # one); otherwise the coalescing is dropped and the copy stays.
         coalesced = {}
@@ -746,11 +784,16 @@ class ASMGen:
             c = cmds[idx]
             if isinstance(c, value_cmds.Set) and c.arg in coalesced:
                 skip[idx] = 1
-        # Frame: saved {x29,x30} (16) + saved callee regs (nreg*8) + spills.
-        off = 16 + nreg * 8
+        # Frame: saved {x29,x30} (16) + int callee regs (nreg*8) + fp callee regs
+        # (nfreg*8) + spills.
+        fpbase = 16 + nreg * 8
+        self._arm64_fpbase = fpbase
+        self._arm64_nfreg = nfreg
+        off = fpbase + nfreg * 8
         slot_of = {}
         for v in values:
-            if v not in reg_of and v not in glob and v not in fused_out:
+            if v not in reg_of and v not in freg_of and v not in glob \
+                    and v not in fused_out:
                 sz = v.ctype.size
                 if sz < 8:
                     sz = 8
@@ -758,7 +801,7 @@ class ASMGen:
                 slot_of[v] = off
                 off += sz
         frame = 0
-        if nreg > 0 or len(slot_of) > 0 or has_call:
+        if nreg > 0 or nfreg > 0 or len(slot_of) > 0 or has_call:
             frame = off + (-off % 16)      # 16-byte align
 
         self.asm_code.add(asm_cmds.AsmLabel(func))
@@ -769,6 +812,9 @@ class ASMGen:
             for i in range(nreg):
                 self.asm_code.add(asm_cmds.Raw(
                     "str\tx%d, [x29, #%d]" % (19 + i, 16 + i * 8)))
+            for i in range(nfreg):
+                self.asm_code.add(asm_cmds.Raw(
+                    "str\td%d, [x29, #%d]" % (8 + i, fpbase + i * 8)))
         # Load cached global addresses once (their registers are callee-saved
         # above, so they survive calls and every access just uses [xR]).
         for v in values:
@@ -790,10 +836,104 @@ class ASMGen:
         for i in range(nreg):
             self.asm_code.add(asm_cmds.Raw(
                 "ldr\tx%d, [x29, #%d]" % (19 + i, 16 + i * 8)))
+        for i in range(self._arm64_nfreg):
+            self.asm_code.add(asm_cmds.Raw(
+                "ldr\td%d, [x29, #%d]" % (8 + i, self._arm64_fpbase + i * 8)))
         if frame:
             self.asm_code.add(asm_cmds.Raw(
                 "ldp\tx29, x30, [sp], #%d" % frame))
         self.asm_code.add(asm_cmds.Raw("ret"))
+
+    def _arm64_frn(self, regnum, value):
+        """FP register name of the right width for `value` (s<n> for 4-byte
+        float, d<n> for 8-byte double)."""
+        if value is not None and value.ctype.size == 4:
+            return "s%d" % regnum
+        return "d%d" % regnum
+
+    def _arm64_float_label(self, value):
+        """Emit the data for float literal `value` once and return its label."""
+        name = self._arm64_fltlit.get(value)
+        if name is not None:
+            return name
+        import struct
+        val = self.il_code.float_literals[value]
+        name = "__a64flt%d" % self._arm64_fltlit_n
+        if value.ctype.size == 4:
+            bits = struct.unpack("<I", struct.pack("<f", val))[0]
+            self.asm_code.add_data(name, 4, bits)
+        else:
+            bits = struct.unpack("<Q", struct.pack("<d", val))[0]
+            self.asm_code.add_data(name, 8, bits)
+        self._arm64_fltlit_n += 1
+        self._arm64_fltlit[value] = name
+        return name
+
+    def _arm64_fload_lit(self, value, fn):
+        """Load float literal `value` into FP register number <fn>. Uses
+        adrp/add to form the address so the `ldr` needs no `:lo12:` relocation
+        (which would require the literal to be naturally aligned)."""
+        name = self._arm64_float_label(value)
+        self.asm_code.add(asm_cmds.Raw("adrp\tx9, %s" % name))
+        self.asm_code.add(asm_cmds.Raw("add\tx9, x9, :lo12:%s" % name))
+        self.asm_code.add(asm_cmds.Raw(
+            "ldr\t%s, [x9]" % self._arm64_frn(fn, value)))
+
+    def _arm64_floatuse(self, value, scratch, slot_of):
+        """Return an FP register name holding float `value`: its home (no code),
+        a load from its slot/global, or a loaded literal -> v<scratch>."""
+        if value in self.il_code.float_literals:
+            self._arm64_fload_lit(value, scratch)
+            return self._arm64_frn(scratch, value)
+        r = self._arm64_freg.get(value, -1)
+        if r >= 0:
+            return self._arm64_frn(r, value)
+        target = self._arm64_mem_addr(value, 9, slot_of)
+        name = self._arm64_frn(scratch, value)
+        self.asm_code.add(asm_cmds.Raw("ldr\t%s, %s" % (name, target)))
+        return name
+
+    def _arm64_fdefreg(self, value, scratch):
+        """FP register to write float `value` into: home, else v<scratch>."""
+        r = self._arm64_freg.get(value, -1)
+        if r >= 0:
+            return self._arm64_frn(r, value)
+        return self._arm64_frn(scratch, value)
+
+    def _arm64_fwb(self, value, scratch, slot_of):
+        """Store FP scratch back to float `value`'s slot/global, if not a home."""
+        if self._arm64_freg.get(value, -1) < 0:
+            target = self._arm64_mem_addr(value, 15, slot_of)
+            self.asm_code.add(asm_cmds.Raw(
+                "str\t%s, %s" % (self._arm64_frn(scratch, value), target)))
+
+    def _arm64_finto(self, value, n, slot_of):
+        """Force float `value` into FP register number <n> (call args/return)."""
+        name = self._arm64_frn(n, value)
+        if value in self.il_code.float_literals:
+            self._arm64_fload_lit(value, n)
+            return
+        r = self._arm64_freg.get(value, -1)
+        if r >= 0:
+            src = self._arm64_frn(r, value)
+            if src != name:
+                self.asm_code.add(asm_cmds.Raw("fmov\t%s, %s" % (name, src)))
+            return
+        target = self._arm64_mem_addr(value, 9, slot_of)
+        self.asm_code.add(asm_cmds.Raw("ldr\t%s, %s" % (name, target)))
+
+    def _arm64_ffrom(self, n, value, slot_of):
+        """Store FP register number <n> into float `value`'s home/slot/global
+        (LoadArg / call return value)."""
+        src = self._arm64_frn(n, value)
+        r = self._arm64_freg.get(value, -1)
+        if r >= 0:
+            dst = self._arm64_frn(r, value)
+            if dst != src:
+                self.asm_code.add(asm_cmds.Raw("fmov\t%s, %s" % (dst, src)))
+        else:
+            target = self._arm64_mem_addr(value, 15, slot_of)
+            self.asm_code.add(asm_cmds.Raw("str\t%s, %s" % (src, target)))
 
     def _arm64_rn(self, regnum, value):
         """Register name of the right width for `value` (w<n> for <=4 bytes,
@@ -1095,6 +1235,24 @@ class ASMGen:
                  "hi": "ls", "ls": "hi"}
         return pairs[cc]
 
+    def _arm64_fcmp_cc(self, cmd):
+        """AArch64 condition code after `fcmp` for floating comparison `cmd`
+        (ordered; unordered/NaN compares false)."""
+        import shivyc.il_cmds.compare as cmp_cmds
+        if isinstance(cmd, cmp_cmds.EqualCmp):
+            return "eq"
+        if isinstance(cmd, cmp_cmds.NotEqualCmp):
+            return "ne"
+        if isinstance(cmd, cmp_cmds.LessCmp):
+            return "mi"
+        if isinstance(cmd, cmp_cmds.GreaterCmp):
+            return "gt"
+        if isinstance(cmd, cmp_cmds.LessOrEqCmp):
+            return "ls"
+        if isinstance(cmd, cmp_cmds.GreaterOrEqCmp):
+            return "ge"
+        return "eq"
+
     def _arm64_cmp_cc(self, cmd, signed):
         """AArch64 condition code (for `cset`) implementing comparison `cmd`."""
         import shivyc.il_cmds.compare as cmp_cmds
@@ -1121,9 +1279,14 @@ class ASMGen:
         import shivyc.il_cmds.compare as cmp_cmds
 
         if isinstance(cmd, value_cmds.LoadArg):
-            # The arg_num-th integer parameter arrives in w/x<arg_num> (AAPCS64);
-            # move/spill it to its home at entry, before any call clobbers x0-x7.
-            self._arm64_from(cmd.arg_num, cmd.output, reg_of, slot_of)
+            # Parameter arrives in its AAPCS64 register (x<gp> for integers,
+            # v<fp> for floats); move/spill it to its home before any call.
+            if cmd.output.ctype.is_floating():
+                self._arm64_ffrom(
+                    self._arm64_argfp[cmd.arg_num], cmd.output, slot_of)
+            else:
+                self._arm64_from(
+                    self._arm64_arggp[cmd.arg_num], cmd.output, reg_of, slot_of)
             return
         if isinstance(cmd, control.Call):
             name = addrof_name.get(cmd.func)
@@ -1133,13 +1296,21 @@ class ASMGen:
             if len(cmd.args) > 8:
                 raise NotImplementedError(
                     "arm64 back end: >8 arguments (stack args) not implemented")
-            i = 0
+            gp = 0
+            fp = 0
             for a in cmd.args:
-                self._arm64_into(a, i, reg_of, slot_of)   # arg -> w/x<i>
-                i += 1
+                if a.ctype.is_floating():
+                    self._arm64_finto(a, fp, slot_of)        # arg -> v<fp>
+                    fp += 1
+                else:
+                    self._arm64_into(a, gp, reg_of, slot_of)  # arg -> w/x<gp>
+                    gp += 1
             self.asm_code.add(asm_cmds.Raw("bl\t%s" % spots.mangle_symbol(name)))
             if not cmd.void_return:
-                self._arm64_from(0, cmd.ret, reg_of, slot_of)  # w0/x0 -> ret home
+                if cmd.ret.ctype.is_floating():
+                    self._arm64_ffrom(0, cmd.ret, slot_of)    # s0/d0 -> ret home
+                else:
+                    self._arm64_from(0, cmd.ret, reg_of, slot_of)  # w0/x0 -> ret
             return
         if isinstance(cmd, value_cmds.AddrOf):
             name = self.symbol_table.names.get(cmd.var)
@@ -1170,12 +1341,21 @@ class ASMGen:
             return
         if isinstance(cmd, value_cmds.ReadAt):
             ra = self._arm64_use(cmd.addr, 9, reg_of, slot_of)
+            if cmd.output.ctype.is_floating():
+                rd = self._arm64_fdefreg(cmd.output, 16)
+                self.asm_code.add(asm_cmds.Raw("ldr\t%s, [%s]" % (rd, ra)))
+                self._arm64_fwb(cmd.output, 16, slot_of)
+                return
             rd = self._arm64_defreg(cmd.output, 10, reg_of)
             self.asm_code.add(asm_cmds.Raw("ldr\t%s, [%s]" % (rd, ra)))
             self._arm64_wb(cmd.output, 10, reg_of, slot_of)
             return
         if isinstance(cmd, value_cmds.SetAt):
             ra = self._arm64_use(cmd.addr, 9, reg_of, slot_of)
+            if cmd.val.ctype.is_floating():
+                rv = self._arm64_floatuse(cmd.val, 16, slot_of)
+                self.asm_code.add(asm_cmds.Raw("str\t%s, [%s]" % (rv, ra)))
+                return
             rv = self._arm64_use(cmd.val, 10, reg_of, slot_of)
             self.asm_code.add(asm_cmds.Raw("str\t%s, [%s]" % (rv, ra)))
             return
@@ -1184,6 +1364,11 @@ class ASMGen:
             target = self._arm64_rel_target(
                 cmd.base, cmd.chunk, cmd.count, 12, reg_of, slot_of)
             out = cmd.output
+            if out.ctype.is_floating():
+                rd = self._arm64_fdefreg(out, 16)
+                self.asm_code.add(asm_cmds.Raw("ldr\t%s, %s" % (rd, target)))
+                self._arm64_fwb(out, 16, slot_of)
+                return
             rd = self._arm64_defreg(out, 9, reg_of)
             op = self._arm64_ldr_op(out.ctype.size, self._arm64_signed(out))
             self.asm_code.add(asm_cmds.Raw("%s\t%s, %s" % (op, rd, target)))
@@ -1193,6 +1378,10 @@ class ASMGen:
             # *(base + chunk*count) = val   (array / pointer indexed store)
             target = self._arm64_rel_target(
                 cmd.base, cmd.chunk, cmd.count, 12, reg_of, slot_of)
+            if cmd.val.ctype.is_floating():
+                rv = self._arm64_floatuse(cmd.val, 16, slot_of)
+                self.asm_code.add(asm_cmds.Raw("str\t%s, %s" % (rv, target)))
+                return
             rv = self._arm64_use(cmd.val, 9, reg_of, slot_of)
             op = self._arm64_str_op(cmd.val.ctype.size)
             self.asm_code.add(asm_cmds.Raw("%s\t%s, %s" % (op, rv, target)))
@@ -1223,6 +1412,44 @@ class ASMGen:
         if isinstance(cmd, value_cmds.Set):
             out = cmd.output
             arg = cmd.arg
+            # Floating point: float<->float moves/casts and int<->float
+            # conversions all live here.
+            of = out.ctype.is_floating()
+            af = arg.ctype.is_floating()
+            if of or af:
+                if of and af:
+                    if out.ctype.size == arg.ctype.size:
+                        src = self._arm64_floatuse(arg, 16, slot_of)
+                        rd = self._arm64_fdefreg(out, 16)
+                        if rd != src:
+                            self.asm_code.add(asm_cmds.Raw(
+                                "fmov\t%s, %s" % (rd, src)))
+                        self._arm64_fwb(out, 16, slot_of)
+                    else:                       # float <-> double conversion
+                        src = self._arm64_floatuse(arg, 16, slot_of)
+                        rd = self._arm64_fdefreg(out, 16)
+                        self.asm_code.add(asm_cmds.Raw(
+                            "fcvt\t%s, %s" % (rd, src)))
+                        self._arm64_fwb(out, 16, slot_of)
+                elif of:                        # integer -> float
+                    ra = self._arm64_use(arg, 9, reg_of, slot_of)
+                    rd = self._arm64_fdefreg(out, 16)
+                    sg = not (arg.ctype.is_pointer()
+                              or (arg.ctype.is_integral() and not arg.ctype.signed))
+                    op = "scvtf" if sg else "ucvtf"
+                    self.asm_code.add(asm_cmds.Raw(
+                        "%s\t%s, %s" % (op, rd, ra)))
+                    self._arm64_fwb(out, 16, slot_of)
+                else:                           # float -> integer (truncating)
+                    fa = self._arm64_floatuse(arg, 16, slot_of)
+                    rd = self._arm64_defreg(out, 9, reg_of)
+                    sg = not (out.ctype.is_pointer()
+                              or (out.ctype.is_integral() and not out.ctype.signed))
+                    op = "fcvtzs" if sg else "fcvtzu"
+                    self.asm_code.add(asm_cmds.Raw(
+                        "%s\t%s, %s" % (op, rd, fa)))
+                    self._arm64_wb(out, 9, reg_of, slot_of)
+                return
             # Whole-aggregate copy (struct/array assignment): both operands are
             # memory-homed; copy size bytes in 8/4/2/1-byte chunks via scratch.
             if out.ctype.is_struct_union() or out.ctype.is_array():
@@ -1279,9 +1506,12 @@ class ASMGen:
                             "mov\tw%d, %s" % (r, self._arm64_wname(src))))
                 else:
                     dst = self._arm64_rn(r, out)
-                    if dst != src:
+                    src2 = src
+                    if ds <= 4:           # narrowing/same: match dest's w width
+                        src2 = self._arm64_wname(src)
+                    if dst != src2:
                         self.asm_code.add(asm_cmds.Raw(
-                            "mov\t%s, %s" % (dst, src)))
+                            "mov\t%s, %s" % (dst, src2)))
             else:
                 stsrc = src
                 if widen:
@@ -1292,6 +1522,8 @@ class ASMGen:
                         self.asm_code.add(asm_cmds.Raw(
                             "mov\tw9, %s" % self._arm64_wname(src)))
                     stsrc = self._arm64_rn(9, out)
+                elif ds <= 4:             # store the low word for a narrow dest
+                    stsrc = self._arm64_wname(src)
                 target = self._arm64_mem_addr(out, 15, slot_of)
                 self.asm_code.add(asm_cmds.Raw(
                     "%s\t%s, %s"
@@ -1301,6 +1533,20 @@ class ASMGen:
                 or isinstance(cmd, math_cmds.Mult):
             ins = cmd.inputs()
             out = cmd.outputs()[0]
+            if out.ctype.is_floating():
+                fa = self._arm64_floatuse(ins[0], 16, slot_of)
+                fb = self._arm64_floatuse(ins[1], 17, slot_of)
+                if isinstance(cmd, math_cmds.Add):
+                    fop = "fadd"
+                elif isinstance(cmd, math_cmds.Subtr):
+                    fop = "fsub"
+                else:
+                    fop = "fmul"
+                rd = self._arm64_fdefreg(out, 16)
+                self.asm_code.add(asm_cmds.Raw(
+                    "%s\t%s, %s, %s" % (fop, rd, fa, fb)))
+                self._arm64_fwb(out, 16, slot_of)
+                return
             if isinstance(cmd, math_cmds.Add):
                 op = "add"
             elif isinstance(cmd, math_cmds.Subtr):
@@ -1341,6 +1587,14 @@ class ASMGen:
         if isinstance(cmd, math_cmds.Div) or isinstance(cmd, math_cmds.Mod):
             ins = cmd.inputs()
             out = cmd.outputs()[0]
+            if out.ctype.is_floating():        # float division (Mod n/a for float)
+                fa = self._arm64_floatuse(ins[0], 16, slot_of)
+                fb = self._arm64_floatuse(ins[1], 17, slot_of)
+                rd = self._arm64_fdefreg(out, 16)
+                self.asm_code.add(asm_cmds.Raw(
+                    "fdiv\t%s, %s, %s" % (rd, fa, fb)))
+                self._arm64_fwb(out, 16, slot_of)
+                return
             ra = self._arm64_use(ins[0], 9, reg_of, slot_of)
             rb = self._arm64_use(ins[1], 10, reg_of, slot_of)
             ct = out.ctype
@@ -1416,6 +1670,15 @@ class ASMGen:
         if isinstance(cmd, cmp_cmds._GeneralCmp):
             ins = cmd.inputs()
             out = cmd.outputs()[0]
+            if ins[0].ctype.is_floating():
+                fa = self._arm64_floatuse(ins[0], 16, slot_of)
+                fb = self._arm64_floatuse(ins[1], 17, slot_of)
+                self.asm_code.add(asm_cmds.Raw("fcmp\t%s, %s" % (fa, fb)))
+                rd = self._arm64_defreg(out, 9, reg_of)
+                self.asm_code.add(asm_cmds.Raw(
+                    "cset\t%s, %s" % (rd, self._arm64_fcmp_cc(cmd))))
+                self._arm64_wb(out, 9, reg_of, slot_of)
+                return
             ra = self._arm64_use(ins[0], 9, reg_of, slot_of)
             imm = self._arm64_imm(ins[1])
             if imm >= 0:
@@ -1443,7 +1706,10 @@ class ASMGen:
             return
         if isinstance(cmd, control.Return):
             if cmd.arg is not None:
-                self._arm64_into(cmd.arg, 0, reg_of, slot_of)  # retval -> w0/x0
+                if cmd.arg.ctype.is_floating():
+                    self._arm64_finto(cmd.arg, 0, slot_of)     # retval -> s0/d0
+                else:
+                    self._arm64_into(cmd.arg, 0, reg_of, slot_of)  # -> w0/x0
             self._arm64_epilogue(nreg, frame)
             return
         raise NotImplementedError(
