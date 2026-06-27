@@ -570,8 +570,31 @@ class ASMGen:
         for v in self.symbol_table.linkages[EXTERNAL].values():
             if self.symbol_table.def_state.get(v) == DEFINED:
                 self.asm_code.add_global(self.symbol_table.names[v])
+        # value -> assembler symbol, for globals (static/file-scope storage),
+        # and a dedup set so each global's storage is emitted once.
+        self._arm64_glob = {}
+        self._arm64_gemit = {}
         for func in self.il_code.commands:
             self._arm64_function(func, self.il_code.commands[func])
+
+    def _arm64_emit_global_storage(self, v):
+        """Emit `.comm`/`.data` storage for a static/file-scope global `v`
+        (once), mirroring the x86 path's _get_global_spotmap."""
+        name = self.symbol_table.asm_name(v)
+        if name in self._arm64_gemit:
+            return
+        self._arm64_gemit[name] = 1
+        TENTATIVE = self.symbol_table.TENTATIVE
+        INTERNAL = self.symbol_table.INTERNAL
+        if self.symbol_table.def_state.get(v) == TENTATIVE:
+            local = (self.symbol_table.linkage_type[v] == INTERNAL)
+            self.asm_code.add_comm(name, v.ctype.size, local)
+        elif v in self.il_code.static_block_inits:
+            entries, total = self.il_code.static_block_inits[v]
+            self.asm_code.add_data_block(name, entries, total)
+        else:
+            init_val = self.il_code.static_inits.get(v, 0)
+            self.asm_code.add_data(name, v.ctype.size, init_val)
 
     def _arm64_function(self, func, cmds):
         """Register-allocate, emit prologue, lower each IL command, per func.
@@ -616,20 +639,31 @@ class ASMGen:
                     or v.ctype.size > 8:
                 forced[v] = 1
 
-        # Assign homes: register-eligible values (scalar, not address-taken) take
-        # x19.. first; everything else spills to suitably-sized frame slots.
+        # Static / file-scope globals are not x29-relative; they live at a
+        # symbol and are addressed with adrp/add. Record them and emit storage.
+        STATIC = self.symbol_table.STATIC
+        glob = {}
+        for v in values:
+            if self.symbol_table.storage.get(v) == STATIC:
+                glob[v] = self.symbol_table.asm_name(v)
+                self._arm64_glob[v] = glob[v]
+                self._arm64_emit_global_storage(v)
+
+        # Assign homes: register-eligible values (scalar, not address-taken, not
+        # global) take x19.. first; everything else spills to frame slots.
         NUM_REGS = 10                      # x19 .. x28 (callee-saved)
         reg_of = {}
         nreg = 0
         for v in values:
-            if v not in forced and v.ctype.size <= 8 and nreg < NUM_REGS:
+            if v not in forced and v not in glob and v.ctype.size <= 8 \
+                    and nreg < NUM_REGS:
                 reg_of[v] = 19 + nreg
                 nreg += 1
         # Frame: saved {x29,x30} (16) + saved callee regs (nreg*8) + spills.
         off = 16 + nreg * 8
         slot_of = {}
         for v in values:
-            if v not in reg_of:
+            if v not in reg_of and v not in glob:
                 sz = v.ctype.size
                 if sz < 8:
                     sz = 8
@@ -669,6 +703,19 @@ class ASMGen:
             return "x%d" % regnum
         return "w%d" % regnum
 
+    def _arm64_mem_addr(self, value, areg, slot_of):
+        """Addressing operand for a memory-resident `value`. For a local it is
+        `[x29, #slot]` (no code emitted). For a global it emits adrp/add of the
+        symbol into x<areg> and returns `[x<areg>]`."""
+        name = self._arm64_glob.get(value)
+        if name is not None:
+            a = "x%d" % areg
+            self.asm_code.add(asm_cmds.Raw("adrp\t%s, %s" % (a, name)))
+            self.asm_code.add(asm_cmds.Raw(
+                "add\t%s, %s, :lo12:%s" % (a, a, name)))
+            return "[%s]" % a
+        return "[x29, #%d]" % slot_of[value]
+
     def _arm64_use(self, value, scratch, reg_of, slot_of):
         """Return a register name holding `value`, emitting a load if needed:
         its home register (no code), a `mov` for a literal, or an `ldr` from its
@@ -681,9 +728,10 @@ class ASMGen:
         r = reg_of.get(value, -1)
         if r >= 0:
             return self._arm64_rn(r, value)
+        target = self._arm64_mem_addr(value, scratch, slot_of)
         name = self._arm64_rn(scratch, value)
-        self.asm_code.add(asm_cmds.Raw(
-            "ldr\t%s, [x29, #%d]" % (name, slot_of[value])))
+        op = self._arm64_ldr_op(value.ctype.size, self._arm64_signed(value))
+        self.asm_code.add(asm_cmds.Raw("%s\t%s, %s" % (op, name, target)))
         return name
 
     def _arm64_defreg(self, value, scratch, reg_of):
@@ -695,11 +743,14 @@ class ASMGen:
         return self._arm64_rn(scratch, value)
 
     def _arm64_wb(self, value, scratch, reg_of, slot_of):
-        """Store scratch <scratch> back to `value`'s slot, if it was spilled."""
+        """Store scratch <scratch> back to `value`'s home, if it is not in a
+        register (spilled local or global). x15 holds a global's address so it
+        does not clobber the result in <scratch>."""
         if reg_of.get(value, -1) < 0:
+            target = self._arm64_mem_addr(value, 15, slot_of)
+            op = self._arm64_str_op(value.ctype.size)
             self.asm_code.add(asm_cmds.Raw(
-                "str\t%s, [x29, #%d]"
-                % (self._arm64_rn(scratch, value), slot_of[value])))
+                "%s\t%s, %s" % (op, self._arm64_rn(scratch, value), target)))
 
     def _arm64_into(self, value, n, reg_of, slot_of):
         """Force `value` into a specific register number <n> (for call args and
@@ -715,8 +766,9 @@ class ASMGen:
             if src != name:
                 self.asm_code.add(asm_cmds.Raw("mov\t%s, %s" % (name, src)))
             return
-        self.asm_code.add(asm_cmds.Raw(
-            "ldr\t%s, [x29, #%d]" % (name, slot_of[value])))
+        target = self._arm64_mem_addr(value, n, slot_of)
+        op = self._arm64_ldr_op(value.ctype.size, self._arm64_signed(value))
+        self.asm_code.add(asm_cmds.Raw("%s\t%s, %s" % (op, name, target)))
 
     def _arm64_from(self, n, value, reg_of, slot_of):
         """Store register number <n> into `value`'s home (for LoadArg and the
@@ -728,8 +780,9 @@ class ASMGen:
             if dst != src:
                 self.asm_code.add(asm_cmds.Raw("mov\t%s, %s" % (dst, src)))
         else:
-            self.asm_code.add(asm_cmds.Raw(
-                "str\t%s, [x29, #%d]" % (src, slot_of[value])))
+            target = self._arm64_mem_addr(value, 15, slot_of)
+            op = self._arm64_str_op(value.ctype.size)
+            self.asm_code.add(asm_cmds.Raw("%s\t%s, %s" % (op, src, target)))
 
     def _arm64_wname(self, name):
         """The 32-bit (w) form of a register name (x12 -> w12); used when an
@@ -749,6 +802,14 @@ class ASMGen:
             v = v * 2
             i += 1
         return -1
+
+    def _arm64_signed(self, value):
+        """Whether `value` needs a sign-extending sub-word load. Only 1/2-byte
+        integers care; wider or non-integer types (e.g. pointers, which have no
+        `signed` attribute) report False safely via the size short-circuit."""
+        if value.ctype.size <= 2:
+            return value.ctype.signed
+        return False
 
     def _arm64_ldr_op(self, size, signed):
         """Load mnemonic for a `size`-byte value (sign- or zero-extending the
@@ -773,6 +834,7 @@ class ASMGen:
         into scratch registers x<an>.. . `base` is either array storage (its
         address is x29 + slot) or a pointer value."""
         base_is_mem = base.ctype.is_array() or base.ctype.is_struct_union()
+        gname = self._arm64_glob.get(base)
         # Constant total offset? (no count -> fixed chunk byte offset; literal
         # count -> chunk*index).
         const_off = None
@@ -783,6 +845,14 @@ class ASMGen:
             if lit is not None:
                 const_off = chunk * lit.val
         if const_off is not None:
+            if gname is not None:
+                a = "x%d" % an
+                self.asm_code.add(asm_cmds.Raw("adrp\t%s, %s" % (a, gname)))
+                self.asm_code.add(asm_cmds.Raw(
+                    "add\t%s, %s, :lo12:%s" % (a, a, gname)))
+                if const_off == 0:
+                    return "[%s]" % a
+                return "[%s, #%d]" % (a, const_off)
             if base_is_mem:
                 return "[x29, #%d]" % (slot_of[base] + const_off)
             rb = self._arm64_use(base, an, reg_of, slot_of)
@@ -791,7 +861,11 @@ class ASMGen:
             return "[%s, #%d]" % (rb, const_off)
         # Variable index: compute the effective address into x<an>.
         addr = "x%d" % an
-        if base_is_mem:
+        if gname is not None:
+            self.asm_code.add(asm_cmds.Raw("adrp\t%s, %s" % (addr, gname)))
+            self.asm_code.add(asm_cmds.Raw(
+                "add\t%s, %s, :lo12:%s" % (addr, addr, gname)))
+        elif base_is_mem:
             self.asm_code.add(asm_cmds.Raw(
                 "add\t%s, x29, #%d" % (addr, slot_of[base])))
         else:
@@ -814,7 +888,12 @@ class ASMGen:
         count is None) into register x<an>, returning its name. Like
         _arm64_rel_target but materializing the address (for AddrRel / &a[i])."""
         addr = "x%d" % an
-        if base.ctype.is_array() or base.ctype.is_struct_union():
+        gname = self._arm64_glob.get(base)
+        if gname is not None:
+            self.asm_code.add(asm_cmds.Raw("adrp\t%s, %s" % (addr, gname)))
+            self.asm_code.add(asm_cmds.Raw(
+                "add\t%s, %s, :lo12:%s" % (addr, addr, gname)))
+        elif base.ctype.is_array() or base.ctype.is_struct_union():
             self.asm_code.add(asm_cmds.Raw(
                 "add\t%s, x29, #%d" % (addr, slot_of[base])))
         else:
@@ -894,6 +973,16 @@ class ASMGen:
             if name is not None and cmd.var.ctype.is_function():
                 addrof_name[cmd.output] = name
                 return
+            gname = self._arm64_glob.get(cmd.var)
+            if gname is not None:
+                # Address of a global: adrp/add of its symbol (pointers are
+                # 8-byte, so rd is an x-register).
+                rd = self._arm64_defreg(cmd.output, 9, reg_of)
+                self.asm_code.add(asm_cmds.Raw("adrp\t%s, %s" % (rd, gname)))
+                self.asm_code.add(asm_cmds.Raw(
+                    "add\t%s, %s, :lo12:%s" % (rd, rd, gname)))
+                self._arm64_wb(cmd.output, 9, reg_of, slot_of)
+                return
             # Address of a local: x29 + its frame slot. The variable was forced
             # to memory in _arm64_function, so slot_of[var] exists.
             rd = self._arm64_defreg(cmd.output, 9, reg_of)
@@ -918,7 +1007,7 @@ class ASMGen:
                 cmd.base, cmd.chunk, cmd.count, 12, reg_of, slot_of)
             out = cmd.output
             rd = self._arm64_defreg(out, 9, reg_of)
-            op = self._arm64_ldr_op(out.ctype.size, out.ctype.signed)
+            op = self._arm64_ldr_op(out.ctype.size, self._arm64_signed(out))
             self.asm_code.add(asm_cmds.Raw("%s\t%s, %s" % (op, rd, target)))
             self._arm64_wb(out, 9, reg_of, slot_of)
             return
@@ -959,6 +1048,10 @@ class ASMGen:
             # Whole-aggregate copy (struct/array assignment): both operands are
             # memory-homed; copy size bytes in 8/4/2/1-byte chunks via scratch.
             if out.ctype.is_struct_union() or out.ctype.is_array():
+                if out in self._arm64_glob or arg in self._arm64_glob:
+                    raise NotImplementedError(
+                        "arm64 back end: whole-aggregate copy with a global"
+                        " operand not implemented yet")
                 oo = slot_of[out]
                 ao = slot_of[arg]
                 sz = out.ctype.size
@@ -1021,9 +1114,10 @@ class ASMGen:
                         self.asm_code.add(asm_cmds.Raw(
                             "mov\tw9, %s" % self._arm64_wname(src)))
                     stsrc = self._arm64_rn(9, out)
+                target = self._arm64_mem_addr(out, 15, slot_of)
                 self.asm_code.add(asm_cmds.Raw(
-                    "%s\t%s, [x29, #%d]"
-                    % (self._arm64_str_op(ds), stsrc, slot_of[out])))
+                    "%s\t%s, %s"
+                    % (self._arm64_str_op(ds), stsrc, target)))
             return
         if isinstance(cmd, math_cmds.Add) or isinstance(cmd, math_cmds.Subtr) \
                 or isinstance(cmd, math_cmds.Mult):
