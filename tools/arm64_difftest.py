@@ -191,6 +191,58 @@ STAGE11 = [
                       " return g.x+g.y;}"),
 ]
 
+# Stage 12: floating point, multi-dimensional arrays, compound-assignment.
+STAGE12 = [
+    # multi-dimensional arrays (decompose into existing IL; locked in here)
+    ("md_2d_const", "int main(){int a[3][4]; a[1][2]=7; return a[1][2];}"),
+    ("md_2d_var", "int main(){int a[2][3]; int i=1,j=2; a[i][j]=9;"
+                  " return a[i][j];}"),
+    ("md_2d_fill", "int main(){int a[3][3]; int i=0; while(i<3){int j=0;"
+                   " while(j<3){a[i][j]=i*3+j; j=j+1;} i=i+1;} return a[2][2];}"),
+    ("md_2d_sum", "int main(){int m[2][2]; m[0][0]=1;m[0][1]=2;m[1][0]=3;"
+                  "m[1][1]=4; int s=0,i=0; while(i<2){int j=0; while(j<2){"
+                  "s=s+m[i][j];j=j+1;}i=i+1;} return s;}"),
+    ("md_2d_global", "int g[2][3]; int main(){g[1][2]=42; return g[1][2];}"),
+    # compound-assignment
+    ("ca_local", "int main(){int x=5; x+=3; x*=2; return x;}"),
+    ("ca_global", "int g=0; int main(){g+=7; g-=2; return g;}"),
+    ("ca_array", "int main(){int a[5]; a[2]=10; a[2]+=5; return a[2];}"),
+    # floating point: arithmetic
+    ("f_lit_cast", "int main(){float f=1.5; return (int)f;}"),
+    ("f_add", "int main(){float a=1.5,b=2.5; return (int)(a+b);}"),
+    ("f_sub", "int main(){float a=10.0,b=3.0; return (int)(a-b);}"),
+    ("d_mul", "int main(){double d=3.0; d=d*2.0; return (int)d;}"),
+    ("f_div", "int main(){float a=10.0,b=4.0; return (int)(a/b);}"),
+    ("d_div", "int main(){double d=100.0,e=7.0; return (int)(d/e);}"),
+    # floating point: calls (arg/return register convention)
+    ("f_call", "float add(float a,float b){return a+b;}"
+               " int main(){return (int)add(1.5,2.5);}"),
+    ("d_call", "double area(double r){return 3.14159*r*r;}"
+               " int main(){return (int)area(2.0);}"),
+    ("f_sq", "float sq(float x){return x*x;} int main(){return (int)sq(5.0);}"),
+    # floating point: comparisons
+    ("f_cmp_gt", "int main(){float a=2.5; if(a>2.0) return 1; return 0;}"),
+    ("d_cmp_fn", "int cmp(double a,double b){if(a<b) return 1; return 0;}"
+                 " int main(){return cmp(2.5,3.5);}"),
+    # floating point: conversions
+    ("i_to_f", "int main(){int i=5; float f=i; f=f*2.0; return (int)f;}"),
+    ("f_to_d", "int main(){float f=3.14; double d=f; return (int)(d*2.0);}"),
+    ("d_trunc", "int main(){double d=7.9; return (int)d;}"),
+    # floating point: loops, aggregates, globals, pointers
+    ("f_accum_loop", "int main(){float s=0.0; int i=0; while(i<5){s=s+1.5;"
+                     " i=i+1;} return (int)s;}"),
+    ("d_pow_loop", "double pw(int n){double r=1.0; int i=0; while(i<n){"
+                   "r=r*2.0; i=i+1;} return r;} int main(){return (int)pw(5);}"),
+    ("f_array", "int main(){float arr[3]; arr[0]=1.5; arr[1]=2.5; arr[2]=3.0;"
+                " return (int)(arr[0]+arr[1]+arr[2]);}"),
+    ("d_array_loop", "int main(){double a[4]; int i=0; while(i<4){a[i]=i*1.5;"
+                     " i=i+1;} return (int)(a[0]+a[1]+a[2]+a[3]);}"),
+    ("f_struct", "struct V{float x;float y;}; int main(){struct V v; v.x=3.0;"
+                 " v.y=4.0; return (int)(v.x*v.x+v.y*v.y);}"),
+    ("f_global", "float g=2.5; int main(){g=g+1.5; return (int)g;}"),
+    ("f_ptr", "int main(){float f=5.5; float *p=&f; *p=*p+1.0; return (int)f;}"),
+]
+
 
 def _run(cmd):
     p = subprocess.run(cmd, capture_output=True, text=True)
@@ -259,7 +311,7 @@ def main(argv):
             with open(path) as f:
                 progs.append((os.path.basename(path), f.read()))
     else:
-        progs = STAGE2 + STAGE3 + STAGE4 + STAGE6 + STAGE7 + STAGE8 + STAGE9 + STAGE10 + STAGE11
+        progs = STAGE2 + STAGE3 + STAGE4 + STAGE6 + STAGE7 + STAGE8 + STAGE9 + STAGE10 + STAGE11 + STAGE12
 
     workdir = tempfile.mkdtemp(prefix="arm64diff-")
     counts = {"PASS": 0, "FAIL": 0, "SKIP": 0, "ERROR": 0}
