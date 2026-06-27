@@ -438,6 +438,8 @@ class ASMGen:
         # (Stage 2: return an integer literal; later stages add real codegen).
         if self.asm_code.target.name == "arm64":
             return self._make_asm_arm64()
+        if self.asm_code.target.name == "riscv64":
+            return self._make_asm_riscv64()
 
         global_spotmap = self._get_global_spotmap()
 
@@ -723,7 +725,7 @@ class ASMGen:
                         and out.ctype.size <= 8 \
                         and out.ctype.size == arg.ctype.size \
                         and out.ctype.is_floating() == arg.ctype.is_floating() \
-                        and self._arm64_coalesce_safe(
+                        and self._il_coalesce_safe(
                             cmds, defidx.get(arg, -1), k, out):
                     coalesce[arg] = out
 
@@ -766,40 +768,20 @@ class ASMGen:
                 if v is not None and getattr(v, "literal", None) is None \
                         and v not in forced and v not in glob \
                         and v not in fused_out:
-                    u.append(self._arm64_canon(v, coalesce))
+                    u.append(self._il_canon(v, coalesce))
             for v in c.outputs():
                 if v is not None and getattr(v, "literal", None) is None \
                         and v not in forced and v not in glob \
                         and v not in fused_out:
-                    d.append(self._arm64_canon(v, coalesce))
+                    d.append(self._il_canon(v, coalesce))
             uses.append(u)
             defs.append(d)
-        live_in, live_out = self._arm64_liveness(cmds, n, uses, defs)
+        live_in, live_out = self._il_liveness(cmds, n, uses, defs)
 
-        # Live interval [start, end] per value (conservative min/max live index),
-        # and whether it is live across any call (=> needs a callee-saved home).
-        start = {}
-        end = {}
-        crosses = {}
-        for idx in range(n):
-            here = []
-            for v in live_in[idx]:
-                here.append(v)
-            for v in live_out[idx]:
-                here.append(v)
-            for v in defs[idx]:
-                here.append(v)
-            for v in uses[idx]:
-                here.append(v)
-            for v in here:
-                if v not in start or idx < start[v]:
-                    start[v] = idx
-                if v not in end or idx > end[v]:
-                    end[v] = idx
-            if isinstance(cmds[idx], control.Call):
-                for v in live_out[idx]:
-                    if v in live_in[idx]:
-                        crosses[v] = 1
+        # Live interval [start, end] per value, and whether it is live across a
+        # call (=> needs a callee-saved home). Both are target-neutral.
+        start, end, crosses = self._il_intervals(
+            cmds, n, live_in, live_out, uses, defs)
 
         # Argument set-up for a call writes only x0..x<gp_max-1> / v0..v<fp_max-1>,
         # and incoming parameters arrive in x0..x<agp-1> / v0..v<afp-1>; caller-
@@ -867,7 +849,7 @@ class ASMGen:
         reps = {}
         order = []
         for v in values:
-            cv = self._arm64_canon(v, coalesce)
+            cv = self._il_canon(v, coalesce)
             if cv is None or getattr(cv, "literal", None) is not None \
                     or cv in forced or cv in glob or cv in fused_out \
                     or cv in reps:
@@ -876,44 +858,10 @@ class ASMGen:
             order.append(cv)
         order.sort(key=lambda vv: start.get(vv, 0))
 
-        reg_of = {}
-        freg_of = {}
-        spill = {}
-        for v in order:
-            s = start.get(v, 0)
-            e = end.get(v, s)
-            if v.ctype.is_floating():
-                if v in crosses:
-                    r = self._arm64_pick(fp_callee, busy_fp, s)
-                    if r >= 0:
-                        used_fp_callee[r] = 1
-                else:
-                    r = self._arm64_pick(fp_caller, busy_fp, s)
-                    if r < 0:
-                        r = self._arm64_pick(fp_callee, busy_fp, s)
-                        if r >= 0:
-                            used_fp_callee[r] = 1
-                if r >= 0:
-                    freg_of[v] = r
-                    busy_fp[r] = e
-                else:
-                    spill[v] = 1
-            else:
-                if v in crosses:
-                    r = self._arm64_pick(int_callee, busy_int, s)
-                    if r >= 0:
-                        used_int_callee[r] = 1
-                else:
-                    r = self._arm64_pick(int_caller, busy_int, s)
-                    if r < 0:
-                        r = self._arm64_pick(int_callee, busy_int, s)
-                        if r >= 0:
-                            used_int_callee[r] = 1
-                if r >= 0:
-                    reg_of[v] = r
-                    busy_int[r] = e
-                else:
-                    spill[v] = 1
+        reg_of, freg_of, spill = self._il_linear_scan(
+            order, start, end, crosses, int_caller, int_callee,
+            fp_caller, fp_callee, busy_int, busy_fp,
+            used_int_callee, used_fp_callee)
         self._arm64_freg = freg_of
 
         # Lay out the saved-register area, then spill slots for everything left
@@ -937,7 +885,7 @@ class ASMGen:
             off += 8
         slot_of = {}
         for v in values:
-            cv = self._arm64_canon(v, coalesce)
+            cv = self._il_canon(v, coalesce)
             if cv in reg_of or cv in freg_of or v in glob or v in fused_out:
                 continue
             if cv not in slot_of:
@@ -951,7 +899,7 @@ class ASMGen:
                 slot_of[v] = slot_of[cv]
         # Coalesced temps share their target's home; their copy is elided.
         for arg in coalesce:
-            o = self._arm64_canon(arg, coalesce)
+            o = self._il_canon(arg, coalesce)
             if o in reg_of:
                 reg_of[arg] = reg_of[o]
             if o in freg_of:
@@ -998,7 +946,7 @@ class ASMGen:
             self._lower_arm64(cmds[idx], idx, func, reg_of, slot_of,
                               0, frame, addrof_name)
 
-    def _arm64_coalesce_safe(self, cmds, dk, k, out):
+    def _il_coalesce_safe(self, cmds, dk, k, out):
         """True if coalescing the copy at index k into `out` is safe: tmp is
         defined at index dk, dk..k is one straight-line block, and `out` is not
         referenced in [dk, k) (so out's prior value is dead and the defining op
@@ -1024,7 +972,87 @@ class ASMGen:
             j += 1
         return True
 
-    def _arm64_canon(self, v, coalesce):
+    def _il_intervals(self, cmds, n, live_in, live_out, uses, defs):
+        """Per-value conservative live interval [start, end] (min/max live index,
+        safe across loop back-edges) plus a `crosses` set of values live across
+        some call (live in both live_in and live_out at a Call index). All three
+        are architecture-neutral and shared by every back end's allocator."""
+        import shivyc.il_cmds.control as control
+        start = {}
+        end = {}
+        crosses = {}
+        for idx in range(n):
+            here = []
+            for v in live_in[idx]:
+                here.append(v)
+            for v in live_out[idx]:
+                here.append(v)
+            for v in defs[idx]:
+                here.append(v)
+            for v in uses[idx]:
+                here.append(v)
+            for v in here:
+                if v not in start or idx < start[v]:
+                    start[v] = idx
+                if v not in end or idx > end[v]:
+                    end[v] = idx
+            if isinstance(cmds[idx], control.Call):
+                for v in live_out[idx]:
+                    if v in live_in[idx]:
+                        crosses[v] = 1
+        return start, end, crosses
+
+    def _il_linear_scan(self, order, start, end, crosses,
+                        int_caller, int_callee, fp_caller, fp_callee,
+                        busy_int, busy_fp, used_int_callee, used_fp_callee):
+        """Architecture-neutral linear-scan core. Assigns each value in `order`
+        (sorted by interval start) a register from the supplied pools: a value
+        live across a call takes a callee-saved register; a call-clean value
+        prefers a caller-saved one (no save) and falls back to callee, else
+        spills. The pools and ABI facts are passed in by the target back end;
+        the mechanism here is shared. Returns (reg_of, freg_of, spill); the
+        used_*_callee maps are updated in place to drive prologue saves."""
+        reg_of = {}
+        freg_of = {}
+        spill = {}
+        for v in order:
+            s = start.get(v, 0)
+            e = end.get(v, s)
+            if v.ctype.is_floating():
+                if v in crosses:
+                    r = self._il_pick(fp_callee, busy_fp, s)
+                    if r >= 0:
+                        used_fp_callee[r] = 1
+                else:
+                    r = self._il_pick(fp_caller, busy_fp, s)
+                    if r < 0:
+                        r = self._il_pick(fp_callee, busy_fp, s)
+                        if r >= 0:
+                            used_fp_callee[r] = 1
+                if r >= 0:
+                    freg_of[v] = r
+                    busy_fp[r] = e
+                else:
+                    spill[v] = 1
+            else:
+                if v in crosses:
+                    r = self._il_pick(int_callee, busy_int, s)
+                    if r >= 0:
+                        used_int_callee[r] = 1
+                else:
+                    r = self._il_pick(int_caller, busy_int, s)
+                    if r < 0:
+                        r = self._il_pick(int_callee, busy_int, s)
+                        if r >= 0:
+                            used_int_callee[r] = 1
+                if r >= 0:
+                    reg_of[v] = r
+                    busy_int[r] = e
+                else:
+                    spill[v] = 1
+        return reg_of, freg_of, spill
+
+    def _il_canon(self, v, coalesce):
         """Follow the copy-coalescing chain v -> ... so coalesced temps resolve
         to the value whose home they share."""
         seen = {}
@@ -1033,7 +1061,7 @@ class ASMGen:
             v = coalesce[v]
         return v
 
-    def _arm64_pick(self, pool, busy, s):
+    def _il_pick(self, pool, busy, s):
         """First register in `pool` free at index `s` (its last occupant ended
         before s), or -1 if none is free."""
         for rr in pool:
@@ -1041,7 +1069,7 @@ class ASMGen:
                 return rr
         return -1
 
-    def _arm64_liveness(self, cmds, n, uses, defs):
+    def _il_liveness(self, cmds, n, uses, defs):
         """Backward live-variable fixpoint over the per-index `uses`/`defs`
         value lists. Returns (live_in, live_out), each a list of {value: 1}."""
         import shivyc.il_cmds.control as control
@@ -1993,6 +2021,446 @@ class ASMGen:
             "arm64 back end: IL command '%s' not implemented yet"
             % type(cmd).__name__)
 
+
+    # ================= RISC-V 64 (rv64, lp64) back end =================
+    # Brought up after aarch64 to exercise the target seam: it reuses the
+    # architecture-neutral middle end verbatim -- copy-coalescing safety
+    # (_il_coalesce_safe), liveness (_il_liveness), live intervals + call-cross
+    # detection (_il_intervals), and the caller/callee linear-scan allocator
+    # (_il_linear_scan). Only instruction selection, the register file, and the
+    # ABI below are new. Scope is the integer core (locals, +-*/% , the six
+    # comparisons, if/while, direct calls, recursion); unsupported IL raises
+    # rather than miscompile, exactly as the aarch64 back end did at this stage.
+    #
+    # Register file (lp64): x0=zero, x1=ra, x2=sp; scratch t0-t2 (x5-x7) and
+    # t3 (x28); argument/return a0-a7 (x10-x17); callee-saved homes s2-s11
+    # (x18-x27); extra caller-saved homes t4-t6 (x29-x31). Frames are
+    # sp-relative (no frame pointer); leaf functions with no spills are
+    # frameless.
+
+    def _make_asm_riscv64(self):
+        """RISC-V 64 lowering. Runs only under `--target riscv64`; the x86-64
+        and aarch64 paths are untouched."""
+        EXTERNAL = self.symbol_table.EXTERNAL
+        DEFINED = self.symbol_table.DEFINED
+        for v in self.symbol_table.linkages[EXTERNAL].values():
+            if self.symbol_table.def_state.get(v) == DEFINED:
+                self.asm_code.add_global(self.symbol_table.names[v])
+        for func in self.il_code.commands:
+            self._rv_function(func, self.il_code.commands[func])
+
+    def _rv_rn(self, regnum):
+        """RISC-V register name (x0..x31)."""
+        return "x%d" % regnum
+
+    def _rv_use(self, value, scratch, reg_of, slot_of):
+        """Register holding `value`: its home (no code), a loaded literal, or a
+        load from its spill slot into x<scratch>."""
+        lit = getattr(value, "literal", None)
+        if lit is not None:
+            name = self._rv_rn(scratch)
+            self.asm_code.add(asm_cmds.Raw("li\t%s, %s" % (name, lit.val)))
+            return name
+        r = reg_of.get(value, -1)
+        if r >= 0:
+            return self._rv_rn(r)
+        name = self._rv_rn(scratch)
+        op = "lw" if value.ctype.size <= 4 else "ld"
+        self.asm_code.add(asm_cmds.Raw(
+            "%s\t%s, %d(sp)" % (op, name, slot_of[value])))
+        return name
+
+    def _rv_defreg(self, value, scratch, reg_of):
+        """Register to write `value` into: its home, else x<scratch>."""
+        r = reg_of.get(value, -1)
+        if r >= 0:
+            return self._rv_rn(r)
+        return self._rv_rn(scratch)
+
+    def _rv_wb(self, value, scratch, reg_of, slot_of):
+        """Store x<scratch> back to `value`'s spill slot, if it has no home."""
+        if reg_of.get(value, -1) < 0:
+            op = "sw" if value.ctype.size <= 4 else "sd"
+            self.asm_code.add(asm_cmds.Raw(
+                "%s\t%s, %d(sp)" % (op, self._rv_rn(scratch), slot_of[value])))
+
+    def _rv_into(self, value, n, reg_of, slot_of):
+        """Force `value` into x<n> (call argument / return value)."""
+        name = self._rv_rn(n)
+        lit = getattr(value, "literal", None)
+        if lit is not None:
+            self.asm_code.add(asm_cmds.Raw("li\t%s, %s" % (name, lit.val)))
+            return
+        r = reg_of.get(value, -1)
+        if r >= 0:
+            if r != n:
+                self.asm_code.add(asm_cmds.Raw(
+                    "mv\t%s, %s" % (name, self._rv_rn(r))))
+            return
+        op = "lw" if value.ctype.size <= 4 else "ld"
+        self.asm_code.add(asm_cmds.Raw(
+            "%s\t%s, %d(sp)" % (op, name, slot_of[value])))
+
+    def _rv_from(self, n, value, reg_of, slot_of):
+        """Store x<n> into `value`'s home (parameter unload / call result)."""
+        src = self._rv_rn(n)
+        r = reg_of.get(value, -1)
+        if r >= 0:
+            if r != n:
+                self.asm_code.add(asm_cmds.Raw(
+                    "mv\t%s, %s" % (self._rv_rn(r), src)))
+        else:
+            op = "sw" if value.ctype.size <= 4 else "sd"
+            self.asm_code.add(asm_cmds.Raw(
+                "%s\t%s, %d(sp)" % (op, src, slot_of[value])))
+
+    def _rv_epilogue(self, frame, has_call):
+        for r in self._rv_saved_int:
+            self.asm_code.add(asm_cmds.Raw(
+                "ld\t%s, %d(sp)" % (self._rv_rn(r), self._rv_int_save_off[r])))
+        if has_call:
+            self.asm_code.add(asm_cmds.Raw(
+                "ld\tra, %d(sp)" % self._rv_ra_off))
+        if frame:
+            self.asm_code.add(asm_cmds.Raw("addi\tsp, sp, %d" % frame))
+        self.asm_code.add(asm_cmds.Raw("ret"))
+
+    def _rv_function(self, func, cmds):
+        import shivyc.il_cmds.control as control
+        import shivyc.il_cmds.value as value_cmds
+        import shivyc.il_cmds.math as math_cmds
+        import shivyc.il_cmds.compare as cmp_cmds
+        n = len(cmds)
+        # Distinct non-literal values; refuse anything outside the integer core.
+        values = []
+        seen = {}
+        has_call = False
+        STATIC = self.symbol_table.STATIC
+        for c in cmds:
+            if isinstance(c, control.Call):
+                has_call = True
+            for v in c.inputs() + c.outputs():
+                if v is None or getattr(v, "literal", None) is not None:
+                    continue
+                if self.symbol_table.storage.get(v) == STATIC:
+                    raise NotImplementedError(
+                        "riscv64 back end: globals not implemented yet")
+                if v.ctype.is_floating() or v.ctype.is_array() \
+                        or v.ctype.is_struct_union() or v.ctype.size > 8:
+                    raise NotImplementedError(
+                        "riscv64 back end: only the integer core is implemented")
+                if v not in seen:
+                    seen[v] = 1
+                    values.append(v)
+
+        forced = {}
+        glob = {}
+        fused_out = {}
+        usecount = {}
+        defcount = {}
+        for c in cmds:
+            for v in c.inputs():
+                if v is not None:
+                    usecount[v] = usecount.get(v, 0) + 1
+            for v in c.outputs():
+                if v is not None:
+                    defcount[v] = defcount.get(v, 0) + 1
+        # int parameter count / mapping
+        self._rv_arggp = {}
+        agp = 0
+        for c in cmds:
+            if isinstance(c, value_cmds.LoadArg):
+                self._rv_arggp[c.arg_num] = agp
+                agp += 1
+
+        # Copy coalescing (shared safety check).
+        defidx = {}
+        for idx in range(n):
+            for v in cmds[idx].outputs():
+                if v is not None:
+                    defidx[v] = idx
+        coalesce = {}
+        skip = {}
+        for k in range(n):
+            c = cmds[k]
+            if isinstance(c, value_cmds.Set):
+                arg = c.arg
+                out = c.output
+                if getattr(arg, "literal", None) is None \
+                        and usecount.get(arg, 0) == 1 \
+                        and defcount.get(arg, 0) == 1 \
+                        and out.ctype.size == arg.ctype.size \
+                        and self._il_coalesce_safe(
+                            cmds, defidx.get(arg, -1), k, out):
+                    coalesce[arg] = out
+
+        uses = []
+        defs = []
+        for idx in range(n):
+            c = cmds[idx]
+            u = []
+            d = []
+            for v in c.inputs():
+                if v is not None and getattr(v, "literal", None) is None:
+                    u.append(self._il_canon(v, coalesce))
+            for v in c.outputs():
+                if v is not None and getattr(v, "literal", None) is None:
+                    d.append(self._il_canon(v, coalesce))
+            uses.append(u)
+            defs.append(d)
+        live_in, live_out = self._il_liveness(cmds, n, uses, defs)
+        start, end, crosses = self._il_intervals(
+            cmds, n, live_in, live_out, uses, defs)
+
+        # Argument set-up writes a0..a<gp_max-1>; parameters arrive in a0..
+        # a<agp-1>. Caller-saved homes are placed above both.
+        gp_max = 0
+        for c in cmds:
+            if isinstance(c, control.Call):
+                g = len(c.args)
+                if g > 8:
+                    raise NotImplementedError(
+                        "riscv64 back end: >8 arguments not implemented")
+                if g > gp_max:
+                    gp_max = g
+        cs = gp_max
+        if agp > cs:
+            cs = agp
+        if cs < 1:
+            cs = 1
+        int_caller = []
+        a = cs
+        while a <= 7:
+            int_caller.append(10 + a)        # a<cs>..a7
+            a += 1
+        int_caller.append(29)                # t4, t5, t6: caller-saved, non-arg
+        int_caller.append(30)
+        int_caller.append(31)
+        int_callee = []
+        r = 18
+        while r <= 27:                       # s2..s11
+            int_callee.append(r)
+            r += 1
+
+        busy_int = {}
+        busy_fp = {}
+        used_int_callee = {}
+        used_fp_callee = {}
+        reps = {}
+        order = []
+        for v in values:
+            cv = self._il_canon(v, coalesce)
+            if cv in reps:
+                continue
+            reps[cv] = 1
+            order.append(cv)
+        order.sort(key=lambda vv: start.get(vv, 0))
+        reg_of, freg_of, spill = self._il_linear_scan(
+            order, start, end, crosses, int_caller, int_callee, [], [],
+            busy_int, busy_fp, used_int_callee, used_fp_callee)
+
+        # Frame: ra (if any call) + used callee saves + spills, sp-relative.
+        saved_int = []
+        for r in range(18, 28):
+            if r in used_int_callee:
+                saved_int.append(r)
+        off = 0
+        self._rv_ra_off = 0
+        if has_call:
+            self._rv_ra_off = off
+            off += 8
+        int_save_off = {}
+        for r in saved_int:
+            int_save_off[r] = off
+            off += 8
+        slot_of = {}
+        for v in values:
+            cv = self._il_canon(v, coalesce)
+            if cv in reg_of:
+                continue
+            if cv not in slot_of:
+                sz = cv.ctype.size
+                if sz < 8:
+                    sz = 8
+                sz = sz + (-sz % 8)
+                slot_of[cv] = off
+                off += sz
+            if v is not cv:
+                slot_of[v] = slot_of[cv]
+        for arg in coalesce:
+            o = self._il_canon(arg, coalesce)
+            if o in reg_of:
+                reg_of[arg] = reg_of[o]
+            if o in slot_of:
+                slot_of[arg] = slot_of[o]
+        for idx in range(n):
+            c = cmds[idx]
+            if isinstance(c, value_cmds.Set) and c.arg in coalesce:
+                skip[idx] = 1
+
+        frame = 0
+        if len(saved_int) > 0 or len(slot_of) > 0 or has_call:
+            frame = off + (-off % 16)
+        self._rv_saved_int = saved_int
+        self._rv_int_save_off = int_save_off
+
+        self.asm_code.add(asm_cmds.AsmLabel(func))
+        if frame:
+            self.asm_code.add(asm_cmds.Raw("addi\tsp, sp, -%d" % frame))
+            if has_call:
+                self.asm_code.add(asm_cmds.Raw(
+                    "sd\tra, %d(sp)" % self._rv_ra_off))
+            for r in saved_int:
+                self.asm_code.add(asm_cmds.Raw(
+                    "sd\t%s, %d(sp)" % (self._rv_rn(r), int_save_off[r])))
+        addrof_name = {}
+        for idx in range(n):
+            if idx in skip:
+                continue
+            self._lower_riscv(cmds[idx], idx, func, reg_of, slot_of,
+                              frame, has_call, addrof_name)
+
+    def _rv_binop(self, cmd, math_cmds, size):
+        w = "w" if size <= 4 else ""
+        if isinstance(cmd, math_cmds.Add):
+            return "add" + w
+        if isinstance(cmd, math_cmds.Subtr):
+            return "sub" + w
+        if isinstance(cmd, math_cmds.Mult):
+            return "mul" + w
+        return None
+
+    def _lower_riscv(self, cmd, idx, func, reg_of, slot_of,
+                     frame, has_call, addrof_name):
+        import shivyc.il_cmds.control as control
+        import shivyc.il_cmds.value as value_cmds
+        import shivyc.il_cmds.math as math_cmds
+        import shivyc.il_cmds.compare as cmp_cmds
+
+        if isinstance(cmd, value_cmds.Set):
+            out = cmd.output
+            arg = cmd.arg
+            lit = getattr(arg, "literal", None)
+            rd = self._rv_defreg(out, 5, reg_of)
+            if lit is not None:
+                self.asm_code.add(asm_cmds.Raw("li\t%s, %s" % (rd, lit.val)))
+            else:
+                rs = self._rv_use(arg, 5, reg_of, slot_of)
+                if out.ctype.size <= 4 and arg.ctype.size > 4:
+                    self.asm_code.add(asm_cmds.Raw(
+                        "addiw\t%s, %s, 0" % (rd, rs)))   # narrow to 32-bit
+                elif rd != rs:
+                    self.asm_code.add(asm_cmds.Raw("mv\t%s, %s" % (rd, rs)))
+            self._rv_wb(out, 5, reg_of, slot_of)
+            return
+
+        if isinstance(cmd, math_cmds.Add) or isinstance(cmd, math_cmds.Subtr) \
+                or isinstance(cmd, math_cmds.Mult):
+            ins = cmd.inputs()
+            out = cmd.outputs()[0]
+            ra = self._rv_use(ins[0], 5, reg_of, slot_of)
+            rb = self._rv_use(ins[1], 6, reg_of, slot_of)
+            rd = self._rv_defreg(out, 5, reg_of)
+            op = self._rv_binop(cmd, math_cmds, out.ctype.size)
+            self.asm_code.add(asm_cmds.Raw(
+                "%s\t%s, %s, %s" % (op, rd, ra, rb)))
+            self._rv_wb(out, 5, reg_of, slot_of)
+            return
+
+        if isinstance(cmd, math_cmds.Div) or isinstance(cmd, math_cmds.Mod):
+            ins = cmd.inputs()
+            out = cmd.outputs()[0]
+            ra = self._rv_use(ins[0], 5, reg_of, slot_of)
+            rb = self._rv_use(ins[1], 6, reg_of, slot_of)
+            rd = self._rv_defreg(out, 5, reg_of)
+            sg = not (out.ctype.is_pointer()
+                      or (out.ctype.is_integral() and not out.ctype.signed))
+            w = "w" if out.ctype.size <= 4 else ""
+            if isinstance(cmd, math_cmds.Div):
+                base = "div" if sg else "divu"
+            else:
+                base = "rem" if sg else "remu"
+            self.asm_code.add(asm_cmds.Raw(
+                "%s%s\t%s, %s, %s" % (base, w, rd, ra, rb)))
+            self._rv_wb(out, 5, reg_of, slot_of)
+            return
+
+        if isinstance(cmd, cmp_cmds._GeneralCmp):
+            ins = cmd.inputs()
+            out = cmd.outputs()[0]
+            ra = self._rv_use(ins[0], 5, reg_of, slot_of)
+            rb = self._rv_use(ins[1], 6, reg_of, slot_of)
+            rd = self._rv_defreg(out, 5, reg_of)
+            if isinstance(cmd, cmp_cmds.EqualCmp):
+                self.asm_code.add(asm_cmds.Raw("sub\t%s, %s, %s" % (rd, ra, rb)))
+                self.asm_code.add(asm_cmds.Raw("seqz\t%s, %s" % (rd, rd)))
+            elif isinstance(cmd, cmp_cmds.NotEqualCmp):
+                self.asm_code.add(asm_cmds.Raw("sub\t%s, %s, %s" % (rd, ra, rb)))
+                self.asm_code.add(asm_cmds.Raw("snez\t%s, %s" % (rd, rd)))
+            elif isinstance(cmd, cmp_cmds.LessCmp):
+                self.asm_code.add(asm_cmds.Raw("slt\t%s, %s, %s" % (rd, ra, rb)))
+            elif isinstance(cmd, cmp_cmds.GreaterCmp):
+                self.asm_code.add(asm_cmds.Raw("slt\t%s, %s, %s" % (rd, rb, ra)))
+            elif isinstance(cmd, cmp_cmds.LessOrEqCmp):
+                self.asm_code.add(asm_cmds.Raw("slt\t%s, %s, %s" % (rd, rb, ra)))
+                self.asm_code.add(asm_cmds.Raw("xori\t%s, %s, 1" % (rd, rd)))
+            else:                              # GreaterOrEqCmp
+                self.asm_code.add(asm_cmds.Raw("slt\t%s, %s, %s" % (rd, ra, rb)))
+                self.asm_code.add(asm_cmds.Raw("xori\t%s, %s, 1" % (rd, rd)))
+            self._rv_wb(out, 5, reg_of, slot_of)
+            return
+
+        if isinstance(cmd, control.Label):
+            self.asm_code.add(asm_cmds.AsmLabel(cmd.label))
+            return
+        if isinstance(cmd, control.Jump):
+            self.asm_code.add(asm_cmds.Raw(
+                "j\t%s" % spots.mangle_symbol(cmd.label)))
+            return
+        if isinstance(cmd, control.JumpZero):
+            rc = self._rv_use(cmd.cond, 5, reg_of, slot_of)
+            self.asm_code.add(asm_cmds.Raw(
+                "beqz\t%s, %s" % (rc, spots.mangle_symbol(cmd.label))))
+            return
+        if isinstance(cmd, control.JumpNotZero):
+            rc = self._rv_use(cmd.cond, 5, reg_of, slot_of)
+            self.asm_code.add(asm_cmds.Raw(
+                "bnez\t%s, %s" % (rc, spots.mangle_symbol(cmd.label))))
+            return
+
+        if isinstance(cmd, value_cmds.LoadArg):
+            self._rv_from(10 + self._rv_arggp[cmd.arg_num], cmd.output,
+                          reg_of, slot_of)
+            return
+        if isinstance(cmd, value_cmds.AddrOf):
+            name = self.symbol_table.names.get(cmd.var)
+            if name is not None and cmd.var.ctype.is_function():
+                addrof_name[cmd.output] = name
+                return
+            raise NotImplementedError(
+                "riscv64 back end: address-of a variable not implemented yet")
+        if isinstance(cmd, control.Call):
+            name = addrof_name.get(cmd.func)
+            if name is None:
+                raise NotImplementedError(
+                    "riscv64 back end: only direct calls are implemented")
+            gp = 0
+            for arg in cmd.args:
+                self._rv_into(arg, 10 + gp, reg_of, slot_of)
+                gp += 1
+            self.asm_code.add(asm_cmds.Raw(
+                "call\t%s" % spots.mangle_symbol(name)))
+            if not cmd.void_return:
+                self._rv_from(10, cmd.ret, reg_of, slot_of)
+            return
+        if isinstance(cmd, control.Return):
+            if cmd.arg is not None:
+                self._rv_into(cmd.arg, 10, reg_of, slot_of)   # a0
+            self._rv_epilogue(frame, has_call)
+            return
+        raise NotImplementedError(
+            "riscv64 back end: IL command '%s' not implemented yet"
+            % type(cmd).__name__)
 
     def _apply_thread_budget(self, func):
         """Restrict `alloc_registers`/`all_registers` for `func` to its thread
