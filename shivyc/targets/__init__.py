@@ -76,12 +76,30 @@ class RiscV64Target(Target):
         self.asm_syntax_epilogue = []
 
 
+class M68kTarget(Target):
+    """Motorola 68000 / Neo-Geo bare-metal cross target (the console's main CPU;
+    ngdevkit cross-compiles to it with gcc). CISC, big-endian, two register
+    files (data d0-d7 / address a0-a7), two-address ALU ops, .b/.w/.l sizes, and
+    a stack-based calling convention -- a deliberately different shape from the
+    RISC back ends, chosen to test how far the target-neutral middle end
+    stretches. The integer-core lowering reuses the shared liveness + linear-scan
+    allocator unchanged; only instruction selection and the m68k ABI are new."""
+
+    def __init__(self):
+        Target.__init__(self)
+        self.name = "m68k"
+        self.triple = "m68k-neogeo-elf"
+        # m68k GAS uses one native (Motorola/MIT) syntax; no toggle is emitted.
+        self.asm_syntax_prologue = []
+        self.asm_syntax_epilogue = []
+
+
 # Canonical name plus accepted aliases -> constructor.
 def get_target(name):
     """Return a fresh Target instance for `name` (default x86-64). Aliases:
-    amd64->x86_64, aarch64->arm64, rv64->riscv64. An unknown name falls back to
-    x86-64 so the compiler stays usable; front ends should validate the name
-    explicitly."""
+    amd64->x86_64, aarch64->arm64, rv64->riscv64, neogeo/68k->m68k. An unknown
+    name falls back to x86-64 so the compiler stays usable; front ends should
+    validate the name explicitly."""
     n = name if name else "x86_64"
     if n == "x86_64" or n == "amd64":
         return X86_64Target()
@@ -89,12 +107,15 @@ def get_target(name):
         return Arm64Target()
     if n == "riscv64" or n == "rv64":
         return RiscV64Target()
+    if n == "m68k" or n == "neogeo" or n == "68k":
+        return M68kTarget()
     return X86_64Target()
 
 
 def is_known_target(name):
     """True if `name` is a recognized target or alias."""
-    return name in ("x86_64", "amd64", "arm64", "aarch64", "riscv64", "rv64")
+    return name in ("x86_64", "amd64", "arm64", "aarch64", "riscv64", "rv64",
+                    "m68k", "neogeo", "68k")
 
 
 DEFAULT_TARGET = "x86_64"
