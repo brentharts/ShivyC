@@ -468,6 +468,16 @@ class ASMGen:
             self._near_off = 0
             self._near_size = 0
 
+            # Each function gets its own stack frame, so the rbp-relative slot
+            # offset must restart at 0 here. (Locals are also removed from the
+            # shared spotmap after each function -- see _make_asm.) Without this
+            # reset the offset accumulated across every function in the module,
+            # so functions emitted late were given frames large enough to reach
+            # slots sitting atop all earlier functions' dead space -- e.g. a
+            # ~200-byte function reserving ~8 KB -- which overflowed the stack
+            # on deep recursion (quicksort worst case, deep Collatz, etc.).
+            self.offset = 0
+
             # A near-scratch leaf is meant to stay frameless (spilling into its
             # static buffer); using a callee-saved register would force a
             # save/restore frame, so keep these functions on caller-saved only.
