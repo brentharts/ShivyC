@@ -477,6 +477,28 @@ benchmarks:
 	cd benchmarks && python3 run_benchmarks.py
 
 # ---------------------------------------------------------------------------
+# rpython cross-runtime benchmarks: the same pure-Python programs run under
+# CPython, PyPy3, py2c+gcc, and the self-hosted ShivyCX compiler, measuring
+# runtime + peak memory + compile time. The harness builds shivyc_native once
+# (cached in benchmarks/build_native_bench, or supply one via $SHIVYC_NATIVE).
+BENCH_PLOT_DIR ?= /tmp/shivyc_benchmarks
+
+benchmarks_rpython:
+	python3 benchmarks/run_rpython_benchmarks.py
+
+# Full report: run the harness, render the matplotlib figures (PNG+PDF), and
+# typeset tools/benchmarks.tex into $(BENCH_PLOT_DIR)/benchmarks.pdf.
+benchmarks_report: benchmarks_rpython
+	python3 benchmarks/plot_rpython.py $(BENCH_PLOT_DIR)
+	@command -v pdflatex >/dev/null 2>&1 || { \
+		echo "pdflatex not found; figures are in $(BENCH_PLOT_DIR) but the PDF was not built."; \
+		exit 0; }
+	cp tools/benchmarks.tex $(BENCH_PLOT_DIR)/
+	cd $(BENCH_PLOT_DIR) && pdflatex -interaction=nonstopmode benchmarks.tex >/dev/null 2>&1 \
+		&& pdflatex -interaction=nonstopmode benchmarks.tex >/dev/null 2>&1
+	@echo "Benchmark report: $(BENCH_PLOT_DIR)/benchmarks.pdf"
+
+# ---------------------------------------------------------------------------
 # Micropython targets
 
 # Clone the objcore micropython fork (or fast-forward an existing checkout),
