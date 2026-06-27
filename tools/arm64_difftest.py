@@ -64,6 +64,9 @@ STAGE4 = [
                   " int main(){return g(1,2,3,4,5);}"),
     ("eight_args", "int h(int a,int b,int c,int d,int e,int f,int g,int i)"
                    "{return a+b+c+d+e+f+g+i;} int main(){return h(1,2,3,4,5,6,7,8);}"),
+    # >10 live values forces the register allocator to spill the overflow.
+    ("spill12", "int main(){int a=1,b=2,c=3,d=4,e=5,f=6,g=7,h=8,i=9,j=10,k=11,"
+                "l=12; return a+b+c+d+e+f+g+h+i+j+k+l;}"),
 ]
 
 
