@@ -277,7 +277,8 @@ BENCHES = {
 
 # All ShivyCX source globs used for the coverage report.
 COVERAGE_GLOBS = ["shivyc/*.py", "shivyc/tree/*.py",
-                  "shivyc/parser/*.py", "shivyc/il_cmds/*.py"]
+                  "shivyc/parser/*.py", "shivyc/il_cmds/*.py",
+                  "shivyc/targets/*.py"]
 
 
 # ==========================================================================
