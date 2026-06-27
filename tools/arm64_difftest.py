@@ -118,6 +118,27 @@ STAGE8 = [
                     " while(i<4){s=s+a[i].x+a[i].y; i=i+1;} return s;}"),
 ]
 
+# Stage 9: globals -- static / file-scope storage, addressed via adrp/add.
+STAGE9 = [
+    ("g_set", "int g; int main(){g=5; return g;}"),
+    ("g_init", "int g=7; int main(){return g;}"),
+    ("g_rmw", "int g=10; int main(){g=g+1; return g;}"),
+    ("g_counter", "int c=0; void inc(){c=c+1;}"
+                  " int main(){inc(); inc(); inc(); return c;}"),
+    ("g_static", "static int s=42; int main(){return s;}"),
+    ("g_two", "int a; int b=5; int main(){a=b*2; return a+b;}"),
+    ("g_array", "int a[5]; int main(){int i=0; while(i<5){a[i]=i*i; i=i+1;}"
+                " return a[4];}"),
+    ("g_array_init", "int a[4]={10,20,30,40}; int main(){return a[0]+a[3];}"),
+    ("g_array_xfn", "int a[3]; int sum(){int s=0,i=0; while(i<3){s=s+a[i];"
+                    " i=i+1;} return s;} int main(){a[0]=1;a[1]=2;a[2]=3;"
+                    " return sum();}"),
+    ("g_ptr", "int g=99; int main(){int *p=&g; *p=7; return g;}"),
+    ("g_struct", "struct P{int x;int y;}; struct P g;"
+                 " int main(){g.x=8; g.y=34; return g.x+g.y;}"),
+    ("g_char_array", "char m[6]={72,105,0,0,0,0}; int main(){return m[0]+m[1];}"),
+]
+
 
 def _run(cmd):
     p = subprocess.run(cmd, capture_output=True, text=True)
@@ -186,7 +207,7 @@ def main(argv):
             with open(path) as f:
                 progs.append((os.path.basename(path), f.read()))
     else:
-        progs = STAGE2 + STAGE3 + STAGE4 + STAGE6 + STAGE7 + STAGE8
+        progs = STAGE2 + STAGE3 + STAGE4 + STAGE6 + STAGE7 + STAGE8 + STAGE9
 
     workdir = tempfile.mkdtemp(prefix="arm64diff-")
     counts = {"PASS": 0, "FAIL": 0, "SKIP": 0, "ERROR": 0}
