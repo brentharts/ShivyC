@@ -164,6 +164,33 @@ STAGE10 = [
                  " int main(){long x=f(); if(x>0) return 1; return 0;}"),
 ]
 
+# Stage 11: bitwise/shift/unary operators, and global-address caching.
+STAGE11 = [
+    ("bit_and", "int main(){int a=12,b=10; return a&b;}"),
+    ("bit_or", "int main(){int a=12,b=10; return a|b;}"),
+    ("bit_xor", "int main(){int a=12,b=10; return a^b;}"),
+    ("bit_combined", "int main(){int x=0xF0; return (x&0x0F)|(x>>4);}"),
+    ("shl_imm", "int main(){int a=1; return a<<4;}"),
+    ("shr_imm", "int main(){int a=256; return a>>2;}"),
+    ("shr_unsigned", "unsigned f(){unsigned a=0x80000000u; return a>>30;}"
+                     " int main(){return f();}"),
+    ("shr_signed", "int f(){int a=-16; return a>>2;} int main(){return f()+10;}"),
+    ("shl_reg", "int main(){int a=3,b=5; return a<<b;}"),
+    ("shift_long", "long f(){long a=1; return a<<40;}"
+                   " int main(){long x=f(); return x>>33;}"),
+    ("bit_not", "int main(){int a=5; return (~a)+10;}"),
+    ("neg", "int main(){int a=5; return -a+10;}"),
+    ("g_accum_loop", "int g=0; int main(){int i=0; while(i<100){g=g+i; i=i+1;}"
+                     " return g;}"),
+    ("g_array_cached", "int a[10]; int main(){int i=0; while(i<10){a[i]=i*i;"
+                       " i=i+1;} int s=0;i=0; while(i<10){s=s+a[i];i=i+1;}"
+                       " return s;}"),
+    ("g_addr_cached", "int g=5; int main(){int *p=&g; *p=*p+1; return g + *p;}"),
+    ("g_struct_loop", "struct P{int x;int y;}; struct P g; int main(){int i=0;"
+                      " while(i<5){g.x=g.x+i; g.y=g.y+1; i=i+1;}"
+                      " return g.x+g.y;}"),
+]
+
 
 def _run(cmd):
     p = subprocess.run(cmd, capture_output=True, text=True)
@@ -232,7 +259,7 @@ def main(argv):
             with open(path) as f:
                 progs.append((os.path.basename(path), f.read()))
     else:
-        progs = STAGE2 + STAGE3 + STAGE4 + STAGE6 + STAGE7 + STAGE8 + STAGE9 + STAGE10
+        progs = STAGE2 + STAGE3 + STAGE4 + STAGE6 + STAGE7 + STAGE8 + STAGE9 + STAGE10 + STAGE11
 
     workdir = tempfile.mkdtemp(prefix="arm64diff-")
     counts = {"PASS": 0, "FAIL": 0, "SKIP": 0, "ERROR": 0}
