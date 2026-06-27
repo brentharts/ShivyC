@@ -30,6 +30,11 @@ On top of standard C, ShivyCX adds:
   automatic `free` insertion for unannotated C.
 - **Bare-metal operation** — freestanding, bootable 64-bit images with an inlined
   mini-OS.
+- **Multiple back ends** — besides x86-64, an AArch64 (ARM64) cross target with a
+  liveness-based linear-scan register allocator, plus an integer-core RISC-V 64
+  target that reuses the same allocator; both validated differentially against the
+  GNU cross toolchains under qemu, and selected with `--target` (see
+  [ARM64.md](ARM64.md)).
 - **A Python→C transpiler** — toward compiling the front end with itself, which
   doubles as **rpython**: a fast, runtime-free Python subset (typed numpy-style
   arrays, auto-contract SIMD, libm, file/socket I/O) that `shivyc.main` compiles
@@ -158,7 +163,57 @@ ELF64 entry, symbol resolution) since this environment has no emulator. See
 
 ---
 
-## Implementation overview
+## Multiple back ends: ARM64 and RISC-V (bare-metal cross targets)
+
+The IL produced by `il_gen` is architecture-neutral; everything below it — the
+register file, the calling convention, instruction selection, and assembler
+syntax — lives behind a `Target` seam ([`shivyc/targets`](shivyc/targets/__init__.py))
+and is selected with `--target`. On top of the original x86-64 back end there are
+now two cross targets, developed at the Python (rpython) level and validated
+*differentially* against the GNU cross toolchains under qemu — each ShivyCX
+binary's exit code is compared to the same program compiled by `gcc`.
+
+```sh
+# AArch64: full scalar C + floats, arrays, structs, globals, pointers
+python3 -m shivyc.main prog.c -S -o prog.s --target arm64
+aarch64-linux-gnu-gcc -static prog.s -o prog && qemu-aarch64 ./prog
+
+# RISC-V 64: integer core (locals, arithmetic, control flow, calls, recursion)
+python3 -m shivyc.main prog.c -S -o prog.s --target riscv64
+riscv64-linux-gnu-gcc -static prog.s -o prog && qemu-riscv64 ./prog
+```
+
+**AArch64** is the more complete target: integer and floating-point arithmetic,
+the six comparisons with compare/branch fusion, `if`/`while`, pointers and
+address-of, single- and multi-dimensional arrays, structs (by-value copy),
+file-scope globals (with address caching), direct calls and recursion, and
+AAPCS64 argument/return lowering including the integer/FP register split. Its
+register allocator is a **liveness-based linear scan with a caller/callee split**:
+values live across a call get callee-saved homes, call-clean values get
+caller-saved homes that need no save/restore, and leaf functions come out
+frameless — beating `gcc -O0` instruction counts on leaf and call-light code.
+See **[ARM64.md](ARM64.md)** for the full design, the staged bring-up, and the
+differential-testing methodology.
+
+**RISC-V 64** was brought up next, and deliberately small, to validate the seam:
+it implements the integer core and **reuses the entire architecture-neutral
+middle end verbatim** — copy-coalescing with its safety check, the live-variable
+analysis, live-interval and call-cross detection, and the caller/callee
+linear-scan allocator are all shared methods (`_il_*` in
+[`asm_gen.py`](shivyc/asm_gen.py)); only instruction selection, the register
+file, and the lp64 ABI are new. Standing up a working second ISA — locals,
+`+ - * / %`, comparisons, `if`/`while`, direct calls, recursion, register
+pressure with spills, and cross-call liveness — therefore took only a lowering
+pass, which is exactly the payoff of doing compiler work at the rpython level.
+
+Differential test harnesses live alongside the compiler:
+[`tools/arm64_difftest.py`](tools/arm64_difftest.py) (130 cases) and
+[`tools/riscv64_difftest.py`](tools/riscv64_difftest.py) (integer-core cases);
+each compiles a corpus both ways and checks the exit codes match under qemu.
+
+---
+
+
 
 #### Preprocessor
 A token-stream macro engine with conditional compilation, function-like macros,
@@ -188,6 +243,11 @@ values live across a call can stay in registers. General code in
 whole-program pass in [`pack_args.py`](shivyc/pack_args.py), and loop
 register-promotion of `_Nbit` packed globals is an IL pass in
 [`simd_pack_promote.py`](shivyc/simd_pack_promote.py).
+
+The same IL feeds two cross targets selected with `--target`: an AArch64 back end
+(see [ARM64.md](ARM64.md)) and an integer-core RISC-V 64 back end, which share a
+target-neutral liveness-based linear-scan register allocator (the `_il_*` methods
+in [`asm_gen.py`](shivyc/asm_gen.py)).
 
 #### Whole-program call graph
 The driver can build and print the program-wide call graph
