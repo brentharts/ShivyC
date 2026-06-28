@@ -47,3 +47,10 @@ def eval_str(src: "str") -> "str":
 def eval_bool(src: "str") -> "bool":
     v: bool = eval(src)
     return v
+
+
+def py_version() -> "str":
+    """The embedded interpreter's version string, read from its internal `sys`
+    module -- a quick check that the internal stdlib is wired up."""
+    v: str = eval("__import__('sys').version")
+    return v
