@@ -9,21 +9,24 @@ inf = float("inf")
 class MatchError(Exception):
     pass
 
-class Node(list):
+class Node:
     def __init__(self, name=None, value=None):
-        list.__init__(self, value if value is not None else [])
         self.name = name
+        self.children = list(value) if value is not None else []
 
     def __repr__(self):
-        return "%s%s" % (self.name, list.__repr__(self))
+        return "%s%s" % (self.name, self.children)
 
     def pprint(self, indent=0):
         print(" "*indent + self.name)
-        for child in self:
-            if not hasattr(child, "pprint"):
+        for child in self.children:
+            if not is_node(child):
                 print(" "*(indent + 1), type(child).__name__, repr(child))
             else:
                 child.pprint(indent + 2)
+
+def is_node(x):
+    return isinstance(x, Node)
 
 def simple_wrap_tree(root):
     if type(root) != list:
@@ -32,26 +35,31 @@ def simple_wrap_tree(root):
 
 def pop(input):
     input[1] += 1
-    try:
-        return input[0][input[1]]
-    except IndexError:
+    if input[1] >= len(input[0]):
         raise MatchError("EOF")
+    return input[0][input[1]]
 
 def to_list(output):
-    return output  if getattr(output, "name", None) == "And" else\
-           []      if output is None else\
-           [output]
+    if is_node(output) and output.name == "And":
+        return output.children
+    if output is None:
+        return []
+    return [output]
 
 def to_node(outputs):
-    outputs = [elem for output in outputs for elem in to_list(output)]
-    return outputs[0]       if len(outputs) == 1 else\
-           None             if len(outputs) == 0 else\
-           "".join(outputs) if all(type(output) == str for output in outputs)\
-           else Node("And", outputs)
+    flat = [elem for output in outputs for elem in to_list(output)]
+    if len(flat) == 1:
+        return flat[0]
+    if len(flat) == 0:
+        return None
+    if all(type(x) == str for x in flat):
+        return "".join(flat)
+    return Node("And", flat)
 
 class Interpreter:
     def __init__(self, grammar_tree, whitespace="\t\n\r \\"):
-        self.rules = {rule[NAME][0]:rule for rule in grammar_tree}
+        self.rules = {rule.children[0].children[0]: rule
+                      for rule in grammar_tree.children}
         self.whitespace = whitespace
 
     def eval(self, root):
@@ -64,8 +72,8 @@ class Interpreter:
         L = self.locals
         if code == "any_token(self.input)":
             return any_token(self.input)
-        if code == "any_token(self.input, binary=False)":
-            return any_token(self.input, binary=False)
+        if code == "any_token(self.input, False)":
+            return any_token(self.input, False)
         if code == 'int("".join(n[0] for n in s))':
             s = L['s']
             return int("".join(n[0] for n in s))
@@ -94,29 +102,29 @@ class Interpreter:
         old_input = self.input[:]
         name = root.name
         if name in ["and", "args", "output"]:
-            outputs = [self.match(child) for child in root]
-            if any(child.name == "output" for child in root):
-                outputs = [output for child, output in zip(root, outputs)
+            outputs = [self.match(child) for child in root.children]
+            if any(child.name == "output" for child in root.children):
+                outputs = [output for child, output in zip(root.children, outputs)
                            if child.name == "output"]
-            elif any(child.name == "rule_value" for child in root):
-                outputs = [output for child, output in zip(root, outputs)
+            elif any(child.name == "rule_value" for child in root.children):
+                outputs = [output for child, output in zip(root.children, outputs)
                            if child.name == "rule_value"]
                 assert(len(outputs) == 1)
         elif name == "quantified":
-            assert(root[1].name == "quantifier")
-            lower, upper = {"*": (0, inf), "+": (1, inf), "?": (0, 1)}[root[1][0]]
+            assert(root.children[1].name == "quantifier")
+            lower, upper = {"*": (0, inf), "+": (1, inf), "?": (0, 1)}[root.children[1].children[0]]
             outputs = []
             while len(outputs) < upper:
                 last_input = self.input[:]
                 try:
-                    outputs.append(self.match(root[0]))
+                    outputs.append(self.match(root.children[0]))
                 except MatchError:
                     self.input = last_input[:]
                     break
             if lower > len(outputs):
                 raise MatchError("Matched %s < %s times" % (len(outputs), lower))
         elif name == "or":
-            for child in root:
+            for child in root.children:
                 try:
                     return self.match(child)
                 except MatchError:
@@ -128,62 +136,62 @@ class Interpreter:
                     if self.input[0][self.input[1]] == '\\':
                         pop(self.input)
                 self.input[1] -= 1
-            for char in root[0]:
+            for char in root.children[0]:
                 if pop(self.input) != char:
-                    raise MatchError("Not exactly %s" % root[0])
-            if name == "token" and root[0].isalpha():
+                    raise MatchError("Not exactly %s" % root.children[0])
+            if name == "token" and root.children[0].isalpha():
                 top = pop(self.input)
                 if top.isalnum() or top == '_':
                     raise MatchError("Prefix matched but didn't end.")
                 self.input[1] -= 1
-            return root[0]
+            return root.children[0]
         elif name == "apply":
-            #import inspect
-            #print " "*(len(inspect.stack())-9), "matching", name, root[NAME], self.input[1], self.input[0][self.input[1]+1:self.input[1]+11]
-            if root[NAME] == "anything":
+            if root.children[0] == "anything":
                 return pop(self.input)
-            elif root[NAME] == "void":
+            elif root.children[0] == "void":
                 return
             old_locals = self.locals
             self.locals = {}
             try:
-                outputs = self.match(self.rules[root[NAME]][BODY])
-            finally:
+                outputs = self.match(self.rules[root.children[0]].children[3])
+            except MatchError:
                 self.locals = old_locals
-            if root[NAME] == "escaped_char":
+                raise
+            self.locals = old_locals
+            if root.children[0] == "escaped_char":
                 chars = dict(["''", '""', "t\t", "n\n", "r\r", "b\b", "f\f", "\\\\"])
                 return chars[outputs[-1]]
-            and_node = getattr(outputs, "name", None) == "And"
-            make_node = "!" in self.rules[root[NAME]][FLAGS] or\
-                        (and_node and len(outputs) > 1)
+            and_node = is_node(outputs) and outputs.name == "And"
+            make_node = "!" in self.rules[root.children[0]].children[1].children or\
+                        (and_node and len(outputs.children) > 1)
             if not make_node:
                 return outputs
-            return Node(root[NAME], to_list(outputs))
-        elif name in "bound":
-            if root[1].name == "inline":
-                return Node(root[1][0], to_list(self.match(root[0])))
-            else: # bind
-                self.locals[root[1][0]] = self.match(root[0])
+            return Node(root.children[0], to_list(outputs))
+        elif name == "bound":
+            if root.children[1].name == "inline":
+                return Node(root.children[1].children[0], to_list(self.match(root.children[0])))
+            else:  # bind
+                self.locals[root.children[1].children[0]] = self.match(root.children[0])
                 return
         elif name == "negation":
             try:
-                self.match(root[0])
+                self.match(root.children[0])
             except MatchError:
                 self.input = old_input
                 return None
             raise MatchError("Negation true")
         elif name == "rule_value":
-            return self.eval(root[0])
+            return self.eval(root.children[0])
         elif name == "predicate":
-            output = self.eval(root[0])
+            output = self.eval(root.children[0])
             if not output:
                 raise MatchError("Predicate evaluates to false")
             return None if output == True else Node("predicate", [output])
         elif name == "action":
-            self._action(root[0])
+            self._action(root.children[0])
             return
         elif name == "lookahead":
-            output = self.match(root[0])
+            output = self.match(root.children[0])
             self.input = old_input[:]
             return output
         else:
@@ -196,9 +204,9 @@ def reformat_atom(atom, trailers):
         if trailer.name == "arglist":
             output = Node("__call__", [output, trailer])
         elif trailer.name == "NAME":
-            output = Node("__getattr__", [output, Node("NAME", trailer)])
+            output = Node("__getattr__", [output, Node("NAME", trailer.children)])
         elif trailer.name == "subscriptlist":
-            output = Node("__getitem__", [output] + trailer)
+            output = Node("__getitem__", [output] + trailer.children)
         else:
             raise Exception("Unknown trailer %s" % trailer.name)
     return output
@@ -210,36 +218,49 @@ binary_ops = ((">=", "<=", "<>", "<", ">", "==", "!=",
 priority = {op:i for i, ops in enumerate(binary_ops) for op in ops}
 expr_ops = binary_ops[1:]
 
-def reformat_binary(start, tokens):
-    def parse(lhs, tokens, index=0):
-        threshold = priority[tokens[index][0][0]]
-        while index < len(tokens):
-            op, rhs = tokens[index]
-            op = op[0]
-            if priority[op] < threshold:
-                break
-            index += 1
-            while index < len(tokens) and\
-                  priority[tokens[index][0][0]] > priority[op]:
-                rhs, index = parse(rhs, tokens, index)
-            lhs = Node("__binary__", [op, lhs, rhs])
-        return (lhs, index)
-    if not tokens:
-        return start
-    tokens = list(zip(tokens[::2], tokens[1::2]))
-    lhs, index = start, 0
+def _rb_parse(lhs, tokens, index):
+    threshold = priority[tokens[index][0].children[0]]
     while index < len(tokens):
-        lhs, index = parse(lhs, tokens, index)
+        op, rhs = tokens[index]
+        op = op.children[0]
+        if priority[op] < threshold:
+            break
+        index += 1
+        while index < len(tokens) and\
+              priority[tokens[index][0].children[0]] > priority[op]:
+            rhs, index = _rb_parse(rhs, tokens, index)
+        lhs = Node("__binary__", [op, lhs, rhs])
+    return (lhs, index)
+
+def reformat_binary(start, tokens):
+    if tokens is None:
+        return start
+    toks = tokens.children
+    pairs = list(zip(toks[::2], toks[1::2]))
+    lhs, index = start, 0
+    while index < len(pairs):
+        lhs, index = _rb_parse(lhs, pairs, index)
     return lhs
+
+def _all_match(input, token):
+    # Short-circuiting replacement for all(pop(input) == c for c in token):
+    # stops at the first mismatch so `pop` is not called extra times (minipy
+    # materialises generator expressions, so a side-effecting genexp would
+    # over-advance the input).
+    for char in token:
+        if pop(input) != char:
+            return False
+    return True
 
 def any_token(input, binary=True):
     ops = binary_ops if binary else expr_ops
     old_input = input[:]
     for tokens in ops:
         for token in tokens:
-            if all(pop(input) == char for char in token):
+            if _all_match(input, token):
                 return token
-            input[:] = old_input[:]
+            input[0] = old_input[0]
+            input[1] = old_input[1]
     return False
 
 grammar = r"""
@@ -350,7 +371,7 @@ not_test = ("not" {not_test})=not_test | comparison
 comparison = factor:start (hspaces {?(any_token(self.input))}
                            hspaces {factor})*:oper_and_atoms
              -> reformat_binary(start, oper_and_atoms)
-expr = factor:start (hspaces {?(any_token(self.input, binary=False))}
+expr = factor:start (hspaces {?(any_token(self.input, False))}
                      hspaces {factor})*:oper_and_atoms
      -> reformat_binary(start, oper_and_atoms)
 
@@ -525,12 +546,12 @@ tree = ['And',
  ['rule', ['rule_name', 'spaces'], ['flags'], ['args'],
   ['quantified', ['apply', 'space'], ['quantifier', '*']]]]
 
-if __name__ == "__main__":
-    import sys
+def parse_python(source):
+    """Parse Python `source` into a pymetaterp Node tree (the grammar covers a
+    Python-2-flavoured subset)."""
     i1 = Interpreter(simple_wrap_tree(tree))
-    match_tree1 = i1.match(i1.rules['grammar'][-1], grammar + extra)
-    i2 = Interpreter(match_tree1)
-    match_tree2 = i2.match(i2.rules['grammar'][-1], python_grammar + extra)
-    pyi = Interpreter(match_tree2, whitespace="\t \\")
-    ast = pyi.match(pyi.rules['file_input'][-1], open(sys.argv[-1]).read())
-    ast.pprint()
+    mt1 = i1.match(i1.rules['grammar'].children[-1], grammar + extra)
+    i2 = Interpreter(mt1)
+    mt2 = i2.match(i2.rules['grammar'].children[-1], python_grammar + extra)
+    pyi = Interpreter(mt2, "\t \\")
+    return pyi.match(pyi.rules['file_input'].children[-1], source)
