@@ -614,3 +614,170 @@ never frees container memory, so repeated calls in one process accumulate in the
 1 GiB arena and eventually abort. A single parse fits comfortably; batch use would
 need either hoisting the bootstrap out of `parse_python` (parse the grammars once,
 reuse the `Interpreter`) or arena reuse/freeing. This is the natural next step.
+
+---
+
+## Status update — benchmarking minipy vs CPython (and PyPy)
+
+Added a cross-runtime benchmark harness, `benchmarks/run_minipy_benchmarks.py`, plus
+eight self-contained benchmark programs in `benchmarks/minipy/` (no imports/argv,
+since minipy runs top-level module code): `fib` (recursion), `loops` (integer
+arithmetic), `sieve`, `matmul`, `sort` (insertion sort), `dicts`, `strings`, and
+`collatz`. Each prints a result; the harness runs it under CPython, PyPy3 (when
+present), and minipy-native (compile to bytecode, then run the py2c-compiled interp),
+checks that all backends print identical stdout, and records best-of-N runtime and
+exact peak RSS (via a minimal-footprint C probe). Results land in
+`benchmarks/results/minipy_results.json`. PyPy3 is not installed in this environment,
+so the runs below are minipy vs CPython.
+
+### Two correctness bugs the benchmarks surfaced (native-only; ref VM was correct)
+- **Floored division/modulo.** Native `%` and `//` used C truncated semantics, so
+  `-1 % 7` gave `-1` instead of `6` and `-7 // 2` gave `-3` instead of `-4`. Added
+  `_floordiv_int`/`_mod_int` (and `_ffloor` for floats) implementing Python's floored
+  behaviour; the correction is a no-op under CPython's already-floored `//`, so the
+  same code is correct in both the under-CPython and native runs.
+- **Sequence repeat.** `[x] * n`, `n * [x]`, `(...) * n`, and `n * "s"` were
+  unimplemented natively (they fell through to numeric multiply and produced garbage).
+  `v_mul` now handles list/tuple/str repeat in both operand orders.
+
+### A memory optimisation: frame pooling
+The interpreter allocates a register array and an argument list per call and never
+frees them, so allocation-heavy programs ballooned (fib(28) peaked ~717 MB). Since
+calls are stack-nested, frames are safe to recycle: added a register-array pool on
+`St` that `run_func` borrows from on entry and returns on every exit, and the CALL
+opcode now recycles its argument list the same way. fib(28) dropped to ~492 MB
+(~30% less) with correctness and speed unchanged.
+
+### Results (work sizes tuned so CPython runs in ~30-160 ms; best-of-3)
+| benchmark | minipy vs CPython | minipy peak RSS | note |
+|-----------|-------------------|-----------------|------|
+| matmul    | ~1.0x  | 8 MB   | tight nested int loops |
+| strings   | ~1.0x  | 23 MB  | slicing / split / find |
+| sieve     | ~1.8x  | 57 MB  | bool-list indexing |
+| loops     | ~3.4x  | 517 MB | integer arithmetic |
+| sort      | ~3.6x  | 70 MB  | insertion sort, list writes |
+| collatz   | ~5.0x  | 528 MB | int arithmetic, while |
+| fib       | ~8.8x  | 492 MB | 1.3M recursive calls |
+| dicts     | ~203x  | 25 MB  | **O(n) dict lookup** |
+
+All eight agree with CPython byte-for-byte. The headline numbers: minipy is typically
+**~2-9x slower** than CPython on compute (reasonable for a boxed-value register VM that
+is itself an interpreter written in the py2c subset), with two clear weaknesses:
+
+1. **`dict` is a linear-scan association list** (`dict_find` is O(n)), so the dict
+   benchmark degrades to O(n²) and runs ~200x slower. A real hash table is the
+   single biggest available speedup and the obvious next optimisation.
+2. **No garbage collection.** Peak RSS tracks *total* allocations, not the live set, so
+   long allocation-heavy runs use hundreds of MB. Frame pooling mitigates the call-path
+   lists; the remaining cost is unfreed value boxes (every integer result is a heap V).
+   Unboxed small integers or an arena reset between top-level statements would help.
+
+Runtime *correctness* is solid across recursion, nested loops, lists, dicts, strings,
+classes, and exceptions — the same interpreter that now parses `rast.py` natively.
+
+---
+
+## Status update — dict hash table, and two optimisation experiments
+
+### Dict hash table: 203x -> 2.0x slower than CPython
+The dict was a flat `items = [k0, v0, k1, v1, ...]` list with a linear `dict_find`,
+so lookup/insert/`in` were all O(n) and the dicts benchmark was O(n^2) (~203x slower
+than CPython). It now uses an open-addressing hash index, in the spirit of CPython's
+compact dict: `items` stays the ordered backing store (preserving Python insertion
+order for iteration, `keys()`, `values()`, `for k in d`), and a new `buckets` array on
+the `Cont` indexes into it. Added `v_hash` (int/bool -> value, str -> djb2, none/float
+handled), `dict_reindex` (power-of-two capacity, load factor < 2/3, rebuilt on growth),
+`dict_lookup`, and `dict_insert`; every dict op (`[]` read/write, `in`, `get`,
+`setdefault`, `update`, `BUILD_DICT`) routes through them. minipy has no `del`/dict
+deletion, so no tombstones are needed. Result: the dicts benchmark dropped to ~2.0x
+CPython, a ~100x speedup, with all benchmarks and the full regression still byte-identical.
+
+One py2c wrinkle worth recording: a `list[int]` *struct field* is not unboxed the way a
+`list[int]` *local* is, so `cont.buckets[slot]` came back boxed (`obj`) and the C did not
+type-check. Storing the index as a `list[V]` of `v_int` slot values (read via `.iv`, with
+a shared `v_int(-1)` empty sentinel) uses the standard container machinery and compiles
+cleanly.
+
+### Experiment 1 (reverted): if/elif dispatch -> C switch in py2c
+The interpreter's opcode dispatch is a long `if op == 1: elif op == 2: ...` chain. The
+hypothesis was that emitting a C `switch` (jump table) would make dispatch O(1) and speed
+up every benchmark. A gated transform was added to py2c (`st_If` -> `switch` when a chain
+compares one variable to >=5 distinct int constants with no loop-escaping `break`). It
+compiled, produced `switch (op)`, and was byte-for-byte correct -- but gave **zero**
+measurable speedup. gcc `-O2` already lowers a dense integer `if/elif` chain to a jump
+table, so the explicit switch added nothing. The change was reverted to keep py2c
+unchanged; the finding is that **dispatch is not the bottleneck**.
+
+### Experiment 2 (reverted): small-int / None / True / False cache
+Since the switch result points at allocation rather than dispatch, the next idea was to
+stop heap-allocating the most common values: cache `None`, `True`, `False`, and small
+integers as shared immutable `V` singletons (`V` is never mutated in place, so sharing is
+safe). This needs runtime-initialised module-global state of a class type. py2c currently
+emits such globals inconsistently (sometimes `V*`, sometimes `obj`, with a non-constant
+static initialiser), so the interpreter did not compile. Reverted.
+
+This is the same capability the design doc's "single large block of instructions"
+(`_list_Instr_global_lookup`) and compact-`FuncOpt` ideas depend on, so the concrete
+next step toward unboxing is **py2c support for runtime-initialised, class-typed module
+globals** (a zero-init `.bss` pointer plus an init function, consistently typed). With
+that in place, the small-int/singleton cache and the global instruction block become
+straightforward, and the larger goal -- shrinking `V` from ~32 bytes to a 16-byte
+tag+union -- can follow. The measurements here show why it matters: the slowest
+benchmarks (fib 8.9x, collatz 9.3x) are dominated by per-value heap allocation and the
+no-GC memory growth, not by interpreter dispatch.
+
+---
+
+## Status update — py2c: runtime-initialized class-typed globals, and the value cache
+
+### The py2c enabler: class-typed module globals stored as `obj`
+The previous unboxing attempt (a shared-singleton value cache) was blocked because a
+module-level class-typed global initialized to None -- `_v: "V" = None` -- did not
+compile: `st_AnnAssign` emitted `V* _v = (V*)AS_OBJ(OBJ_NONE);`, which is both a
+non-constant static initializer and a type-mismatch with every use site (the
+global-type registry, and every `global v; v = V(...)` store/read, already treat such a
+global as the boxed `obj`). The declaration was the only piece out of step.
+
+Fix (one targeted change in `st_AnnAssign`): when a *toplevel* annotated assignment has
+a class-pointer annotation and an explicit `= None`, store it as `obj`. This matches the
+registry's existing coercion (`collect_module_globals` already maps `*`+None to obj), so
+the file-scope declaration, the stores, and the reads now all agree, and `obj` zero-init
+is a valid `.bss` static initializer (T_NONE == 0). The change is gated exactly to that
+pattern -- a `grep` of all transpiled compiler/stdlib sources shows it appears nowhere
+there, so self-hosting and every existing program transpile byte-for-byte unchanged; 7/8
+rpython benchmarks were confirmed identical and the 8th matches the old output too. This
+is the capability the design doc's global instruction block and compact-object work both
+need.
+
+### The payoff: a small-int / None / True / False value cache
+With class-typed globals working, the interpreter now allocates the most common values
+once at startup (`setup_cache`) and hands out shared immutable singletons: `None`,
+`True`, `False`, and the small integers in [-8, 256]. `V` is never mutated in place and
+minipy compares by value (not identity), so sharing is safe. `v_none`, `v_bool`, and
+`v_int` return the cached `V` on the hot path and only allocate for out-of-range ints.
+
+This was a large win in *both* speed and memory, because small ints, loop counters, and
+the boolean results of every comparison were the bulk of all allocations:
+
+| benchmark | before | after | peak RSS before -> after |
+|-----------|--------|-------|--------------------------|
+| matmul    | 1.0x   | 0.5-1.0x (~CPython or faster) | 8 MB -> 3 MB |
+| sieve     | 1.8x   | ~1.0-1.6x | 56 MB -> 23 MB |
+| dicts     | 2.0x   | 2.0x   | 28 MB -> 20 MB |
+| strings   | 1.7x   | 1.3-2.0x | 25 MB -> 20 MB |
+| sort      | 3.6x   | 2.0x   | 68 MB -> 16 MB |
+| loops     | 3.4x   | 3.2x   | 505 MB -> 236 MB |
+| collatz   | 9.3x   | 2.8x   | 516 MB -> 48 MB |
+| fib       | 8.9x   | 4.1x   | 480 MB -> 82 MB |
+
+The recursion/arithmetic-heavy cases improved the most: collatz 9.3x -> 2.8x with an 11x
+memory drop, fib 8.9x -> 4.1x with a 6x memory drop. matmul now runs at or below CPython.
+All eight stay byte-identical, and the full regression, `testfast`, and the rast.py
+native parse all pass.
+
+The remaining allocation hot spot is large integers (fib's growing sums, loops'
+accumulator), which fall outside the small-int range and still allocate. The clear next
+steps, both now unblocked by the class-typed-global support: (1) move the per-call
+instruction list into a single global block (the design doc's `_list_Instr_global_lookup`)
+and shrink `Func`, and (2) the larger goal of shrinking `V` itself from ~32 bytes to a
+16-byte tag+union, which needs py2c support for union/overlapping POD fields.

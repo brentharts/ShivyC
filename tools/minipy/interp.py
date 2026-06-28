@@ -84,6 +84,19 @@ class V:
         self.sv = sv
 
 
+# Shared immutable singletons (V is never mutated in place), populated once by
+# setup_cache() at interpreter start. Caching None/True/False and small ints
+# avoids a heap V allocation on the hottest paths (comparisons, loop counters,
+# default register slots).
+_CACHE_LO = -8
+_CACHE_HI = 256
+_cache_ready: "int" = 0
+_none_v: "V" = None
+_true_v: "V" = None
+_false_v: "V" = None
+_int_cache: "list[V]" = None
+
+
 # A heap cell. kind: 0 list, 1 dict (items = [k0,v0,k1,v1,...]), 2 set,
 # 3 tuple, 4 iter (items = materialised elements, cursor = position).
 class Cont:
@@ -121,11 +134,30 @@ def new_reg_pool() -> "list[list[V]]":
     return r
 
 
+def setup_cache() -> "int":
+    global _cache_ready, _none_v, _true_v, _false_v, _int_cache
+    _none_v = V(0, 0, 0.0, "")
+    _false_v = V(4, 0, 0.0, "")
+    _true_v = V(4, 1, 0.0, "")
+    c = new_v_list()
+    n = _CACHE_LO
+    while n <= _CACHE_HI:
+        c.append(V(1, n, 0.0, ""))
+        n = n + 1
+    _int_cache = c
+    _cache_ready = 1
+    return 0
+
+
 def v_none() -> "V":
+    if _cache_ready != 0:
+        return _none_v
     return V(0, 0, 0.0, "")
 
 
 def v_int(n: "long") -> "V":
+    if _cache_ready != 0 and n >= _CACHE_LO and n <= _CACHE_HI:
+        return _int_cache[n - _CACHE_LO]
     return V(1, n, 0.0, "")
 
 
@@ -138,6 +170,10 @@ def v_str(t: "char*") -> "V":
 
 
 def v_bool(b: "int") -> "V":
+    if _cache_ready != 0:
+        if b:
+            return _true_v
+        return _false_v
     return V(4, 1 if b else 0, 0.0, "")
 
 
@@ -1947,6 +1983,7 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
 
 
 def interp_run(prog: "Program") -> "int":
+    setup_cache()
     glob = new_v_list()
     heap = []
     cz = Cont(0, 0, new_v_list(), new_v_list())
