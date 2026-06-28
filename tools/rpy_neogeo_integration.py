@@ -78,25 +78,32 @@ def bake_source(path):
 def _img_c(prefix, img):
     pal = ", ".join("0x%04X" % w for w in img.palette)
     pix = ", ".join("%d" % p for p in img.pixels)
+    cols, rows, size, planar = pack_image_tiles(img)
+    tdata = ", ".join("0x%02X" % b for b in planar)
     lines = []
     lines.append("static const unsigned short %s_palette[%d] = { %s };"
                  % (prefix, len(img.palette), pal))
     lines.append("static const unsigned char %s_pixels[%d] = { %s };"
                  % (prefix, len(img.pixels), pix))
-    return "\n".join(lines)
+    lines.append("/* %d x %d tiles of %dx%d px, 4 bitplanes each (Neo-Geo gfx"
+                 " ROM order) */" % (cols, rows, size, size))
+    lines.append("static const unsigned char %s_tiles[%d] = { %s };"
+                 % (prefix, len(planar), tdata))
+    return "\n".join(lines), cols, rows, size, len(planar)
 
 
 def scene_to_c(scene):
-    """Emit the baked scene as portable C: per-image palette and pixel arrays,
-    plus a `neogeo_layer` table describing each layer. Tile/bitplane packing for
-    the real C-ROM is a later step; this is the colour-correct source data."""
+    """Emit the baked scene as portable C: per-image palette, pixel, and packed
+    4-bitplane tile arrays, plus a `neogeo_layer` table describing each layer."""
     out = []
     out.append("/* Neo-Geo scene baked from ASCII art at translate time. */")
     out.append("typedef struct {")
     out.append("    const char* kind;")
     out.append("    int width, height, tile;")
+    out.append("    int tile_cols, tile_rows, tile_bytes;")
     out.append("    const unsigned short* palette; int palette_len;")
     out.append("    const unsigned char* pixels;")
+    out.append("    const unsigned char* tiles;")
     out.append("} neogeo_layer;")
     out.append("")
 
@@ -104,10 +111,12 @@ def scene_to_c(scene):
     n = 0
     for img in scene.backgrounds + scene.sprites:
         prefix = "ng_layer%d" % n
-        out.append(_img_c(prefix, img))
-        table.append('    { "%s", %d, %d, %d, %s_palette, %d, %s_pixels }'
-                     % (img.kind, img.width, img.height, img.tile_size(),
-                        prefix, len(img.palette), prefix))
+        body, cols, rows, size, tbytes = _img_c(prefix, img)
+        out.append(body)
+        table.append('    { "%s", %d, %d, %d, %d, %d, %d, %s_palette, %d,'
+                     ' %s_pixels, %s_tiles }'
+                     % (img.kind, img.width, img.height, size, cols, rows,
+                        tbytes, prefix, len(img.palette), prefix, prefix))
         n += 1
     out.append("")
     out.append("static const neogeo_layer neogeo_scene[%d] = {" % n)
@@ -143,6 +152,82 @@ def scene_main_c(scene):
         "           neogeo_scene_len, total, chk);\n"
         "    return total & 255;\n"
         "}\n")
+
+
+# ---- tile / bitplane packing -----------------------------------------------
+
+def _tile_grid(img):
+    """Split an image into tile_size x tile_size tiles (8 for backgrounds/fix,
+    16 for sprites), row-major across the tile grid. Partial edge tiles are
+    padded with transparent (index 0). Returns (cols, rows, list-of-tiles), each
+    tile a flat list of `size*size` palette indices."""
+    size = img.tile_size()
+    cols = (img.width + size - 1) // size
+    rows = (img.height + size - 1) // size
+    tiles = []
+    for ty in range(rows):
+        for tx in range(cols):
+            tile = []
+            for y in range(size):
+                for x in range(size):
+                    sx = tx * size + x
+                    sy = ty * size + y
+                    if sx < img.width and sy < img.height:
+                        tile.append(img.pixels[sy * img.width + sx])
+                    else:
+                        tile.append(0)
+            tiles.append(tile)
+    return cols, rows, tiles
+
+
+def pack_bitplanes(tile, size):
+    """Pack one tile's 4-bit indices into 4 Neo-Geo bitplanes. Each plane is one
+    bit per pixel, row-major, MSB first, so a `size`x`size` tile yields 4 byte
+    strings of size*size/8 bytes. (The final per-ROM byte interleave for the
+    physical C/S ROMs is applied by the ngdevkit packaging step.)"""
+    planes = []
+    for bit in range(4):
+        bytes_out = []
+        acc = 0
+        nbits = 0
+        for idx in tile:
+            acc = (acc << 1) | ((idx >> bit) & 1)
+            nbits += 1
+            if nbits == 8:
+                bytes_out.append(acc)
+                acc = 0
+                nbits = 0
+        if nbits:
+            bytes_out.append(acc << (8 - nbits))
+        planes.append(bytes_out)
+    return planes
+
+
+def unpack_bitplanes(planes, size):
+    """Inverse of pack_bitplanes: reconstruct the size*size index list (used to
+    verify packing is lossless)."""
+    out = []
+    for i in range(size * size):
+        byte_i = i // 8
+        bit_i = 7 - (i % 8)
+        idx = 0
+        for bit in range(4):
+            idx |= ((planes[bit][byte_i] >> bit_i) & 1) << bit
+        out.append(idx)
+    return out
+
+
+def pack_image_tiles(img):
+    """Tile an image and bitplane-pack every tile. Returns (cols, rows, size,
+    planar_bytes) where planar_bytes is the concatenation, per tile, of its 4
+    bitplanes -- the 4bpp planar tile data the Neo-Geo gfx ROMs hold."""
+    size = img.tile_size()
+    cols, rows, tiles = _tile_grid(img)
+    planar = []
+    for tile in tiles:
+        for plane in pack_bitplanes(tile, size):
+            planar.extend(plane)
+    return cols, rows, size, planar
 
 
 # ---- off-hardware preview (testing) ----------------------------------------
