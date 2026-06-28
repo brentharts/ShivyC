@@ -4347,6 +4347,7 @@ class Transpiler:
     def run(self, tree):
         global KNOWN_CLASSES, VTABLE_METHODS
         rewrite_class_lambdas(tree)
+        self._rewrite_thread_decorators(tree)
         if self.stdlib_root:
             rewrite_module_lambdas(tree)
         self.closure_specs = lift_nested_functions(tree)
@@ -7595,6 +7596,92 @@ class Transpiler:
         self.indent -= 1
         self.emit("}")
 
+    def _thread_decorator_info(self, dec):
+        """If `dec` is @rpy.threads.left(core=N) / .right(core=N), return
+        (side, core); else None."""
+        if not isinstance(dec, ast.Call):
+            return None
+        f = dec.func
+        if not (isinstance(f, ast.Attribute) and f.attr in ("left", "right")):
+            return None
+        v = f.value
+        if not (isinstance(v, ast.Attribute) and v.attr == "threads"
+                and isinstance(v.value, ast.Name) and v.value.id == "rpy"):
+            return None
+        core = 0
+        for kw in dec.keywords:
+            if kw.arg == "core" and isinstance(kw.value, ast.Constant):
+                core = int(kw.value.value)
+        return f.attr, core
+
+    def _is_start_new_thread(self, node):
+        """`rpy.threads.start_new_thread(fn, ...)` -> the started fn's name,
+        else None."""
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "start_new_thread"):
+            return None
+        v = node.func.value
+        if isinstance(v, ast.Attribute) and v.attr == "threads" \
+                and isinstance(v.value, ast.Name) and v.value.id == "rpy":
+            if node.args and isinstance(node.args[0], ast.Name):
+                return node.args[0].id
+        return None
+
+    def _rewrite_thread_decorators(self, tree):
+        """Recognize ShivyCX bare-metal thread declarations written as rpython
+        decorators. Records `@rpy.threads.left/right(core=N)` on each function
+        (stripping the decorator so the function translates as an ordinary void
+        function), and -- when the program drives them from a `__main__` guard
+        rather than an explicit `main` -- synthesizes a `main` whose body is that
+        guard with each `rpy.threads.start_new_thread(fn)` turned into `fn()`.
+        The recorded contracts are emitted in main's header by _auto_contracts.
+        """
+        self._thread_contracts = {}
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.decorator_list:
+                keep = []
+                for dec in node.decorator_list:
+                    info = self._thread_decorator_info(dec)
+                    if info is not None:
+                        self._thread_contracts[node.name] = info
+                    else:
+                        keep.append(dec)
+                node.decorator_list = keep
+        if not self._thread_contracts:
+            return
+        if any(isinstance(n, ast.FunctionDef) and n.name == "main"
+               for n in tree.body):
+            return
+        guard = None
+        for n in tree.body:
+            if _is_dunder_main_guard(n):
+                guard = n
+                break
+        main_body = []
+        if guard is not None:
+            for st in guard.body:
+                fn = self._is_start_new_thread(st.value) \
+                    if isinstance(st, ast.Expr) else None
+                if fn is not None:
+                    main_body.append(ast.Expr(value=ast.Call(
+                        func=ast.Name(id=fn, ctx=ast.Load()),
+                        args=[], keywords=[])))
+                else:
+                    main_body.append(st)
+        main_body.append(ast.Return(value=ast.Constant(value=0)))
+        main_fn = ast.FunctionDef(
+            name="main",
+            args=ast.arguments(posonlyargs=[], args=[], vararg=None,
+                               kwonlyargs=[], kw_defaults=[], kwarg=None,
+                               defaults=[]),
+            body=main_body, decorator_list=[],
+            returns=ast.Constant(value="int"))
+        if guard is not None:
+            tree.body = [n for n in tree.body if n is not guard]
+        tree.body.append(main_fn)
+        ast.fix_missing_locations(tree)
+
     def _extract_contracts(self, node):
         """Pull leading `assert len(arr) ...` statements off the body and render
         them as ShivyCX contract clauses (which sit between the parameter list
@@ -7666,6 +7753,12 @@ class Transpiler:
                 nm = cname(a.arg)
                 clauses.append("assert not len(%s) %% %d" % (nm, lanes))
                 clauses.append("assert len(%s) >= %d" % (nm, lanes))
+        # Register-partitioned bare-metal threads: emit `assert FN in
+        # threads.SIDE(core=N)` in main's header for each decorated worker.
+        if node.name == "main" and getattr(self, "_thread_contracts", None):
+            for fn, (side, core) in self._thread_contracts.items():
+                clauses.append("assert %s in threads.%s(core=%d)"
+                               % (self.fnsym(fn), side, core))
         return clauses
 
     def _uses_argv(self, node):
@@ -13353,6 +13446,29 @@ def transpile_file(path, out_dir, stdlib_dir=None):
         except Exception as e:
             print("  pgo: skipped (%s)" % e)
     src = open(path, encoding="utf-8").read()
+    # Neo-Geo specialisation: a source that `import neogeo`s declares a scene out
+    # of constant ASCII art. Rather than transpile the declarative API, run the
+    # ASCII->pixel-art conversion now (at translate time) and emit the finished
+    # palette/tile data as C, plus a small driver -- so the on-target program is
+    # just data and a copy loop. (See tools/rpy_neogeo_integration.py.)
+    if "neogeo" in src:
+        try:
+            _here = os.path.dirname(os.path.abspath(__file__))
+            if _here not in sys.path:
+                sys.path.insert(0, _here)
+            import rpy_neogeo_integration as _ng
+            if _ng.imports_neogeo(path):
+                scene = _ng.bake_source(path)
+                cbody = _ng.scene_to_c(scene) + _ng.scene_main_c(scene)
+                base = os.path.splitext(os.path.basename(path))[0]
+                cpath = os.path.join(out_dir, base + ".c")
+                with open(cpath, "w") as _cf:
+                    _cf.write(cbody)
+                print("  neogeo: baked %d layer(s) from ASCII art -> %s"
+                      % (len(scene.backgrounds) + len(scene.sprites), cpath))
+                return cpath, None
+        except Exception as _e:
+            print("  neogeo: bake failed (%s)" % _e)
     modname, base_dir, stdlib_root = _stdlib_context(path, stdlib_dir)
     py_mod = py_modname_from_path(path, stdlib_root) if stdlib_root else None
     try:
