@@ -682,6 +682,100 @@ obj mp_call_import(const char* mod, const char* attr, int n, ...) {
 }
 '''
 
+# Self-contained native evaluator for eval() of Python *expressions*, used in
+# place of the MicroPython core (nothing external to link). minipy's compiler
+# and parser are Python, so a transpiled C binary cannot compile arbitrary
+# source at runtime; what it can do cheaply -- and what the overwhelmingly common
+# eval() pattern needs (e.g. eval(f"{a}+{b}")) -- is evaluate a literal numeric
+# expression. This recursive-descent evaluator covers int/float literals,
+# + - * / // % ** with Python's floor/mod semantics, unary +/-, parentheses, and
+# the six comparisons, boxing the result into the ShivyCX object model. Anything
+# outside that grammar (names, calls, containers) needs the minipy frontend
+# compiled to C and is future work.
+MINIPY_EVAL_C = r'''/* ---- minipy eval: native expression evaluator (no MicroPython) ---- */
+#include <math.h>
+typedef struct { int isf; long i; double d; } mpe_val;
+static double mpe_tod(mpe_val v) { return v.isf ? v.d : (double)v.i; }
+static mpe_val mpe_int(long x)  { mpe_val v; v.isf=0; v.i=x; v.d=0; return v; }
+static mpe_val mpe_flt(double x){ mpe_val v; v.isf=1; v.i=0; v.d=x; return v; }
+
+typedef struct { const char* s; } mpe_p;
+static void mpe_ws(mpe_p* p){ while(*p->s==' '||*p->s=='\t') p->s++; }
+static mpe_val mpe_cmp(mpe_p* p);
+
+static mpe_val mpe_atom(mpe_p* p){
+    mpe_ws(p);
+    if(*p->s=='('){ p->s++; mpe_val v=mpe_cmp(p); mpe_ws(p); if(*p->s==')') p->s++; return v; }
+    const char* st=p->s; int isf=0;
+    while(*p->s>='0'&&*p->s<='9') p->s++;
+    if(*p->s=='.'){ isf=1; p->s++; while(*p->s>='0'&&*p->s<='9') p->s++; }
+    if(*p->s=='e'||*p->s=='E'){ isf=1; p->s++; if(*p->s=='+'||*p->s=='-') p->s++;
+        while(*p->s>='0'&&*p->s<='9') p->s++; }
+    if(isf) return mpe_flt(strtod(st,0));
+    return mpe_int(strtol(st,0,10));
+}
+static mpe_val mpe_unary(mpe_p* p){
+    mpe_ws(p);
+    if(*p->s=='-'){ p->s++; mpe_val v=mpe_unary(p); return v.isf?mpe_flt(-v.d):mpe_int(-v.i); }
+    if(*p->s=='+'){ p->s++; return mpe_unary(p); }
+    return mpe_atom(p);
+}
+static mpe_val mpe_power(mpe_p* p){
+    mpe_val b=mpe_unary(p); mpe_ws(p);
+    if(p->s[0]=='*'&&p->s[1]=='*'){ p->s+=2; mpe_val e=mpe_power(p);
+        double r=pow(mpe_tod(b),mpe_tod(e));
+        if(!b.isf&&!e.isf&&e.i>=0) return mpe_int((long)(r+0.5));
+        return mpe_flt(r); }
+    return b;
+}
+static mpe_val mpe_term(mpe_p* p){
+    mpe_val a=mpe_power(p);
+    for(;;){ mpe_ws(p); char c=*p->s;
+        if(c=='*'&&p->s[1]!='*'){ p->s++; mpe_val b=mpe_power(p);
+            a = (a.isf||b.isf) ? mpe_flt(mpe_tod(a)*mpe_tod(b)) : mpe_int(a.i*b.i); }
+        else if(c=='/'&&p->s[1]=='/'){ p->s+=2; mpe_val b=mpe_power(p);
+            if(a.isf||b.isf){ a=mpe_flt(floor(mpe_tod(a)/mpe_tod(b))); }
+            else { long q=a.i/b.i; if((a.i%b.i!=0)&&((a.i<0)!=(b.i<0))) q--; a=mpe_int(q); } }
+        else if(c=='/'){ p->s++; mpe_val b=mpe_power(p); a=mpe_flt(mpe_tod(a)/mpe_tod(b)); }
+        else if(c=='%'){ p->s++; mpe_val b=mpe_power(p);
+            if(a.isf||b.isf){ double m=fmod(mpe_tod(a),mpe_tod(b));
+                if(m!=0&&((m<0)!=(mpe_tod(b)<0))) m+=mpe_tod(b); a=mpe_flt(m); }
+            else { long m=a.i%b.i; if(m!=0&&((m<0)!=(b.i<0))) m+=b.i; a=mpe_int(m); } }
+        else break; }
+    return a;
+}
+static mpe_val mpe_add(mpe_p* p){
+    mpe_val a=mpe_term(p);
+    for(;;){ mpe_ws(p); char c=*p->s;
+        if(c=='+'){ p->s++; mpe_val b=mpe_term(p);
+            a=(a.isf||b.isf)?mpe_flt(mpe_tod(a)+mpe_tod(b)):mpe_int(a.i+b.i); }
+        else if(c=='-'){ p->s++; mpe_val b=mpe_term(p);
+            a=(a.isf||b.isf)?mpe_flt(mpe_tod(a)-mpe_tod(b)):mpe_int(a.i-b.i); }
+        else break; }
+    return a;
+}
+static mpe_val mpe_cmp(mpe_p* p){
+    mpe_val a=mpe_add(p); mpe_ws(p); const char* s=p->s; int op=0;
+    if(s[0]=='='&&s[1]=='='){op=1;p->s+=2;} else if(s[0]=='!'&&s[1]=='='){op=2;p->s+=2;}
+    else if(s[0]=='<'&&s[1]=='='){op=3;p->s+=2;} else if(s[0]=='>'&&s[1]=='='){op=4;p->s+=2;}
+    else if(s[0]=='<'){op=5;p->s++;} else if(s[0]=='>'){op=6;p->s++;}
+    if(op){ mpe_val b=mpe_add(p); double x=mpe_tod(a),y=mpe_tod(b); long r=0;
+        if(op==1)r=(x==y);else if(op==2)r=(x!=y);else if(op==3)r=(x<=y);
+        else if(op==4)r=(x>=y);else if(op==5)r=(x<y);else r=(x>y);
+        return mpe_int(r); }
+    return a;
+}
+static mpe_val mpe_run(const char* src){ mpe_p p; p.s=src; return mpe_cmp(&p); }
+
+obj    rpy_eval(const char* src){ mpe_val v=mpe_run(src); return v.isf?OBJ_FLOAT(v.d):OBJ_INT(v.i); }
+long   rpy_eval_int(const char* src){ mpe_val v=mpe_run(src); return v.isf?(long)v.d:v.i; }
+double rpy_eval_float(const char* src){ return mpe_tod(mpe_run(src)); }
+bool   rpy_eval_bool(const char* src){ mpe_val v=mpe_run(src); return v.isf?(v.d!=0.0):(v.i!=0); }
+str    rpy_eval_str(const char* src){ mpe_val v=mpe_run(src); char* b=aalloc(40);
+    if(v.isf) sprintf(b,"%g",v.d); else sprintf(b,"%ld",v.i); return b; }
+void   rpy_exec(const char* src){ (void)src; /* statements need the minipy frontend in C */ }
+'''
+
 RUNTIME_C = r'''/* ShivyCX transpiler runtime -- generated by tools/py2c.py */
 #include <ctype.h>
 #include "shivyc_rt.h"
@@ -13616,7 +13710,7 @@ MP_DEFINE_CONST_FUN_OBJ_KW(mp_builtin_open_obj, 1, shivyc_builtin_open);
 '''
 
 
-def write_runtime(out_dir, mp_bridge=False):
+def write_runtime(out_dir, mp_bridge=False, minipy_eval=False):
     with open(os.path.join(out_dir, "shivyc_rt.h"), "w") as f:
         f.write(RUNTIME_H)
     with open(os.path.join(out_dir, "shivyc_rt.c"), "w") as f:
@@ -13625,6 +13719,10 @@ def write_runtime(out_dir, mp_bridge=False):
             # Define the dynamic-dispatch functions against the object model;
             # with the bridge they are provided by the micropython core instead.
             f.write(MP_NOBRIDGE_C)
+            if minipy_eval:
+                # Standalone eval(): the native expression evaluator provides
+                # rpy_eval* without pulling in the micropython core.
+                f.write(MINIPY_EVAL_C)
     if mp_bridge:
         with open(os.path.join(out_dir, "mp_stdlib_bridge.h"), "w") as f:
             f.write(MP_BRIDGE_H)
@@ -13987,10 +14085,16 @@ def main(argv):
             print("  pgo: skipped (need .py input(s))")
     set_local_module_dirs(files)
     _, _, stdlib_root = _stdlib_context(files[0] if len(files) == 1 else "", None)
+    uses_eval = any(_uses_eval_builtin(p) for p in files)
+    # eval() no longer forces the MicroPython core: a standalone program gets the
+    # self-contained minipy expression evaluator. The bridge is pulled in only
+    # for the actual stdlib (sys/math/...), or when explicitly requested via
+    # SHIVYC_MP_EVAL=1 (e.g. to eval expressions outside minipy's grammar).
     mp_bridge = bool(stdlib_dir) or any(
         "python-stdlib" in os.path.abspath(p) for p in files) \
-        or any(_uses_eval_builtin(p) for p in files)
-    write_runtime(out_dir, mp_bridge=mp_bridge)
+        or (uses_eval and os.environ.get("SHIVYC_MP_EVAL") == "1")
+    minipy_eval = uses_eval and not mp_bridge
+    write_runtime(out_dir, mp_bridge=mp_bridge, minipy_eval=minipy_eval)
     print("  runtime -> %s/shivyc_rt.{h,c}" % out_dir)
     ok = 0
     for path in files:
