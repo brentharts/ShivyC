@@ -383,3 +383,48 @@ slicing; `finally`/`from`; `__str__`/`__repr__` dunders (instances print as
 `<Name object>`); container value-equality (containers compare by identity);
 builtin exception types (`ValueError` etc. are unknown bases → matched only by
 user hierarchy); `%`-format zero-pad of negative numbers.
+
+---
+
+## Status update — front-end widening toward the py2c subset (native-validated)
+
+A survey of `py2c.py`'s own AST (`ast.walk`) drove this phase: after operators
+that were already handled inside the binop/compare/boolop dispatchers are
+discounted, the highest-frequency structural gaps were ternaries (262), slices
+(150), and the `|`/`&` set operators, followed by a long tail of builtins and
+methods. The following now run end-to-end as a py2c-compiled native binary,
+byte-identical to `python3` and the reference VM:
+
+- **Ternary** `a if c else b` (`IfExp`) — both arms target the same register.
+- **Slicing** `seq[lo:hi]` on lists, tuples, and strings, with negative and
+  open bounds (`xs[:2]`, `xs[3:]`, `xs[-2:]`); step is restricted to 1. Slice
+  *assignment* is still unsupported.
+- **Set algebra** `|` `&` `^` (union / intersection / symmetric-difference) and,
+  on ints, the same tokens as **bitwise** or/and/xor, plus `<<` / `>>` shifts and
+  `**` power.
+- **Annotated assignment** `x: T = v` (annotation ignored; a bare `x: T` is a
+  no-op declaration whose name is still collected as a local).
+- **`for` tuple-unpacking** `for i, v in enumerate(xs)` / `for k, v in d.items()`.
+- **New builtins:** `isinstance` (user classes, type-builtins like `str`/`int`,
+  and tuples of either), `enumerate`, `zip` (2–3 args), `any`, `all`, `ord`,
+  `chr`, `reversed`, `getattr` (instance attr or bound method, with default),
+  `hasattr`.
+- **New methods:** list `extend` / `insert` / `index` / `count`; dict `update` /
+  `setdefault`; str `splitlines` / `rstrip` / `lstrip` / `isdigit` / `isupper` /
+  `islower`.
+
+### py2c typing notes discovered this phase
+- **Local annotations are honoured.** Writing `r: "long" = 1` (or `"double"`)
+  makes py2c type the local accordingly. This is the clean fix for accumulators
+  that py2c would otherwise box.
+- **Pow-accumulator boxing.** A loop accumulator seeded with an int literal
+  (`r = 1`) and then multiplied by a `long` field/param gets boxed to `obj`,
+  producing a C type error at the `return`. Moving the loop into a small helper
+  with typed params and return (`_pw_int(base, e) -> "long"`) — or annotating the
+  local — fixes it. Helper names must avoid the runtime's own symbols: the
+  runtime already defines `ipow` and `obj_pow`, so the helpers are `_pw_int` /
+  `_pw_flt`.
+
+The reference VM gets set `|`/`&`/`^` for free because Python's operators already
+span sets and ints; the native interpreter implements union/intersection/
+symmetric-difference explicitly over the side-heap set representation.

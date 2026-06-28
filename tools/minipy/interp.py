@@ -364,6 +364,125 @@ def v_neg(x: "V") -> "V":
     return v_int(-x.iv)
 
 
+def _pw_int(base: "long", e: "long") -> "long":
+    r: "long" = 1
+    k = 0
+    while k < e:
+        r = r * base
+        k = k + 1
+    return r
+
+
+def _pw_flt(base: "double", e: "long") -> "double":
+    r: "double" = 1.0
+    k = 0
+    while k < e:
+        r = r * base
+        k = k + 1
+    return r
+
+
+def v_pow(x: "V", y: "V") -> "V":
+    if y.tag != 2:                          # integer exponent
+        e = y.iv
+        if e >= 0:
+            if x.tag == 2:
+                return v_float(_pw_flt(x.dv, e))
+            return v_int(_pw_int(x.iv, e))
+    return v_float(0.0)                      # float/negative exponent: v0 stub
+
+
+def set_has(st: "St", setv: "V", item: "V") -> "int":
+    items = items_of(st, setv)
+    j = 0
+    while j < len(items):
+        if v_eq_bool(items[j], item) != 0:
+            return 1
+        j = j + 1
+    return 0
+
+
+def v_bitor(st: "St", x: "V", y: "V") -> "V":
+    if x.tag == 9 and y.tag == 9:           # set union
+        out = new_v_list()
+        sv = v_container(st, 9, 2, out)
+        for e in items_of(st, x):
+            _set_add(st, sv, e)
+        for e in items_of(st, y):
+            _set_add(st, sv, e)
+        return sv
+    return v_int(x.iv | y.iv)
+
+
+def v_bitand(st: "St", x: "V", y: "V") -> "V":
+    if x.tag == 9 and y.tag == 9:           # set intersection
+        out = new_v_list()
+        sv = v_container(st, 9, 2, out)
+        for e in items_of(st, x):
+            if set_has(st, y, e) != 0:
+                _set_add(st, sv, e)
+        return sv
+    return v_int(x.iv & y.iv)
+
+
+def v_bitxor(st: "St", x: "V", y: "V") -> "V":
+    if x.tag == 9 and y.tag == 9:           # set symmetric difference
+        out = new_v_list()
+        sv = v_container(st, 9, 2, out)
+        for e in items_of(st, x):
+            if set_has(st, y, e) == 0:
+                _set_add(st, sv, e)
+        for e in items_of(st, y):
+            if set_has(st, x, e) == 0:
+                _set_add(st, sv, e)
+        return sv
+    return v_int(x.iv ^ y.iv)
+
+
+def v_slice(st: "St", seq: "V", lo_v: "V", hi_v: "V") -> "V":
+    if seq.tag == 3:
+        n = len(seq.sv)
+    elif seq.tag == 7 or seq.tag == 10:
+        n = len(items_of(st, seq))
+    else:
+        return v_none()
+    lo = lo_v.iv
+    if lo < 0:
+        lo = lo + n
+    if lo < 0:
+        lo = 0
+    if lo > n:
+        lo = n
+    if hi_v.tag == 0:
+        hi = n
+    else:
+        hi = hi_v.iv
+        if hi < 0:
+            hi = hi + n
+        if hi < 0:
+            hi = 0
+        if hi > n:
+            hi = n
+    if hi < lo:
+        hi = lo
+    if seq.tag == 3:
+        out = ""
+        k = lo
+        while k < hi:
+            out = out + seq.sv[k]
+            k = k + 1
+        return v_str(out)
+    src = items_of(st, seq)
+    res = new_v_list()
+    k = lo
+    while k < hi:
+        res.append(src[k])
+        k = k + 1
+    if seq.tag == 10:
+        return v_container(st, 10, 3, res)
+    return v_container(st, 7, 0, res)
+
+
 # ---- subscript / membership / iteration ----
 def _norm_index(i: "long", n: "long") -> "long":
     if i < 0:
@@ -696,6 +815,30 @@ def method_id(name: "char*") -> "long":
         return 114
     if name == "lower":
         return 115
+    if name == "extend":
+        return 116
+    if name == "insert":
+        return 117
+    if name == "index":
+        return 118
+    if name == "count":
+        return 119
+    if name == "update":
+        return 120
+    if name == "setdefault":
+        return 121
+    if name == "splitlines":
+        return 122
+    if name == "rstrip":
+        return 123
+    if name == "lstrip":
+        return 124
+    if name == "isdigit":
+        return 125
+    if name == "isupper":
+        return 126
+    if name == "islower":
+        return 127
     return -1
 
 
@@ -711,6 +854,69 @@ def is_instance(st: "St", exc: "V", clsv: "V") -> "int":
         ci = classes[c]
         c = ci.base
     return 0
+
+
+def inst_has(st: "St", obj: "V", name: "char*") -> "int":
+    items = items_of(st, obj)
+    j = 0
+    while j < len(items):
+        if items[j].tag == 3 and _strcmp(items[j].sv, name) == 0:
+            return 1
+        j = j + 2
+    return 0
+
+
+def _isinst_type(obj: "V", bid: "long") -> "int":
+    if bid == 3:                            # int (bool counts as int)
+        return 1 if (obj.tag == 1 or obj.tag == 4) else 0
+    if bid == 5:
+        return 1 if obj.tag == 2 else 0     # float
+    if bid == 4:
+        return 1 if obj.tag == 3 else 0     # str
+    if bid == 7:
+        return 1 if obj.tag == 4 else 0     # bool
+    if bid == 8:
+        return 1 if obj.tag == 7 else 0     # list
+    if bid == 9:
+        return 1 if obj.tag == 8 else 0     # dict
+    if bid == 10:
+        return 1 if obj.tag == 9 else 0     # set
+    if bid == 11:
+        return 1 if obj.tag == 10 else 0    # tuple
+    return 0
+
+
+def native_isinstance(st: "St", obj: "V", spec: "V") -> "int":
+    if spec.tag == 13:                      # user class
+        return is_instance(st, obj, spec)
+    if spec.tag == 6:                       # type builtin (int/str/list/...)
+        return _isinst_type(obj, spec.iv)
+    if spec.tag == 10:                      # tuple of types
+        for s in items_of(st, spec):
+            if native_isinstance(st, obj, s) != 0:
+                return 1
+        return 0
+    return 0
+
+
+def _is_ws(ch: "char*") -> "int":
+    o = ord(ch)
+    return 1 if (o == 32 or o == 9 or o == 10 or o == 13) else 0
+
+
+def _rstrip(s: "char*") -> "char*":
+    e = len(s)
+    while e > 0 and _is_ws(s[e - 1]) != 0:
+        e = e - 1
+    return s[0:e]
+
+
+def _lstrip(s: "char*") -> "char*":
+    i = 0
+    n = len(s)
+    while i < n and _is_ws(s[i]) != 0:
+        i = i + 1
+    return s[i:n]
 
 
 # ---- const -> value ----
@@ -835,6 +1041,110 @@ def do_builtin(st: "St", bid: "long", args: "list[V]") -> "V":
         return _minmax(st, args, -1)
     if bid == 16:              # max
         return _minmax(st, args, 1)
+    if bid == 17:              # isinstance
+        if len(args) >= 2:
+            return v_bool(native_isinstance(st, args[0], args[1]))
+        return v_bool(0)
+    if bid == 18:              # enumerate
+        out = new_v_list()
+        if len(args) > 0:
+            els = materialize(st, args[0])
+            k = 0
+            while k < len(els):
+                pair = new_v_list()
+                pair.append(v_int(k))
+                pair.append(els[k])
+                out.append(v_container(st, 10, 3, pair))
+                k = k + 1
+        return v_container(st, 7, 0, out)
+    if bid == 19:              # zip
+        out = new_v_list()
+        if len(args) == 2:
+            a0 = materialize(st, args[0])
+            a1 = materialize(st, args[1])
+            m = len(a0)
+            if len(a1) < m:
+                m = len(a1)
+            k = 0
+            while k < m:
+                pair = new_v_list()
+                pair.append(a0[k])
+                pair.append(a1[k])
+                out.append(v_container(st, 10, 3, pair))
+                k = k + 1
+        elif len(args) == 3:
+            a0 = materialize(st, args[0])
+            a1 = materialize(st, args[1])
+            a2 = materialize(st, args[2])
+            m = len(a0)
+            if len(a1) < m:
+                m = len(a1)
+            if len(a2) < m:
+                m = len(a2)
+            k = 0
+            while k < m:
+                pair = new_v_list()
+                pair.append(a0[k])
+                pair.append(a1[k])
+                pair.append(a2[k])
+                out.append(v_container(st, 10, 3, pair))
+                k = k + 1
+        return v_container(st, 7, 0, out)
+    if bid == 20:              # any
+        if len(args) > 0:
+            for e in materialize(st, args[0]):
+                if truthy(e) != 0:
+                    return v_bool(1)
+        return v_bool(0)
+    if bid == 21:              # all
+        if len(args) > 0:
+            for e in materialize(st, args[0]):
+                if truthy(e) == 0:
+                    return v_bool(0)
+        return v_bool(1)
+    if bid == 22:              # ord
+        if len(args) > 0:
+            return v_int(ord(args[0].sv))
+        return v_int(0)
+    if bid == 23:              # chr
+        if len(args) > 0:
+            return v_str(chr(args[0].iv))
+        return v_str("")
+    if bid == 24:              # reversed
+        out = new_v_list()
+        if len(args) > 0:
+            els = materialize(st, args[0])
+            k = len(els) - 1
+            while k >= 0:
+                out.append(els[k])
+                k = k - 1
+        return v_container(st, 7, 0, out)
+    if bid == 25:              # getattr
+        if len(args) >= 2:
+            obj = args[0]
+            nm = args[1].sv
+            if obj.tag == 12:
+                if inst_has(st, obj, nm) != 0:
+                    return inst_get(st, obj, nm)
+                fidx = lookup_method(st, st.heap[obj.iv].cursor, nm)
+                if fidx >= 0:
+                    bargs = new_v_list(); bargs.append(obj)
+                    bv = v_container(st, 14, 6, bargs)
+                    st.heap[bv.iv].cursor = fidx
+                    return bv
+            if len(args) >= 3:
+                return args[2]
+        return v_none()
+    if bid == 26:              # hasattr
+        if len(args) >= 2:
+            obj = args[0]
+            nm = args[1].sv
+            if obj.tag == 12:
+                if inst_has(st, obj, nm) != 0:
+                    return v_bool(1)
+                if lookup_method(st, st.heap[obj.iv].cursor, nm) >= 0:
+                    return v_bool(1)
+        return v_bool(0)
     return v_none()
 
 
@@ -927,6 +1237,114 @@ def do_method(st: "St", mid: "long", args: "list[V]") -> "V":
         return v_str(recv.sv.upper())
     if mid == 115:             # lower
         return v_str(recv.sv.lower())
+    if mid == 116:             # list.extend
+        items = items_of(st, recv)
+        for e in materialize(st, args[1]):
+            items.append(e)
+        return v_none()
+    if mid == 117:             # list.insert(i, val)
+        items = items_of(st, recv)
+        i = _norm_index(args[1].iv, len(items) + 1)
+        items.append(v_none())             # grow by one, then shift right
+        j = len(items) - 1
+        while j > i:
+            items[j] = items[j - 1]
+            j = j - 1
+        items[i] = args[2]
+        return v_none()
+    if mid == 118:             # index(val)
+        items = items_of(st, recv)
+        j = 0
+        while j < len(items):
+            if v_eq_bool(items[j], args[1]) != 0:
+                return v_int(j)
+            j = j + 1
+        return v_int(-1)
+    if mid == 119:             # count(val)
+        items = items_of(st, recv)
+        c = 0
+        j = 0
+        while j < len(items):
+            if v_eq_bool(items[j], args[1]) != 0:
+                c = c + 1
+            j = j + 1
+        return v_int(c)
+    if mid == 120:             # dict.update(other)
+        other = items_of(st, args[1])
+        j = 0
+        while j < len(other):
+            v_setindex(st, recv, other[j], other[j + 1])
+            j = j + 2
+        return v_none()
+    if mid == 121:             # dict.setdefault(key[, default])
+        items = items_of(st, recv)
+        j = dict_find(items, args[1])
+        if j >= 0:
+            return items[j + 1]
+        dv = v_none()
+        if len(args) >= 3:
+            dv = args[2]
+        v_setindex(st, recv, args[1], dv)
+        return dv
+    if mid == 122:             # str.splitlines
+        out = new_v_list()
+        s = recv.sv
+        cur = ""
+        k = 0
+        while k < len(s):
+            ch = s[k]
+            if ord(ch) == 10:
+                out.append(v_str(cur)); cur = ""
+            elif ord(ch) == 13:
+                k = k + 1
+                continue
+            else:
+                cur = cur + ch
+            k = k + 1
+        if len(cur) > 0:
+            out.append(v_str(cur))
+        return v_container(st, 7, 0, out)
+    if mid == 123:             # str.rstrip (whitespace)
+        return v_str(_rstrip(recv.sv))
+    if mid == 124:             # str.lstrip (whitespace)
+        return v_str(_lstrip(recv.sv))
+    if mid == 125:             # str.isdigit
+        s = recv.sv
+        if len(s) == 0:
+            return v_bool(0)
+        k = 0
+        while k < len(s):
+            o = ord(s[k])
+            if o < 48 or o > 57:
+                return v_bool(0)
+            k = k + 1
+        return v_bool(1)
+    if mid == 126:             # str.isupper
+        s = recv.sv
+        up = 0
+        lo = 0
+        k = 0
+        while k < len(s):
+            o = ord(s[k])
+            if o >= 65 and o <= 90:
+                up = up + 1
+            elif o >= 97 and o <= 122:
+                lo = lo + 1
+            k = k + 1
+        return v_bool(1 if (up > 0 and lo == 0) else 0)
+    if mid == 127:             # str.islower
+        s = recv.sv
+        up = 0
+        lo = 0
+        k = 0
+        while k < len(s):
+            o = ord(s[k])
+            if o >= 65 and o <= 90:
+                up = up + 1
+            elif o >= 97 and o <= 122:
+                lo = lo + 1
+            k = k + 1
+        return v_bool(1 if (lo > 0 and up == 0) else 0)
     return v_none()
 
 
@@ -1085,6 +1503,20 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
             regs[a] = v_mod(st, regs[b], regs[c]); pc = pc + 1
         elif op == 25:
             regs[a] = v_floordiv(regs[b], regs[c]); pc = pc + 1
+        elif op == 26:
+            regs[a] = v_pow(regs[b], regs[c]); pc = pc + 1
+        elif op == 27:
+            regs[a] = v_bitor(st, regs[b], regs[c]); pc = pc + 1
+        elif op == 28:
+            regs[a] = v_bitand(st, regs[b], regs[c]); pc = pc + 1
+        elif op == 29:
+            regs[a] = v_bitxor(st, regs[b], regs[c]); pc = pc + 1
+        elif op == 36:
+            regs[a] = v_int(regs[b].iv << regs[c].iv); pc = pc + 1
+        elif op == 37:
+            regs[a] = v_int(regs[b].iv >> regs[c].iv); pc = pc + 1
+        elif op == 38:
+            regs[a] = v_slice(st, regs[a], regs[b], regs[c]); pc = pc + 1
         elif op == 30:
             regs[a] = v_bool(1 if v_cmp(regs[b], regs[c]) < 0 else 0); pc = pc + 1
         elif op == 31:

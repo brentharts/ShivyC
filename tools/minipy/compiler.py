@@ -66,8 +66,11 @@ OPS = {
     # --- generic arithmetic (20-29): reg[a] = reg[b] OP reg[c] ---
     "ADD":         20, "SUB": 21, "MUL": 22, "DIV": 23,
     "MOD":         24, "FLOORDIV": 25, "POW": 26,
+    "BITOR":       27, "BITAND": 28, "BITXOR": 29,  # int bitwise / set ops
     # --- generic compare (30-39): reg[a] = reg[b] CMP reg[c] ---
     "LT":          30, "LE": 31, "GT": 32, "GE": 33, "EQ": 34, "NE": 35,
+    "SHL":         36, "SHR": 37,        # reg[a] = reg[b] << / >> reg[c]
+    "SLICE":       38,                   # reg[a] = reg[a][reg[b]:reg[c]]
     # --- unary (40-49): reg[a] = OP reg[b] ---
     "NEG":         40, "NOT": 41,
     # --- AOT-specialised numeric fast paths (60-89): no tag check ---
@@ -79,7 +82,9 @@ OPNAME = {v: k for k, v in OPS.items()}
 # Builtin ids, stored in a const of kind "builtin".
 BUILTINS = {n: i for i, n in enumerate(
     ["print", "len", "range", "int", "str", "float", "abs", "bool",
-     "list", "dict", "set", "tuple", "repr", "sorted", "sum", "min", "max"])}
+     "list", "dict", "set", "tuple", "repr", "sorted", "sum", "min", "max",
+     "isinstance", "enumerate", "zip", "any", "all", "ord", "chr",
+     "reversed", "getattr", "hasattr"])}
 
 # Method ids (receiver passed as arg0). Distinct id band (100+) so do_builtin can
 # tell a global builtin from a bound method; invoked through the same CALL path.
@@ -88,6 +93,9 @@ METHODS = {
     "items": 105, "add": 106, "split": 107, "join": 108, "strip": 109,
     "startswith": 110, "endswith": 111, "find": 112, "replace": 113,
     "upper": 114, "lower": 115,
+    "extend": 116, "insert": 117, "index": 118, "count": 119,
+    "update": 120, "setdefault": 121, "splitlines": 122, "rstrip": 123,
+    "lstrip": 124, "isdigit": 125, "isupper": 126, "islower": 127,
 }
 
 
@@ -272,6 +280,25 @@ class Compiler:
         raise CompileError("v0 assign: unsupported target %s (line %s)"
                            % (type(tgt).__name__, node.lineno))
 
+    def st_AnnAssign(self, f, node):
+        # `x: T = v` (annotation ignored); bare `x: T` is a no-op declaration
+        if node.value is None:
+            return
+        if isinstance(node.target, ast.Name):
+            r = self.expr(f, node.value)
+            self._store_name(f, node.target.id, r)
+            f.pop_to(r)
+            return
+        if isinstance(node.target, ast.Attribute):
+            robj = self.expr(f, node.target.value)
+            rval = self.expr(f, node.value)
+            cn = self.consts.add("str", node.target.attr)
+            f.emit("STORE_ATTR", robj, rval, cn)
+            f.pop_to(robj)
+            return
+        raise CompileError("v0 annassign: Name/Attribute target only (line %s)"
+                           % node.lineno)
+
     def st_AugAssign(self, f, node):
         if not isinstance(node.target, ast.Name):
             raise CompileError("v0 augassign: Name target only (line %s)" % node.lineno)
@@ -323,15 +350,17 @@ class Compiler:
             f.code[pc][1] = end
 
     def st_For(self, f, node):
-        if not isinstance(node.target, ast.Name):
-            raise CompileError("v0 for: Name target only (line %s)" % node.lineno)
-        name = node.target.id
+        tgt = node.target
         is_range = (isinstance(node.iter, ast.Call)
                     and isinstance(node.iter.func, ast.Name)
                     and node.iter.func.id == "range")
         if is_range:
-            self._for_range(f, name, node)
+            if not isinstance(tgt, ast.Name):
+                raise CompileError("v0 for-range: Name target only (line %s)" % node.lineno)
+            self._for_range(f, tgt.id, node)
             return
+        if not isinstance(tgt, (ast.Name, ast.Tuple, ast.List)):
+            raise CompileError("v0 for: Name/tuple target only (line %s)" % node.lineno)
         # general iterable: ITER_NEW once, ITER_NEXT per turn (target = loop end)
         rit = self.expr(f, node.iter)
         f.emit("ITER_NEW", rit, rit)         # rit now holds the iterator
@@ -339,8 +368,18 @@ class Compiler:
         top = len(f.code)
         rx = f.push()
         nx = len(f.code); f.emit("ITER_NEXT", rx, rit, 0)   # c patched to end
-        self._store_name(f, name, rx)
-        f.pop_to(rit + 1)
+        if isinstance(tgt, ast.Name):
+            self._store_name(f, tgt.id, rx)
+            f.pop_to(rit + 1)
+        else:                                # unpack tuple element into names
+            for i, elt in enumerate(tgt.elts):
+                if not isinstance(elt, ast.Name):
+                    raise CompileError("v0 for-unpack: Name targets only (line %s)" % node.lineno)
+                ridx = self._const_reg(f, ("int", i))
+                f.emit("INDEX", ridx, rx, ridx)
+                self._store_name(f, elt.id, ridx)
+                f.pop_to(ridx)
+            f.pop_to(rit + 1)
         loop = _Loop(top); self._loops.append(loop)
         for s in node.body:
             self.stmt(f, s)
@@ -536,6 +575,20 @@ class Compiler:
         f.pop_to(rb + 1)
         return rb
 
+    def ex_IfExp(self, f, node):
+        # ternary `body if test else orelse`; both arms land in the same reg
+        rc = self.expr(f, node.test)
+        jf = len(f.code); f.emit("JUMP_IF_FALSE", rc, 0)
+        f.pop_to(rc)
+        self.expr(f, node.body)               # -> rc
+        f.pop_to(rc)                          # value persists in reg rc at runtime
+        jend = len(f.code); f.emit("JUMP", 0)
+        f.code[jf][2] = len(f.code)           # false -> orelse
+        self.expr(f, node.orelse)             # -> rc
+        f.code[jend][1] = len(f.code)
+        f.numreg.discard(rc)
+        return rc
+
     def ex_UnaryOp(self, f, node):
         r = self.expr(f, node.operand)
         if isinstance(node.op, ast.USub):
@@ -672,9 +725,26 @@ class Compiler:
         return rb
 
     def ex_Subscript(self, f, node):
-        rb = self.expr(f, node.value)
         if isinstance(node.slice, ast.Slice):
-            raise CompileError("v0: slicing not yet supported (line %s)" % node.lineno)
+            sl = node.slice
+            if sl.step is not None and not (
+                    isinstance(sl.step, ast.Constant) and sl.step.value in (1, None)):
+                raise CompileError("v0 slice: step unsupported (line %s)" % node.lineno)
+            rb = self.expr(f, node.value)               # seq at rb
+            if sl.lower is None:
+                rlo = self._const_reg(f, ("int", 0))
+            else:
+                rlo = self.expr(f, sl.lower)
+            assert rlo == rb + 1
+            if sl.upper is None:
+                rhi = self._const_reg(f, ("none", None))  # sentinel -> end
+            else:
+                rhi = self.expr(f, sl.upper)
+            assert rhi == rb + 2
+            f.emit("SLICE", rb, rb + 1, rb + 2)
+            f.pop_to(rb + 1); f.numreg.discard(rb)
+            return rb
+        rb = self.expr(f, node.value)
         rc = self.expr(f, node.slice)
         f.emit("INDEX", rb, rb, rc)
         f.pop_to(rb + 1); f.numreg.discard(rb)
@@ -743,7 +813,9 @@ class Compiler:
     def _binop(self, f, op, dst, rb, rc):
         name = {ast.Add: "ADD", ast.Sub: "SUB", ast.Mult: "MUL",
                 ast.Div: "DIV", ast.Mod: "MOD", ast.FloorDiv: "FLOORDIV",
-                ast.Pow: "POW"}.get(type(op))
+                ast.Pow: "POW", ast.BitOr: "BITOR", ast.BitAnd: "BITAND",
+                ast.BitXor: "BITXOR", ast.LShift: "SHL",
+                ast.RShift: "SHR"}.get(type(op))
         if name is None:
             raise CompileError("v0 binop: unsupported %s" % type(op).__name__)
         self._binop_op(f, name, dst, rb, rc)
@@ -849,6 +921,13 @@ def _collect_locals(node):
                         if isinstance(e, ast.Name) and e.id not in found:
                             found.append(e.id)
         elif isinstance(n, (ast.AugAssign, ast.For)) and isinstance(getattr(n, "target", None), ast.Name):
+            if n.target.id not in found:
+                found.append(n.target.id)
+        elif isinstance(n, (ast.For, ast.comprehension)) and isinstance(getattr(n, "target", None), (ast.Tuple, ast.List)):
+            for e in n.target.elts:
+                if isinstance(e, ast.Name) and e.id not in found:
+                    found.append(e.id)
+        elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name):
             if n.target.id not in found:
                 found.append(n.target.id)
         elif isinstance(n, ast.comprehension) and isinstance(n.target, ast.Name):
@@ -984,6 +1063,14 @@ class VM:
             elif op == 24: regs[a] = regs[b] % regs[c]
             elif op == 25: regs[a] = regs[b] // regs[c]
             elif op == 26: regs[a] = regs[b] ** regs[c]
+            elif op == 27: regs[a] = regs[b] | regs[c]    # int-or / set union
+            elif op == 28: regs[a] = regs[b] & regs[c]    # int-and / set inter
+            elif op == 29: regs[a] = regs[b] ^ regs[c]    # int-xor / set symdiff
+            elif op == 36: regs[a] = regs[b] << regs[c]
+            elif op == 37: regs[a] = regs[b] >> regs[c]
+            elif op == 38:                                # SLICE seq[lo:hi]
+                seq = regs[a]; lo = regs[b]; hi = regs[c]
+                regs[a] = seq[lo:(len(seq) if hi is None else hi)]
             elif op == 30: regs[a] = regs[b] < regs[c]
             elif op == 31: regs[a] = regs[b] <= regs[c]
             elif op == 32: regs[a] = regs[b] > regs[c]
@@ -1088,7 +1175,57 @@ class VM:
         if name == "sum":   return sum(args[0])
         if name == "min":   return min(args[0]) if len(args) == 1 else min(args)
         if name == "max":   return max(args[0]) if len(args) == 1 else max(args)
+        if name == "isinstance": return self._isinst(args[0], args[1])
+        if name == "enumerate": return [(i, x) for i, x in enumerate(args[0])]
+        if name == "zip":   return [tuple(t) for t in zip(*args)]
+        if name == "any":   return any(args[0])
+        if name == "all":   return all(args[0])
+        if name == "ord":   return ord(args[0])
+        if name == "chr":   return chr(args[0])
+        if name == "reversed": return list(reversed(args[0]))
+        if name == "getattr":  return self._getattr(args)
+        if name == "hasattr":
+            obj = args[0]
+            return (isinstance(obj, _Inst)
+                    and (args[1] in obj.attrs
+                         or self._lookup_method(obj.cid, args[1]) is not None))
         raise RuntimeError("unknown builtin id %d" % bid)
+
+    def _isinst(self, obj, spec):
+        if isinstance(spec, tuple) and spec and spec[0] == "class":
+            return self._isinstance(obj, spec)
+        if isinstance(spec, tuple) and spec and spec[0] == "builtin":
+            return self._isinst_type(obj, spec[1])
+        if isinstance(spec, tuple):                  # tuple of types
+            for s in spec:
+                if self._isinst(obj, s):
+                    return True
+            return False
+        return False
+
+    def _isinst_type(self, obj, bid):
+        nm = [k for k, v in BUILTINS.items() if v == bid][0]
+        if nm == "int":   return isinstance(obj, int)
+        if nm == "float": return isinstance(obj, float)
+        if nm == "str":   return isinstance(obj, str)
+        if nm == "bool":  return isinstance(obj, bool)
+        if nm == "list":  return isinstance(obj, list)
+        if nm == "dict":  return isinstance(obj, dict)
+        if nm == "set":   return isinstance(obj, set)
+        if nm == "tuple": return isinstance(obj, tuple)
+        return False
+
+    def _getattr(self, args):
+        obj, attr = args[0], args[1]
+        if isinstance(obj, _Inst):
+            if attr in obj.attrs:
+                return obj.attrs[attr]
+            fidx = self._lookup_method(obj.cid, attr)
+            if fidx is not None:
+                return ("bound", fidx, obj)
+        if len(args) >= 3:
+            return args[2]
+        return None
 
     def _method(self, mid, args):
         name = [k for k, v in METHODS.items() if v == mid][0]
@@ -1109,6 +1246,18 @@ class VM:
         if name == "replace": return recv.replace(rest[0], rest[1])
         if name == "upper":  return recv.upper()
         if name == "lower":  return recv.lower()
+        if name == "extend": recv.extend(rest[0]); return None
+        if name == "insert": recv.insert(rest[0], rest[1]); return None
+        if name == "index":  return recv.index(*rest)
+        if name == "count":  return recv.count(rest[0])
+        if name == "update": recv.update(rest[0]); return None
+        if name == "setdefault": return recv.setdefault(*rest)
+        if name == "splitlines": return recv.splitlines()
+        if name == "rstrip": return recv.rstrip(*rest)
+        if name == "lstrip": return recv.lstrip(*rest)
+        if name == "isdigit": return recv.isdigit()
+        if name == "isupper": return recv.isupper()
+        if name == "islower": return recv.islower()
         raise RuntimeError("unknown method id %d" % mid)
 
 
