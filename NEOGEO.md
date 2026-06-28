@@ -35,17 +35,26 @@ doing as a flexibility test.
 
 ## What works today
 
-The integer core, validated end to end against the m68k oracle:
+Validated end to end against the m68k oracle (48 differential cases):
 
 - 32-bit `int` locals; `+ - * / %`; the six comparisons; `if`/`while`/`for`.
 - Stack-argument function calls, including multi-argument calls and recursion
   (direct and mutual).
 - Register pressure with spills, and the copy-coalescing safety check (swaps).
+- **Pointers** (address-of, load/store through a pointer), **arrays** (constant
+  and variable index, multi-dimensional, array arguments), **structs**, and
+  **file-scope globals** (read/write, initialized, and arrays), addressed through
+  the m68k address registers with `lea`/`adda`/indexed `(%aN)` loads sized
+  `.b`/`.w`/`.l` with sign/zero extension.
+- **String literals** (`char *p = "..."`), with a 4-byte `.int` relocation for
+  the pointer (m68k pointers are 4 bytes; an 8-byte `.quad` is unencodable).
+- **Bitwise / shift / unary** ops (`& | ^ << >> ~ -`), including the Neo-Geo
+  fix-map entry packing and the `ng_color` palette packing.
 
-Anything outside that — floating point, pointers and arrays, structs, globals —
-makes the back end **raise** rather than emit wrong code, so the differential
-tester reports those as skips, never silent miscompiles. They are the next steps,
-not landmines.
+`long` and pointers are treated as 4-byte values, matching the m68k-linux ABI
+and the oracle. Floating point and true 64-bit `long long` still make the back
+end **raise** rather than emit wrong code, so the differential tester reports
+those as skips, never silent miscompiles.
 
 ## How it reuses the rest of the compiler
 
@@ -109,23 +118,32 @@ bare-metal AArch64. Both default to 68020+, which is why the 32-bit `muls.l`/
 
 ## Roadmap to a real Neo-Geo ROM
 
-These steps build on the working integer core, in roughly increasing effort:
+Pointers, arrays, structs, globals, string literals, and bitwise/shift ops now
+land (see *What works today*), so the upload side is reachable. The
+[`neogeo`](tools/rpy_lib/neogeo.py) bake now also emits **4-bitplane tile data**
+per layer (8×8 fix / 16×16 sprite tiles; the packing is lossless, verified by
+round-trip), and [`examples/rpython2c/neogeo/upload.c`](examples/rpython2c/neogeo/upload.c)
+is a **VRAM/palette MMIO upload** routine that compiles with `shivyc --target
+m68k` — its palette loop emits a real `move.w %d0,(%a0)` to palette RAM at
+`0x400000`. What remains:
 
-1. **Sub-word integers** — honor `.b`/`.w` for `char`/`short`, and 16-bit `int`
-   under a `-mshort`-style model (the Neo-Geo is a 16-bit-era machine; many of its
-   hardware registers are 16-bit). This wants target-dependent ctype sizes in the
-   front end.
-2. **Pointers, arrays, structs, and globals** — the same IL the other back ends
-   already lower; on m68k this is `lea`/indirect addressing through the address
-   registers (`a0`-`a5`) and `.data`/`.bss` emission.
-3. **68000-only multiply/divide** — replace `muls.l`/`divsl.l` with 16-bit
-   sequences or runtime helpers so the output runs on the actual console CPU.
-4. **Neo-Geo ROM packaging** — emit the `m68k-neogeo-elf` sections, ROM header,
+1. **Final ROM byte-ordering for the C/S ROMs** — the bitplanes are correct 4bpp
+   data; the physical S-ROM column order and C-ROM odd/even ROM split are applied
+   by ngdevkit's tile tools at pack time.
+2. **68000-only multiply/divide** — replace `muls.l`/`divsl.l` with 16-bit
+   sequences or runtime helpers so the output runs on the actual console CPU (the
+   oracle is 68020+; qemu emulates a 68040).
+3. **Neo-Geo ROM packaging** — emit the `m68k-neogeo-elf` sections, ROM header,
    interrupt vectors, and DIP/handler declarations that ngdevkit expects, and link
    against its headers and BIOS. This is where ShivyCX output meets the real
-   hardware/emulator (GnGeo).
-5. **The Z80 sound CPU** is a separate target entirely (ngdevkit uses SDCC for it);
+   hardware/emulator (GnGeo). The upload code above is written to slot straight in.
+4. **The Z80 sound CPU** is a separate target entirely (ngdevkit uses SDCC for it);
    out of scope here, but a natural future seam.
+
+Two pragmatic limits remain in the integer model: true 64-bit `long long` (the
+front end and m68k both want 8 bytes, but the back end uses the low long), and
+aggregates whose fields are pointers (8-byte front-end stride vs 4-byte m68k
+pointers) — neither is needed by the upload path.
 
 ## Files
 
@@ -193,8 +211,10 @@ console (it matches the CPython oracle exactly). The baked C compiles with gcc a
 with ShivyC's own x86 back end.
 
 **Honest status.** The baked data is colour-correct Neo-Geo palette + indexed
-pixels, and the conversion/specialisation is real and tested. What is *not* here
-yet: the C-ROM/fix-ROM **bitplane tile packing**, the VRAM/palette MMIO upload
-(which needs the m68k back end's pointer/array/global support — see the roadmap
-above), and ngdevkit ROM packaging. Those are the steps from "correct pixel data
-baked at translate time" to "pixels on a Neo-Geo screen."
+pixels *and* 4-bitplane tile data (lossless, round-trip verified). The m68k back
+end now compiles the pointer/array/global + MMIO upload code
+([`upload.c`](examples/rpython2c/neogeo/upload.c)) — its palette loop emits a real
+write to palette RAM at `0x400000`. What is *not* here yet: the final per-ROM byte
+ordering for the physical C/S ROMs (an ngdevkit pack step) and ngdevkit ROM
+packaging (vectors, header, BIOS link). Those are the last steps from "correct
+tile data + working upload code" to "pixels on a Neo-Geo screen."
