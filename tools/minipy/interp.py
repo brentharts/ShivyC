@@ -87,10 +87,12 @@ class V:
 # A heap cell. kind: 0 list, 1 dict (items = [k0,v0,k1,v1,...]), 2 set,
 # 3 tuple, 4 iter (items = materialised elements, cursor = position).
 class Cont:
-    def __init__(self, kind: "int", cursor: "int", items: "list[V]"):
+    def __init__(self, kind: "int", cursor: "int", items: "list[V]",
+                 buckets: "list[V]"):
         self.kind = kind
         self.cursor = cursor
         self.items = items
+        self.buckets = buckets         # dict hash index (over items); else empty
 
 
 class St:
@@ -148,7 +150,7 @@ def v_builtin(bid: "long") -> "V":
 
 
 def _heap_put(st: "St", kind: "int", items: "list[V]") -> "long":
-    c = Cont(kind, 0, items)
+    c = Cont(kind, 0, items, new_v_list())
     st.heap.append(c)
     return len(st.heap) - 1
 
@@ -596,6 +598,95 @@ def _norm_index(i: "long", n: "long") -> "long":
     return i
 
 
+def v_hash(key: "V") -> "long":
+    t = key.tag
+    if t == 1 or t == 4:               # int / bool
+        return key.iv
+    if t == 0:                         # none
+        return 0
+    if t == 3:                         # str (djb2)
+        s = key.sv
+        h: "long" = 5381
+        i = 0
+        n = len(s)
+        while i < n:
+            h = h * 33 + ord(s[i])
+            i = i + 1
+        return h
+    if t == 2:                         # float (consistent with int when integral)
+        return int(key.dv)
+    return 0                           # other: constant; correctness via eq check
+
+
+def dict_reindex(cont: "Cont") -> "int":
+    items = cont.items
+    n = len(items)
+    cnt = n // 2
+    cap = 8
+    while cap * 2 < cnt * 3:           # keep load factor under 2/3
+        cap = cap * 2
+    buckets = new_v_list()
+    empty = v_int(-1)                  # shared empty sentinel (immutable)
+    i = 0
+    while i < cap:
+        buckets.append(empty)
+        i = i + 1
+    j = 0
+    while j < n:
+        h = v_hash(items[j])
+        slot = h & (cap - 1)
+        while buckets[slot].iv != -1:
+            slot = (slot + 1) & (cap - 1)
+        buckets[slot] = v_int(j)
+        j = j + 2
+    cont.buckets = buckets
+    return 0
+
+
+def dict_lookup(cont: "Cont", key: "V") -> "long":
+    buckets = cont.buckets
+    cap = len(buckets)
+    if cap == 0:
+        if len(cont.items) == 0:
+            return -1
+        dict_reindex(cont)             # lazily build index over existing items
+        buckets = cont.buckets
+        cap = len(buckets)
+    h = v_hash(key)
+    slot = h & (cap - 1)
+    probes = 0
+    while probes < cap:
+        ki = buckets[slot].iv
+        if ki == -1:
+            return -1
+        if v_eq_bool(cont.items[ki], key) != 0:
+            return ki
+        slot = (slot + 1) & (cap - 1)
+        probes = probes + 1
+    return -1
+
+
+def dict_insert(cont: "Cont", key: "V", val: "V") -> "int":
+    ki = dict_lookup(cont, key)
+    if ki >= 0:
+        cont.items[ki + 1] = val
+        return 0
+    cont.items.append(key)             # new key: append to ordered backing store
+    cont.items.append(val)
+    j = len(cont.items) - 2
+    cnt = len(cont.items) // 2
+    cap = len(cont.buckets)
+    if cap == 0 or cap * 2 < cnt * 3:
+        dict_reindex(cont)             # grow (or first build): includes new key
+        return 0
+    h = v_hash(key)
+    slot = h & (cap - 1)
+    while cont.buckets[slot].iv != -1:
+        slot = (slot + 1) & (cap - 1)
+    cont.buckets[slot] = v_int(j)
+    return 0
+
+
 def dict_find(items: "list[V]", key: "V") -> "int":
     j = 0
     n = len(items)
@@ -615,10 +706,10 @@ def v_index(st: "St", seq: "V", idx: "V") -> "V":
         i = _norm_index(idx.iv, len(items))
         return items[i]
     if seq.tag == 8:
-        items = items_of(st, seq)
-        j = dict_find(items, idx)
+        cont = st.heap[seq.iv]
+        j = dict_lookup(cont, idx)
         if j >= 0:
-            return items[j + 1]
+            return cont.items[j + 1]
         return v_none()
     return v_none()
 
@@ -630,13 +721,8 @@ def v_setindex(st: "St", seq: "V", idx: "V", val: "V") -> "int":
         items[i] = val
         return 0
     if seq.tag == 8:
-        items = items_of(st, seq)
-        j = dict_find(items, idx)
-        if j >= 0:
-            items[j + 1] = val
-        else:
-            items.append(idx)
-            items.append(val)
+        cont = st.heap[seq.iv]
+        dict_insert(cont, idx, val)
         return 0
     return 0
 
@@ -653,8 +739,8 @@ def v_contains(st: "St", container: "V", item: "V") -> "V":
             j = j + 1
         return v_bool(0)
     if container.tag == 8:
-        items = items_of(st, container)
-        return v_bool(1 if dict_find(items, item) >= 0 else 0)
+        cont = st.heap[container.iv]
+        return v_bool(1 if dict_lookup(cont, item) >= 0 else 0)
     return v_bool(0)
 
 
@@ -1382,10 +1468,10 @@ def do_method(st: "St", mid: "long", args: "list[V]") -> "V":
             return pop_saved
         return items.pop()                 # no-arg -> list_pop (removes last)
     if mid == 102:             # dict.get
-        items = items_of(st, recv)
-        j = dict_find(items, args[1])
-        if j >= 0:
-            return items[j + 1]
+        cont = st.heap[recv.iv]
+        dj = dict_lookup(cont, args[1])
+        if dj >= 0:
+            return cont.items[dj + 1]
         if len(args) >= 3:
             return args[2]
         return v_none()
@@ -1508,10 +1594,10 @@ def do_method(st: "St", mid: "long", args: "list[V]") -> "V":
             j = j + 2
         return v_none()
     if mid == 121:             # dict.setdefault(key[, default])
-        items = items_of(st, recv)
-        j = dict_find(items, args[1])
-        if j >= 0:
-            return items[j + 1]
+        cont = st.heap[recv.iv]
+        dj = dict_lookup(cont, args[1])
+        if dj >= 0:
+            return cont.items[dj + 1]
         dv = v_none()
         if len(args) >= 3:
             dv = args[2]
@@ -1863,7 +1949,7 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
 def interp_run(prog: "Program") -> "int":
     glob = new_v_list()
     heap = []
-    cz = Cont(0, 0, new_v_list())
+    cz = Cont(0, 0, new_v_list(), new_v_list())
     heap.append(cz)                        # heap[0] reserved; anchors list[Cont]
     st = St(prog, glob, heap, 0, v_none(), new_reg_pool())
     k = 0
