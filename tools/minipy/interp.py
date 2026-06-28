@@ -108,7 +108,19 @@ _int_cache: "list[V]" = None
 # per call (the dominant per-call allocation on recursion-heavy code). The first
 # SETUP_EXCEPT in a frame swaps in a private list. Handler PCs are stored as
 # v_int so the stack is a list[V] (uniformly boxed, unlike list[int]).
+# A bound *user* method packs (instance heap index, function index) into a single
+# V (tag 14) instead of allocating a heap Cont per call: iv = hidx*SHIFT + fidx.
+# fidx < SHIFT (16M funcs is plenty); the instance lives on the heap already, so
+# the receiver V(12, hidx) reconstructs exactly. This makes `obj.method(...)` --
+# the hot path in OOP code -- allocate nothing for the bound method itself.
+_METH_SHIFT = 16777216
+
 _empty_blocks: "list[V]" = None
+# Shared read-only empty dict-index. Only dicts use the buckets field; every
+# other container (list/set/tuple/instance/iterator/bound method) left an empty
+# list there and allocated one per container. They borrow this sentinel instead;
+# a dict replaces it with its own list on first reindex.
+_empty_buckets: "list[V]" = None
 # Per-program cache of materialized constant values (filled once at startup).
 _const_vs: "list[V]" = None
 _const_vs_ready: "int" = 0
@@ -153,7 +165,9 @@ def new_reg_pool() -> "list[list[V]]":
 
 def setup_cache() -> "int":
     global _cache_ready, _none_v, _true_v, _false_v, _int_cache, _empty_blocks
+    global _empty_buckets
     _empty_blocks = new_v_list()
+    _empty_buckets = new_v_list()
     _none_v = V(0, 0)
     _false_v = V(4, 0)
     _true_v = V(4, 1)
@@ -208,7 +222,7 @@ def v_builtin(bid: "long") -> "V":
 
 
 def _heap_put(st: "St", kind: "int", items: "list[V]") -> "long":
-    c = Cont(kind, 0, items, new_v_list())
+    c = Cont(kind, 0, items, _empty_buckets)
     st.heap.append(c)
     return len(st.heap) - 1
 
@@ -1442,10 +1456,7 @@ def do_builtin(st: "St", bid: "long", args: "list[V]") -> "V":
                     return inst_get(st, obj, nm)
                 fidx = lookup_method(st, st.heap[obj.iv].cursor, nm)
                 if fidx >= 0:
-                    bargs = new_v_list(); bargs.append(obj)
-                    bv = v_container(st, 14, 6, bargs)
-                    st.heap[bv.iv].cursor = fidx
-                    return bv
+                    return V(14, obj.iv * _METH_SHIFT + fidx)   # packed bound
             if len(args) >= 3:
                 return args[2]
         return v_none()
@@ -1763,20 +1774,35 @@ def do_call(st: "St", callee: "V", args: "list[V]") -> "V":
         return do_builtin(st, callee.iv, args)
     if callee.tag == 13:                   # CLASS -> instantiate
         return instantiate(st, callee.iv, args)
-    if callee.tag == 14:                   # bound user method
-        cont = st.heap[callee.iv]
-        callargs = new_v_list()
-        callargs.append(cont.items[0])
+    if callee.tag == 14:                   # bound user method (packed, no Cont)
+        fidx = callee.iv % _METH_SHIFT
+        hidx = callee.iv // _METH_SHIFT
+        if len(st.regpool) > 0:            # pooled arg list (was leaked before)
+            callargs = st.regpool.pop()
+            while len(callargs) > 0:
+                callargs.pop()
+        else:
+            callargs = new_v_list()
+        callargs.append(V(12, hidx))
         for a in args:
             callargs.append(a)
-        return run_func(st, cont.cursor, callargs)
+        r = run_func(st, fidx, callargs)
+        st.regpool.append(callargs)
+        return r
     if callee.tag == 15:                   # bound builtin method
         cont = st.heap[callee.iv]
-        callargs = new_v_list()
+        if len(st.regpool) > 0:
+            callargs = st.regpool.pop()
+            while len(callargs) > 0:
+                callargs.pop()
+        else:
+            callargs = new_v_list()
         callargs.append(cont.items[0])
         for a in args:
             callargs.append(a)
-        return do_builtin(st, cont.cursor, callargs)
+        r = do_builtin(st, cont.cursor, callargs)
+        st.regpool.append(callargs)
+        return r
     return v_none()
 
 
@@ -1916,9 +1942,7 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
             obj = regs[b]
             if obj.tag == 12:              # instance -> bound user method
                 fidx = lookup_method(st, st.heap[obj.iv].cursor, nm)
-                bargs = new_v_list(); bargs.append(obj)
-                regs[a] = v_container(st, 14, 6, bargs)
-                st.heap[regs[a].iv].cursor = fidx
+                regs[a] = V(14, obj.iv * _METH_SHIFT + fidx)   # packed, no alloc
             else:                          # container/str -> bound builtin
                 bargs = new_v_list(); bargs.append(obj)
                 regs[a] = v_container(st, 15, 7, bargs)
