@@ -95,12 +95,13 @@ class Cont:
 
 class St:
     def __init__(self, prog: "Program", glob: "list[V]", heap: "list[Cont]",
-                 exc_flag: "int", exc_val: "V"):
+                 exc_flag: "int", exc_val: "V", regpool: "list[list[V]]"):
         self.prog = prog
         self.glob = glob
         self.heap = heap
         self.exc_flag = exc_flag
         self.exc_val = exc_val
+        self.regpool = regpool
 
 
 def new_int_list() -> "list[int]":
@@ -109,6 +110,11 @@ def new_int_list() -> "list[int]":
 
 
 def new_v_list() -> "list[V]":
+    r = []
+    return r
+
+
+def new_reg_pool() -> "list[list[V]]":
     r = []
     return r
 
@@ -377,14 +383,53 @@ def v_sub(x: "V", y: "V") -> "V":
     return v_int(x.iv - y.iv)
 
 
+def _floordiv_int(a: "long", b: "long") -> "long":
+    q = a // b                      # truncated under py2c/C, floored under CPython
+    r = a - q * b
+    if r != 0 and ((r < 0) != (b < 0)):
+        q = q - 1
+    return q
+
+
+def _mod_int(a: "long", b: "long") -> "long":
+    r = a - (a // b) * b
+    if r != 0 and ((r < 0) != (b < 0)):
+        r = r + b
+    return r
+
+
+def _ffloor(x: "double") -> "double":
+    t = float(int(x))               # truncate toward zero
+    if t > x:
+        t = t - 1.0
+    return t
+
+
 def v_mul(st: "St", x: "V", y: "V") -> "V":
-    if x.tag == 3 and y.tag == 1:
+    if x.tag == 3 and y.tag == 1:           # str * int
         out = ""
         k = 0
         while k < y.iv:
             out = out + x.sv
             k = k + 1
         return v_str(out)
+    if x.tag == 1 and y.tag == 3:           # int * str
+        return v_mul(st, y, x)
+    if (x.tag == 7 or x.tag == 10) and y.tag == 1:   # list/tuple * int
+        src = items_of(st, x)
+        out2 = new_v_list()
+        k = 0
+        while k < y.iv:
+            m = 0
+            while m < len(src):
+                out2.append(src[m])
+                m = m + 1
+            k = k + 1
+        if x.tag == 10:
+            return v_container(st, 10, 3, out2)
+        return v_container(st, 7, 0, out2)
+    if x.tag == 1 and (y.tag == 7 or y.tag == 10):   # int * list/tuple
+        return v_mul(st, y, x)
     if x.tag == 2 or y.tag == 2:
         return v_float(to_float(x) * to_float(y))
     return v_int(x.iv * y.iv)
@@ -396,8 +441,8 @@ def v_div(x: "V", y: "V") -> "V":
 
 def v_floordiv(x: "V", y: "V") -> "V":
     if x.tag == 2 or y.tag == 2:
-        return v_float(float(int(to_float(x) / to_float(y))))
-    return v_int(x.iv // y.iv)
+        return v_float(_ffloor(to_float(x) / to_float(y)))
+    return v_int(_floordiv_int(x.iv, y.iv))
 
 
 def v_mod(st: "St", x: "V", y: "V") -> "V":
@@ -412,8 +457,8 @@ def v_mod(st: "St", x: "V", y: "V") -> "V":
     if x.tag == 2 or y.tag == 2:
         fa = to_float(x)
         fb = to_float(y)
-        return v_float(fa - fb * float(int(fa / fb)))
-    return v_int(x.iv % y.iv)
+        return v_float(fa - fb * _ffloor(fa / fb))
+    return v_int(_mod_int(x.iv, y.iv))
 
 
 def v_neg(x: "V") -> "V":
@@ -1584,16 +1629,23 @@ def do_call(st: "St", callee: "V", args: "list[V]") -> "V":
 # ---- the dispatch loop ----
 def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
     fn = st.prog.funcs[fidx]
-    regs = new_v_list()
     nr = fn.nregs
     if fn.nparams > nr:
         nr = fn.nparams
+    if len(st.regpool) > 0:                  # reuse a frame (calls are nested)
+        regs = st.regpool.pop()
+    else:
+        regs = new_v_list()
     k = 0
     while k < nr:
         if k < len(args):
-            regs.append(args[k])
+            rv = args[k]
         else:
-            regs.append(v_none())
+            rv = v_none()
+        if k < len(regs):
+            regs[k] = rv
+        else:
+            regs.append(rv)
         k = k + 1
     na = len(args)                          # supply defaults for missing params
     if na < fn.nparams:
@@ -1624,7 +1676,9 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
         elif op == 4:
             regs[a] = regs[b]; pc = pc + 1
         elif op == 5:
-            return regs[a]
+            rret = regs[a]
+            st.regpool.append(regs)
+            return rret
         elif op == 6:
             pc = a
         elif op == 7:
@@ -1634,12 +1688,19 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
                 pc = b
         elif op == 8:
             callee = regs[b]
-            cargs = new_v_list()
+            if len(st.regpool) > 0:
+                cargs = st.regpool.pop()
+                while len(cargs) > 0:
+                    cargs.pop()
+            else:
+                cargs = new_v_list()
             j = 0
             while j < c:
                 cargs.append(regs[b + 1 + j])
                 j = j + 1
-            regs[a] = do_call(st, callee, cargs); pc = pc + 1
+            rcall = do_call(st, callee, cargs)
+            st.regpool.append(cargs)
+            regs[a] = rcall; pc = pc + 1
         elif op == 9:                      # BUILD_LIST
             items = new_v_list()
             j = 0
@@ -1793,7 +1854,9 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
                 pc = blocks[bn]            # jump to nearest handler
                 st.exc_flag = 0
             else:
+                st.regpool.append(regs)
                 return v_none()            # propagate to caller
+    st.regpool.append(regs)
     return v_none()
 
 
@@ -1802,7 +1865,7 @@ def interp_run(prog: "Program") -> "int":
     heap = []
     cz = Cont(0, 0, new_v_list())
     heap.append(cz)                        # heap[0] reserved; anchors list[Cont]
-    st = St(prog, glob, heap, 0, v_none())
+    st = St(prog, glob, heap, 0, v_none(), new_reg_pool())
     k = 0
     while k < prog.nglobals:
         glob.append(v_none())
