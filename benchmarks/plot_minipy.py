@@ -101,11 +101,17 @@ The pipeline has three stages that must agree byte-for-byte on every program:
 Values are a 16-byte tagged union (\texttt{tag} + an overlapping
 \texttt{int}/\texttt{double}/\texttt{char*} slot, a py2c anonymous-union POD);
 small integers, \texttt{None}, the booleans, and program constants are interned;
-register frames, call-argument lists, and the exception block-stack are pooled or
-shared so that hot recursion allocates almost nothing. The benchmarks below run
-the same eight programs under CPython and under the \texttt{py2c}-compiled
-interpreter, checking that their output is identical and recording best-of-$N$
-runtime and exact peak resident memory.
+register frames, call-argument lists, the exception block-stack, and the
+dict-index slot are pooled or shared so that hot recursion and method calls
+allocate almost nothing (a bound method is itself packed into a single value).
+The suite spans deliberately different workloads -- integer loops, recursion
+(\texttt{fib}, \texttt{ack}), method-dispatch-heavy OOP (\texttt{objects},
+\texttt{bintree}), dictionaries and strings (\texttt{dicts}, \texttt{wordfreq},
+\texttt{strings}), and floating point (\texttt{nbody}, \texttt{matmul}) -- to
+show where the interpreter is competitive with CPython and where it is not. Each
+program is run under both CPython and the \texttt{py2c}-compiled interpreter,
+checking that their output is identical and recording best-of-$N$ runtime and
+exact peak resident memory.
 
 """
 
