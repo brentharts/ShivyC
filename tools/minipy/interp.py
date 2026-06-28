@@ -35,11 +35,12 @@ class Instr:
 
 class Func:
     def __init__(self, name: "char*", nparams: "int", nregs: "int",
-                 code: "list[Instr]"):
+                 code: "list[Instr]", defaults: "list[int]"):
         self.name = name
         self.nparams = nparams
         self.nregs = nregs
         self.code = code
+        self.defaults = defaults
 
 
 class MethEnt:
@@ -1386,6 +1387,14 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
         else:
             regs.append(v_none())
         k = k + 1
+    na = len(args)                          # supply defaults for missing params
+    if na < fn.nparams:
+        defs = fn.defaults
+        i = na
+        while i < fn.nparams:
+            if i < len(defs) and defs[i] >= 0:
+                regs[i] = const_to_v(st.prog, defs[i])
+            i = i + 1
 
     code = fn.code
     n = len(code)

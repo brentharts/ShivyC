@@ -163,6 +163,7 @@ class _Frame:
         self.maxreg = self.base
         self.code = []                   # list of [op, a, b, c]
         self.numreg = set()              # regs statically known to hold a number
+        self.defaults = []               # per-param const index, -1 = required
 
     # register stack discipline
     def push(self):
@@ -506,12 +507,41 @@ class Compiler:
         r = f.push(); f.emit("LOAD_CONST", r, ci)
         f.emit("STORE_GLOBAL", r, self.gslot(node.name)); f.pop_to(r)
 
+    def _literal_const_index(self, node):
+        if not isinstance(node, ast.Constant):
+            raise CompileError("v0 default: constant literal only (line %s)"
+                               % getattr(node, "lineno", "?"))
+        v = node.value
+        if isinstance(v, bool):
+            return self.consts.add("bool", v)     # bool before int (subclass)
+        if isinstance(v, int):
+            return self.consts.add("int", v)
+        if isinstance(v, float):
+            return self.consts.add("float", v)
+        if isinstance(v, str):
+            return self.consts.add("str", v)
+        if v is None:
+            return self.consts.add("none", None)
+        raise CompileError("v0 default: unsupported literal %r" % (v,))
+
+    def _build_defaults(self, node, nparams):
+        # defaults apply to the trailing params; store one const index per param
+        # (-1 = required). Restricting defaults to literals keeps them constant
+        # (CPython evaluates defaults once at def time, which literals satisfy).
+        defs = [-1] * nparams
+        dlist = node.args.defaults
+        start = nparams - len(dlist)
+        for j, dexpr in enumerate(dlist):
+            defs[start + j] = self._literal_const_index(dexpr)
+        return defs
+
     def _compile_method(self, node):
-        if node.args.vararg or node.args.kwarg or node.args.kwonlyargs or node.args.defaults:
-            raise CompileError("v0 method: positional params only (line %s)" % node.lineno)
+        if node.args.vararg or node.args.kwarg or node.args.kwonlyargs:
+            raise CompileError("v0 method: no *args/**kwargs/kwonly (line %s)" % node.lineno)
         params = [a.arg for a in node.args.args]
         extra = _collect_locals(node)
         frame = _Frame(node.name, params, extra, is_module=False)
+        frame.defaults = self._build_defaults(node, len(params))
         for arg in node.args.args:
             ann = _ann_name(arg.annotation)
             if ann in ("int", "float", "long", "double") and arg.arg in frame.locals:
@@ -525,10 +555,11 @@ class Compiler:
         if not f.is_module:
             raise CompileError("v0: nested functions unsupported (line %s)" % node.lineno)
         params = [a.arg for a in node.args.args]
-        if node.args.vararg or node.args.kwarg or node.args.kwonlyargs or node.args.defaults:
-            raise CompileError("v0 def: positional params only (line %s)" % node.lineno)
+        if node.args.vararg or node.args.kwarg or node.args.kwonlyargs:
+            raise CompileError("v0 def: no *args/**kwargs/kwonly (line %s)" % node.lineno)
         extra = _collect_locals(node)
         frame = _Frame(node.name, params, extra, is_module=False)
+        frame.defaults = self._build_defaults(node, len(params))
         # annotation-driven typing: int/float params start known-numeric, so
         # arithmetic on them lowers to the *_NN fast ops (py2c annotates heavily)
         for ai, arg in enumerate(node.args.args):
@@ -875,6 +906,7 @@ class Compiler:
                 "nregs": fr.maxreg,
                 "code": [{"op": op, "a": a, "b": b, "c": c}
                          for (op, a, b, c) in fr.code],
+                "defaults": fr.defaults,
             })
         names = [None] * len(self.gnames)
         for nm, slot in self.gnames.items():
@@ -1007,6 +1039,10 @@ class VM:
         regs = [None] * max(fn["nregs"], fn["nparams"])
         for i, a in enumerate(args):
             regs[i] = a
+        defs = fn.get("defaults", [])       # supply defaults for missing params
+        for i in range(len(args), fn["nparams"]):
+            if i < len(defs) and defs[i] >= 0:
+                regs[i] = self._const(defs[i])
         code = fn["code"]
         blocks = []
         pc = 0

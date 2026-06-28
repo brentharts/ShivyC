@@ -468,3 +468,30 @@ drop the `import sys` / `__main__` entry block in favour of a driver. After that
 the boxed-value representation for parser match results (`str` / `Node` / `None`
 / `list`, today held in dynamically-typed Python locals) needs the same kind of
 tagged-union treatment minipy already uses for `V`.
+
+---
+
+## Status update — default parameter values (native-validated)
+
+Functions and methods now support default arguments (`def f(a, b=1, c="x")`),
+filled **callee-side**: each function carries a `defaults` list (one const index
+per parameter, `-1` for required), and on entry the runtime supplies a default
+for every trailing parameter the caller omitted. Defaults are restricted to
+constant literals (`None`, ints, floats, strings, bools), which matches CPython's
+"evaluate once at def time" semantics for the cases that actually occur and keeps
+the value embeddable as a constant. This is the highest-frequency remaining gap
+for both `rast.py` (6 uses) and `py2c.py`.
+
+The bytecode `funcs[*]` object gains a `defaults: list[int]` field; the native
+`Func` struct gains the matching `defaults` member, decoded the same way as the
+existing scalar-element `names: list[char*]` (so `rpy.json.generate_decoder`
+needed no changes). All three executors agree, full regression
+(demo2/3/4, cont, cls, exc, wide, bm, asrt, defs) and `make testfast` pass.
+
+### Remaining gaps to run `rast.py` under minipy
+With `assert` and default parameters done, the open items are: step slices
+`x[::2]` (2 uses), generator expressions passed as call args (5), comprehension
+`if`-clauses / multiple generators (4), and the source-side rewrites
+(`class Node(list)` → internal child list; lift the one `reformat_binary`
+closure; drop `import`/`__main__`). The Python-2-scoped embedded grammar also
+needs py3 extensions before it can parse minipy's own annotated sources.
