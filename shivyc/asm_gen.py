@@ -2496,22 +2496,45 @@ class ASMGen:
         for v in self.symbol_table.linkages[EXTERNAL].values():
             if self.symbol_table.def_state.get(v) == DEFINED:
                 self.asm_code.add_global(self.symbol_table.names[v])
+        self._m68_gemit = {}                  # global symbol -> emitted once
+        # String-literal storage (.byte data at each strlit symbol), mirroring
+        # the x86 path so `char *p = "..."` and friends resolve. Names are
+        # generated here if absent and recorded so references use the same one.
+        snum = 0
+        for v in self.il_code.string_literals:
+            nm = self.il_code.string_literal_names.get(v)
+            if nm is None:
+                nm = "__strlit%d" % snum
+                self.il_code.string_literal_names[v] = nm
+            snum += 1
+            elem_size = v.ctype.el.size if v.ctype.is_array() else 1
+            self.asm_code.add_string_literal(
+                nm, self.il_code.string_literals[v], elem_size)
         for func in self.il_code.commands:
             self._m68_function(func, self.il_code.commands[func])
 
     def _m68_src(self, value, reg_of, slot_of):
-        """Source operand string for `value`: immediate, data register, or its
-        fp-relative spill slot."""
+        """Source operand string for `value`: immediate, scalar global (absolute
+        symbol), data register, or its fp-relative spill slot."""
         lit = getattr(value, "literal", None)
         if lit is not None:
             return "#%s" % lit.val
+        g = getattr(self, "_m68_glob", {}).get(value)
+        if g is not None:
+            return g                           # absolute addressing on the symbol
         r = reg_of.get(value, -1)
         if r >= 0:
             return "%%d%d" % r
         return "%d(%%fp)" % slot_of[value]
 
     def _m68_store(self, value, from_dreg, reg_of, slot_of):
-        """Store data register d<from> into `value`'s home (register or slot)."""
+        """Store data register d<from> into `value`'s home (register, scalar
+        global, or fp-relative slot)."""
+        g = getattr(self, "_m68_glob", {}).get(value)
+        if g is not None:
+            self.asm_code.add(asm_cmds.Raw(
+                "move.l %%d%d,%s" % (from_dreg, g)))
+            return
         r = reg_of.get(value, -1)
         if r >= 0:
             if r != from_dreg:
@@ -2527,6 +2550,129 @@ class ASMGen:
         if use_fp:
             self.asm_code.add(asm_cmds.Raw("unlk %fp"))
         self.asm_code.add(asm_cmds.Raw("rts"))
+
+    def _m68_emit_global_storage(self, v):
+        """Emit `.comm`/`.data` storage for a static/file-scope global `v` once
+        (the directives are target-neutral GAS, assembled big-endian for m68k)."""
+        name = self.symbol_table.asm_name(v)
+        if name in self._m68_gemit:
+            return
+        self._m68_gemit[name] = 1
+        TENTATIVE = self.symbol_table.TENTATIVE
+        INTERNAL = self.symbol_table.INTERNAL
+        # Scalars (int / long / pointer / char / short) are stored as a single
+        # 4-byte cell so a `move.l` on the symbol reads the value correctly on
+        # this big-endian target; aggregates keep their full size.
+        sz = v.ctype.size
+        if v.ctype.is_scalar():
+            sz = 4
+        if self.symbol_table.def_state.get(v) == TENTATIVE:
+            local = (self.symbol_table.linkage_type[v] == INTERNAL)
+            self.asm_code.add_comm(name, sz, local)
+        elif v in self.il_code.static_block_inits:
+            entries, total = self.il_code.static_block_inits[v]
+            self._m68_emit_data_block(name, entries, total, v)
+        else:
+            init_val = self.il_code.static_inits.get(v, 0)
+            self.asm_code.add_data(name, sz, init_val)
+
+    def _m68_emit_data_block(self, name, entries, total, v):
+        """Emit an initialized aggregate/static object for m68k. Plain numeric
+        blocks reuse the shared emitter; a scalar pointer initialized to an
+        address emits a 4-byte `.int` relocation (m68k pointers are 4 bytes, and
+        an 8-byte `.quad` reloc is unencodable). Aggregates with pointer-valued
+        initializers (8-byte field stride) are not laid out yet."""
+        has_sym = any(isinstance(val, tuple) and val and val[0] == "sym"
+                      for _off, _size, val in entries)
+        if not has_sym:
+            self.asm_code.add_data_block(name, entries, total)
+            return
+        if v.ctype.is_array() or v.ctype.is_struct_union():
+            raise NotImplementedError(
+                "m68k back end: aggregate with pointer-valued initializer is"
+                " not implemented")
+        from shivyc.spots import mangle_symbol
+        self.asm_code.data.append("%s:" % mangle_symbol(name))
+        _off, _size, val = sorted(entries, key=lambda e: e[0])[0]
+        _, sym, addend = val
+        msym = mangle_symbol(sym)
+        ref = msym if not addend else "%s+%d" % (msym, addend)
+        self.asm_code.data.append("\t.int %s" % ref)
+
+    def _m68_base_addr(self, base, areg, reg_of, slot_of):
+        """Materialize the base *address* into %a<areg>: a global aggregate's or
+        local aggregate's address, or a scalar pointer's value (the address it
+        holds). Returns the register name."""
+        a = "%%a%d" % areg
+        g = self._m68_glob.get(base)
+        if g is not None:
+            if base.ctype.is_array() or base.ctype.is_struct_union():
+                self.asm_code.add(asm_cmds.Raw("lea %s,%s" % (g, a)))
+            else:                              # global scalar pointer: its value
+                self.asm_code.add(asm_cmds.Raw("move.l %s,%s" % (g, a)))
+            return a
+        if base.ctype.is_array() or base.ctype.is_struct_union():
+            self.asm_code.add(asm_cmds.Raw(
+                "lea %d(%%fp),%s" % (slot_of[base], a)))
+            return a
+        src = self._m68_src(base, reg_of, slot_of)
+        self.asm_code.add(asm_cmds.Raw("move.l %s,%s" % (src, a)))
+        return a
+
+    def _m68_addr_into(self, base, chunk, count, areg, reg_of, slot_of):
+        """Compute base_address + chunk*count into %a<areg> (count None -> just
+        + chunk). Uses %d0 for a variable index, so call before loading a value
+        into %d0."""
+        a = self._m68_base_addr(base, areg, reg_of, slot_of)
+        if count is None:
+            if chunk:
+                self.asm_code.add(asm_cmds.Raw("adda.l #%d,%s" % (chunk, a)))
+            return a
+        lit = getattr(count, "literal", None)
+        if lit is not None:
+            off = chunk * lit.val
+            if off:
+                self.asm_code.add(asm_cmds.Raw("adda.l #%d,%s" % (off, a)))
+            return a
+        csrc = self._m68_src(count, reg_of, slot_of)
+        self.asm_code.add(asm_cmds.Raw("move.l %s,%%d0" % csrc))
+        if chunk != 1:
+            self.asm_code.add(asm_cmds.Raw("muls.l #%d,%%d0" % chunk))
+        self.asm_code.add(asm_cmds.Raw("adda.l %%d0,%s" % a))
+        return a
+
+    def _m68_load_sized(self, ea, size, signed, dreg):
+        """Load `size` bytes from effective address string `ea` into %d<dreg>,
+        sign- or zero-extending sub-word loads to a full 32-bit value."""
+        d = "%%d%d" % dreg
+        if size >= 4:
+            self.asm_code.add(asm_cmds.Raw("move.l %s,%s" % (ea, d)))
+        elif size == 2:
+            if signed:
+                self.asm_code.add(asm_cmds.Raw("move.w %s,%s" % (ea, d)))
+                self.asm_code.add(asm_cmds.Raw("ext.l %s" % d))
+            else:
+                self.asm_code.add(asm_cmds.Raw("moveq #0,%s" % d))
+                self.asm_code.add(asm_cmds.Raw("move.w %s,%s" % (ea, d)))
+        else:
+            if signed:
+                self.asm_code.add(asm_cmds.Raw("move.b %s,%s" % (ea, d)))
+                self.asm_code.add(asm_cmds.Raw("extb.l %s" % d))
+            else:
+                self.asm_code.add(asm_cmds.Raw("moveq #0,%s" % d))
+                self.asm_code.add(asm_cmds.Raw("move.b %s,%s" % (ea, d)))
+
+    def _m68_store_sized(self, ea, size, dreg):
+        """Store the low `size` bytes of %d<dreg> to effective address `ea`."""
+        d = "%%d%d" % dreg
+        suf = "l" if size >= 4 else ("w" if size == 2 else "b")
+        self.asm_code.add(asm_cmds.Raw("move.%s %s,%s" % (suf, d, ea)))
+
+    def _m68_signed(self, value):
+        ct = value.ctype
+        if ct.is_pointer() or ct.is_array() or ct.is_struct_union():
+            return False
+        return bool(getattr(ct, "signed", True))
 
     def _m68_function(self, func, cmds):
         import shivyc.il_cmds.control as control
@@ -2546,30 +2692,53 @@ class ASMGen:
         has_call = False
         has_arg = False
         STATIC = self.symbol_table.STATIC
+        # Static / file-scope globals live at a symbol, not in the frame; record
+        # each and emit its storage once. They never occupy a register.
+        glob = {}
         for c in cmds:
             if isinstance(c, control.Call):
                 has_call = True
             if isinstance(c, value_cmds.LoadArg):
                 has_arg = True
             for v in c.inputs() + c.outputs():
-                if v is None or getattr(v, "literal", None) is not None \
-                        or v in funcptr:
+                if v is None:
+                    continue
+                if v in self.il_code.string_literals:
+                    nm = self.il_code.string_literal_names.get(v)
+                    if nm is not None and v not in glob:
+                        glob[v] = nm          # address is the strlit symbol
+                    continue
+                if getattr(v, "literal", None) is not None or v in funcptr:
                     continue
                 if self.symbol_table.storage.get(v) == STATIC:
+                    if v not in glob:
+                        glob[v] = self.symbol_table.asm_name(v)
+                        self._m68_emit_global_storage(v)
+                    continue
+                if v.ctype.is_floating():
                     raise NotImplementedError(
-                        "m68k back end: globals not implemented yet")
-                if v.ctype.is_floating() or v.ctype.is_array() \
-                        or v.ctype.is_struct_union() or v.ctype.is_pointer() \
-                        or v.ctype.size > 4:
-                    raise NotImplementedError(
-                        "m68k back end: only the 32-bit integer core is"
-                        " implemented")
+                        "m68k back end: floating point is not implemented")
+                # The front end (an x86-64 compiler) sizes `long` and pointers
+                # at 8 bytes, but on m68k they are 4 (matching m68k-linux and the
+                # oracle), and compiler-generated index/offset `long`s fit in 32
+                # bits. So every integer scalar is treated as a 4-byte value (its
+                # low long). True 64-bit `long long` arithmetic is a known limit.
                 if v not in seen:
                     seen[v] = 1
                     values.append(v)
+        self._m68_glob = glob
 
+        # A value whose address is taken, or that is an aggregate (array/struct,
+        # too big for a register), must live in memory so a real address exists.
         forced = {}
-        glob = {}
+        for c in cmds:
+            if isinstance(c, value_cmds.AddrOf) \
+                    and not c.var.ctype.is_function() \
+                    and c.var not in glob:
+                forced[c.var] = 1
+        for v in values:
+            if v.ctype.is_array() or v.ctype.is_struct_union():
+                forced[v] = 1
         fused_out = {}
         usecount = {}
         defcount = {}
@@ -2632,7 +2801,7 @@ class ASMGen:
         order = []
         for v in values:
             cv = self._il_canon(v, coalesce)
-            if cv in reps:
+            if cv in reps or cv in forced or cv in glob:
                 continue
             reps[cv] = 1
             order.append(cv)
@@ -2646,16 +2815,23 @@ class ASMGen:
             if r in used_int_callee:
                 saved.append(r)
         self._m68_saved = saved
-        # Spill slots: fp-relative negative offsets (the link reserves them).
+        # Frame slots at fp-relative negative offsets (the link reserves them):
+        # spilled scalars, address-taken locals, and aggregates -- each sized to
+        # its type so an array/struct gets its whole block. Globals are excluded.
         slot_of = {}
         off = 0
         for v in values:
             cv = self._il_canon(v, coalesce)
-            if cv in reg_of:
+            if cv in reg_of or cv in glob:
                 continue
             if cv not in slot_of:
-                off += 4
-                slot_of[cv] = -off
+                if cv.ctype.is_array() or cv.ctype.is_struct_union():
+                    sz = cv.ctype.size           # aggregate: whole block
+                else:
+                    sz = 4                       # scalar (pointers are 4 on m68k)
+                sz = sz + (sz % 2)               # even alignment
+                off += sz
+                slot_of[cv] = -off              # base (lowest address) of slot
             if v is not cv:
                 slot_of[v] = slot_of[cv]
         for arg in coalesce:
@@ -2711,6 +2887,50 @@ class ASMGen:
             else:
                 op = "muls.l"
             self.asm_code.add(asm_cmds.Raw("%s %s,%%d0" % (op, b)))
+            self._m68_store(out, 0, reg_of, slot_of)
+            return
+
+        if isinstance(cmd, math_cmds.BitAnd) \
+                or isinstance(cmd, math_cmds.BitOr) \
+                or isinstance(cmd, math_cmds.BitXor):
+            ins = cmd.inputs()
+            out = cmd.outputs()[0]
+            a = self._m68_src(ins[0], reg_of, slot_of)
+            b = self._m68_src(ins[1], reg_of, slot_of)
+            self.asm_code.add(asm_cmds.Raw("move.l %s,%%d0" % a))
+            if isinstance(cmd, math_cmds.BitAnd):
+                self.asm_code.add(asm_cmds.Raw("and.l %s,%%d0" % b))
+            elif isinstance(cmd, math_cmds.BitOr):
+                self.asm_code.add(asm_cmds.Raw("or.l %s,%%d0" % b))
+            else:                              # eor's source must be a Dn
+                self.asm_code.add(asm_cmds.Raw("move.l %s,%%d1" % b))
+                self.asm_code.add(asm_cmds.Raw("eor.l %d1,%d0"))
+            self._m68_store(out, 0, reg_of, slot_of)
+            return
+
+        if isinstance(cmd, math_cmds.LBitShift) \
+                or isinstance(cmd, math_cmds.RBitShift):
+            ins = cmd.inputs()
+            out = cmd.outputs()[0]
+            a = self._m68_src(ins[0], reg_of, slot_of)
+            b = self._m68_src(ins[1], reg_of, slot_of)
+            self.asm_code.add(asm_cmds.Raw("move.l %s,%%d0" % a))
+            self.asm_code.add(asm_cmds.Raw("move.l %s,%%d1" % b))
+            if isinstance(cmd, math_cmds.LBitShift):
+                op = "lsl.l"
+            else:                              # arithmetic if the value is signed
+                op = "asr.l" if self._m68_signed(ins[0]) else "lsr.l"
+            self.asm_code.add(asm_cmds.Raw("%s %%d1,%%d0" % op))
+            self._m68_store(out, 0, reg_of, slot_of)
+            return
+
+        if isinstance(cmd, math_cmds.Not) or isinstance(cmd, math_cmds.Neg):
+            ins = cmd.inputs()
+            out = cmd.outputs()[0]
+            a = self._m68_src(ins[0], reg_of, slot_of)
+            self.asm_code.add(asm_cmds.Raw("move.l %s,%%d0" % a))
+            op = "not.l" if isinstance(cmd, math_cmds.Not) else "neg.l"
+            self.asm_code.add(asm_cmds.Raw("%s %%d0" % op))
             self._m68_store(out, 0, reg_of, slot_of)
             return
 
@@ -2785,8 +3005,54 @@ class ASMGen:
             if name is not None and cmd.var.ctype.is_function():
                 addrof_name[cmd.output] = name
                 return
-            raise NotImplementedError(
-                "m68k back end: address-of a variable not implemented yet")
+            g = self._m68_glob.get(cmd.var)
+            if g is not None:                  # &global: address is the symbol
+                self.asm_code.add(asm_cmds.Raw("lea %s,%%a0" % g))
+            else:                              # &local: fp + frame slot
+                self.asm_code.add(asm_cmds.Raw(
+                    "lea %d(%%fp),%%a0" % slot_of[cmd.var]))
+            self.asm_code.add(asm_cmds.Raw("move.l %a0,%d0"))
+            self._m68_store(cmd.output, 0, reg_of, slot_of)
+            return
+        if isinstance(cmd, value_cmds.ReadAt):
+            # output = *addr   (addr is a pointer value)
+            asrc = self._m68_src(cmd.addr, reg_of, slot_of)
+            self.asm_code.add(asm_cmds.Raw("move.l %s,%%a0" % asrc))
+            self._m68_load_sized("(%a0)", cmd.output.ctype.size,
+                                 self._m68_signed(cmd.output), 0)
+            self._m68_store(cmd.output, 0, reg_of, slot_of)
+            return
+        if isinstance(cmd, value_cmds.SetAt):
+            # *addr = val
+            asrc = self._m68_src(cmd.addr, reg_of, slot_of)
+            self.asm_code.add(asm_cmds.Raw("move.l %s,%%a0" % asrc))
+            vsrc = self._m68_src(cmd.val, reg_of, slot_of)
+            self.asm_code.add(asm_cmds.Raw("move.l %s,%%d0" % vsrc))
+            self._m68_store_sized("(%a0)", cmd.val.ctype.size, 0)
+            return
+        if isinstance(cmd, value_cmds.ReadRel):
+            # output = *(base + chunk*count)   (array / pointer indexed load)
+            self._m68_addr_into(cmd.base, cmd.chunk, cmd.count, 0,
+                                reg_of, slot_of)
+            self._m68_load_sized("(%a0)", cmd.output.ctype.size,
+                                 self._m68_signed(cmd.output), 0)
+            self._m68_store(cmd.output, 0, reg_of, slot_of)
+            return
+        if isinstance(cmd, value_cmds.SetRel):
+            # *(base + chunk*count) = val
+            self._m68_addr_into(cmd.base, cmd.chunk, cmd.count, 0,
+                                reg_of, slot_of)
+            vsrc = self._m68_src(cmd.val, reg_of, slot_of)
+            self.asm_code.add(asm_cmds.Raw("move.l %s,%%d0" % vsrc))
+            self._m68_store_sized("(%a0)", cmd.val.ctype.size, 0)
+            return
+        if isinstance(cmd, value_cmds.AddrRel):
+            # output = &(base + chunk*count)   (e.g. &a[i])
+            self._m68_addr_into(cmd.base, cmd.chunk, cmd.count, 0,
+                                reg_of, slot_of)
+            self.asm_code.add(asm_cmds.Raw("move.l %a0,%d0"))
+            self._m68_store(cmd.output, 0, reg_of, slot_of)
+            return
         if isinstance(cmd, control.Call):
             name = addrof_name.get(cmd.func)
             if name is None:
