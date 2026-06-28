@@ -428,3 +428,43 @@ byte-identical to `python3` and the reference VM:
 The reference VM gets set `|`/`&`/`^` for free because Python's operators already
 span sets and ints; the native interpreter implements union/intersection/
 symmetric-difference explicitly over the side-heap set representation.
+
+---
+
+## Status update — Python parser groundwork (`tools/rpy_lib/rast.py`)
+
+The path to running `py2c.py` under minipy needs a Python parser, since CPython's
+`ast` module is far out of reach. Rather than build one from scratch, the PEG /
+OMeta metacircular interpreter from **pymetaterp** (`asrp/pymetaterp`,
+`single_file.py`) was vendored as `tools/rpy_lib/rast.py`. It bootstraps a
+meta-grammar, uses it to parse an embedded Python grammar, and then parses real
+Python source into a tree of `Node` objects (pymetaterp's own vocabulary —
+`funcdef`, `__binary__`, `__call__`, `NAME`, `NUMBER`, … — not CPython `ast`
+names).
+
+Two changes were made on the way in, both verified to leave parser output
+byte-identical on sample programs:
+- **Python 3 port** (the original is Python 2: `print` statements, `map`, lazy
+  `zip`).
+- **De-eval'd.** The interpreter originally ran embedded grammar actions through
+  host `eval`/`exec` (e.g. `-> reformat_binary(start, oper_and_atoms)`,
+  `?(any_token(self.input))`, `!(self.indentation.append(...))`). Those are
+  impossible in RPython. The action set is finite — eight strings total — so
+  `eval`/`exec` were replaced by an explicit dispatch in `Interpreter._action`.
+  This is the single most important step toward an RPython/py2c-compilable
+  parser.
+
+### Remaining work to run `rast.py` under minipy
+An AST survey of `rast.py` against minipy's supported subset gives a short,
+concrete gap list. Compiler features to add: default parameter values (6 uses),
+step slices `x[::2]` (2), generator expressions as call args (5), and
+comprehension `if`-clauses / multiple generators (4). `assert` and
+`class Foo(Exception)` are already handled (`assert` added this phase; it
+evaluates the test but does not raise in v0). Source adaptations to `rast.py`
+(invited by the roadmap — "adapt code to RPython"): rewrite `class Node(list)` to
+hold an internal child list instead of subclassing `list`; lift the one nested
+closure in `reformat_binary` to a module-level helper threading its state; and
+drop the `import sys` / `__main__` entry block in favour of a driver. After that
+the boxed-value representation for parser match results (`str` / `Node` / `None`
+/ `list`, today held in dynamically-typed Python locals) needs the same kind of
+tagged-union treatment minipy already uses for `V`.

@@ -240,6 +240,13 @@ class Compiler:
     def st_Pass(self, f, node):
         pass
 
+    def st_Assert(self, f, node):
+        # v0: the test is evaluated (so any side effects occur) but a failing
+        # assertion does not raise (no AssertionError type yet). Invariant-style
+        # asserts that hold behave identically to CPython.
+        r = self.expr(f, node.test)
+        f.pop_to(r)
+
     def st_Assign(self, f, node):
         if len(node.targets) != 1:
             raise CompileError("v0 assign: single target (line %s)" % node.lineno)
