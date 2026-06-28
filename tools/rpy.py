@@ -144,3 +144,43 @@ class _Json:
 
 
 json = _Json()
+
+
+class _Threads:
+    """Namespace exposed as ``rpy.threads`` for ShivyCX's register-partitioned
+    bare-metal threads.
+
+    Under CPython the decorators are identity wrappers (they only record the
+    side/core on the function for introspection) and ``start_new_thread`` spawns
+    a real OS thread via ``_thread.start_new_thread`` -- so the same source runs,
+    semi-faithfully, on the host.
+
+    Under py2c the ``@rpy.threads.left(core=N)`` / ``.right(core=N)`` decorator
+    is *recognized*: the translator strips it and emits the equivalent
+    ``assert FN in threads.left(core=N)`` partition contract in ``main``'s header
+    (guarded by ``#ifdef __SHIVYC__`` so gcc still accepts the C), and a
+    ``rpy.threads.start_new_thread(fn)`` call lowers to a direct ``fn()``. The
+    contract is what ShivyCX's thread-partition analysis reads to split the
+    register file between the two threads (see shivyc/thread_contracts.py).
+    """
+
+    def left(self, core=0):
+        def deco(fn):
+            fn.__rpy_thread__ = ("left", core)
+            return fn
+        return deco
+
+    def right(self, core=0):
+        def deco(fn):
+            fn.__rpy_thread__ = ("right", core)
+            return fn
+        return deco
+
+    def start_new_thread(self, fn, args=()):
+        """Spawn `fn(*args)` on a new OS thread (CPython). The translator instead
+        lowers `start_new_thread(fn)` to a direct call `fn()`."""
+        import _thread
+        return _thread.start_new_thread(fn, tuple(args))
+
+
+threads = _Threads()
