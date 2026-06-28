@@ -402,6 +402,7 @@ long   rpy_eval_int(const char* src);   /* x: int   = eval(s)                 */
 double rpy_eval_float(const char* src); /* x: float = eval(s)                 */
 bool   rpy_eval_bool(const char* src);  /* x: bool  = eval(s)                 */
 str    rpy_eval_str(const char* src);   /* x: str   = eval(s)                 */
+void   rpy_exec(const char* src);       /* exec(s): run statements            */
 
 #endif /* SHIVYC_RT_H */
 '''
@@ -420,6 +421,7 @@ long   rpy_eval_int(const char* src);   /* x: int   = eval(s)                 */
 double rpy_eval_float(const char* src); /* x: float = eval(s)                 */
 bool   rpy_eval_bool(const char* src);  /* x: bool  = eval(s)                 */
 str    rpy_eval_str(const char* src);   /* x: str   = eval(s)                 */
+void   rpy_exec(const char* src);       /* exec(s): run statements            */
 #endif
 '''
 
@@ -592,6 +594,25 @@ str rpy_eval_str(const char* src) {
     char* out = aalloc(len + 1);
     memcpy(out, s, len); out[len] = 0;
     return out;
+}
+
+/* exec(): run a block of Python *statements* (FILE input), e.g. a whole script.
+   Unlike eval there is no value; an uncaught exception is printed like CPython
+   would and execution of the caller continues. */
+void rpy_exec(const char* src) {
+    rpy_mp_ensure();
+    nlr_buf_t nlr;
+    if (nlr_push(&nlr) == 0) {
+        mp_lexer_t* lex = mp_lexer_new_from_str_len(
+            MP_QSTR__lt_string_gt_, src, strlen(src), 0);
+        qstr src_name = lex->source_name;
+        mp_parse_tree_t pt = mp_parse(lex, MP_PARSE_FILE_INPUT);
+        mp_obj_t fun = mp_compile(&pt, src_name, false);
+        mp_call_function_0(fun);
+        nlr_pop();
+    } else {
+        mp_obj_print_exception(&mp_plat_print, MP_OBJ_FROM_PTR(nlr.ret_val));
+    }
 }
 '''
 
@@ -10896,6 +10917,11 @@ class Transpiler:
                 # typed value straight out, with no boxing.
                 self._uses_eval = True
                 return "rpy_eval(%s)" % self.as_str(node.args[0])
+            if fn == "exec" and len(node.args) == 1 and not node.keywords:
+                # exec(s): run Python statements through the MicroPython core.
+                # Returns nothing -- emitted as a statement.
+                self._uses_eval = True
+                return "rpy_exec(%s)" % self.as_str(node.args[0])
             if fn == "divmod" and len(node.args) == 2:
                 # (a // b, a % b) as a 2-tuple; uses the same C division as the
                 # `//`/`%` operators so divmod stays consistent with them.
@@ -13484,8 +13510,8 @@ def c_string(s):
 # ==========================================================================
 
 def _uses_eval_builtin(path):
-    """True if the source calls the eval() builtin -- then the MicroPython core
-    must be linked so the expression can be evaluated at runtime."""
+    """True if the source needs the MicroPython core linked: it calls the
+    eval()/exec() builtins, or imports the `micropython` first-class library."""
     if not path.endswith(".py"):
         return False
     try:
@@ -13494,7 +13520,12 @@ def _uses_eval_builtin(path):
         return False
     for n in ast.walk(tree):
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) \
-                and n.func.id == "eval":
+                and n.func.id in ("eval", "exec"):
+            return True
+        if isinstance(n, ast.Import) and any(
+                a.name == "micropython" for a in n.names):
+            return True
+        if isinstance(n, ast.ImportFrom) and n.module == "micropython":
             return True
     return False
 
@@ -13787,6 +13818,13 @@ def main(argv):
     try:
         import rpy_base64_integration as _rpy_base64
         files = _rpy_base64.bundle(files)
+    except Exception:
+        pass
+    # First-class MicroPython: bundle rpy_lib/micropython.py on `import
+    # micropython`, so exec_/eval_*/run_file lower to the MicroPython bridge.
+    try:
+        import rpy_micropython_integration as _rpy_mp
+        files = _rpy_mp.bundle(files)
     except Exception:
         pass
     # First-class Wayland / PyQt: bundle rpy_lib/{rwayland,rpyqt}.py and emit the
