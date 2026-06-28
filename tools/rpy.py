@@ -262,6 +262,15 @@ def _cache_key(path):
     for p in sorted(files):
         h.update(p.encode("utf-8"))
         h.update(files[p].encode("utf-8"))
+    # Fold in the minipy compiler's own source: changing the compiler changes the
+    # emitted bytecode, so a source-only key would serve stale (incompatible)
+    # bytecode after a compiler edit.
+    try:
+        cs = open(_minipy_compiler().__file__, encoding="utf-8").read()
+        h.update(b"\x00compiler\x00")
+        h.update(cs.encode("utf-8"))
+    except OSError:
+        pass
     return h.hexdigest()
 
 
