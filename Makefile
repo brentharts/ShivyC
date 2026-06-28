@@ -489,7 +489,9 @@ benchmarks_rpython:
 # Full report: run the harness, render the matplotlib figures (PNG+PDF), and
 # typeset tools/benchmarks.tex into $(BENCH_PLOT_DIR)/benchmarks.pdf.
 benchmarks_report: benchmarks_rpython
+	python3 benchmarks/run_minipy_benchmarks.py
 	python3 benchmarks/plot_rpython.py $(BENCH_PLOT_DIR)
+	python3 benchmarks/plot_minipy.py $(BENCH_PLOT_DIR)
 	@command -v pdflatex >/dev/null 2>&1 || { \
 		echo "pdflatex not found; figures are in $(BENCH_PLOT_DIR) but the PDF was not built."; \
 		exit 0; }
