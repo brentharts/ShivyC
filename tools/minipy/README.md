@@ -495,3 +495,43 @@ With `assert` and default parameters done, the open items are: step slices
 (`class Node(list)` → internal child list; lift the one `reformat_binary`
 closure; drop `import`/`__main__`). The Python-2-scoped embedded grammar also
 needs py3 extensions before it can parse minipy's own annotated sources.
+
+---
+
+## Status update — comprehension/slice widening, native string methods, cache fix
+
+This phase closes the remaining *compiler-side* feature gaps for `rast.py`:
+
+- **Comprehension tuple targets** — `[v for k, v in pairs]`, `{k: v for k, v in
+  pairs}`, multi-generator and `if`-clause comprehensions (the latter two already
+  worked; only tuple unpacking was missing). Lowered the same way as `for`-loop
+  unpacking (INDEX per element).
+- **Step slices** — `x[::2]`, `x[1::2]`, `x[a:b:step]` on lists, tuples, and
+  strings. The `SLICE` opcode was redefined to take the sequence in `a` and a
+  3-register group `(lo, hi, step)` based at `b` (it previously used `a`/`b`/`c`
+  for seq/lo/hi with no room for step). Positive step only in v0; a non-positive
+  step falls back to 1.
+- **Native string methods.** `split` (whitespace and explicit separator), `join`,
+  `strip`, `find`, and `replace` were previously `v_none` stubs in the native
+  interpreter; they are now implemented (the reference VM already had them via
+  Python). `"".join(...)` in particular is needed by `rast.py`.
+
+### Two py2c gotchas re-encountered
+- **Char comparison.** `s[i] == sub[j]` between two computed 1-char strings
+  compiles to a *pointer* comparison in py2c (it only strcmp's against string
+  literals), so substring search/replace silently failed natively. Comparing
+  `ord(s[i]) == ord(sub[j])` is the reliable form.
+- **Int-literal accumulator boxing.** `start = 0` then `start = idx + len(sep)`
+  boxed `start` to `obj`; the `start: "long" = 0` annotation fixes it, same as the
+  earlier pow accumulator.
+
+### rpy.py cache-key fix (latent bug)
+The bytecode cache key hashed only the *user's* source files, so editing the
+minipy compiler served stale, format-incompatible bytecode from
+`/tmp/<key>.minipy.json` (this surfaced as an `IndexError` when the new
+register-triple `SLICE` met old two-operand bytecode). The compiler's own source
+is now folded into the cache key, so any compiler change invalidates the cache.
+
+After this, the only remaining blockers to compiling `rast.py` through minipy are
+source-side: `class Node(list)` (list subclassing), one `import`, and one nested
+closure in `reformat_binary` — plus py3 extensions to the embedded grammar.

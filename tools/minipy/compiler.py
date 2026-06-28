@@ -70,7 +70,8 @@ OPS = {
     # --- generic compare (30-39): reg[a] = reg[b] CMP reg[c] ---
     "LT":          30, "LE": 31, "GT": 32, "GE": 33, "EQ": 34, "NE": 35,
     "SHL":         36, "SHR": 37,        # reg[a] = reg[b] << / >> reg[c]
-    "SLICE":       38,                   # reg[a] = reg[a][reg[b]:reg[c]]
+    "SLICE":       38,                   # reg[a] = reg[a][lo:hi:step], (lo,hi,
+                                         # step) = reg[b],reg[b+1],reg[b+2]
     # --- unary (40-49): reg[a] = OP reg[b] ---
     "NEG":         40, "NOT": 41,
     # --- AOT-specialised numeric fast paths (60-89): no tag check ---
@@ -765,9 +766,6 @@ class Compiler:
     def ex_Subscript(self, f, node):
         if isinstance(node.slice, ast.Slice):
             sl = node.slice
-            if sl.step is not None and not (
-                    isinstance(sl.step, ast.Constant) and sl.step.value in (1, None)):
-                raise CompileError("v0 slice: step unsupported (line %s)" % node.lineno)
             rb = self.expr(f, node.value)               # seq at rb
             if sl.lower is None:
                 rlo = self._const_reg(f, ("int", 0))
@@ -779,7 +777,12 @@ class Compiler:
             else:
                 rhi = self.expr(f, sl.upper)
             assert rhi == rb + 2
-            f.emit("SLICE", rb, rb + 1, rb + 2)
+            if sl.step is None:
+                rst = self._const_reg(f, ("int", 1))
+            else:
+                rst = self.expr(f, sl.step)
+            assert rst == rb + 3
+            f.emit("SLICE", rb, rb + 1, 0)              # (lo,hi,step) at rb+1..rb+3
             f.pop_to(rb + 1); f.numreg.discard(rb)
             return rb
         rb = self.expr(f, node.value)
@@ -826,15 +829,26 @@ class Compiler:
                 f.pop_to(re)
             return
         gen = gens[gi]
-        if not isinstance(gen.target, ast.Name):
-            raise CompileError("v0 comp: Name target only")
+        tgt = gen.target
+        if not isinstance(tgt, (ast.Name, ast.Tuple, ast.List)):
+            raise CompileError("v0 comp: Name/tuple target only")
         rit = self.expr(f, gen.iter)
         f.emit("ITER_NEW", rit, rit); f.numreg.discard(rit)
         top = len(f.code)
         rx = f.push()
         nx = len(f.code); f.emit("ITER_NEXT", rx, rit, 0)
-        self._store_name(f, gen.target.id, rx)
-        f.pop_to(rit + 1)
+        if isinstance(tgt, ast.Name):
+            self._store_name(f, tgt.id, rx)
+            f.pop_to(rit + 1)
+        else:                               # unpack tuple element into names
+            for i, elt in enumerate(tgt.elts):
+                if not isinstance(elt, ast.Name):
+                    raise CompileError("v0 comp-unpack: Name targets only")
+                ridx = self._const_reg(f, ("int", i))
+                f.emit("INDEX", ridx, rx, ridx)
+                self._store_name(f, elt.id, ridx)
+                f.pop_to(ridx)
+            f.pop_to(rit + 1)
         skip_jumps = []
         for cond in gen.ifs:
             rc = self.expr(f, cond)
@@ -1111,9 +1125,9 @@ class VM:
             elif op == 29: regs[a] = regs[b] ^ regs[c]    # int-xor / set symdiff
             elif op == 36: regs[a] = regs[b] << regs[c]
             elif op == 37: regs[a] = regs[b] >> regs[c]
-            elif op == 38:                                # SLICE seq[lo:hi]
-                seq = regs[a]; lo = regs[b]; hi = regs[c]
-                regs[a] = seq[lo:(len(seq) if hi is None else hi)]
+            elif op == 38:                                # SLICE seq[lo:hi:step]
+                seq = regs[a]; lo = regs[b]; hi = regs[b + 1]; step = regs[b + 2]
+                regs[a] = seq[lo:(len(seq) if hi is None else hi):step]
             elif op == 30: regs[a] = regs[b] < regs[c]
             elif op == 31: regs[a] = regs[b] <= regs[c]
             elif op == 32: regs[a] = regs[b] > regs[c]

@@ -440,13 +440,16 @@ def v_bitxor(st: "St", x: "V", y: "V") -> "V":
     return v_int(x.iv ^ y.iv)
 
 
-def v_slice(st: "St", seq: "V", lo_v: "V", hi_v: "V") -> "V":
+def v_slice(st: "St", seq: "V", lo_v: "V", hi_v: "V", step_v: "V") -> "V":
     if seq.tag == 3:
         n = len(seq.sv)
     elif seq.tag == 7 or seq.tag == 10:
         n = len(items_of(st, seq))
     else:
         return v_none()
+    step = step_v.iv
+    if step <= 0:                           # v0 supports positive step only
+        step = 1
     lo = lo_v.iv
     if lo < 0:
         lo = lo + n
@@ -471,14 +474,14 @@ def v_slice(st: "St", seq: "V", lo_v: "V", hi_v: "V") -> "V":
         k = lo
         while k < hi:
             out = out + seq.sv[k]
-            k = k + 1
+            k = k + step
         return v_str(out)
     src = items_of(st, seq)
     res = new_v_list()
     k = lo
     while k < hi:
         res.append(src[k])
-        k = k + 1
+        k = k + step
     if seq.tag == 10:
         return v_container(st, 10, 3, res)
     return v_container(st, 7, 0, res)
@@ -920,6 +923,46 @@ def _lstrip(s: "char*") -> "char*":
     return s[i:n]
 
 
+def _find_sub(s: "char*", sub: "char*", start: "long") -> "long":
+    n = len(s)
+    m = len(sub)
+    if m == 0:
+        return start
+    i = start
+    while i + m <= n:
+        j = 0
+        while j < m and ord(s[i + j]) == ord(sub[j]):
+            j = j + 1
+        if j == m:
+            return i
+        i = i + 1
+    return -1
+
+
+def _replace_all(s: "char*", old: "char*", rep: "char*") -> "char*":
+    m = len(old)
+    if m == 0:
+        return s
+    out = ""
+    i = 0
+    n = len(s)
+    while i < n:
+        hit = 0
+        if i + m <= n:
+            j = 0
+            while j < m and ord(s[i + j]) == ord(old[j]):
+                j = j + 1
+            if j == m:
+                hit = 1
+        if hit != 0:
+            out = out + rep
+            i = i + m
+        else:
+            out = out + s[i]
+            i = i + 1
+    return out
+
+
 # ---- const -> value ----
 def const_to_v(prog: "Program", idx: "int") -> "V":
     k = prog.consts[idx]
@@ -1234,6 +1277,47 @@ def do_method(st: "St", mid: "long", args: "list[V]") -> "V":
         return v_bool(1 if recv.sv.startswith(args[1].sv) else 0)
     if mid == 111:             # endswith
         return v_bool(1 if recv.sv.endswith(args[1].sv) else 0)
+    if mid == 107:             # str.split([sep])
+        s = recv.sv
+        out = new_v_list()
+        if len(args) >= 2:
+            sep = args[1].sv
+            start: "long" = 0
+            idx = _find_sub(s, sep, start)
+            while idx >= 0:
+                out.append(v_str(s[start:idx]))
+                start = idx + len(sep)
+                idx = _find_sub(s, sep, start)
+            out.append(v_str(s[start:len(s)]))
+        else:                              # no sep: split on whitespace runs
+            cur = ""
+            k = 0
+            while k < len(s):
+                if _is_ws(s[k]) != 0:
+                    if len(cur) > 0:
+                        out.append(v_str(cur)); cur = ""
+                else:
+                    cur = cur + s[k]
+                k = k + 1
+            if len(cur) > 0:
+                out.append(v_str(cur))
+        return v_container(st, 7, 0, out)
+    if mid == 108:             # str.join(iterable)
+        sep = recv.sv
+        out = ""
+        first = 1
+        for e in materialize(st, args[1]):
+            if first == 0:
+                out = out + sep
+            out = out + e.sv
+            first = 0
+        return v_str(out)
+    if mid == 109:             # str.strip (whitespace, both ends)
+        return v_str(_lstrip(_rstrip(recv.sv)))
+    if mid == 112:             # str.find(sub)
+        return v_int(_find_sub(recv.sv, args[1].sv, 0))
+    if mid == 113:             # str.replace(old, new)
+        return v_str(_replace_all(recv.sv, args[1].sv, args[2].sv))
     if mid == 114:             # upper
         return v_str(recv.sv.upper())
     if mid == 115:             # lower
@@ -1525,7 +1609,7 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
         elif op == 37:
             regs[a] = v_int(regs[b].iv >> regs[c].iv); pc = pc + 1
         elif op == 38:
-            regs[a] = v_slice(st, regs[a], regs[b], regs[c]); pc = pc + 1
+            regs[a] = v_slice(st, regs[a], regs[b], regs[b + 1], regs[b + 2]); pc = pc + 1
         elif op == 30:
             regs[a] = v_bool(1 if v_cmp(regs[b], regs[c]) < 0 else 0); pc = pc + 1
         elif op == 31:
