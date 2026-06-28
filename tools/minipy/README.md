@@ -535,3 +535,82 @@ is now folded into the cache key, so any compiler change invalidates the cache.
 After this, the only remaining blockers to compiling `rast.py` through minipy are
 source-side: `class Node(list)` (list subclassing), one `import`, and one nested
 closure in `reformat_binary` — plus py3 extensions to the embedded grammar.
+
+---
+
+## Status update — rast.py runs end-to-end on the reference VM
+
+With the source adaptations in place (Node no longer subclasses `list`; the
+`reformat_binary` closure lifted to a module-level `_rb_parse`; `__main__`/`import`
+replaced by a `parse_python(source)` entry; `try/finally` → `except/reraise`;
+slice-assignment → element assignment; keyword args → positional; `pop` bounds-checked
+instead of catching a host `IndexError`), the parser now **runs end-to-end on the
+minipy reference VM**, producing parse trees that are byte-identical to CPython.
+
+### The last blocker: generator-expression short-circuiting
+`any_token` used `all(pop(input) == char for char in token)` to match an operator.
+CPython short-circuits the generator, so `pop` is called only up to the first
+mismatch; minipy **materialises** generator expressions (a documented v0
+simplification), so `all(...)` evaluated every element and `pop` over-advanced the
+input — which spuriously hit EOF on multi-character operators and failed every
+binary-operator parse. The fix is a short-circuiting helper `_all_match(input, token)`
+(a side-effecting genexp is un-RPythonic anyway). The other `all(...)`/`any(...)`
+sites in rast.py iterate pure expressions, so materialisation is harmless there.
+
+### What parses identically through minipy now
+Assignments, NAMEs, NUMBERs, strings; binary operators with full precedence
+(`a + b * c` nests correctly); parentheses; calls, attribute access and subscripts
+(`foo(1, 2).bar`, `lst[i] + d[k]`); list and dict displays; `if` / `while` / `for`;
+`class` with methods; `def` with bodies and `return`; comparisons. Verified by a
+structural tree dump diffed against CPython `rast` across all of the above.
+
+This is the first time minipy executes a non-trivial program of its own
+(`rast.py`, ~18 functions) on real input. Remaining work to run rast.py *natively*
+(py2c-compiled) is the higher bar: the parser's heterogeneous values
+(`str | Node | None | list | tuple | bool`) need to flow through the static V boxing,
+and `type`/`isalpha`/`isalnum` (added last phase) plus `MatchError`-driven control
+flow must all hold up under the C backend.
+
+---
+
+## Status update — rast.py parses natively, including nested blocks
+
+The native (py2c-compiled) interpreter now runs the `rast.py` parser end-to-end and
+produces parse trees **byte-identical to CPython** for a broad Python subset,
+including deeply nested code: recursive `fib` (an `if` nested inside a `def`),
+classes with multiple methods, nested `while`/`for`, and comprehensions.
+
+Getting from "compiles" to "runs natively" meant clearing a chain of walls that only
+surfaced under the C backend (all fixed in `interp.py`):
+
+1. **`float("inf")` → 0.0.** Native `float()` ignored string arguments (it read the
+   string V's zero `iv` field), so the quantifier upper bound `inf` collapsed to 0 and
+   every `*`/`+` matched zero times. Added `_str_to_float`, an `_inf_val()` helper
+   (`1e308 * 10` overflows to +inf in C), and `inf`/`-inf` formatting in `_fmt_float`.
+2. **`dict([pairs])` → empty.** The `escaped_char` rule builds `dict([...])` then
+   indexes it; native `dict()` ignored its argument and returned an empty dict, so
+   escape characters resolved to `None`, corrupting the tree and later
+   null-dereferencing inside `materialize` (caught precisely with AddressSanitizer).
+   Implemented native dict-construction from a list of pairs.
+3. **`int("1")` → 0.** Same string-parsing gap as float, which made every NUMBER leaf
+   come out `<0>`. Added `_str_to_int`.
+4. **`list.pop()` didn't remove anything.** py2c compiles the *indexed* `lst.pop(i)`
+   form to `dict_pop` (a no-op on a list), while the runtime's correct `list_pop`
+   takes no argument. So `self.indentation.pop()` (the DEDENT action) never shrank the
+   indentation stack, and any nested block failed to parse. Rewrote native `pop` to
+   use the no-arg `items.pop()` (→ `list_pop`) and to do indexed removal with an
+   explicit left-shift.
+
+### A recurring py2c gotcha: per-function name unification
+Twice this phase a new local in `do_builtin`/`do_method` reused a name already used as
+a `long` elsewhere in the same function (`k` in the dict branch, `j` in `pop`), and
+because py2c infers one C type per variable *name per function*, the shared name was
+boxed to `obj` and an unrelated `v_int(...)` stopped compiling. Fix: give helper
+locals unique names (`dkey`/`dval`, `pop_i`/`pop_j`/...).
+
+### Known native limitation
+`parse_python` re-bootstraps both grammars on every call, and the native interpreter
+never frees container memory, so repeated calls in one process accumulate in the fixed
+1 GiB arena and eventually abort. A single parse fits comfortably; batch use would
+need either hoisting the bootstrap out of `parse_python` (parse the grammars once,
+reuse the `Interpreter`) or arena reuse/freeing. This is the natural next step.

@@ -172,7 +172,64 @@ def to_int(v: "V") -> "long":
     return v.iv
 
 
+def _str_to_int(s: "char*") -> "long":
+    n = len(s)
+    if n == 0:
+        return 0
+    i = 0
+    sign = 1
+    if s[0] == "-":
+        sign = -1
+        i = 1
+    elif s[0] == "+":
+        i = 1
+    r: "long" = 0
+    while i < n and ord(s[i]) >= 48 and ord(s[i]) <= 57:
+        r = r * 10 + (ord(s[i]) - 48)
+        i = i + 1
+    return sign * r
+
+
+def _inf_val() -> "double":
+    big: "double" = 1e308
+    return big * 10.0          # overflows to +inf in C
+
+
+def _str_to_float(s: "char*") -> "double":
+    n = len(s)
+    if n == 0:
+        return 0.0
+    if s == "inf":
+        return _inf_val()
+    if s == "-inf":
+        return -_inf_val()
+    i = 0
+    sign: "double" = 1.0
+    if s[0] == "-":
+        sign = -1.0
+        i = 1
+    elif s[0] == "+":
+        i = 1
+    intpart: "double" = 0.0
+    while i < n and ord(s[i]) >= 48 and ord(s[i]) <= 57:
+        intpart = intpart * 10.0 + float(ord(s[i]) - 48)
+        i = i + 1
+    frac: "double" = 0.0
+    scale: "double" = 1.0
+    if i < n and s[i] == ".":
+        i = i + 1
+        while i < n and ord(s[i]) >= 48 and ord(s[i]) <= 57:
+            frac = frac * 10.0 + float(ord(s[i]) - 48)
+            scale = scale * 10.0
+            i = i + 1
+    return sign * (intpart + frac / scale)
+
+
 def _fmt_float(d: "double") -> "char*":
+    if d > 1e308:
+        return "inf"
+    if d < -1e308:
+        return "-inf"
     asint = int(d)
     if float(asint) == d:
         return str(asint) + ".0"
@@ -843,6 +900,10 @@ def method_id(name: "char*") -> "long":
         return 126
     if name == "islower":
         return 127
+    if name == "isalpha":
+        return 128
+    if name == "isalnum":
+        return 129
     return -1
 
 
@@ -1027,6 +1088,8 @@ def do_builtin(st: "St", bid: "long", args: "list[V]") -> "V":
         return v_container(st, 7, 0, out)
     if bid == 3:               # int
         if len(args) > 0:
+            if args[0].tag == 3:
+                return v_int(_str_to_int(args[0].sv))
             return v_int(to_int(args[0]))
         return v_int(0)
     if bid == 4:               # str
@@ -1035,6 +1098,8 @@ def do_builtin(st: "St", bid: "long", args: "list[V]") -> "V":
         return v_str("")
     if bid == 5:               # float
         if len(args) > 0:
+            if args[0].tag == 3:
+                return v_float(_str_to_float(args[0].sv))
             return v_float(to_float(args[0]))
         return v_float(0.0)
     if bid == 6:               # abs
@@ -1052,8 +1117,14 @@ def do_builtin(st: "St", bid: "long", args: "list[V]") -> "V":
         if len(args) > 0:
             return v_container(st, 7, 0, materialize(st, args[0]))
         return v_container(st, 7, 0, new_v_list())
-    if bid == 9:               # dict (copy from list of pairs not supported; empty)
-        return v_container(st, 8, 1, new_v_list())
+    if bid == 9:               # dict([pairs]) or dict()
+        ddict = v_container(st, 8, 1, new_v_list())
+        if len(args) > 0:
+            for dpair in materialize(st, args[0]):
+                dkey = v_index(st, dpair, v_int(0))
+                dval = v_index(st, dpair, v_int(1))
+                v_setindex(st, ddict, dkey, dval)
+        return ddict
     if bid == 10:              # set
         out = new_v_list()
         sv = v_container(st, 9, 2, out)
@@ -1189,6 +1260,29 @@ def do_builtin(st: "St", bid: "long", args: "list[V]") -> "V":
                 if lookup_method(st, st.heap[obj.iv].cursor, nm) >= 0:
                     return v_bool(1)
         return v_bool(0)
+    if bid == 27:              # type
+        if len(args) > 0:
+            v = args[0]
+            t = v.tag
+            if t == 12:
+                return V(13, st.heap[v.iv].cursor, 0.0, "")
+            if t == 1:
+                return v_builtin(3)
+            if t == 2:
+                return v_builtin(5)
+            if t == 3:
+                return v_builtin(4)
+            if t == 4:
+                return v_builtin(7)
+            if t == 7:
+                return v_builtin(8)
+            if t == 8:
+                return v_builtin(9)
+            if t == 9:
+                return v_builtin(10)
+            if t == 10:
+                return v_builtin(11)
+        return v_builtin(-1)
     return v_none()
 
 
@@ -1231,10 +1325,17 @@ def do_method(st: "St", mid: "long", args: "list[V]") -> "V":
         return v_none()
     if mid == 101:             # pop
         items = items_of(st, recv)
-        if len(args) >= 2:
-            i = _norm_index(args[1].iv, len(items))
-            return items.pop(i)
-        return items.pop(len(items) - 1)
+        pop_n = len(items)
+        if len(args) >= 2:                 # pop(i): shift left, then drop last
+            pop_i = _norm_index(args[1].iv, pop_n)
+            pop_saved = items[pop_i]
+            pop_j = pop_i
+            while pop_j < pop_n - 1:
+                items[pop_j] = items[pop_j + 1]
+                pop_j = pop_j + 1
+            items.pop()                    # no-arg -> list_pop (removes last)
+            return pop_saved
+        return items.pop()                 # no-arg -> list_pop (removes last)
     if mid == 102:             # dict.get
         items = items_of(st, recv)
         j = dict_find(items, args[1])
@@ -1430,6 +1531,29 @@ def do_method(st: "St", mid: "long", args: "list[V]") -> "V":
                 lo = lo + 1
             k = k + 1
         return v_bool(1 if (lo > 0 and up == 0) else 0)
+    if mid == 128:             # str.isalpha
+        s = recv.sv
+        if len(s) == 0:
+            return v_bool(0)
+        k = 0
+        while k < len(s):
+            o = ord(s[k])
+            if not ((o >= 65 and o <= 90) or (o >= 97 and o <= 122)):
+                return v_bool(0)
+            k = k + 1
+        return v_bool(1)
+    if mid == 129:             # str.isalnum
+        s = recv.sv
+        if len(s) == 0:
+            return v_bool(0)
+        k = 0
+        while k < len(s):
+            o = ord(s[k])
+            if not ((o >= 48 and o <= 57) or (o >= 65 and o <= 90)
+                    or (o >= 97 and o <= 122)):
+                return v_bool(0)
+            k = k + 1
+        return v_bool(1)
     return v_none()
 
 
