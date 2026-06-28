@@ -85,7 +85,7 @@ BUILTINS = {n: i for i, n in enumerate(
     ["print", "len", "range", "int", "str", "float", "abs", "bool",
      "list", "dict", "set", "tuple", "repr", "sorted", "sum", "min", "max",
      "isinstance", "enumerate", "zip", "any", "all", "ord", "chr",
-     "reversed", "getattr", "hasattr"])}
+     "reversed", "getattr", "hasattr", "type"])}
 
 # Method ids (receiver passed as arg0). Distinct id band (100+) so do_builtin can
 # tell a global builtin from a bound method; invoked through the same CALL path.
@@ -97,6 +97,7 @@ METHODS = {
     "extend": 116, "insert": 117, "index": 118, "count": 119,
     "update": 120, "setdefault": 121, "splitlines": 122, "rstrip": 123,
     "lstrip": 124, "isdigit": 125, "isupper": 126, "islower": 127,
+    "isalpha": 128, "isalnum": 129,
 }
 
 
@@ -309,15 +310,44 @@ class Compiler:
                            % node.lineno)
 
     def st_AugAssign(self, f, node):
-        if not isinstance(node.target, ast.Name):
-            raise CompileError("v0 augassign: Name target only (line %s)" % node.lineno)
-        name = node.target.id
-        rb = self._load_name(f, name)
-        rc = self.expr(f, node.value)
-        self._binop(f, node.op, rb, rb, rc)
-        f.pop_to(rb + 1)
-        self._store_name(f, name, rb)
-        f.pop_to(rb)
+        if isinstance(node.target, ast.Name):
+            name = node.target.id
+            rb = self._load_name(f, name)
+            rc = self.expr(f, node.value)
+            self._binop(f, node.op, rb, rb, rc)
+            f.pop_to(rb + 1)
+            self._store_name(f, name, rb)
+            f.pop_to(rb)
+            return
+        # `obj.attr op= val` / `obj[idx] op= val`: evaluate the target object
+        # (and index) exactly once, load the current value, apply the op, and
+        # store back through the same object/index registers.
+        if isinstance(node.target, ast.Attribute):
+            robj = self.expr(f, node.target.value)
+            cn = self.consts.add("str", node.target.attr)
+            rcur = f.push()
+            f.emit("LOAD_ATTR", rcur, robj, cn)
+            rval = self.expr(f, node.value)
+            self._binop(f, node.op, rcur, rcur, rval)
+            f.emit("STORE_ATTR", robj, rcur, cn)
+            f.pop_to(robj)
+            return
+        if isinstance(node.target, ast.Subscript):
+            if isinstance(node.target.slice, ast.Slice):
+                raise CompileError(
+                    "v0: slice aug-assign unsupported (line %s)" % node.lineno)
+            robj = self.expr(f, node.target.value)
+            ridx = self.expr(f, node.target.slice)
+            rcur = f.push()
+            f.emit("INDEX", rcur, robj, ridx)
+            rval = self.expr(f, node.value)
+            self._binop(f, node.op, rcur, rcur, rval)
+            f.emit("SETINDEX", robj, ridx, rcur)
+            f.pop_to(robj)
+            return
+        raise CompileError(
+            "v0 augassign: Name/Attribute/Subscript target only (line %s)"
+            % node.lineno)
 
     def st_Return(self, f, node):
         if node.value is None:
@@ -509,6 +539,15 @@ class Compiler:
         f.emit("STORE_GLOBAL", r, self.gslot(node.name)); f.pop_to(r)
 
     def _literal_const_index(self, node):
+        # A unary-minus on a numeric literal (`-1`, `-2.5`) is a constant for
+        # default-argument purposes: fold it to the negated literal.
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub) \
+                and isinstance(node.operand, ast.Constant) \
+                and isinstance(node.operand.value, (int, float)) \
+                and not isinstance(node.operand.value, bool):
+            v = node.operand.value
+            kind = "float" if isinstance(v, float) else "int"
+            return self.consts.add(kind, -v)
         if not isinstance(node, ast.Constant):
             raise CompileError("v0 default: constant literal only (line %s)"
                                % getattr(node, "lineno", "?"))
@@ -1246,7 +1285,24 @@ class VM:
             return (isinstance(obj, _Inst)
                     and (args[1] in obj.attrs
                          or self._lookup_method(obj.cid, args[1]) is not None))
+        if name == "type":
+            return self._typeof(args[0])
         raise RuntimeError("unknown builtin id %d" % bid)
+
+    def _typeof(self, x):
+        # Mirror the native interp: type(x) is the type's builtin value
+        # (("builtin", id), comparable to the bare name `int`/`str`/...), or
+        # ("class", cid) for a user instance.
+        if isinstance(x, _Inst):           return ("class", x.cid)
+        if isinstance(x, bool):            return ("builtin", BUILTINS["bool"])
+        if isinstance(x, int):             return ("builtin", BUILTINS["int"])
+        if isinstance(x, float):           return ("builtin", BUILTINS["float"])
+        if isinstance(x, str):             return ("builtin", BUILTINS["str"])
+        if isinstance(x, list):            return ("builtin", BUILTINS["list"])
+        if isinstance(x, dict):            return ("builtin", BUILTINS["dict"])
+        if isinstance(x, set):             return ("builtin", BUILTINS["set"])
+        if isinstance(x, tuple):           return ("builtin", BUILTINS["tuple"])
+        return ("builtin", -1)
 
     def _isinst(self, obj, spec):
         if isinstance(spec, tuple) and spec and spec[0] == "class":
@@ -1315,6 +1371,8 @@ class VM:
         if name == "isdigit": return recv.isdigit()
         if name == "isupper": return recv.isupper()
         if name == "islower": return recv.islower()
+        if name == "isalpha": return recv.isalpha()
+        if name == "isalnum": return recv.isalnum()
         raise RuntimeError("unknown method id %d" % mid)
 
 

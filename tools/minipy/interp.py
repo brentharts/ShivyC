@@ -103,6 +103,15 @@ _none_v: "V" = None
 _true_v: "V" = None
 _false_v: "V" = None
 _int_cache: "list[V]" = None
+# Shared read-only empty block-stack. A function with no try/except never pushes
+# a handler, so it borrows this one sentinel instead of allocating a fresh list
+# per call (the dominant per-call allocation on recursion-heavy code). The first
+# SETUP_EXCEPT in a frame swaps in a private list. Handler PCs are stored as
+# v_int so the stack is a list[V] (uniformly boxed, unlike list[int]).
+_empty_blocks: "list[V]" = None
+# Per-program cache of materialized constant values (filled once at startup).
+_const_vs: "list[V]" = None
+_const_vs_ready: "int" = 0
 
 
 # A heap cell. kind: 0 list, 1 dict (items = [k0,v0,k1,v1,...]), 2 set,
@@ -143,7 +152,8 @@ def new_reg_pool() -> "list[list[V]]":
 
 
 def setup_cache() -> "int":
-    global _cache_ready, _none_v, _true_v, _false_v, _int_cache
+    global _cache_ready, _none_v, _true_v, _false_v, _int_cache, _empty_blocks
+    _empty_blocks = new_v_list()
     _none_v = V(0, 0)
     _false_v = V(4, 0)
     _true_v = V(4, 1)
@@ -1204,7 +1214,7 @@ def _replace_all(s: "char*", old: "char*", rep: "char*") -> "char*":
 
 
 # ---- const -> value ----
-def const_to_v(prog: "Program", idx: "int") -> "V":
+def const_to_v_raw(prog: "Program", idx: "int") -> "V":
     k = prog.consts[idx]
     if k.t == "int":
         return v_int(k.i)
@@ -1221,6 +1231,16 @@ def const_to_v(prog: "Program", idx: "int") -> "V":
     if k.t == "class":
         return V(13, k.i)
     return v_none()
+
+
+def const_to_v(prog: "Program", idx: "int") -> "V":
+    # Constants are immutable, so each one is materialized into a V exactly once
+    # (at startup) and that shared V is returned on every load. Without this a
+    # large literal in a hot loop (e.g. the `1000000` bound in a while-condition)
+    # allocates a fresh V on every iteration.
+    if _const_vs_ready != 0:
+        return _const_vs[idx]
+    return const_to_v_raw(prog, idx)
 
 
 # ---- builtins (ids 0-99) and methods (ids 100+) ----
@@ -1792,7 +1812,8 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
 
     code = fn.code
     n = len(code)
-    blocks = new_int_list()
+    blocks = _empty_blocks                   # shared empty sentinel; a private
+    has_blocks = 0                           # list is allocated on first handler
     bn = 0                                  # block-stack depth (list[int].pop is
     pc = 0                                  # miscompiled by py2c, so index by bn)
     while pc < n:
@@ -1960,10 +1981,13 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
         elif op == 66:
             regs[a] = v_bool(1 if v_cmp(regs[b], regs[c]) >= 0 else 0); pc = pc + 1
         elif op == 70:                     # SETUP_EXCEPT
+            if has_blocks == 0:            # leave the shared sentinel untouched
+                blocks = new_v_list()
+                has_blocks = 1
             if bn < len(blocks):
-                blocks[bn] = a
+                blocks[bn] = v_int(a)
             else:
-                blocks.append(a)
+                blocks.append(v_int(a))
             bn = bn + 1
             pc = pc + 1
         elif op == 71:                     # POP_BLOCK
@@ -1985,7 +2009,7 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
         if st.exc_flag != 0:               # an exception is in flight
             if bn > 0:
                 bn = bn - 1
-                pc = blocks[bn]            # jump to nearest handler
+                pc = blocks[bn].iv         # jump to nearest handler
                 st.exc_flag = 0
             else:
                 st.regpool.append(regs)
@@ -1995,7 +2019,14 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
 
 
 def interp_run(prog: "Program") -> "int":
+    global _const_vs, _const_vs_ready
     setup_cache()
+    _const_vs = new_v_list()               # materialize each constant once
+    ci = 0
+    while ci < len(prog.consts):
+        _const_vs.append(const_to_v_raw(prog, ci))
+        ci = ci + 1
+    _const_vs_ready = 1
     glob = new_v_list()
     heap = []
     cz = Cont(0, 0, new_v_list(), new_v_list())
