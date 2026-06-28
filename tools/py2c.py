@@ -9164,6 +9164,21 @@ class Transpiler:
             if sz:
                 self.array_sizes[node.target.id] = sz
         tgt = self.expr(node.target)
+        # A module-scope class-pointer global initialized to None (e.g.
+        # `_v: "V" = None`) is stored as the boxed `obj`, matching how class
+        # values flow everywhere else and how the global-type registry records
+        # it (collect_module_globals coerces the same `*`+None case to obj).
+        # This keeps the file-scope declaration consistent with every
+        # `global x; x = ...` store and read, and obj zero-init is a valid
+        # static (.bss) initializer (T_NONE == 0), whereas
+        # `V* x = (V*)AS_OBJ(OBJ_NONE)` is not a constant expression. Enables
+        # runtime-initialized typed globals (value caches, global lookup tables).
+        if toplevel and isinstance(node.target, ast.Name) \
+                and isinstance(node.value, ast.Constant) \
+                and node.value.value is None \
+                and isinstance(ctype, str) and ctype.endswith("*") \
+                and ctype[:-1] in self.classes:
+            ctype = OBJ
         if node.value is None:
             return ["%s %s;" % (ctype, tgt)]
         # A module-scope `obj` initialized to None is zero-initialized and
