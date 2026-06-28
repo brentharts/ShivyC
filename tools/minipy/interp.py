@@ -77,11 +77,19 @@ class Program:
 # For containers V.iv is an index into St.heap; the scalar payload lives in
 # iv/dv/sv as before so int/float/etc. need no heap allocation.
 class V:
-    def __init__(self, tag: "int", iv: "long", dv: "double", sv: "char*"):
+    # A tagged value. iv/dv/sv share one 8-byte slot (anonymous union): a value
+    # is exactly one of int/heap-index (iv), float (dv), or string (sv), chosen
+    # by `tag`, so they never need to coexist. This makes V a 16-byte
+    # tag+union POD (was ~32 bytes), halving allocation size and memory traffic.
+    tag: "int"
+    iv: "long"
+    dv: "double"
+    sv: "char*"
+    _c_union_ = ("iv", "dv", "sv")
+
+    def __init__(self, tag: "int", iv: "long"):
         self.tag = tag
         self.iv = iv
-        self.dv = dv
-        self.sv = sv
 
 
 # Shared immutable singletons (V is never mutated in place), populated once by
@@ -136,13 +144,13 @@ def new_reg_pool() -> "list[list[V]]":
 
 def setup_cache() -> "int":
     global _cache_ready, _none_v, _true_v, _false_v, _int_cache
-    _none_v = V(0, 0, 0.0, "")
-    _false_v = V(4, 0, 0.0, "")
-    _true_v = V(4, 1, 0.0, "")
+    _none_v = V(0, 0)
+    _false_v = V(4, 0)
+    _true_v = V(4, 1)
     c = new_v_list()
     n = _CACHE_LO
     while n <= _CACHE_HI:
-        c.append(V(1, n, 0.0, ""))
+        c.append(V(1, n))
         n = n + 1
     _int_cache = c
     _cache_ready = 1
@@ -152,21 +160,25 @@ def setup_cache() -> "int":
 def v_none() -> "V":
     if _cache_ready != 0:
         return _none_v
-    return V(0, 0, 0.0, "")
+    return V(0, 0)
 
 
 def v_int(n: "long") -> "V":
     if _cache_ready != 0 and n >= _CACHE_LO and n <= _CACHE_HI:
         return _int_cache[n - _CACHE_LO]
-    return V(1, n, 0.0, "")
+    return V(1, n)
 
 
 def v_float(x: "double") -> "V":
-    return V(2, 0, x, "")
+    r = V(2, 0)
+    r.dv = x
+    return r
 
 
 def v_str(t: "char*") -> "V":
-    return V(3, 0, 0.0, t)
+    r = V(3, 0)
+    r.sv = t
+    return r
 
 
 def v_bool(b: "int") -> "V":
@@ -174,15 +186,15 @@ def v_bool(b: "int") -> "V":
         if b:
             return _true_v
         return _false_v
-    return V(4, 1 if b else 0, 0.0, "")
+    return V(4, 1 if b else 0)
 
 
 def v_func(idx: "long") -> "V":
-    return V(5, idx, 0.0, "")
+    return V(5, idx)
 
 
 def v_builtin(bid: "long") -> "V":
-    return V(6, bid, 0.0, "")
+    return V(6, bid)
 
 
 def _heap_put(st: "St", kind: "int", items: "list[V]") -> "long":
@@ -192,7 +204,7 @@ def _heap_put(st: "St", kind: "int", items: "list[V]") -> "long":
 
 
 def v_container(st: "St", tag: "int", kind: "int", items: "list[V]") -> "V":
-    return V(tag, _heap_put(st, kind, items), 0.0, "")
+    return V(tag, _heap_put(st, kind, items))
 
 
 def cont_of(st: "St", v: "V") -> "Cont":
@@ -1207,7 +1219,7 @@ def const_to_v(prog: "Program", idx: "int") -> "V":
     if k.t == "builtin":
         return v_builtin(k.i)
     if k.t == "class":
-        return V(13, k.i, 0.0, "")
+        return V(13, k.i)
     return v_none()
 
 
@@ -1432,7 +1444,7 @@ def do_builtin(st: "St", bid: "long", args: "list[V]") -> "V":
             v = args[0]
             t = v.tag
             if t == 12:
-                return V(13, st.heap[v.iv].cursor, 0.0, "")
+                return V(13, st.heap[v.iv].cursor)
             if t == 1:
                 return v_builtin(3)
             if t == 2:
