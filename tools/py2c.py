@@ -2376,6 +2376,8 @@ class ClassInfo:
         self.property_methods = set()  # @property: direct call, not vtable slot
         self.own_fields = []
         self.const_dicts = {}
+        self.union_fields = []      # fields that share storage (anonymous C
+                                    # union); declared via `_c_union_ = (...)`
         self.class_statics = {}     # class-level obj constants (lists / dicts
                                     # the const_dict fast-path can't specialize)
         self.class_attrs = {}       # class-level scalar defaults (instance flds)
@@ -2873,6 +2875,15 @@ def collect_classes(tree):
             elif isinstance(item, ast.Assign) and len(item.targets) == 1 \
                     and isinstance(item.targets[0], ast.Name):
                 nm, val = item.targets[0].id, item.value
+                if nm == "_c_union_" and isinstance(val, ast.Tuple) and all(
+                        isinstance(e, ast.Constant) and isinstance(e.value, str)
+                        for e in val.elts):
+                    # `_c_union_ = ("iv", "dv", "sv")`: these fields share one
+                    # storage slot (anonymous C union). Mutually-exclusive by a
+                    # discriminant the program manages (e.g. a tag field), this
+                    # shrinks the POD toward the 16-byte tagged-union model.
+                    ci.union_fields = [e.value for e in val.elts]
+                    continue
                 if isinstance(val, ast.Dict) and _const_dict_specializable(val):
                     ci.const_dicts[nm] = val
                 elif isinstance(val, (ast.Dict, ast.List, ast.Set, ast.Tuple)):
@@ -6587,7 +6598,21 @@ class Transpiler:
         ff = ci.full_fields()
         if not ff:
             self.emit("char _empty;")
+        uset = set(getattr(ci, "union_fields", []))
+        emitted_union = False
         for fn, ft in ff:
+            if fn in uset:
+                if not emitted_union:    # emit the whole anonymous union once,
+                    self.emit("union {")  # at the position of its first member
+                    self.indent += 1
+                    for ufn, uft in ff:
+                        if ufn in uset:
+                            self.emit("%s %s;" % (self.ctype_csym(uft),
+                                                  self.fnsym(ufn)))
+                    self.indent -= 1
+                    self.emit("};")
+                    emitted_union = True
+                continue
             self.emit("%s %s;" % (self.ctype_csym(ft), self.fnsym(fn)))
         self.indent -= 1
         self.emit("} %s;" % ci.csym)
