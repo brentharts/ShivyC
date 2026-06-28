@@ -460,6 +460,12 @@ def _compile_and_scan(files, budget_json=None):
             shutil.copyfile(f, cpy)
             cmd = [sys.executable, "-m", "shivyc.main", cpy, "-c",
                    "-o", cpy[:-2] + ".o"]
+            # Resolve includes (e.g. py2c's `#include "shivyc_rt.h"`) against the
+            # original file's directory, so generated C -- not just standalone
+            # hand-written C -- can be compiled and scanned for its footprint.
+            srcdir = os.path.dirname(os.path.abspath(f))
+            if srcdir:
+                cmd += ["-I", srcdir]
             if budget_json:
                 cmd += ["--thread-alloc-json", budget_json]
             r = subprocess.run(cmd, cwd=repo_root, capture_output=True, text=True)
