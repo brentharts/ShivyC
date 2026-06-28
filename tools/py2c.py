@@ -13658,6 +13658,16 @@ def main(argv):
         files = _rpy_heapq.bundle(files)
     except Exception:
         pass
+    try:
+        import rpy_hashlib_integration as _rpy_hashlib
+        files = _rpy_hashlib.bundle(files)
+    except Exception:
+        pass
+    try:
+        import rpy_base64_integration as _rpy_base64
+        files = _rpy_base64.bundle(files)
+    except Exception:
+        pass
     # First-class Wayland / PyQt: bundle rpy_lib/{rwayland,rpyqt}.py and emit the
     # generated glue (runtime + scanned xdg-shell) so no C is hand-written. The
     # integration modules live next to py2c.py; make that directory importable
