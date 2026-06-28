@@ -40,6 +40,29 @@ OPS = {
     "JUMP":         6,   # pc = a
     "JUMP_IF_FALSE": 7,  # if not truthy(reg[a]): pc = b
     "CALL":         8,   # reg[a] = reg[b](reg[b+1..b+c]); c = argcount
+    # --- containers (9-19) ---
+    "BUILD_LIST":   9,   # reg[a] = [regs[b..b+c-1]]
+    "BUILD_TUPLE": 10,   # reg[a] = (regs[b..b+c-1])
+    "BUILD_DICT":  11,   # reg[a] = {regs[b],regs[b+1] : ...}  c pairs
+    "BUILD_SET":   12,   # reg[a] = {regs[b..b+c-1]}
+    "INDEX":       13,   # reg[a] = reg[b][reg[c]]
+    "SETINDEX":    14,   # reg[a][reg[b]] = reg[c]
+    "ITER_NEW":    15,   # reg[a] = iter(reg[b])
+    "ITER_NEXT":   16,   # if next: reg[a]=next, pc++ ; else pc=c
+    "CONTAINS":    17,   # reg[a] = (reg[c] in reg[b])
+    "LIST_APPEND": 18,   # reg[a].append(reg[b])
+    "SET_ADD":     19,   # reg[a].add(reg[b])
+    # --- classes (50-52) ---
+    "LOAD_ATTR":   50,   # reg[a] = reg[b].<consts[c]>
+    "STORE_ATTR":  51,   # reg[a].<consts[c]> = reg[b]
+    "LOAD_METHOD": 52,   # reg[a] = bound-method reg[b].<consts[c]>
+    # --- exceptions (70-75) ---
+    "SETUP_EXCEPT": 70,  # push handler block; a = dispatch pc
+    "POP_BLOCK":    71,  # pop handler block (try body finished normally)
+    "RAISE":        72,  # raise reg[a]
+    "RERAISE":      73,  # re-raise the in-flight exception
+    "LOAD_EXC":     74,  # reg[a] = current in-flight exception value
+    "EXC_MATCH":    75,  # reg[a] = isinstance(in-flight exc, class reg[b])
     # --- generic arithmetic (20-29): reg[a] = reg[b] OP reg[c] ---
     "ADD":         20, "SUB": 21, "MUL": 22, "DIV": 23,
     "MOD":         24, "FLOORDIV": 25, "POW": 26,
@@ -55,7 +78,17 @@ OPNAME = {v: k for k, v in OPS.items()}
 
 # Builtin ids, stored in a const of kind "builtin".
 BUILTINS = {n: i for i, n in enumerate(
-    ["print", "len", "range", "int", "str", "float", "abs", "bool"])}
+    ["print", "len", "range", "int", "str", "float", "abs", "bool",
+     "list", "dict", "set", "tuple", "repr", "sorted", "sum", "min", "max"])}
+
+# Method ids (receiver passed as arg0). Distinct id band (100+) so do_builtin can
+# tell a global builtin from a bound method; invoked through the same CALL path.
+METHODS = {
+    "append": 100, "pop": 101, "get": 102, "keys": 103, "values": 104,
+    "items": 105, "add": 106, "split": 107, "join": 108, "strip": 109,
+    "startswith": 110, "endswith": 111, "find": 112, "replace": 113,
+    "upper": 114, "lower": 115,
+}
 
 
 class CompileError(Exception):
@@ -96,6 +129,8 @@ class _Consts:
                 rec["i"] = payload          # func index
             elif kind == "builtin":
                 rec["i"] = payload          # builtin id
+            elif kind == "class":
+                rec["i"] = payload          # class id
             out.append(rec)
         return out
 
@@ -145,6 +180,8 @@ class Compiler:
         self.gnames = {}                 # global name -> slot
         self.funcs = []                  # list of _Frame (entry = 0)
         self._pending = []               # (FunctionDef, frame) to compile
+        self.classes = []                # list of {name, base, methods:[...]}
+        self._class_id = {}              # class name -> id
 
     # --- name/slot helpers ---
     def gslot(self, name):
@@ -196,12 +233,44 @@ class Compiler:
         pass
 
     def st_Assign(self, f, node):
-        if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
-            raise CompileError("v0 assign: single Name target only (line %s)"
-                               % node.lineno)
-        r = self.expr(f, node.value)
-        self._store_name(f, node.targets[0].id, r)
-        f.pop_to(r)
+        if len(node.targets) != 1:
+            raise CompileError("v0 assign: single target (line %s)" % node.lineno)
+        tgt = node.targets[0]
+        if isinstance(tgt, ast.Name):
+            r = self.expr(f, node.value)
+            self._store_name(f, tgt.id, r)
+            f.pop_to(r)
+            return
+        if isinstance(tgt, ast.Attribute):
+            robj = self.expr(f, tgt.value)
+            rval = self.expr(f, node.value)
+            cn = self.consts.add("str", tgt.attr)
+            f.emit("STORE_ATTR", robj, rval, cn)
+            f.pop_to(robj)
+            return
+        if isinstance(tgt, ast.Subscript):
+            if isinstance(tgt.slice, ast.Slice):
+                raise CompileError("v0: slice assignment unsupported (line %s)" % node.lineno)
+            robj = self.expr(f, tgt.value)
+            ridx = self.expr(f, tgt.slice)
+            rval = self.expr(f, node.value)
+            f.emit("SETINDEX", robj, ridx, rval)
+            f.pop_to(robj)
+            return
+        if isinstance(tgt, (ast.Tuple, ast.List)):
+            # a, b = <iterable>: index the (materialised) value positionally
+            rseq = self.expr(f, node.value)
+            for i, elt in enumerate(tgt.elts):
+                if not isinstance(elt, ast.Name):
+                    raise CompileError("v0 unpack: Name targets only (line %s)" % node.lineno)
+                ridx = self._const_reg(f, ("int", i))
+                f.emit("INDEX", ridx, rseq, ridx)
+                self._store_name(f, elt.id, ridx)
+                f.pop_to(ridx)
+            f.pop_to(rseq)
+            return
+        raise CompileError("v0 assign: unsupported target %s (line %s)"
+                           % (type(tgt).__name__, node.lineno))
 
     def st_AugAssign(self, f, node):
         if not isinstance(node.target, ast.Name):
@@ -254,15 +323,38 @@ class Compiler:
             f.code[pc][1] = end
 
     def st_For(self, f, node):
-        # v0: only `for <name> in range(...)`, lowered to a counter while-loop.
-        # The fused compare+increment op (TPython op 80) is the specialiser's job;
-        # here we emit generic ops, which the numeric fast-path already upgrades.
-        if not (isinstance(node.iter, ast.Call)
-                and isinstance(node.iter.func, ast.Name)
-                and node.iter.func.id == "range"):
-            raise CompileError("v0 for: only `for x in range(...)` (line %s)" % node.lineno)
         if not isinstance(node.target, ast.Name):
             raise CompileError("v0 for: Name target only (line %s)" % node.lineno)
+        name = node.target.id
+        is_range = (isinstance(node.iter, ast.Call)
+                    and isinstance(node.iter.func, ast.Name)
+                    and node.iter.func.id == "range")
+        if is_range:
+            self._for_range(f, name, node)
+            return
+        # general iterable: ITER_NEW once, ITER_NEXT per turn (target = loop end)
+        rit = self.expr(f, node.iter)
+        f.emit("ITER_NEW", rit, rit)         # rit now holds the iterator
+        f.numreg.discard(rit)
+        top = len(f.code)
+        rx = f.push()
+        nx = len(f.code); f.emit("ITER_NEXT", rx, rit, 0)   # c patched to end
+        self._store_name(f, name, rx)
+        f.pop_to(rit + 1)
+        loop = _Loop(top); self._loops.append(loop)
+        for s in node.body:
+            self.stmt(f, s)
+        f.emit("JUMP", top)
+        end = len(f.code)
+        f.code[nx][3] = end
+        self._loops.pop()
+        f.pop_to(rit)
+        for pc in loop.breaks:
+            f.code[pc][1] = end
+
+    def _for_range(self, f, name, node):
+        # `for <name> in range(...)`, lowered to a counter while-loop. Generic
+        # ops here; the numeric fast-path upgrades the compare/increment.
         args = node.iter.args
         if len(args) == 1:
             start, stop, step = ast.Constant(0), args[0], ast.Constant(1)
@@ -270,21 +362,17 @@ class Compiler:
             start, stop, step = args[0], args[1], ast.Constant(1)
         else:
             start, stop, step = args[0], args[1], args[2]
-        name = node.target.id
-        # i = start
         rs = self.expr(f, start); self._store_name(f, name, rs); f.pop_to(rs)
-        # stop/step into stable temps (recomputed each turn for v0 simplicity)
         top = len(f.code)
         ri = self._load_name(f, name)
         rstop = self.expr(f, stop)
-        f.emit("LT", ri, ri, rstop)        # ri = (i < stop); numeric -> LT_NN
+        f.emit("LT", ri, ri, rstop)
         self._maybe_num_cmp(f, ri)
         jf = len(f.code); f.emit("JUMP_IF_FALSE", ri, 0)
         f.pop_to(ri)
         loop = _Loop(top); self._loops.append(loop)
         for s in node.body:
             self.stmt(f, s)
-        # i += step
         ri2 = self._load_name(f, name)
         rstep = self.expr(f, step)
         self._binop_op(f, "ADD", ri2, ri2, rstep)
@@ -305,6 +393,87 @@ class Compiler:
         if not self._loops:
             raise CompileError("continue outside loop (line %s)" % node.lineno)
         f.emit("JUMP", self._loops[-1].top)
+
+    def st_Try(self, f, node):
+        if node.finalbody:
+            raise CompileError("v0 try: finally not supported (line %s)" % node.lineno)
+        setup = len(f.code); f.emit("SETUP_EXCEPT", 0)
+        for s in node.body:
+            self.stmt(f, s)
+        f.emit("POP_BLOCK")
+        if node.orelse:
+            for s in node.orelse:
+                self.stmt(f, s)
+        end_jumps = [len(f.code)]; f.emit("JUMP", 0)
+        f.code[setup][1] = len(f.code)        # dispatch entry
+        for h in node.handlers:
+            jf = None
+            if h.type is not None:
+                rexc = f.push(); f.emit("LOAD_EXC", rexc)
+                rcls = self.expr(f, h.type)
+                assert rcls == rexc + 1
+                f.emit("EXC_MATCH", rexc, rcls)
+                f.pop_to(rexc + 1)
+                jf = len(f.code); f.emit("JUMP_IF_FALSE", rexc, 0)
+                f.pop_to(rexc)
+            if h.name:
+                re = f.push(); f.emit("LOAD_EXC", re)
+                self._store_name(f, h.name, re); f.pop_to(re)
+            for s in h.body:
+                self.stmt(f, s)
+            end_jumps.append(len(f.code)); f.emit("JUMP", 0)
+            if jf is not None:
+                f.code[jf][2] = len(f.code)   # type mismatch -> next handler
+        f.emit("RERAISE")                     # nothing matched -> propagate
+        after = len(f.code)
+        for ej in end_jumps:
+            f.code[ej][1] = after
+
+    def st_Raise(self, f, node):
+        if node.exc is None:
+            f.emit("RERAISE")
+            return
+        if node.cause is not None:
+            raise CompileError("v0 raise: no `from` cause (line %s)" % node.lineno)
+        r = self.expr(f, node.exc)
+        f.emit("RAISE", r)
+        f.pop_to(r)
+
+    def st_ClassDef(self, f, node):
+        if node.keywords or node.decorator_list:
+            raise CompileError("v0 class: no keywords/decorators (line %s)" % node.lineno)
+        base = -1
+        if node.bases:
+            if len(node.bases) != 1 or not isinstance(node.bases[0], ast.Name):
+                raise CompileError("v0 class: single Name base only (line %s)" % node.lineno)
+            base = self._class_id.get(node.bases[0].id, -1)
+        cid = len(self.classes)
+        self._class_id[node.name] = cid
+        methods = []
+        self.classes.append({"name": node.name, "base": base, "methods": methods})
+        for item in node.body:
+            if isinstance(item, ast.FunctionDef):
+                fidx = self._compile_method(item)
+                methods.append({"name": item.name, "func": fidx})
+            # class-level (non-method) statements are ignored in v0
+        ci = self.consts.add("class", cid)
+        r = f.push(); f.emit("LOAD_CONST", r, ci)
+        f.emit("STORE_GLOBAL", r, self.gslot(node.name)); f.pop_to(r)
+
+    def _compile_method(self, node):
+        if node.args.vararg or node.args.kwarg or node.args.kwonlyargs or node.args.defaults:
+            raise CompileError("v0 method: positional params only (line %s)" % node.lineno)
+        params = [a.arg for a in node.args.args]
+        extra = _collect_locals(node)
+        frame = _Frame(node.name, params, extra, is_module=False)
+        for arg in node.args.args:
+            ann = _ann_name(arg.annotation)
+            if ann in ("int", "float", "long", "double") and arg.arg in frame.locals:
+                frame.numreg.add(frame.locals[arg.arg])
+        idx = len(self.funcs)
+        self.funcs.append(frame)
+        self._pending.append((node, frame))
+        return idx
 
     def st_FunctionDef(self, f, node):
         if not f.is_module:
@@ -380,11 +549,22 @@ class Compiler:
     def ex_Compare(self, f, node):
         if len(node.ops) != 1:
             raise CompileError("v0 compare: single comparator only (line %s)" % node.lineno)
+        op = node.ops[0]
+        # membership: `x in seq` / `x not in seq`
+        if isinstance(op, (ast.In, ast.NotIn)):
+            rx = self.expr(f, node.left)
+            rseq = self.expr(f, node.comparators[0])
+            f.emit("CONTAINS", rx, rseq, rx)   # reg[rx] = (rx in rseq)
+            f.pop_to(rx + 1)
+            if isinstance(op, ast.NotIn):
+                f.emit("NOT", rx, rx)
+            f.numreg.discard(rx)
+            return rx
         rb = self.expr(f, node.left)
         rc = self.expr(f, node.comparators[0])
-        op = node.ops[0]
         name = {ast.Lt: "LT", ast.LtE: "LE", ast.Gt: "GT", ast.GtE: "GE",
-                ast.Eq: "EQ", ast.NotEq: "NE"}.get(type(op))
+                ast.Eq: "EQ", ast.NotEq: "NE",
+                ast.Is: "EQ", ast.IsNot: "NE"}.get(type(op))
         if name is None:
             raise CompileError("v0 compare: unsupported op %s" % type(op).__name__)
         numeric = rb in f.numreg and rc in f.numreg
@@ -417,7 +597,28 @@ class Compiler:
     def ex_Call(self, f, node):
         if node.keywords:
             raise CompileError("v0 call: no keyword args (line %s)" % node.lineno)
-        # contiguous window: callable, then args
+        # method call `recv.meth(args)`: callable = method-id builtin, receiver
+        # is arg0, then the real args -- reuses the CALL window machinery.
+        if isinstance(node.func, ast.Attribute):
+            # all `obj.meth(args)` go through LOAD_METHOD; the runtime resolves
+            # a user method (instance receiver) vs a builtin method (container/
+            # string receiver) by type, so names like .get/.pop/.add never clash.
+            meth = node.func.attr
+            rfun = f.push()
+            ro = self.expr(f, node.func.value)
+            assert ro == rfun + 1
+            cn = self.consts.add("str", meth)
+            f.emit("LOAD_METHOD", rfun, ro, cn)   # bound method captures self
+            f.pop_to(rfun + 1)
+            n = 0
+            for a in node.args:
+                ra = self.expr(f, a)
+                assert ra == rfun + 1 + n
+                n += 1
+            f.emit("CALL", rfun, rfun, n)
+            f.pop_to(rfun + 1); f.numreg.discard(rfun)
+            return rfun
+        # plain call
         rfun = self.expr(f, node.func)
         n = 0
         for a in node.args:
@@ -428,6 +629,115 @@ class Compiler:
         f.pop_to(rfun + 1)                 # result lands in rfun
         f.numreg.discard(rfun)
         return rfun
+
+    # ---- container / subscript / comprehension expressions ----
+    def ex_List(self, f, node):
+        base = f.top
+        for e in node.elts:
+            self.expr(f, e)
+        f.emit("BUILD_LIST", base, base, len(node.elts))
+        f.pop_to(base + 1); f.numreg.discard(base)
+        return base
+
+    def ex_Tuple(self, f, node):
+        base = f.top
+        for e in node.elts:
+            self.expr(f, e)
+        f.emit("BUILD_TUPLE", base, base, len(node.elts))
+        f.pop_to(base + 1); f.numreg.discard(base)
+        return base
+
+    def ex_Set(self, f, node):
+        base = f.top
+        for e in node.elts:
+            self.expr(f, e)
+        f.emit("BUILD_SET", base, base, len(node.elts))
+        f.pop_to(base + 1); f.numreg.discard(base)
+        return base
+
+    def ex_Dict(self, f, node):
+        base = f.top
+        for k, v in zip(node.keys, node.values):
+            self.expr(f, k)
+            self.expr(f, v)
+        f.emit("BUILD_DICT", base, base, len(node.keys))
+        f.pop_to(base + 1); f.numreg.discard(base)
+        return base
+
+    def ex_Attribute(self, f, node):
+        rb = self.expr(f, node.value)
+        cn = self.consts.add("str", node.attr)
+        f.emit("LOAD_ATTR", rb, rb, cn)
+        f.numreg.discard(rb)
+        return rb
+
+    def ex_Subscript(self, f, node):
+        rb = self.expr(f, node.value)
+        if isinstance(node.slice, ast.Slice):
+            raise CompileError("v0: slicing not yet supported (line %s)" % node.lineno)
+        rc = self.expr(f, node.slice)
+        f.emit("INDEX", rb, rb, rc)
+        f.pop_to(rb + 1); f.numreg.discard(rb)
+        return rb
+
+    def ex_ListComp(self, f, node):
+        return self._comp(f, node, "list")
+
+    def ex_SetComp(self, f, node):
+        return self._comp(f, node, "set")
+
+    def ex_GeneratorExp(self, f, node):
+        return self._comp(f, node, "list")   # materialised; good enough for v0
+
+    def ex_DictComp(self, f, node):
+        return self._comp(f, node, "dict")
+
+    def _comp(self, f, node, kind):
+        acc = f.push()
+        if kind == "list":
+            f.emit("BUILD_LIST", acc, acc, 0)
+        elif kind == "set":
+            f.emit("BUILD_SET", acc, acc, 0)
+        else:
+            f.emit("BUILD_DICT", acc, acc, 0)
+        f.numreg.discard(acc)
+        self._comp_gen(f, node, kind, acc, 0)
+        return acc
+
+    def _comp_gen(self, f, node, kind, acc, gi):
+        gens = node.generators
+        if gi >= len(gens):
+            if kind == "dict":
+                rk = self.expr(f, node.key)
+                rv = self.expr(f, node.value)
+                f.emit("SETINDEX", acc, rk, rv)
+                f.pop_to(rk)
+            else:
+                re = self.expr(f, node.elt)
+                f.emit("LIST_APPEND" if kind == "list" else "SET_ADD", acc, re)
+                f.pop_to(re)
+            return
+        gen = gens[gi]
+        if not isinstance(gen.target, ast.Name):
+            raise CompileError("v0 comp: Name target only")
+        rit = self.expr(f, gen.iter)
+        f.emit("ITER_NEW", rit, rit); f.numreg.discard(rit)
+        top = len(f.code)
+        rx = f.push()
+        nx = len(f.code); f.emit("ITER_NEXT", rx, rit, 0)
+        self._store_name(f, gen.target.id, rx)
+        f.pop_to(rit + 1)
+        skip_jumps = []
+        for cond in gen.ifs:
+            rc = self.expr(f, cond)
+            skip_jumps.append(len(f.code)); f.emit("JUMP_IF_FALSE", rc, 0)
+            f.pop_to(rc)
+        self._comp_gen(f, node, kind, acc, gi + 1)
+        for sj in skip_jumps:
+            f.code[sj][2] = len(f.code)     # failed if -> next iteration
+        f.emit("JUMP", top)
+        end = len(f.code); f.code[nx][3] = end
+        f.pop_to(rit)
 
     # ---- shared lowering ----
     def _binop(self, f, op, dst, rb, rc):
@@ -497,6 +807,12 @@ class Compiler:
             "names": names,
             "nglobals": len(self.gnames),
             "funcs": funcs,
+            "classes": [
+                {"cname": ci["name"], "base": ci["base"],
+                 "methods": [{"mname": m["name"], "mfunc": m["func"]}
+                             for m in ci["methods"]]}
+                for ci in self.classes
+            ],
             "entry": 0,
         }
 
@@ -528,7 +844,14 @@ def _collect_locals(node):
             for t in n.targets:
                 if isinstance(t, ast.Name) and t.id not in found:
                     found.append(t.id)
+                elif isinstance(t, (ast.Tuple, ast.List)):
+                    for e in t.elts:
+                        if isinstance(e, ast.Name) and e.id not in found:
+                            found.append(e.id)
         elif isinstance(n, (ast.AugAssign, ast.For)) and isinstance(getattr(n, "target", None), ast.Name):
+            if n.target.id not in found:
+                found.append(n.target.id)
+        elif isinstance(n, ast.comprehension) and isinstance(n.target, ast.Name):
             if n.target.id not in found:
                 found.append(n.target.id)
     return found
@@ -566,6 +889,8 @@ class VM:
         self.funcs = prog["funcs"]
         import sys as _sys
         self.out = out if out is not None else _sys.stdout
+        self._exc_flag = False
+        self._exc_val = None
 
     def _const(self, i):
         c = self.consts[i]
@@ -584,6 +909,8 @@ class VM:
             return ("func", c["i"])
         if t == "builtin":
             return ("builtin", c["i"])
+        if t == "class":
+            return ("class", c["i"])
         raise RuntimeError("bad const %r" % (c,))
 
     def run(self):
@@ -595,6 +922,7 @@ class VM:
         for i, a in enumerate(args):
             regs[i] = a
         code = fn["code"]
+        blocks = []
         pc = 0
         while pc < len(code):
             ins = code[pc]; op = ins["op"]; a = ins["a"]; b = ins["b"]; c = ins["c"]
@@ -610,6 +938,45 @@ class VM:
             elif op == 8:
                 callee = regs[b]; ca = [regs[b + 1 + k] for k in range(c)]
                 regs[a] = self._invoke(callee, ca)
+            elif op == 9:                       # BUILD_LIST
+                regs[a] = [regs[b + k] for k in range(c)]
+            elif op == 10:                      # BUILD_TUPLE
+                regs[a] = tuple(regs[b + k] for k in range(c))
+            elif op == 11:                      # BUILD_DICT
+                d = {}
+                for k in range(c):
+                    d[regs[b + 2 * k]] = regs[b + 2 * k + 1]
+                regs[a] = d
+            elif op == 12:                      # BUILD_SET
+                regs[a] = set(regs[b + k] for k in range(c))
+            elif op == 13:                      # INDEX
+                regs[a] = regs[b][regs[c]]
+            elif op == 14:                      # SETINDEX
+                regs[a][regs[b]] = regs[c]
+            elif op == 15:                      # ITER_NEW
+                regs[a] = [list(regs[b]), 0]
+            elif op == 16:                      # ITER_NEXT
+                it = regs[b]
+                if it[1] < len(it[0]):
+                    regs[a] = it[0][it[1]]; it[1] += 1
+                else:
+                    pc = c
+            elif op == 17:                      # CONTAINS
+                regs[a] = regs[c] in regs[b]
+            elif op == 18:                      # LIST_APPEND
+                regs[a].append(regs[b])
+            elif op == 19:                      # SET_ADD
+                regs[a].add(regs[b])
+            elif op == 50:                      # LOAD_ATTR
+                regs[a] = regs[b].attrs[self._const(c)]
+            elif op == 51:                      # STORE_ATTR
+                regs[a].attrs[self._const(c)] = regs[b]
+            elif op == 52:                      # LOAD_METHOD
+                obj = regs[b]; name = self._const(c)
+                if isinstance(obj, _Inst):
+                    regs[a] = ("bound", self._lookup_method(obj.cid, name), obj)
+                else:                            # builtin method on a container/str
+                    regs[a] = ("boundb", METHODS[name], obj)
             elif op == 20: regs[a] = regs[b] + regs[c]
             elif op == 21: regs[a] = regs[b] - regs[c]
             elif op == 22: regs[a] = regs[b] * regs[c]
@@ -632,8 +999,29 @@ class VM:
             elif op == 64: regs[a] = regs[b] <= regs[c]
             elif op == 65: regs[a] = regs[b] > regs[c]
             elif op == 66: regs[a] = regs[b] >= regs[c]
+            elif op == 70:                      # SETUP_EXCEPT
+                blocks.append(a)
+            elif op == 71:                      # POP_BLOCK
+                blocks.pop()
+            elif op == 72:                      # RAISE
+                v = regs[a]
+                if isinstance(v, tuple) and v and v[0] == "class":
+                    v = self._invoke(v, [])
+                self._exc_val = v; self._exc_flag = True
+            elif op == 73:                      # RERAISE
+                self._exc_flag = True
+            elif op == 74:                      # LOAD_EXC
+                regs[a] = self._exc_val
+            elif op == 75:                      # EXC_MATCH
+                regs[a] = self._isinstance(self._exc_val, regs[b])
             else:
                 raise RuntimeError("unknown op %d" % op)
+            if self._exc_flag:                  # an exception is in flight
+                if blocks:
+                    pc = blocks.pop()           # jump to nearest handler
+                    self._exc_flag = False
+                else:
+                    return None                 # propagate to caller
         return None
 
     def _invoke(self, callee, args):
@@ -641,9 +1029,45 @@ class VM:
             return self._call(callee[1], args)
         if isinstance(callee, tuple) and callee[0] == "builtin":
             return self._builtin(callee[1], args)
+        if isinstance(callee, tuple) and callee[0] == "class":
+            inst = _Inst(callee[1], self.prog["classes"][callee[1]]["cname"])
+            init = self._lookup_method(callee[1], "__init__")
+            if init is not None:
+                self._call(init, [inst] + args)
+            return inst
+        if isinstance(callee, tuple) and callee[0] == "bound":
+            return self._call(callee[1], [callee[2]] + args)
+        if isinstance(callee, tuple) and callee[0] == "boundb":
+            return self._method(callee[1], [callee[2]] + args)
         raise RuntimeError("not callable: %r" % (callee,))
 
+    def _lookup_method(self, cid, name):
+        classes = self.prog["classes"]
+        while cid >= 0:
+            ci = classes[cid]
+            for m in ci["methods"]:
+                if m["mname"] == name:
+                    return m["mfunc"]
+            cid = ci["base"]
+        return None
+
+    def _isinstance(self, exc, classval):
+        if not isinstance(exc, _Inst):
+            return False
+        if not (isinstance(classval, tuple) and classval and classval[0] == "class"):
+            return False
+        target = classval[1]
+        cid = exc.cid
+        classes = self.prog["classes"]
+        while cid >= 0:
+            if cid == target:
+                return True
+            cid = classes[cid]["base"]
+        return False
+
     def _builtin(self, bid, args):
+        if bid >= 100:
+            return self._method(bid, args)
         name = [k for k, v in BUILTINS.items() if v == bid][0]
         if name == "print":
             self.out.write(" ".join(_pystr(x) for x in args) + "\n")
@@ -655,13 +1079,53 @@ class VM:
         if name == "float": return float(args[0]) if args else 0.0
         if name == "abs":   return abs(args[0])
         if name == "bool":  return bool(args[0]) if args else False
+        if name == "list":  return list(args[0]) if args else []
+        if name == "dict":  return dict(args[0]) if args else {}
+        if name == "set":   return set(args[0]) if args else set()
+        if name == "tuple": return tuple(args[0]) if args else ()
+        if name == "repr":  return repr(args[0])
+        if name == "sorted": return sorted(args[0])
+        if name == "sum":   return sum(args[0])
+        if name == "min":   return min(args[0]) if len(args) == 1 else min(args)
+        if name == "max":   return max(args[0]) if len(args) == 1 else max(args)
         raise RuntimeError("unknown builtin id %d" % bid)
+
+    def _method(self, mid, args):
+        name = [k for k, v in METHODS.items() if v == mid][0]
+        recv = args[0]; rest = args[1:]
+        if name == "append": recv.append(rest[0]); return None
+        if name == "pop":    return recv.pop(*rest)
+        if name == "get":    return recv.get(*rest)
+        if name == "keys":   return list(recv.keys())
+        if name == "values": return list(recv.values())
+        if name == "items":  return [list(t) for t in recv.items()]
+        if name == "add":    recv.add(rest[0]); return None
+        if name == "split":  return recv.split(*rest) if rest else recv.split()
+        if name == "join":   return recv.join(rest[0])
+        if name == "strip":  return recv.strip(*rest)
+        if name == "startswith": return recv.startswith(rest[0])
+        if name == "endswith":   return recv.endswith(rest[0])
+        if name == "find":   return recv.find(*rest)
+        if name == "replace": return recv.replace(rest[0], rest[1])
+        if name == "upper":  return recv.upper()
+        if name == "lower":  return recv.lower()
+        raise RuntimeError("unknown method id %d" % mid)
+
+
+class _Inst:
+    """A minipy instance in the reference VM: a class id plus an attribute map.
+    (The native interpreter stores the same thing in its container heap.)"""
+    def __init__(self, cid, name):
+        self.cid = cid
+        self.name = name
+        self.attrs = {}
 
 
 def _pystr(x):
     if x is True:  return "True"
     if x is False: return "False"
     if x is None:  return "None"
+    if isinstance(x, _Inst): return "<%s object>" % x.name
     return str(x)
 
 

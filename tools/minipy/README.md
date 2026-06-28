@@ -92,7 +92,7 @@ function can later be lowered to C by py2c and called from the interpreter with
 
 Two cheap wins borrowed from TPython's 16-byte packing
 (`tp.pyh`, the `tp_obj` union):
-- https://gitlab.com/hartsantler/tpythonpp
+
 - **Tiny inline strings.** The current layout wastes the 7 bytes between `tag`
   and the 8-byte union. A `T_STR_TINY` tag can store ≤7 (or, by overlapping the
   union, ≤15) chars *inline*, so identifiers and short dict keys never touch the
@@ -334,3 +334,52 @@ MINIPY.md              # this document
 
 Total target footprint: a few thousand lines of RPython + a handful of vendored
 pure-Python leaf modules — versus pulling in the multi-megabyte MicroPython tree.
+
+---
+
+## Status update — containers, classes, exceptions (native-validated)
+
+Three feature tiers now run end-to-end as a py2c-compiled native binary, each
+byte-identical to `python3` and to the pure-Python reference VM:
+
+- **Container values.** list / tuple / dict / set literals; subscript get/set;
+  general `for x in <iterable>` (ITER_NEW/ITER_NEXT) alongside the range
+  counter fast-path; list/set/dict comprehensions (lowered to loops); membership
+  (`in`/`not in`); tuple unpacking; string indexing; the common container/string
+  methods; and `%`-formatting (`%s %d %05d %.2f %x %r`). Containers live in a
+  side heap indexed from the value box, so the scalar path stays alloc-free.
+- **Classes.** instances, `__init__`, data attributes (`self.x`), method
+  dispatch, single inheritance, instantiation. A class table (`classes:
+  list[ClassInfo]`, each with `list[MethEnt]`) ships in the bytecode and is
+  decoded by the same generated cursor decoder.
+- **Exceptions.** `try`/`except [Type [as name]]`/bare-except, `raise`, and
+  re-raise. A per-frame block stack plus an in-flight `exc` signal on the state
+  object unwind across call frames; handler type-matching reuses the class chain
+  (`except Base` catches a derived instance). `finally` and `raise ... from` are
+  rejected by the compiler for now.
+
+Method calls all flow through `LOAD_METHOD`, which resolves a *user* method
+(instance receiver) vs a *builtin* method (container/string receiver) at
+runtime, so user methods named `get`/`pop`/`add`/etc. never collide with
+container methods.
+
+### py2c bug discovered
+`list[int].pop()` (an *unboxed* int list) corrupts the heap in py2c-generated C
+("double free or corruption"), while boxed-list `.pop()` (e.g. `list[str]`,
+`list[V]`) is fine. The interpreter's exception block-stack therefore avoids
+`.pop()` on its `list[int]`, managing depth with an explicit counter and indexed
+access. Minimal repro: a function that appends two ints to a `list[int]` and
+pops one.
+
+### Opcode / table additions
+Containers 9–19 (BUILD_LIST/TUPLE/DICT/SET, INDEX, SETINDEX, ITER_NEW,
+ITER_NEXT, CONTAINS, LIST_APPEND, SET_ADD); classes 50–52 (LOAD_ATTR,
+STORE_ATTR, LOAD_METHOD); exceptions 70–75 (SETUP_EXCEPT, POP_BLOCK, RAISE,
+RERAISE, LOAD_EXC, EXC_MATCH). New value tags: list 7, dict 8, set 9, tuple 10,
+iter 11, obj 12, class 13, bound 14, bound-builtin 15. New const kind `class`.
+
+### Known v0 limitations
+slicing; `finally`/`from`; `__str__`/`__repr__` dunders (instances print as
+`<Name object>`); container value-equality (containers compare by identity);
+builtin exception types (`ValueError` etc. are unknown bases → matched only by
+user hierarchy); `%`-format zero-pad of negative numbers.
