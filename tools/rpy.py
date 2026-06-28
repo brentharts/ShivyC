@@ -328,10 +328,52 @@ def _repl(prog, vm):
             _sys.stdout.write(repr(state["__"]) + "\n")
 
 
+def _ensure_native(force=False):
+    """Build (once) and cache the py2c-compiled interpreter binary; return its
+    path, or None if the toolchain isn't available. The v0 interpreter is
+    generic, so one binary runs any script's bytecode -- it's keyed by the
+    interpreter's own source, not the script. (A per-script *specialised*
+    interpreter is the future optimisation; the cache key would then fold in the
+    script too.)"""
+    import hashlib
+    import subprocess
+    here = _os.path.dirname(_os.path.abspath(__file__))
+    interp_src = _os.path.join(here, "minipy", "interp.py")
+    if not _os.path.isfile(interp_src):
+        return None
+    key = hashlib.md5(open(interp_src, "rb").read()).hexdigest()[:16]
+    bdir = _os.path.join("/tmp", "minipy_interp_" + key)
+    binp = _os.path.join(bdir, "interp")
+    if not force and _os.path.isfile(binp):
+        return binp
+    try:
+        _os.makedirs(bdir, exist_ok=True)
+        py2c = _os.path.join(here, "py2c.py")
+        r = subprocess.run([_sys.executable, py2c, interp_src, "--out", bdir],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            return None
+        # generate the mp-bridge-free runtime, then compile + link
+        subprocess.run(
+            [_sys.executable, "-c",
+             "import sys;sys.path.insert(0,%r);import py2c;py2c.write_runtime(%r)"
+             % (here, bdir)], capture_output=True, text=True)
+        import glob
+        csrc = glob.glob(_os.path.join(bdir, "*.c"))
+        cc = subprocess.run(["gcc", "-std=c99", "-O2", "-I", bdir] + csrc
+                            + ["-o", binp], capture_output=True, text=True)
+        if cc.returncode != 0 or not _os.path.isfile(binp):
+            return None
+        return binp
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def main(argv=None):
     argv = list(_sys.argv[1:] if argv is None else argv)
     interactive = False
     rebuild = False
+    backend = "native"          # default; falls back to "ref" if no toolchain
     rest = []
     i = 0
     while i < len(argv):
@@ -340,11 +382,17 @@ def main(argv=None):
             interactive = True
         elif a == "-B":
             rebuild = True
+        elif a == "--ref":
+            backend = "ref"
+        elif a == "--native":
+            backend = "native"
         elif a in ("-h", "--help"):
             _sys.stdout.write(
-                "usage: rpy.py [-i] [-B] script.py [args...]\n"
-                "  -i  interactive REPL after the script\n"
-                "  -B  force rebuild (ignore /tmp cache)\n")
+                "usage: rpy.py [-i] [-B] [--ref|--native] script.py [args...]\n"
+                "  -i        interactive REPL after the script\n"
+                "  -B        force rebuild (ignore /tmp caches)\n"
+                "  --ref     run via the CPython reference VM\n"
+                "  --native  run via the py2c-compiled interpreter (default)\n")
             return 0
         elif a.startswith("-"):
             _sys.stderr.write("rpy.py: unknown option %s\n" % a); return 2
@@ -358,10 +406,19 @@ def main(argv=None):
     if not _os.path.isfile(script):
         _sys.stderr.write("rpy.py: no such file: %s\n" % script); return 2
     C = _minipy_compiler()
-    prog, _cache = _load_or_build(script, force=rebuild)
+    prog, cache = _load_or_build(script, force=rebuild)
+
+    # The REPL needs in-process globals, so -i always runs through the reference
+    # VM (its state feeds the prompt). Plain runs default to the native binary.
+    if backend == "native" and not interactive:
+        binp = _ensure_native(force=rebuild)
+        if binp is not None:
+            import subprocess
+            r = subprocess.run([binp, cache] + script_argv)
+            return r.returncode
+        _sys.stderr.write("rpy.py: native build unavailable, using --ref\n")
+
     vm = C.VM(prog)
-    # forward argv to the interpreted program (sys.argv-style); minipy v0 does
-    # not yet expose argv to scripts, but the plumbing lives here.
     vm.script_argv = [script] + script_argv
     vm.run()
     if interactive:
