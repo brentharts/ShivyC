@@ -184,3 +184,190 @@ class _Threads:
 
 
 threads = _Threads()
+
+
+# ===========================================================================
+# rpy.minipy -- driver for the tiny rpython Python interpreter.
+#
+# `py2json_bytecode(path)` is the AOT front end: it turns a .py file into the
+# *flattened, pre-optimised bytecode* JSON the interpreter consumes (NOT a raw
+# AST tree). See tools/minipy/compiler.py for the format and a reference VM.
+#
+# The command-line driver `python3 tools/rpy.py S.py [args...]` runs S.py:
+#   1. hash S.py + the project .py files it imports (md5),
+#   2. reuse /tmp/<md5>.minipy.json if fresh, else compile and cache it,
+#   3. execute, forwarding argv;  `-i` drops into a REPL afterwards.
+#
+# Today execution uses the CPython reference VM (backend="ref"); the seam marked
+# below is where a per-script py2c-compiled interpreter (/tmp/<md5>.interp.bin)
+# will plug in as backend="native".
+# ===========================================================================
+import os as _os
+import sys as _sys
+
+
+def _minipy_compiler():
+    """Import tools/minipy.compiler regardless of how rpy.py was launched."""
+    here = _os.path.dirname(_os.path.abspath(__file__))
+    if here not in _sys.path:
+        _sys.path.insert(0, here)
+    from minipy import compiler as C
+    return C
+
+
+def py2json_bytecode(path):
+    """Compile `path` to the interpreter's flattened-bytecode JSON (a string)."""
+    import json as _json
+    C = _minipy_compiler()
+    return _json.dumps(C.compile_file(path))
+
+
+def _project_files(path):
+    """`path` plus every sibling/subdir .py it transitively imports. Used for the
+    cache key so editing any imported module rebuilds. Stdlib/3rd-party imports
+    (no matching .py next to the project) are ignored on purpose."""
+    import ast as _ast
+    root = _os.path.dirname(_os.path.abspath(path))
+    seen, queue = {}, [_os.path.abspath(path)]
+    while queue:
+        p = queue.pop()
+        if p in seen or not _os.path.isfile(p):
+            continue
+        try:
+            src = open(p, encoding="utf-8").read()
+        except OSError:
+            continue
+        seen[p] = src
+        try:
+            tree = _ast.parse(src)
+        except SyntaxError:
+            continue
+        mods = []
+        for n in _ast.walk(tree):
+            if isinstance(n, _ast.Import):
+                mods += [a.name for a in n.names]
+            elif isinstance(n, _ast.ImportFrom) and n.module and n.level == 0:
+                mods.append(n.module)
+        for m in mods:
+            cand = _os.path.join(root, m.replace(".", _os.sep) + ".py")
+            if _os.path.isfile(cand):
+                queue.append(_os.path.abspath(cand))
+    return seen
+
+
+def _cache_key(path):
+    import hashlib
+    files = _project_files(path)
+    h = hashlib.md5()
+    for p in sorted(files):
+        h.update(p.encode("utf-8"))
+        h.update(files[p].encode("utf-8"))
+    return h.hexdigest()
+
+
+def _load_or_build(path, force=False):
+    """Return (program_dict, cache_path), compiling + caching on a miss."""
+    import json as _json
+    key = _cache_key(path)
+    cache = _os.path.join("/tmp", key + ".minipy.json")
+    if not force and _os.path.isfile(cache):
+        with open(cache) as fh:
+            return _json.load(fh), cache
+    C = _minipy_compiler()
+    prog = C.compile_file(path)
+    # --- seam: backend="native" would AOT-generate a specialised rpython
+    # interpreter here and py2c-compile it to /tmp/<key>.interp.bin. For now we
+    # cache the bytecode and run it with the reference VM. ---
+    with open(cache, "w") as fh:
+        _json.dump(prog, fh)
+    return prog, cache
+
+
+def _repl(prog, vm):
+    """Minimal interactive shell (`-i`). Shares *values* by name with the script
+    that just ran; expression results are echoed like CPython's REPL. v0 caveat:
+    functions defined in one line aren't callable from a later line yet (their
+    index is program-local) -- that needs the incremental compiler."""
+    import ast as _ast
+    C = _minipy_compiler()
+    # snapshot script globals by name
+    state = {}
+    for slot, nm in enumerate(prog["names"]):
+        if slot < len(vm.globals) and vm.globals[slot] is not None:
+            state[nm] = vm.globals[slot]
+    _sys.stdout.write("minipy REPL (Ctrl-D to exit)\n")
+    while True:
+        try:
+            line = input(">>> ")
+        except EOFError:
+            _sys.stdout.write("\n"); return
+        if not line.strip():
+            continue
+        try:
+            node = _ast.parse(line)
+        except SyntaxError as e:
+            _sys.stdout.write("SyntaxError: %s\n" % e); continue
+        is_expr = len(node.body) == 1 and isinstance(node.body[0], _ast.Expr)
+        src = ("__ = (%s)" % line.strip()) if is_expr else line
+        try:
+            p = C.compile_source(src, "<repl>")
+        except C.CompileError as e:
+            _sys.stdout.write("minipy: %s\n" % e); continue
+        v = C.VM(p)
+        for slot, nm in enumerate(p["names"]):   # seed shared state by name
+            if nm in state:
+                v.globals[slot] = state[nm]
+        try:
+            v.run()
+        except Exception as e:                   # noqa: BLE001 (REPL is lenient)
+            _sys.stdout.write("%s: %s\n" % (type(e).__name__, e)); continue
+        for slot, nm in enumerate(p["names"]):   # read back
+            if slot < len(v.globals) and v.globals[slot] is not None:
+                state[nm] = v.globals[slot]
+        if is_expr and "__" in state and state["__"] is not None:
+            _sys.stdout.write(repr(state["__"]) + "\n")
+
+
+def main(argv=None):
+    argv = list(_sys.argv[1:] if argv is None else argv)
+    interactive = False
+    rebuild = False
+    rest = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "-i":
+            interactive = True
+        elif a == "-B":
+            rebuild = True
+        elif a in ("-h", "--help"):
+            _sys.stdout.write(
+                "usage: rpy.py [-i] [-B] script.py [args...]\n"
+                "  -i  interactive REPL after the script\n"
+                "  -B  force rebuild (ignore /tmp cache)\n")
+            return 0
+        elif a.startswith("-"):
+            _sys.stderr.write("rpy.py: unknown option %s\n" % a); return 2
+        else:
+            rest = argv[i:]
+            break
+        i += 1
+    if not rest:
+        _sys.stderr.write("rpy.py: no script given (try -h)\n"); return 2
+    script, script_argv = rest[0], rest[1:]
+    if not _os.path.isfile(script):
+        _sys.stderr.write("rpy.py: no such file: %s\n" % script); return 2
+    C = _minipy_compiler()
+    prog, _cache = _load_or_build(script, force=rebuild)
+    vm = C.VM(prog)
+    # forward argv to the interpreted program (sys.argv-style); minipy v0 does
+    # not yet expose argv to scripts, but the plumbing lives here.
+    vm.script_argv = [script] + script_argv
+    vm.run()
+    if interactive:
+        _repl(prog, vm)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
