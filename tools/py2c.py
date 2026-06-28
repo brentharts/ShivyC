@@ -397,6 +397,11 @@ obj  mp_call_obj(obj fun, obj args, obj kwargs);
 bool mp_hasattr(obj recv, const char* attr);
 obj  mp_getattr(obj recv, const char* attr, obj dflt);
 obj  mp_getattr_obj(obj recv, obj attr, obj dflt);
+obj    rpy_eval(const char* src);       /* eval(s) -> boxed result            */
+long   rpy_eval_int(const char* src);   /* x: int   = eval(s)                 */
+double rpy_eval_float(const char* src); /* x: float = eval(s)                 */
+bool   rpy_eval_bool(const char* src);  /* x: bool  = eval(s)                 */
+str    rpy_eval_str(const char* src);   /* x: str   = eval(s)                 */
 
 #endif /* SHIVYC_RT_H */
 '''
@@ -410,6 +415,11 @@ obj mp_call_obj(obj fun, obj args, obj kwargs);
 bool mp_hasattr(obj recv, const char* attr);
 obj mp_getattr(obj recv, const char* attr, obj dflt);
 obj mp_getattr_obj(obj recv, obj attr, obj dflt);
+obj    rpy_eval(const char* src);       /* eval(s) -> boxed result            */
+long   rpy_eval_int(const char* src);   /* x: int   = eval(s)                 */
+double rpy_eval_float(const char* src); /* x: float = eval(s)                 */
+bool   rpy_eval_bool(const char* src);  /* x: bool  = eval(s)                 */
+str    rpy_eval_str(const char* src);   /* x: str   = eval(s)                 */
 #endif
 '''
 
@@ -422,6 +432,10 @@ MP_BRIDGE_C = r'''#include "mpconfigstdlib.h"
 #include "py/objstr.h"
 #include "py/objlist.h"
 #include "py/qstr.h"
+#include "py/compile.h"
+#include "py/lexer.h"
+#include "py/gc.h"
+#include "py/stackctrl.h"
 
 static mp_obj_t obj_to_mp(obj v) {
     switch (v.tag) {
@@ -522,6 +536,62 @@ obj mp_getattr_obj(obj recv, obj attr, obj dflt) {
     if (len >= sizeof buf) len = sizeof buf - 1;
     memcpy(buf, s, len); buf[len] = 0;
     return mp_getattr(recv, buf, dflt);
+}
+
+/* ---- eval(): evaluate a Python expression string through the MicroPython core.
+   A standalone (non-stdlib) program has no other mp_init, so initialize the
+   interpreter lazily on first use. mp_to_obj boxes the result for untyped eval;
+   the typed variants pull the value straight out of the result mp_obj_t (a
+   small int is just a shifted field), so `x: int = eval(...)` needs no obj. */
+static int rpy_mp_ready = 0;
+static char rpy_mp_heap[192 * 1024];
+
+void rpy_mp_ensure(void) {
+    if (rpy_mp_ready) return;
+    rpy_mp_ready = 1;
+    mp_stack_ctrl_init();
+    mp_stack_set_limit(0x10000);
+    gc_init(rpy_mp_heap, rpy_mp_heap + sizeof(rpy_mp_heap));
+    mp_init();
+}
+
+static mp_obj_t rpy_mp_eval_raw(const char* src) {
+    rpy_mp_ensure();
+    nlr_buf_t nlr;
+    if (nlr_push(&nlr) == 0) {
+        mp_lexer_t* lex = mp_lexer_new_from_str_len(
+            MP_QSTR__lt_string_gt_, src, strlen(src), 0);
+        qstr src_name = lex->source_name;
+        mp_parse_tree_t pt = mp_parse(lex, MP_PARSE_EVAL_INPUT);
+        mp_obj_t fun = mp_compile(&pt, src_name, false);
+        mp_obj_t res = mp_call_function_0(fun);
+        nlr_pop();
+        return res;
+    }
+    /* Uncaught exception in the evaluated expression: surface as None. */
+    return mp_const_none;
+}
+
+obj rpy_eval(const char* src) { return mp_to_obj(rpy_mp_eval_raw(src)); }
+
+long rpy_eval_int(const char* src) {
+    return mp_obj_get_int(rpy_mp_eval_raw(src));
+}
+
+double rpy_eval_float(const char* src) {
+    return mp_obj_get_float(rpy_mp_eval_raw(src));
+}
+
+bool rpy_eval_bool(const char* src) {
+    return mp_obj_is_true(rpy_mp_eval_raw(src));
+}
+
+str rpy_eval_str(const char* src) {
+    mp_obj_t r = rpy_mp_eval_raw(src);
+    size_t len; const char* s = mp_obj_str_get_data(r, &len);
+    char* out = aalloc(len + 1);
+    memcpy(out, s, len); out[len] = 0;
+    return out;
 }
 '''
 
@@ -9024,6 +9094,27 @@ class Transpiler:
                 return OBJ
         return self.guess_from_value(node)
 
+    def _is_eval_call(self, node):
+        """True for a bare `eval("...")` (one positional arg, no keywords)."""
+        return (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "eval" and len(node.args) == 1
+                and not node.keywords)
+
+    def _eval_typed(self, ctype, srcnode):
+        """The typed bridge call for `<ctype> x = eval(src)`, or None if `ctype`
+        is not a scalar the MicroPython bridge can extract directly (then the
+        caller falls back to the boxed `rpy_eval`)."""
+        src = self.as_str(srcnode)
+        if ctype in ("double", "float"):
+            return "rpy_eval_float(%s)" % src
+        if ctype in ("char*", "str"):
+            return "rpy_eval_str(%s)" % src
+        if ctype == "bool":
+            return "rpy_eval_bool(%s)" % src
+        if ctype in ("int", "long", "short", "char"):
+            return "rpy_eval_int(%s)" % src
+        return None
+
     def st_AnnAssign(self, node, toplevel=False):
         ctype = self._local_ann_ctype(
             getattr(node.target, "id", "x"), node.annotation)
@@ -9065,6 +9156,14 @@ class Transpiler:
         decl = "" if (already or not isinstance(node.target, ast.Name)) \
             else (ctype + " ")
         rhs = self.expr(node.value)
+        # Typed eval: `x: int = eval("...")` pulls the value straight out of the
+        # MicroPython result object (no obj boxing) when the annotation is a
+        # scalar the bridge has a typed extractor for.
+        if isinstance(ctype, str) and self._is_eval_call(node.value):
+            typed = self._eval_typed(ctype, node.value.args[0])
+            if typed is not None:
+                self._uses_eval = True
+                return ["%s%s = %s;" % (decl, tgt, typed)]
         # rpython typed list: `xs: "list[int]" = [..]` builds an unboxed array.
         if isinstance(ctype, str) and ctype.startswith("_tlist_") and \
                 isinstance(node.value, ast.List):
@@ -10791,6 +10890,12 @@ class Transpiler:
                 return "0"
             if fn == "abs" and node.args:
                 return "pyabs(%s)" % self.as_long(node.args[0])
+            if fn == "eval" and len(node.args) == 1 and not node.keywords:
+                # Untyped eval: the MicroPython result is boxed into an obj.
+                # `x: T = eval(...)` is special-cased in st_AnnAssign to pull the
+                # typed value straight out, with no boxing.
+                self._uses_eval = True
+                return "rpy_eval(%s)" % self.as_str(node.args[0])
             if fn == "divmod" and len(node.args) == 2:
                 # (a // b, a % b) as a 2-tuple; uses the same C division as the
                 # `//`/`%` operators so divmod stays consistent with them.
@@ -13378,6 +13483,22 @@ def c_string(s):
 # Driver
 # ==========================================================================
 
+def _uses_eval_builtin(path):
+    """True if the source calls the eval() builtin -- then the MicroPython core
+    must be linked so the expression can be evaluated at runtime."""
+    if not path.endswith(".py"):
+        return False
+    try:
+        tree = ast.parse(open(path, encoding="utf-8").read())
+    except Exception:
+        return False
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) \
+                and n.func.id == "eval":
+            return True
+    return False
+
+
 def write_runtime(out_dir, mp_bridge=False):
     with open(os.path.join(out_dir, "shivyc_rt.h"), "w") as f:
         f.write(RUNTIME_H)
@@ -13735,7 +13856,8 @@ def main(argv):
     set_local_module_dirs(files)
     _, _, stdlib_root = _stdlib_context(files[0] if len(files) == 1 else "", None)
     mp_bridge = bool(stdlib_dir) or any(
-        "python-stdlib" in os.path.abspath(p) for p in files)
+        "python-stdlib" in os.path.abspath(p) for p in files) \
+        or any(_uses_eval_builtin(p) for p in files)
     write_runtime(out_dir, mp_bridge=mp_bridge)
     print("  runtime -> %s/shivyc_rt.{h,c}" % out_dir)
     ok = 0
