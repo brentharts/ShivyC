@@ -1806,8 +1806,58 @@ def _collect_locals(node):
     return found
 
 
+class _WithDesugar(ast.NodeTransformer):
+    """Lower `with` to the manager protocol wrapped in `try/finally`, so it
+    needs no dedicated opcode and `__exit__` runs on the exception path too:
+
+        with A as a:        ->     _with_N = A
+            BODY                   a = _with_N.__enter__()
+                                   try:
+                                       BODY
+                                   finally:
+                                       _with_N.__exit__(None, None, None)
+
+    Multiple items nest left-to-right.  Running before _collect_locals means the
+    `_with_N` manager temps are picked up as ordinary locals (so they get fixed
+    register slots and are per-call / recursion-safe).  v0 passes None/None/None
+    to __exit__ and ignores its result -- cleanup always runs, but the manager
+    cannot inspect or suppress the exception."""
+    def __init__(self):
+        self.ctr = 0
+
+    def visit_With(self, node):
+        self.generic_visit(node)             # desugar any nested withs first
+        body = node.body
+        items = list(node.items)
+        for item in reversed(items):
+            self.ctr += 1
+            tmp = "_with_%d" % self.ctr
+            mgr_store = ast.Name(id=tmp, ctx=ast.Store())
+            assign_mgr = ast.Assign(targets=[mgr_store], value=item.context_expr)
+            enter = ast.Call(func=ast.Attribute(value=ast.Name(id=tmp, ctx=ast.Load()),
+                                                attr="__enter__", ctx=ast.Load()),
+                             args=[], keywords=[])
+            if item.optional_vars is not None:
+                enter_stmt = ast.Assign(targets=[item.optional_vars], value=enter)
+            else:
+                enter_stmt = ast.Expr(value=enter)
+            none_args = [ast.Constant(value=None) for _ in range(3)]
+            exit_stmt = ast.Expr(value=ast.Call(
+                func=ast.Attribute(value=ast.Name(id=tmp, ctx=ast.Load()),
+                                   attr="__exit__", ctx=ast.Load()),
+                args=none_args, keywords=[]))
+            tryfin = ast.Try(body=body, handlers=[], orelse=[], finalbody=[exit_stmt])
+            body = [assign_mgr, enter_stmt, tryfin]
+        for s in body:
+            ast.copy_location(s, node)
+            ast.fix_missing_locations(s)
+        return body
+
+
 def compile_source(src, source_name="<module>"):
     tree = ast.parse(src, filename=source_name)
+    tree = _WithDesugar().visit(tree)        # with -> manager-protocol + try/finally
+    ast.fix_missing_locations(tree)
     c = Compiler()
     c._loops = []
     # give every top-level def its locals before lowering its body
