@@ -5269,20 +5269,25 @@ class Transpiler:
         """Like ast.walk, but for an `if` whose test the translator can fold
         (`sys.implementation.name == 'shivyc'`), descend only the live branch.
         This keeps a dead `else: import torch` from shadowing the alias bound in
-        the taken branch (`import rpy_torch as torch`)."""
-        yield node
+        the taken branch (`import rpy_torch as torch`).
+
+        Returns an eager pre-order list rather than a generator: minipy keeps its
+        bytecode simple and deliberately has no `yield`, so the few generators in
+        py2c are written as list-builders to stay self-hostable."""
+        out = [node]
         if isinstance(node, ast.If):
             cond = self._static_cond(node.test)
             if cond is True:
                 for c in node.body:
-                    yield from self._walk_live(c)
-                return
+                    out.extend(self._walk_live(c))
+                return out
             if cond is False:
                 for c in node.orelse:
-                    yield from self._walk_live(c)
-                return
+                    out.extend(self._walk_live(c))
+                return out
         for c in ast.iter_child_nodes(node):
-            yield from self._walk_live(c)
+            out.extend(self._walk_live(c))
+        return out
 
     def collect_imports(self, tree):
         for node in self._walk_live(tree):
