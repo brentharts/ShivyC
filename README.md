@@ -440,28 +440,42 @@ What makes it fast and small:
   TikZ call graph, safety findings in red, the Python source beside the
   generated C with its auto-inferred contracts, and the program output.
 
-Worked examples live in [`examples/rpython2c/`](examples/rpython2c/): `numpy/`
-(SIMD kernels, BLAS, ufuncs, matmul), `nn/` (a feed-forward neural net showing
-classes→structs), `nbody/` (a gravity sim that passes class instances by
-pointer), `classes/` (inheritance + polymorphism via the object model, plus a
-POD-vs-object-model comparison), `lists/` and `dicts/` (typed `list[T]` /
-`dict[K,V]` lowered to unboxed C arrays — no boxing, no GC),
-`compiler/` (a C-subset lexer kernel — a ShivyCX hotspot rewritten in rpython,
-~18x faster through ShivyCX and ~50x through gcc, with a benchmark harness),
-`memory/` (`del`, compiler-inserted `free` via whole-program escape analysis,
-and the `--pdf` memory report), `multifile/`, `ambig/`, and `fieldwrite/`
-(multi-file programs: cross-module calls, same-named classes module-qualified
-into distinct structs, and cross-module writes into None-initialised `obj`
-fields), `dynattr/` (compiled `getattr`/`setattr` on a struct by runtime key —
-an inline first-character type switch, no dict and no bridge), `rtattr/`
-(`getattr`/`setattr` by runtime key on a *polymorphic* object held as a tagged
-`obj`, dispatched through a per-type field table by the `rt_getattr`/`rt_setattr`
-runtime helpers — again no micropython bridge), `crossattr/` (cross-class field
-discovery: attributes a configurator stamps onto another class via
-`obj.attr =`/`setattr` are promoted to real slots so the writes persist),
-`aggregates/` (varargs-free list/dict/call construction — a 16-byte `obj` mis-lowers through C `...` on the self-compiled backend, so literals and calls build via a stack array instead), `formatting/` (`%` string formatting and f-strings — `fmt % args` is real printf-style formatting, not arithmetic modulo, lowered to a varargs-free `str_mod`), `ctorval/` (constructors used as values: trampoline unboxing of int/float/bool arguments, plus the switch-on-narrow-type integer-promotion fix that makes boolean truthiness correct), `sets/` (set as a first-class type with its own runtime tag: union/intersection/difference/symmetric-difference, order-independent equality, de-duplicating literals and comprehensions), `dictops/` and `wordfreq/` (the general dict type -- get/setdefault/pop/update/copy/merge/comprehensions, plus realistic frequency-counting and grouping), `untyped/` (untyped dicts/lists/sets with type inference and rpython-rule advisories), `promote/` (opt-in auto-promotion of inferred containers to the unboxed typed form), `pgo/` (profile-guided auto-typing via `-fprofile-generate`), `pgo_multi/` (multi-file profile-guided auto-typing), `numpy/fusion.py` (NumPy operator fusion: `out[:]=expr` -> one loop, no temporaries), `io/`, `net/`, and `mandelbrot/`. Run them all with `make rpython`.
+Worked examples live in [`examples/rpython2c/`](examples/rpython2c/): 
+- `numpy/` (SIMD kernels, BLAS, ufuncs, matmul),
+- `nn/` (a feed-forward neural net showing classes→structs), `
+- nbody/` (a gravity sim that passes class instances by pointer),
+- `classes/` (inheritance + polymorphism via the object model, plus a POD-vs-object-model comparison),
+- `lists/` and `dicts/` (typed `list[T]` / `dict[K,V]` lowered to unboxed C arrays — no boxing, no GC),
+- `compiler/` (a C-subset lexer kernel — a ShivyCX hotspot rewritten in rpython, ~18x faster through ShivyCX and ~50x through gcc, with a benchmark harness),
+- `memory/` (`del`, compiler-inserted `free` via whole-program escape analysis, and the `--pdf` memory report),
+- `multifile/`, `ambig/`, and
+- `fieldwrite/` (multi-file programs: cross-module calls, same-named classes module-qualified into distinct structs, and cross-module writes into None-initialised `obj`fields),
+- `dynattr/` (compiled `getattr`/`setattr` on a struct by runtime key — an inline first-character type switch, no dict and no bridge),
+- `rtattr/` (`getattr`/`setattr` by runtime key on a *polymorphic* object held as a tagged `obj`, dispatched through a per-type field table by the
+- `rt_getattr`/`rt_setattr` runtime helpers — again no micropython bridge),
+- `crossattr/` (cross-class field discovery: attributes a configurator stamps onto another class via `obj.attr =`/`setattr` are promoted to real slots so the writes persist),
+- `aggregates/` (varargs-free list/dict/call construction — a 16-byte `obj` mis-lowers through C `...` on the self-compiled backend, so literals and calls build via a stack array instead),
+- `formatting/` (`%` string formatting and f-strings — `fmt % args` is real printf-style formatting, not arithmetic modulo, lowered to a varargs-free `str_mod`),
+- `ctorval/` (constructors used as values: trampoline unboxing of int/float/bool arguments, plus the switch-on-narrow-type integer-promotion fix that makes boolean truthiness correct), `sets/` (set as a first-class type with its own runtime tag: union/intersection/difference/symmetric-difference, order-independent equality, de-duplicating literals and comprehensions),
+- `dictops/` and `wordfreq/` (the general dict type -- get/setdefault/pop/update/copy/merge/comprehensions, plus realistic frequency-counting and grouping), `untyped/` (untyped dicts/lists/sets with type inference and rpython-rule advisories),
+- `promote/` (opt-in auto-promotion of inferred containers to the unboxed typed form),
+- `pgo/` (profile-guided auto-typing via `-fprofile-generate`),
+- `pgo_multi/` (multi-file profile-guided auto-typing),
+- `numpy/fusion.py` (NumPy operator fusion: `out[:]=expr` -> one loop, no temporaries),
+- `io/` rpython io files,
+- `net/` rpython socket io, and
+- `mandelbrot/`.
+
+Run them all with `make rpython`.
 
 `make testfast` is a fast smoke test: a single-file syntax sweep and a multi-file cross-module case, each compiled with CPython (the oracle), the ShivyCX self-compiler, and the py2c->gcc transpiler, requiring all three to agree. It covers most of the language subset in a few seconds.
+
+---
+## MiniPy
+[`MINIPY.md`](MINIPY.md)
+
+A tiny Python interpreter written in Rpython.  Current status, working on performance, and supporting all the features required to run py2c.py,
+thus making the entire project self contained.
 
 ---
 
@@ -472,4 +486,6 @@ discovery: attributes a configurator stamps onto another class via
 - x86-64 ABI — https://github.com/hjl-tools/x86-psABI/wiki/x86-64-psABI-1.0.pdf
 - Iterated Register Coalescing (George and Appel) — https://www.cs.purdue.edu/homes/hosking/502/george.pdf
 - *Foundational Problems with Compilers and Operating Systems* (B. Hartshorn, viXra 2025).
-- https://ai.vixra.org/abs/2507.0081
+    - https://ai.vixra.org/abs/2507.0081
+    - Minipy inspired by https://gitlab.com/hartsantler/tpythonpp
+    - My old Rpython research: https://code.google.com/archive/p/rpythonic/
