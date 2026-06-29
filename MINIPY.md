@@ -1826,3 +1826,44 @@ Confirmed by feeding each to the compiler:
   which minipy still lacks; these stay the larger items.
 - The rest of the stdlib `py2c.py` leans on (`re`, `sys`, `os`) remains, but `rast.py`
   shows the `ast` half of the path is real and runs natively today.
+
+---
+
+## Basic minipy rules (what it deliberately does *not* support)
+
+minipy is meant to stay small and fast, not to cover every corner of Python. As a
+standing rule it does **not** implement `yield` (generators) or `async`/`await`. These
+add a second control-flow model (suspendable frames / an event loop) that would bloat the
+register dispatch loop and the value model for little gain in the workloads minipy targets.
+
+Consequences and the chosen alternatives:
+- **Generator expressions / comprehensions are still fully supported** -- they are desugared
+  *eagerly* into a built list (`sum(x*x for x in xs)`, `all(... for ...)`, list/dict/set
+  comprehensions with filters all work and match CPython).
+- **py2c's own generators are written as list-builders.** The transpiler had one real
+  generator, `_walk_live` (a branch-aware `ast.walk`); it now returns an eager pre-order
+  list instead of `yield`-ing. Same order, same callers (`for n in self._walk_live(t)`),
+  and self-host (`make testfast`) still passes. py2c now contains zero `yield`s, one step
+  closer to compiling under minipy itself.
+
+## v29 -- `try/finally`
+
+`try/finally` (and `try/except/finally`) now compile, with **no new opcodes and no
+interpreter change** -- it is expressed entirely in terms of the existing
+`SETUP_EXCEPT`/`POP_BLOCK`/`RERAISE`. An outer catch-all wraps the body and runs the
+finally then re-raises; the normal fall-through path runs a copy of the finally; and
+`return`/`break`/`continue` inside the body run the pending finallys (tracked on a per-
+function `_finallys` stack) before they exit. `try/except/finally` is handled by nesting
+the existing except logic inside the catch-all.
+
+The finally therefore runs on every exit path -- normal completion, caught/propagated
+exception, `return`, and loop `break`/`continue` -- including correctly ordered nested
+finallys (inner before outer). Verified byte-identical across CPython, the ref VM and the
+native interpreter (`tools/minipy/test_tryfinally.py`), and all 52 regression programs
+plus the existing `try/except` suite still pass.
+
+This unblocks a *correct* `with` (desugar to manager-protocol + `try/finally`, so
+`__exit__` runs on the exception path too). The one remaining wrinkle for `with` is giving
+the context-manager temp a real local slot: minipy collects locals up-front, so the
+desugaring must either run before local collection or hold the manager in a reserved
+register -- a small, self-contained next step.
