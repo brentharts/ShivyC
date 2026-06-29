@@ -1780,3 +1780,49 @@ De-boxing (v25) removed the per-instruction arithmetic *calls*; direct list acce
 last per-instruction boxing roundtrip. Together they nearly halve dispatch time. All 52
 regression programs stay byte-identical to CPython, nbody matches (12982328), and
 self-host (`make testfast`) passes.
+
+---
+
+## v28 -- running a real Python parser on minipy (stdlib/self-host step)
+
+The long pole for self-hosting (eventually running `py2c.py` itself on minipy) was
+never the syntax -- it is the standard library, above all an `ast` to turn Python source
+back into a tree. `tools/rpy_lib/rast.py` is that piece: a PEG Python parser (ported from
+pymetaterp, de-`eval`'d into explicit semantic-action dispatch so it is py2c-portable). It
+is import-free and uses only minipy-supported constructs -- the `yield`/`lambda` tokens in
+it are *grammar rules for parsing* Python that contains them, not constructs the parser
+itself uses -- so `compiler.compile_file` accepts it as-is.
+
+**Result:** minipy compiles and runs the parser, and its output is byte-identical to
+CPython across all three executors. `tools/rpy_lib/rast_test.py` parses ten Python
+snippets (operator precedence, `def`, `if/else`, `while`, `for`, lists, dicts, calls,
+boolean/compare chains) and dumps each Node tree:
+
+```
+PASS: cpython == ref == native  (10 snippets, 172 output lines)
+```
+
+This is the first end-to-end run of a non-trivial real-world Python program on the native
+py2c-compiled interpreter -- exercising classes, methods, recursion, exceptions,
+dict/list comprehensions, generator expressions and heavy string work all at once.
+
+**One fix was needed to make it practical, not to make it correct.** `parse_python`
+re-bootstrapped the entire 3-stage grammar (meta-grammar -> grammar -> Python grammar) on
+*every* call. Under minipy's free-once bump arena (no GC; nothing is reclaimed until the
+program exits) that meant each parse re-allocated the whole grammar, and a handful of
+parses exhausted even the 1 GiB arena (overflow currently faults rather than erroring
+cleanly -- a separate robustness TODO). Since the grammar stages are source-independent
+and `match()` resets its per-source state on each top-level call, the Python-grammar
+interpreter is now built once and cached (`_python_interp()`), turning N parses from
+N x (grammar + tree) into grammar-once + N x tree. The ten-snippet test then fits the
+default arena comfortably.
+
+### Remaining gaps to *running py2c.py itself*
+Confirmed by feeding each to the compiler:
+- **`with`** -> needs `try/finally` first (minipy's `st_Try` still rejects `finalbody`); a
+  correct `with` must call `__exit__` on the exception path, so finally is the real
+  prerequisite. A cleanup-skipping `with` was deliberately *not* shipped.
+- **generators (`yield`)** and **`lambda`** -> both need nested-function / closure support,
+  which minipy still lacks; these stay the larger items.
+- The rest of the stdlib `py2c.py` leans on (`re`, `sys`, `os`) remains, but `rast.py`
+  shows the `ast` half of the path is real and runs natively today.
