@@ -800,6 +800,8 @@ class Compiler:
             r = self._const_reg(f, ("none", None))
         else:
             r = self.expr(f, node.value)
+        if self._finallys:                     # run every enclosing finally first
+            self._run_pending_finallys(f, len(self._finallys))
         f.emit("RETURN", r)
         f.pop_to(r)
 
@@ -981,12 +983,18 @@ class Compiler:
     def st_Break(self, f, node):
         if not self._loops:
             raise CompileError("break outside loop (line %s)" % node.lineno)
+        nf = self._n_loop_finallys()
+        if nf:
+            self._run_pending_finallys(f, nf)
         pc = len(f.code); f.emit("JUMP", 0)
         self._loops[-1].breaks.append(pc)
 
     def st_Continue(self, f, node):
         if not self._loops:
             raise CompileError("continue outside loop (line %s)" % node.lineno)
+        nf = self._n_loop_finallys()
+        if nf:
+            self._run_pending_finallys(f, nf)
         loop = self._loops[-1]
         if loop.rotated:                       # target (back-edge) is a forward ref
             pc = len(f.code); f.emit("JUMP", 0); loop.conts.append(pc)
@@ -995,7 +1003,63 @@ class Compiler:
 
     def st_Try(self, f, node):
         if node.finalbody:
-            raise CompileError("v0 try: finally not supported (line %s)" % node.lineno)
+            self._compile_try_finally(f, node)
+        else:
+            self._compile_try_except(f, node)
+
+    def _compile_try_finally(self, f, node):
+        # try/finally with no new opcodes: an outer catch-all SETUP_EXCEPT runs
+        # the finally then re-raises, the normal fall-through path runs a copy of
+        # the finally, and return/break/continue inside the body run the pending
+        # finallys (via self._finallys) before they exit.  try/except/finally is
+        # handled by nesting the except logic inside this catch-all.
+        fin = node.finalbody
+        setup = len(f.code); f.emit("SETUP_EXCEPT", 0)
+        self._finallys.append((fin, len(self._loops)))
+        if node.handlers or node.orelse:
+            inner = ast.Try(body=node.body, handlers=node.handlers,
+                            orelse=node.orelse, finalbody=[])
+            self._compile_try_except(f, inner)
+        else:
+            for s in node.body:
+                self.stmt(f, s)
+        f.emit("POP_BLOCK")
+        self._finallys.pop()
+        for s in fin:                          # normal completion
+            self.stmt(f, s)
+        endj = len(f.code); f.emit("JUMP", 0)
+        f.code[setup][1] = len(f.code)         # exception dispatch
+        for s in fin:                          # exception path: run finally...
+            self.stmt(f, s)
+        f.emit("RERAISE")                      # ...then propagate
+        f.code[endj][1] = len(f.code)
+
+    def _run_pending_finallys(self, f, n):
+        # Inline the top `n` pending finally bodies, innermost first.  Each body
+        # is compiled with itself (and any inner finallys) hidden from
+        # self._finallys, so a return/break inside a finally runs only the
+        # finallys still enclosing it -- and never recurses into itself.
+        saved = self._finallys
+        total = len(saved)
+        k = total - 1
+        while k >= total - n:
+            self._finallys = saved[:k]
+            for s in saved[k][0]:
+                self.stmt(f, s)
+            k = k - 1
+        self._finallys = saved
+
+    def _n_loop_finallys(self):
+        # finallys nested inside the current innermost loop (those set up after
+        # it was entered) -- the ones a break/continue must run before exiting.
+        cur = len(self._loops)
+        n = 0
+        i = len(self._finallys) - 1
+        while i >= 0 and self._finallys[i][1] >= cur:
+            n = n + 1; i = i - 1
+        return n
+
+    def _compile_try_except(self, f, node):
         setup = len(f.code); f.emit("SETUP_EXCEPT", 0)
         for s in node.body:
             self.stmt(f, s)
@@ -1228,6 +1292,7 @@ class Compiler:
 
     def _compile_func_body(self, node, frame):
         self._loops = []
+        self._finallys = []      # stack of (finalbody_stmts, loop_depth_at_setup)
         frame.vartype = self._infer_types(node.body)
         frame.reclaimable_locals = self._reclaimable_locals(node, frame)
         for s in node.body:
