@@ -478,6 +478,9 @@ A tiny Python interpreter written in Rpython.  Current status, working on perfor
 thus making the entire project self contained.
 
 ---
+## Benchmarks
+- (June 29, 2026) https://doi.org/10.5281/zenodo.21048364
+
 
 ## References
 
