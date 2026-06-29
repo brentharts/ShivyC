@@ -1987,6 +1987,22 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
             if c == 1:                     # rhs was a fresh arith temp -> reclaim it
                 _free_v(bb)
             pc = pc + 1
+        elif op == 67:                     # ACC_ADD_L: reg[a] = reg[a] + reg[b]; reclaim
+            la = regs[a]
+            lb = regs[b]
+            regs[a] = v_add(st, la, lb)
+            _free_v(la)
+            if c == 1:
+                _free_v(lb)
+            pc = pc + 1
+        elif op == 68:                     # ACC_SUB_L: reg[a] = reg[a] - reg[b]; reclaim
+            la = regs[a]
+            lb = regs[b]
+            regs[a] = v_sub(la, lb)
+            _free_v(la)
+            if c == 1:
+                _free_v(lb)
+            pc = pc + 1
         elif op == 15:                     # ITER_NEW
             regs[a] = v_iter(st, regs[b]); pc = pc + 1
         elif op == 16:                     # ITER_NEXT

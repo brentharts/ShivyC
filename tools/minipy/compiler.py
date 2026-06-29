@@ -52,6 +52,8 @@ OPS = {
     "ACC_ADD_GINT":56,   # fused: glob[a] += tlist(reg[b])[reg[c]] (typed accumulate)
     "ACC_MAC_GINT":57,   # fused: glob[a] += tA[k]*tB[j]; b,c pack (row*4096+idx)
     "ACC_ADD_G":   58,   # fused: glob[a] = glob[a] + reg[b] (general accumulate)
+    "ACC_ADD_L":   67,   # fused: reg[a] = reg[a] + reg[b] (local accumulate)
+    "ACC_SUB_L":   68,   # fused: reg[a] = reg[a] - reg[b] (local accumulate)
     "ITER_NEW":    15,   # reg[a] = iter(reg[b])
     "ITER_NEXT":   16,   # if next: reg[a]=next, pc++ ; else pc=c
     "CONTAINS":    17,   # reg[a] = (reg[c] in reg[b])
@@ -172,6 +174,8 @@ class _Frame:
         self.code = []                   # list of [op, a, b, c]
         self.numreg = set()              # regs statically known to hold a number
         self.vartype = {}                # name -> 'tintlist'/'listtint' (typed)
+        self.reclaimable_locals = set()  # locals whose old value may be freed on reassign
+        self.params = set(params)        # parameter names (never reclaimable: alias args)
         self.defaults = []               # per-param const index, -1 = required
 
     # register stack discipline
@@ -445,6 +449,148 @@ class Compiler:
         r = self.expr(f, node.test)
         f.pop_to(r)
 
+    def _reclaimable_locals(self, func_node, frame):
+        # Per-function mirror of _compute_reclaimable_globals: a local may have its
+        # old value freed on reassignment only if every assignment to it is a freshly
+        # built, uniquely-owned value (arithmetic or a cached-small-int constant) and
+        # it never escapes (aliased to another name, returned, stored, passed to a
+        # retaining call, used as a container/attribute base, or bound by a for/unpack
+        # target). Parameters are always excluded -- they alias the caller's argument.
+        assigned = set(); escaped = set(); not_fresh = set()
+
+        def fresh_val(value):
+            if isinstance(value, (ast.BinOp, ast.UnaryOp, ast.Compare, ast.BoolOp)):
+                return True
+            if isinstance(value, ast.Constant):
+                v = value.value
+                if v is None or isinstance(v, bool):
+                    return True
+                if isinstance(v, int) and -8 <= v <= 256:
+                    return True
+            return False
+
+        def mark(node, escaping):
+            if isinstance(node, ast.Name):
+                if escaping:
+                    escaped.add(node.id)
+            elif isinstance(node, ast.BinOp):
+                mark(node.left, False); mark(node.right, False)
+            elif isinstance(node, ast.UnaryOp):
+                mark(node.operand, False)
+            elif isinstance(node, ast.BoolOp):
+                for v in node.values:
+                    mark(v, False)
+            elif isinstance(node, ast.Compare):
+                mark(node.left, False)
+                for c in node.comparators:
+                    mark(c, False)
+            elif isinstance(node, ast.IfExp):
+                mark(node.test, False); mark(node.body, escaping); mark(node.orelse, escaping)
+            elif isinstance(node, ast.Call):
+                ro = isinstance(node.func, ast.Name) and node.func.id in self._READONLY_BUILTINS
+                if not ro:
+                    mark(node.func, True)
+                for a in node.args:
+                    mark(a, not ro)
+                for k in node.keywords:
+                    mark(k.value, not ro)
+            elif isinstance(node, ast.Subscript):
+                mark(node.value, True); mark(node.slice, False)   # read index: not retained
+            elif isinstance(node, ast.Attribute):
+                mark(node.value, True)
+            elif isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+                for e in node.elts:
+                    mark(e, True)
+            elif isinstance(node, ast.Dict):
+                for k in node.keys:
+                    if k is not None:
+                        mark(k, True)
+                for v in node.values:
+                    mark(v, True)
+
+        def visit(stmts):
+            for s in stmts:
+                if isinstance(s, ast.Assign):
+                    mark(s.value, True)
+                    fresh = fresh_val(s.value)
+                    for t in s.targets:
+                        if isinstance(t, ast.Name):
+                            assigned.add(t.id)
+                            if not fresh:
+                                not_fresh.add(t.id)
+                        elif isinstance(t, (ast.Tuple, ast.List)):
+                            for e in t.elts:
+                                if isinstance(e, ast.Name):
+                                    assigned.add(e.id); not_fresh.add(e.id)
+                        elif isinstance(t, ast.Subscript):
+                            mark(t.value, True); mark(t.slice, True)   # store index may be a dict key
+                        elif isinstance(t, ast.Attribute):
+                            mark(t.value, True)
+                elif isinstance(s, ast.AnnAssign):
+                    if s.value is not None:
+                        mark(s.value, True)
+                        if isinstance(s.target, ast.Name):
+                            assigned.add(s.target.id)
+                            if not fresh_val(s.value):
+                                not_fresh.add(s.target.id)
+                elif isinstance(s, ast.AugAssign):
+                    mark(s.value, False)
+                    if isinstance(s.target, ast.Name):
+                        assigned.add(s.target.id)                  # g op= x is fresh
+                    elif isinstance(s.target, ast.Subscript):
+                        mark(s.target.value, True); mark(s.target.slice, True)
+                    elif isinstance(s.target, ast.Attribute):
+                        mark(s.target.value, True)
+                elif isinstance(s, ast.Return):
+                    if s.value is not None:
+                        mark(s.value, True)
+                elif isinstance(s, ast.Expr):
+                    mark(s.value, False)
+                elif isinstance(s, (ast.If, ast.While)):
+                    mark(s.test, False)
+                    visit(s.body); visit(s.orelse)
+                elif isinstance(s, ast.For):
+                    mark(s.iter, True)
+                    if isinstance(s.target, ast.Name):
+                        assigned.add(s.target.id); not_fresh.add(s.target.id)
+                    elif isinstance(s.target, (ast.Tuple, ast.List)):
+                        for e in s.target.elts:
+                            if isinstance(e, ast.Name):
+                                assigned.add(e.id); not_fresh.add(e.id)
+                    visit(s.body); visit(s.orelse)
+                # nested FunctionDef/ClassDef: their bodies are a separate scope
+
+        visit(func_node.body)
+        return (assigned - escaped - not_fresh - frame.params) & set(frame.locals.keys())
+
+    def _try_acc_local(self, f, tgt, value):
+        # Fuse `loc = loc + <pure expr>` / `loc = loc - <pure expr>` into a single
+        # opcode for a reclaimable local: read the local's register, combine, write
+        # back, and reclaim the old value -- the local mirror of ACC_ADD_G. The fused
+        # op reads the local after evaluating the rhs, so (as for globals) the rhs must
+        # be call-free to preserve CPython's left-to-right order.
+        if f.is_module:
+            return False
+        if tgt.id not in f.locals or tgt.id not in f.reclaimable_locals:
+            return False
+        if not (isinstance(value, ast.BinOp) and isinstance(value.op, (ast.Add, ast.Sub))):
+            return False
+        if not (isinstance(value.left, ast.Name) and value.left.id == tgt.id):
+            return False
+        rhs = value.right
+        if self._has_call(rhs):
+            return False
+        r = self.expr(f, rhs)
+        fr = 1 if self._is_fresh_arith(rhs) else 0
+        opn = "ACC_ADD_L" if isinstance(value.op, ast.Add) else "ACC_SUB_L"
+        f.emit(opn, f.locals[tgt.id], r, fr)
+        r_num = r in f.numreg
+        f.pop_to(r)
+        lr = f.locals[tgt.id]
+        if not (lr in f.numreg and r_num):           # result numeric only if both were
+            f.numreg.discard(lr)
+        return True
+
     def _try_acc_gint(self, f, tgt, value):
         # Fuse `g = g + tlist[idx]` into one opcode when g is a reclaimable global
         # and tlist is a typed int list. Collapses load-global + typed-index + add
@@ -509,6 +655,8 @@ class Compiler:
         tgt = node.targets[0]
         if isinstance(tgt, ast.Name):
             if self._try_acc_gint(f, tgt, node.value):
+                return
+            if self._try_acc_local(f, tgt, node.value):
                 return
             r = self.expr(f, node.value)
             self._store_name(f, tgt.id, r)
@@ -956,6 +1104,7 @@ class Compiler:
     def _compile_func_body(self, node, frame):
         self._loops = []
         frame.vartype = self._infer_types(node.body)
+        frame.reclaimable_locals = self._reclaimable_locals(node, frame)
         for s in node.body:
             self.stmt(frame, s)
         frame.emit("RETURN", self._const_reg(frame, ("none", None)))
@@ -1522,6 +1671,10 @@ class VM:
                     regs[b // 4096][regs[b % 4096]] * regs[c // 4096][regs[c % 4096]]
             elif op == 58:                      # ACC_ADD_G (general accumulate)
                 self.globals[a] = self.globals[a] + regs[b]
+            elif op == 67:                      # ACC_ADD_L (local accumulate)
+                regs[a] = regs[a] + regs[b]
+            elif op == 68:                      # ACC_SUB_L (local accumulate)
+                regs[a] = regs[a] - regs[b]
             elif op == 14:                      # SETINDEX
                 regs[a][regs[b]] = regs[c]
             elif op == 15:                      # ITER_NEW
