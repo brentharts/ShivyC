@@ -44,6 +44,7 @@ OPS = {
     "JUMP_IF_TRUE": 82,                    # if truthy(reg[a]): pc=b
     "JT_LT": 83, "JT_LE": 84, "JT_GT": 85,  # fused compare+branch:
     "JT_GE": 86, "JT_EQ": 87, "JT_NE": 88,  # if (reg[a] CMP reg[c]): pc=b
+    "CALL_FUNC": 89,                       # direct call: c = fidx*256 + nargs
     "CALL":         8,   # reg[a] = reg[b](reg[b+1..b+c]); c = argcount
     # --- containers (9-19) ---
     "BUILD_LIST":   9,   # reg[a] = [regs[b..b+c-1]]
@@ -207,6 +208,8 @@ class Compiler:
         self.gnames = {}                 # global name -> slot
         self.funcs = []                  # list of _Frame (entry = 0)
         self._pending = []               # (FunctionDef, frame) to compile
+        self.func_names = {}             # module-level def name -> fidx (direct call)
+        self.reassigned_names = set()    # names rebound by non-def statements
         self.classes = []                # list of {name, base, methods:[...]}
         self._class_id = {}              # class name -> id
         self.reclaimable_globals = set()
@@ -405,6 +408,7 @@ class Compiler:
 
     def compile_module(self, tree, source_name="<module>"):
         self.reclaimable_globals = self._compute_reclaimable_globals(tree)
+        self.reassigned_names = self._compute_reassigned_names(tree)
         mod = _Frame(source_name, [], [], is_module=True)
         mod.vartype = self._infer_types(tree.body)
         self.funcs.append(mod)
@@ -1092,6 +1096,7 @@ class Compiler:
                 frame.numreg.add(frame.locals[arg.arg])
         idx = len(self.funcs)
         self.funcs.append(frame)
+        self.func_names[node.name] = idx
         self._pending.append((node, frame))
         # bind the function object into a global slot
         ci = self.consts.add("func", idx)
@@ -1308,6 +1313,30 @@ class Compiler:
         f.numreg.discard(r)
         return r
 
+    def _compute_reassigned_names(self, tree):
+        # Names that are ever rebound by something other than a `def` (assignment,
+        # aug-assignment, annotation, for-target, unpack). A module-level function
+        # whose name appears here is *not* eligible for direct CALL_FUNC, since the
+        # global slot it resolves to might no longer hold the original function.
+        names = set()
+
+        def tgt(t):
+            if isinstance(t, ast.Name):
+                names.add(t.id)
+            elif isinstance(t, (ast.Tuple, ast.List)):
+                for e in t.elts:
+                    tgt(e)
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for t in node.targets:
+                    tgt(t)
+            elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+                tgt(node.target)
+            elif isinstance(node, ast.For):
+                tgt(node.target)
+        return names
+
     def ex_Call(self, f, node):
         if node.keywords:
             raise CompileError("v0 call: no keyword args (line %s)" % node.lineno)
@@ -1348,6 +1377,26 @@ class Compiler:
             f.pop_to(rfun + 1); f.numreg.discard(rfun)
             return rfun
         # plain call
+        # direct call to a module-level function: resolve its index at compile
+        # time and skip both the LOAD_GLOBAL of the callee and do_call's runtime
+        # type dispatch. Only when the name is a known def, is not rebound anywhere,
+        # and is not shadowed by a local in this scope.
+        if (isinstance(node.func, ast.Name)
+                and node.func.id in self.func_names
+                and node.func.id not in self.reassigned_names
+                and node.func.id not in f.locals
+                and len(node.args) < 256):
+            fidx = self.func_names[node.func.id]
+            rbase = f.push()                   # dst slot (no callee loaded)
+            k = 0
+            for a in node.args:
+                ra = self.expr(f, a)
+                assert ra == rbase + 1 + k
+                k += 1
+            f.emit("CALL_FUNC", rbase, rbase + 1, fidx * 256 + k)
+            f.pop_to(rbase + 1)
+            f.numreg.discard(rbase)
+            return rbase
         rfun = self.expr(f, node.func)
         n = 0
         for a in node.args:
@@ -1569,6 +1618,7 @@ class Compiler:
                 "name": fr.name,
                 "nparams": fr.nparams,
                 "nregs": fr.maxreg,
+                "nlocals": fr.base,
                 "code": [{"op": op, "a": a, "b": b, "c": c}
                          for (op, a, b, c) in fr.code],
                 "defaults": fr.defaults,
@@ -1755,6 +1805,10 @@ class VM:
             elif op == 8:
                 callee = regs[b]; ca = [regs[b + 1 + k] for k in range(c)]
                 regs[a] = self._invoke(callee, ca)
+            elif op == 89:                      # CALL_FUNC (direct)
+                fnum = c // 256; nargs = c % 256
+                ca = [regs[b + k] for k in range(nargs)]
+                regs[a] = self._call(fnum, ca)
             elif op == 9:                       # BUILD_LIST
                 regs[a] = [regs[b + k] for k in range(c)]
             elif op == 10:                      # BUILD_TUPLE

@@ -35,10 +35,11 @@ class Instr:
 
 class Func:
     def __init__(self, name: "char*", nparams: "int", nregs: "int",
-                 code: "list[Instr]", defaults: "list[int]"):
+                 nlocals: "int", code: "list[Instr]", defaults: "list[int]"):
         self.name = name
         self.nparams = nparams
         self.nregs = nregs
+        self.nlocals = nlocals
         self.code = code
         self.defaults = defaults
 
@@ -1844,13 +1845,18 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
     nr = fn.nregs
     if fn.nparams > nr:
         nr = fn.nparams
+    nloc = fn.nlocals                        # named locals occupy regs 0..nloc-1;
+    if nloc > nr:                            # temps (nloc..nr-1) are always written
+        nloc = nr                            # before read, so need no clearing
     if len(st.regpool) > 0:                  # reuse a frame (calls are nested)
         regs = st.regpool.pop()
     else:
         regs = new_v_list()
+    na = len(args)
+    np = fn.nparams
     k = 0
-    while k < nr:
-        if k < len(args):
+    while k < np:                            # parameters receive the arguments
+        if k < na:
             rv = args[k]
         else:
             rv = v_none()
@@ -1859,11 +1865,18 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
         else:
             regs.append(rv)
         k = k + 1
-    na = len(args)                          # supply defaults for missing params
-    if na < fn.nparams:
+    while k < nloc:                          # other named locals: clear to None so
+        if k < len(regs):                    # an unbound read is None, not stale data
+            regs[k] = v_none()
+        else:
+            regs.append(v_none())
+        k = k + 1
+    while len(regs) < nr:                    # grow to nr; reused temp slots are left
+        regs.append(v_none())                # untouched (overwritten before any read)
+    if na < np:                             # supply defaults for missing params
         defs = fn.defaults
         i = na
-        while i < fn.nparams:
+        while i < np:
             if i < len(defs) and defs[i] >= 0:
                 regs[i] = const_to_v(st.prog, defs[i])
             i = i + 1
@@ -1996,6 +2009,22 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
             rcall = do_call(st, callee, cargs)
             st.regpool.append(cargs)
             regs[a] = rcall; pc = pc + 1
+        elif op == 89:                     # CALL_FUNC: direct call, c = fidx*256+nargs
+            fnum = c // 256
+            nargs = c % 256
+            if len(st.regpool) > 0:
+                fargs = st.regpool.pop()
+                while len(fargs) > 0:
+                    fargs.pop()
+            else:
+                fargs = new_v_list()
+            j = 0
+            while j < nargs:
+                fargs.append(regs[b + j])
+                j = j + 1
+            rfc = run_func(st, fnum, fargs)
+            st.regpool.append(fargs)
+            regs[a] = rfc; pc = pc + 1
         elif op == 9:                      # BUILD_LIST
             items = new_v_list()
             j = 0
