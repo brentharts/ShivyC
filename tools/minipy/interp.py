@@ -1960,6 +1960,25 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
             regs[a] = v_index(st, regs[b], regs[c]); pc = pc + 1
         elif op == 14:                     # SETINDEX
             v_setindex(st, regs[a], regs[b], regs[c]); pc = pc + 1
+        elif op == 54:                     # INDEX_INT (typed list[int], no dispatch)
+            regs[a] = st.heap[regs[b].iv].items[regs[c].iv]; pc = pc + 1
+        elif op == 55:                     # SETINDEX_INT (typed list[int])
+            st.heap[regs[a].iv].items[regs[b].iv] = regs[c]; pc = pc + 1
+        elif op == 56:                     # ACC_ADD_GINT: glob[a] += tlist[b][c]
+            ov = st.glob[a]
+            st.glob[a] = v_int(ov.iv + st.heap[regs[b].iv].items[regs[c].iv].iv)
+            _free_v(ov)
+            pc = pc + 1
+        elif op == 57:                     # ACC_MAC_GINT: glob[a] += tA[k]*tB[j]
+            rar = b // 4096
+            rki = b % 4096
+            rbr = c // 4096
+            rji = c % 4096
+            prod = st.heap[regs[rar].iv].items[regs[rki].iv].iv * st.heap[regs[rbr].iv].items[regs[rji].iv].iv
+            ovm = st.glob[a]
+            st.glob[a] = v_int(ovm.iv + prod)
+            _free_v(ovm)
+            pc = pc + 1
         elif op == 15:                     # ITER_NEW
             regs[a] = v_iter(st, regs[b]); pc = pc + 1
         elif op == 16:                     # ITER_NEXT

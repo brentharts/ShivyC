@@ -47,6 +47,10 @@ OPS = {
     "BUILD_SET":   12,   # reg[a] = {regs[b..b+c-1]}
     "INDEX":       13,   # reg[a] = reg[b][reg[c]]
     "SETINDEX":    14,   # reg[a][reg[b]] = reg[c]
+    "INDEX_INT":   54,   # typed list[int] get: reg[a]=reg[b][reg[c]], no dispatch
+    "SETINDEX_INT":55,   # typed list[int] set: reg[a][reg[b]]=reg[c], no dispatch
+    "ACC_ADD_GINT":56,   # fused: glob[a] += tlist(reg[b])[reg[c]] (typed accumulate)
+    "ACC_MAC_GINT":57,   # fused: glob[a] += tA[k]*tB[j]; b,c pack (row*4096+idx)
     "ITER_NEW":    15,   # reg[a] = iter(reg[b])
     "ITER_NEXT":   16,   # if next: reg[a]=next, pc++ ; else pc=c
     "CONTAINS":    17,   # reg[a] = (reg[c] in reg[b])
@@ -166,6 +170,7 @@ class _Frame:
         self.maxreg = self.base
         self.code = []                   # list of [op, a, b, c]
         self.numreg = set()              # regs statically known to hold a number
+        self.vartype = {}                # name -> 'tintlist'/'listtint' (typed)
         self.defaults = []               # per-param const index, -1 = required
 
     # register stack discipline
@@ -238,16 +243,49 @@ class Compiler:
 
     def _compute_reclaimable_globals(self, tree):
         module_assigned = set()
-        for n in tree.body:
-            if isinstance(n, ast.Assign):
-                for t in n.targets:
-                    if isinstance(t, ast.Name):
-                        module_assigned.add(t.id)
-            elif isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name):
-                module_assigned.add(n.target.id)
-            elif isinstance(n, (ast.FunctionDef, ast.ClassDef)):
-                module_assigned.add(n.name)
+
+        def collect(stmts):
+            for n in stmts:
+                if isinstance(n, ast.Assign):
+                    for t in n.targets:
+                        if isinstance(t, ast.Name):
+                            module_assigned.add(t.id)
+                        elif isinstance(t, (ast.Tuple, ast.List)):
+                            for e in t.elts:
+                                if isinstance(e, ast.Name):
+                                    module_assigned.add(e.id)
+                elif isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name):
+                    module_assigned.add(n.target.id)
+                elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name) \
+                        and n.value is not None:
+                    module_assigned.add(n.target.id)
+                elif isinstance(n, (ast.FunctionDef, ast.ClassDef)):
+                    module_assigned.add(n.name)         # def name; don't recurse in
+                elif isinstance(n, (ast.If, ast.While, ast.For)):
+                    if isinstance(n, ast.For) and isinstance(n.target, ast.Name):
+                        module_assigned.add(n.target.id)
+                    collect(n.body); collect(getattr(n, "orelse", []))
+        collect(tree.body)
         escaped = set()
+        not_fresh = set()        # globals that ever receive a non-fresh (aliasable) value
+
+        # A reclaimable global must, at every assignment, receive a freshly built,
+        # uniquely-owned value -- the result of arithmetic, or a small cached int
+        # constant the free gate will never recycle. Anything that can alias an
+        # existing object (another name, a container element via subscript, an
+        # attribute, a call result, a container literal, a for/unpack target, or a
+        # large/float/str constant that may be a shared memoised const) disqualifies
+        # it, because freeing its old value on reassignment could free a value some
+        # other binding still holds.
+        def fresh_val(value):
+            if isinstance(value, (ast.BinOp, ast.UnaryOp, ast.Compare, ast.BoolOp)):
+                return True
+            if isinstance(value, ast.Constant):
+                v = value.value
+                if v is None or isinstance(v, bool):
+                    return True
+                return isinstance(v, int) and -8 <= v <= 256
+            return False
 
         def is_glob(name, loc):
             return name not in loc and name in module_assigned
@@ -298,15 +336,34 @@ class Compiler:
             for s in stmts:
                 if isinstance(s, ast.Assign):
                     mark(s.value, True, loc)            # value binds to target
+                    fresh = fresh_val(s.value)
                     for t in s.targets:
-                        if isinstance(t, ast.Subscript):
-                            mark(t.value, True, loc); mark(t.slice, False, loc)
+                        if isinstance(t, ast.Name):
+                            if not fresh and is_glob(t.id, loc):
+                                not_fresh.add(t.id)
+                        elif isinstance(t, (ast.Tuple, ast.List)):
+                            for e in t.elts:               # unpack target aliases element
+                                if isinstance(e, ast.Name) and is_glob(e.id, loc):
+                                    not_fresh.add(e.id)
+                        elif isinstance(t, ast.Subscript):
+                            mark(t.value, True, loc)
+                            mark(t.slice, True, loc)       # may be a retained dict key
                         elif isinstance(t, ast.Attribute):
                             mark(t.value, True, loc)
+                elif isinstance(s, ast.AnnAssign):
+                    if s.value is not None:
+                        mark(s.value, True, loc)
+                        if isinstance(s.target, ast.Name):
+                            if not fresh_val(s.value) and is_glob(s.target.id, loc):
+                                not_fresh.add(s.target.id)
+                        elif isinstance(s.target, ast.Subscript):
+                            mark(s.target.value, True, loc); mark(s.target.slice, True, loc)
+                        elif isinstance(s.target, ast.Attribute):
+                            mark(s.target.value, True, loc)
                 elif isinstance(s, ast.AugAssign):
-                    mark(s.value, False, loc)
+                    mark(s.value, False, loc)              # g += x  is fresh (g = g + x)
                     if isinstance(s.target, ast.Subscript):
-                        mark(s.target.value, True, loc); mark(s.target.slice, False, loc)
+                        mark(s.target.value, True, loc); mark(s.target.slice, True, loc)
                     elif isinstance(s.target, ast.Attribute):
                         mark(s.target.value, True, loc)
                 elif isinstance(s, ast.Return):
@@ -319,6 +376,12 @@ class Compiler:
                     visit(s.body, loc); visit(s.orelse, loc)
                 elif isinstance(s, ast.For):
                     mark(s.iter, True, loc)
+                    if isinstance(s.target, ast.Name) and is_glob(s.target.id, loc):
+                        not_fresh.add(s.target.id)         # aliases iterated elements
+                    elif isinstance(s.target, (ast.Tuple, ast.List)):
+                        for e in s.target.elts:
+                            if isinstance(e, ast.Name) and is_glob(e.id, loc):
+                                not_fresh.add(e.id)
                     visit(s.body, loc); visit(s.orelse, loc)
                 elif isinstance(s, ast.FunctionDef):
                     visit(s.body, self._scope_locals(s))
@@ -328,11 +391,12 @@ class Compiler:
                             visit(item.body, self._scope_locals(item))
 
         visit(tree.body, set())
-        return module_assigned - escaped - set(BUILTINS.keys())
+        return module_assigned - escaped - not_fresh - set(BUILTINS.keys())
 
     def compile_module(self, tree, source_name="<module>"):
         self.reclaimable_globals = self._compute_reclaimable_globals(tree)
         mod = _Frame(source_name, [], [], is_module=True)
+        mod.vartype = self._infer_types(tree.body)
         self.funcs.append(mod)
         # pre-bind builtins into globals so `print` etc. resolve as names
         for bname, bid in BUILTINS.items():
@@ -380,11 +444,54 @@ class Compiler:
         r = self.expr(f, node.test)
         f.pop_to(r)
 
+    def _try_acc_gint(self, f, tgt, value):
+        # Fuse `g = g + tlist[idx]` into one opcode when g is a reclaimable global
+        # and tlist is a typed int list. Collapses load-global + typed-index + add
+        # + store-global(reclaim) -- the whole inner step of a numeric reduction --
+        # into a single dispatch. Only the typed source takes this path; CPython
+        # runs the same code unchanged.
+        if f.is_module is False and tgt.id in f.locals:
+            return False
+        if tgt.id not in self.reclaimable_globals:
+            return False
+        if not (isinstance(value, ast.BinOp) and isinstance(value.op, ast.Add)):
+            return False
+        if not (isinstance(value.left, ast.Name) and value.left.id == tgt.id):
+            return False
+        rhs = value.right
+        # g += tlist[idx]
+        if isinstance(rhs, ast.Subscript) \
+                and self._type_of(f, rhs.value) == "tintlist":
+            ra = self.expr(f, rhs.value)
+            rk = self.expr(f, rhs.slice)
+            f.emit("ACC_ADD_GINT", self.gslot(tgt.id), ra, rk)
+            f.pop_to(ra)
+            return True
+        # g += tA[i][k] * tB[k][j]  (multiply-accumulate; rows packed with indices)
+        if isinstance(rhs, ast.BinOp) and isinstance(rhs.op, ast.Mult) \
+                and isinstance(rhs.left, ast.Subscript) \
+                and isinstance(rhs.right, ast.Subscript) \
+                and self._type_of(f, rhs.left.value) == "tintlist" \
+                and self._type_of(f, rhs.right.value) == "tintlist":
+            rar = self.expr(f, rhs.left.value)
+            rk = self.expr(f, rhs.left.slice)
+            rbr = self.expr(f, rhs.right.value)
+            rj = self.expr(f, rhs.right.slice)
+            if rar < 4096 and rk < 4096 and rbr < 4096 and rj < 4096:
+                f.emit("ACC_MAC_GINT", self.gslot(tgt.id),
+                       rar * 4096 + rk, rbr * 4096 + rj)
+                f.pop_to(rar)
+                return True
+            f.pop_to(rar)
+        return False
+
     def st_Assign(self, f, node):
         if len(node.targets) != 1:
             raise CompileError("v0 assign: single target (line %s)" % node.lineno)
         tgt = node.targets[0]
         if isinstance(tgt, ast.Name):
+            if self._try_acc_gint(f, tgt, node.value):
+                return
             r = self.expr(f, node.value)
             self._store_name(f, tgt.id, r)
             f.pop_to(r)
@@ -402,7 +509,8 @@ class Compiler:
             robj = self.expr(f, tgt.value)
             ridx = self.expr(f, tgt.slice)
             rval = self.expr(f, node.value)
-            f.emit("SETINDEX", robj, ridx, rval)
+            op = "SETINDEX_INT" if self._type_of(f, tgt.value) == "tintlist" else "SETINDEX"
+            f.emit(op, robj, ridx, rval)
             f.pop_to(robj)
             return
         if isinstance(tgt, (ast.Tuple, ast.List)):
@@ -744,8 +852,92 @@ class Compiler:
         r = f.push(); f.emit("LOAD_CONST", r, ci)
         f.emit("STORE_GLOBAL", r, self.gslot(node.name)); f.pop_to(r)
 
+    # ---- optional type annotations: typed int lists -> specialised opcodes ----
+    # `list[int]` / `list[int:N]` is a list whose elements are ints; `list[list
+    # [int:N]]` is a matrix of such rows. When a value is statically known to be
+    # one of these, subscripting emits INDEX_INT / SETINDEX_INT (no tag dispatch,
+    # no negative-index fixup) and the loaded element is marked numeric so the
+    # surrounding arithmetic takes the NN fast path. CPython ignores the
+    # annotations entirely, so the typed source still runs there unchanged.
+    def _ann_type(self, ann):
+        if isinstance(ann, ast.Str):                    # string form: "list[int]"
+            try:
+                ann = ast.parse(ann.s, mode="eval").body
+            except Exception:
+                return None
+        if isinstance(ann, ast.Constant) and isinstance(ann.value, str):
+            try:
+                ann = ast.parse(ann.value, mode="eval").body
+            except Exception:
+                return None
+        if not (isinstance(ann, ast.Subscript)
+                and isinstance(ann.value, ast.Name) and ann.value.id == "list"):
+            return None
+        elt = ann.slice
+        if elt.__class__.__name__ == "Index":           # py<3.9 wrapper
+            elt = elt.value
+        if isinstance(elt, ast.Name) and elt.id == "int":
+            return "tintlist"
+        if isinstance(elt, ast.Slice):                   # list[int:N]
+            if isinstance(elt.lower, ast.Name) and elt.lower.id == "int":
+                return "tintlist"
+            if self._ann_type(elt.lower) == "tintlist":  # list[list[int:n]:m]
+                return "listtint"
+        if isinstance(elt, ast.Subscript) and self._ann_type(elt) == "tintlist":
+            return "listtint"
+        return None
+
+    def _infer_types(self, body):
+        vt = {}
+        appends = []      # (container_name, elem_name)
+        copies = []       # (target_name, source_name)
+        def scan(stmts):
+            for s in stmts:
+                if isinstance(s, ast.AnnAssign) and isinstance(s.target, ast.Name):
+                    t = self._ann_type(s.annotation)
+                    if t:
+                        vt[s.target.id] = t
+                if isinstance(s, ast.Assign) and len(s.targets) == 1 \
+                        and isinstance(s.targets[0], ast.Name) \
+                        and isinstance(s.value, ast.Name):
+                    copies.append((s.targets[0].id, s.value.id))
+                if isinstance(s, ast.Expr) and isinstance(s.value, ast.Call):
+                    c = s.value
+                    if isinstance(c.func, ast.Attribute) and c.func.attr == "append" \
+                            and isinstance(c.func.value, ast.Name) and len(c.args) == 1 \
+                            and isinstance(c.args[0], ast.Name):
+                        appends.append((c.func.value.id, c.args[0].id))
+                for fld in ("body", "orelse"):
+                    sub = getattr(s, fld, None)
+                    if isinstance(sub, list):
+                        scan(sub)
+        scan(body)
+        elem = {"listtint": "tintlist"}
+        changed = True
+        while changed:
+            changed = False
+            for cont, e in appends:
+                if vt.get(cont) in elem and vt.get(e) != elem[vt[cont]]:
+                    vt[e] = elem[vt[cont]]; changed = True
+            for tgt, src in copies:
+                if src in vt and vt.get(tgt) != vt[src]:
+                    vt[tgt] = vt[src]; changed = True
+        return vt
+
+    def _type_of(self, f, node):
+        if isinstance(node, ast.Name):
+            return f.vartype.get(node.id)
+        if isinstance(node, ast.Subscript):
+            base = self._type_of(f, node.value)
+            if base == "listtint":
+                return "tintlist"
+            if base == "tintlist":
+                return "int"
+        return None
+
     def _compile_func_body(self, node, frame):
         self._loops = []
+        frame.vartype = self._infer_types(node.body)
         for s in node.body:
             self.stmt(frame, s)
         frame.emit("RETURN", self._const_reg(frame, ("none", None)))
@@ -985,6 +1177,10 @@ class Compiler:
             return rb
         rb = self.expr(f, node.value)
         rc = self.expr(f, node.slice)
+        if self._type_of(f, node.value) == "tintlist":
+            f.emit("INDEX_INT", rb, rb, rc)         # element is an int
+            f.pop_to(rb + 1); f.numreg.add(rb)
+            return rb
         f.emit("INDEX", rb, rb, rc)
         f.pop_to(rb + 1); f.numreg.discard(rb)
         return rb
@@ -1297,6 +1493,15 @@ class VM:
                 regs[a] = set(regs[b + k] for k in range(c))
             elif op == 13:                      # INDEX
                 regs[a] = regs[b][regs[c]]
+            elif op == 54:                      # INDEX_INT (typed; same semantics)
+                regs[a] = regs[b][regs[c]]
+            elif op == 55:                      # SETINDEX_INT (typed; same semantics)
+                regs[a][regs[b]] = regs[c]
+            elif op == 56:                      # ACC_ADD_GINT (typed global accumulate)
+                self.globals[a] = self.globals[a] + regs[b][regs[c]]
+            elif op == 57:                      # ACC_MAC_GINT (typed multiply-accumulate)
+                self.globals[a] = self.globals[a] + \
+                    regs[b // 4096][regs[b % 4096]] * regs[c // 4096][regs[c % 4096]]
             elif op == 14:                      # SETINDEX
                 regs[a][regs[b]] = regs[c]
             elif op == 15:                      # ITER_NEW
