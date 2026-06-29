@@ -647,10 +647,24 @@ class Compiler:
     def ex_Name(self, f, node):
         return self._load_name(f, node.id)
 
+    @staticmethod
+    def _is_fresh_arith(node):
+        # A value that ex_BinOp / ex_UnaryOp(-) just allocated lives only in its
+        # temporary register -- it was never loaded from a name, const, index, or
+        # attribute (those alias) -- so once consumed as an operand it is dead and
+        # may be reclaimed. Anything else may alias a live binding.
+        if isinstance(node, ast.BinOp):
+            return True
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            return True
+        return False
+
     def ex_BinOp(self, f, node):
         rb = self.expr(f, node.left)
         rc = self.expr(f, node.right)
-        self._binop(f, node.op, rb, rb, rc)
+        free_b = self._is_fresh_arith(node.left)
+        free_c = self._is_fresh_arith(node.right)
+        self._binop(f, node.op, rb, rb, rc, free_b, free_c)
         f.pop_to(rb + 1)
         return rb
 
@@ -917,7 +931,7 @@ class Compiler:
         f.pop_to(rit)
 
     # ---- shared lowering ----
-    def _binop(self, f, op, dst, rb, rc):
+    def _binop(self, f, op, dst, rb, rc, free_b=False, free_c=False):
         name = {ast.Add: "ADD", ast.Sub: "SUB", ast.Mult: "MUL",
                 ast.Div: "DIV", ast.Mod: "MOD", ast.FloorDiv: "FLOORDIV",
                 ast.Pow: "POW", ast.BitOr: "BITOR", ast.BitAnd: "BITAND",
@@ -925,15 +939,24 @@ class Compiler:
                 ast.RShift: "SHR"}.get(type(op))
         if name is None:
             raise CompileError("v0 binop: unsupported %s" % type(op).__name__)
-        self._binop_op(f, name, dst, rb, rc)
+        self._binop_op(f, name, dst, rb, rc, free_b, free_c)
 
-    def _binop_op(self, f, name, dst, rb, rc):
+    # ops whose interpreter cases decode the free-operand hint bits in dst
+    _FREEABLE = ("ADD", "SUB", "MUL", "DIV", "MOD", "FLOORDIV")
+
+    def _binop_op(self, f, name, dst, rb, rc, free_b=False, free_c=False):
         numeric = rb in f.numreg and rc in f.numreg
+        enc = dst
+        if name in self._FREEABLE:
+            if free_b:
+                enc += 536870912            # bit 29 -> free reg b
+            if free_c:
+                enc += 1073741824           # bit 30 -> free reg c
         if numeric and name in ("ADD", "SUB", "MUL"):
-            f.emit(name + "_NN", dst, rb, rc)
+            f.emit(name + "_NN", enc, rb, rc)
             f.numreg.add(dst)
         else:
-            f.emit(name, dst, rb, rc)
+            f.emit(name, enc, rb, rc)
             if numeric and name in ("FLOORDIV", "MOD", "POW", "DIV"):
                 f.numreg.add(dst)
             else:
@@ -1117,6 +1140,8 @@ class VM:
         pc = 0
         while pc < len(code):
             ins = code[pc]; op = ins["op"]; a = ins["a"]; b = ins["b"]; c = ins["c"]
+            if a >= 536870912:               # strip free-operand hint bits (a no-op
+                a &= 536870911               # in the GC'd reference VM; native frees)
             pc += 1
             if op == 1:    regs[a] = self._const(b)
             elif op == 2:  regs[a] = self.globals[b]

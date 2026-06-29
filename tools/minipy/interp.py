@@ -123,6 +123,13 @@ _empty_blocks: "list[V]" = None
 _empty_buckets: "list[V]" = None
 # Per-program cache of materialized constant values (filled once at startup).
 _const_vs: "list[V]" = None
+# Free-list of uniquely-owned, dead arithmetic temporaries (large ints / floats)
+# that the compiler proved non-escaping. v_int/v_float recycle these in place
+# instead of allocating, which keeps allocation-heavy loops (accumulators, float
+# physics) from growing the heap. Only large ints (outside the small-int cache)
+# and floats are ever placed here -- never a shared singleton, const, string, or
+# container -- so the in-place mutation on reuse is safe.
+_v_freelist: "list[V]" = None
 _const_vs_ready: "int" = 0
 
 
@@ -165,9 +172,10 @@ def new_reg_pool() -> "list[list[V]]":
 
 def setup_cache() -> "int":
     global _cache_ready, _none_v, _true_v, _false_v, _int_cache, _empty_blocks
-    global _empty_buckets
+    global _empty_buckets, _v_freelist
     _empty_blocks = new_v_list()
     _empty_buckets = new_v_list()
+    _v_freelist = new_v_list()
     _none_v = V(0, 0)
     _false_v = V(4, 0)
     _true_v = V(4, 1)
@@ -190,13 +198,37 @@ def v_none() -> "V":
 def v_int(n: "long") -> "V":
     if _cache_ready != 0 and n >= _CACHE_LO and n <= _CACHE_HI:
         return _int_cache[n - _CACHE_LO]
+    if len(_v_freelist) > 0:               # recycle a dead temp in place
+        r = _v_freelist.pop()
+        r.tag = 1
+        r.iv = n
+        return r
     return V(1, n)
 
 
 def v_float(x: "double") -> "V":
+    if len(_v_freelist) > 0:               # recycle a dead temp in place
+        rf = _v_freelist.pop()
+        rf.tag = 2
+        rf.dv = x
+        return rf
     r = V(2, 0)
     r.dv = x
     return r
+
+
+def _free_v(v: "V"):
+    # Reclaim a value the compiler proved is a dead, uniquely-owned arithmetic
+    # temporary. The tag/range gate is a hard backstop: only large ints (outside
+    # the shared small-int cache) and floats are ever recycled, so a singleton,
+    # const, string, or container can never reach the free-list even if a hint
+    # were over-applied.
+    global _v_freelist
+    if v.tag == 1:
+        if v.iv < _CACHE_LO or v.iv > _CACHE_HI:
+            _v_freelist.append(v)
+    elif v.tag == 2:
+        _v_freelist.append(v)
 
 
 def v_str(t: "char*") -> "V":
@@ -1848,6 +1880,17 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
         a = ins.a
         b = ins.b
         c = ins.c
+        # Arithmetic ops may carry "free operand" hints in the high bits of a
+        # (bit 30 = free reg c, bit 29 = free reg b); ra is the real dst reg.
+        ra = a
+        fb = 0
+        fc = 0
+        if ra >= 1073741824:
+            fc = 1
+            ra = ra - 1073741824
+        if ra >= 536870912:
+            fb = 1
+            ra = ra - 536870912
         if op == 1:
             regs[a] = const_to_v(st.prog, b); pc = pc + 1
         elif op == 2:
@@ -1972,17 +2015,53 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
             st.regpool.append(callargs)
             pc = pc + 1
         elif op == 20:
-            regs[a] = v_add(st, regs[b], regs[c]); pc = pc + 1
+            ob = regs[b]; oc = regs[c]
+            regs[ra] = v_add(st, ob, oc)
+            if fc == 1:
+                _free_v(oc)
+            if fb == 1:
+                _free_v(ob)
+            pc = pc + 1
         elif op == 21:
-            regs[a] = v_sub(regs[b], regs[c]); pc = pc + 1
+            ob = regs[b]; oc = regs[c]
+            regs[ra] = v_sub(ob, oc)
+            if fc == 1:
+                _free_v(oc)
+            if fb == 1:
+                _free_v(ob)
+            pc = pc + 1
         elif op == 22:
-            regs[a] = v_mul(st, regs[b], regs[c]); pc = pc + 1
+            ob = regs[b]; oc = regs[c]
+            regs[ra] = v_mul(st, ob, oc)
+            if fc == 1:
+                _free_v(oc)
+            if fb == 1:
+                _free_v(ob)
+            pc = pc + 1
         elif op == 23:
-            regs[a] = v_div(regs[b], regs[c]); pc = pc + 1
+            ob = regs[b]; oc = regs[c]
+            regs[ra] = v_div(ob, oc)
+            if fc == 1:
+                _free_v(oc)
+            if fb == 1:
+                _free_v(ob)
+            pc = pc + 1
         elif op == 24:
-            regs[a] = v_mod(st, regs[b], regs[c]); pc = pc + 1
+            ob = regs[b]; oc = regs[c]
+            regs[ra] = v_mod(st, ob, oc)
+            if fc == 1:
+                _free_v(oc)
+            if fb == 1:
+                _free_v(ob)
+            pc = pc + 1
         elif op == 25:
-            regs[a] = v_floordiv(regs[b], regs[c]); pc = pc + 1
+            ob = regs[b]; oc = regs[c]
+            regs[ra] = v_floordiv(ob, oc)
+            if fc == 1:
+                _free_v(oc)
+            if fb == 1:
+                _free_v(ob)
+            pc = pc + 1
         elif op == 26:
             regs[a] = v_pow(regs[b], regs[c]); pc = pc + 1
         elif op == 27:
@@ -2014,11 +2093,29 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
         elif op == 41:
             regs[a] = v_bool(1 if truthy(regs[b]) == 0 else 0); pc = pc + 1
         elif op == 60:
-            regs[a] = v_add(st, regs[b], regs[c]); pc = pc + 1
+            ob = regs[b]; oc = regs[c]
+            regs[ra] = v_add(st, ob, oc)
+            if fc == 1:
+                _free_v(oc)
+            if fb == 1:
+                _free_v(ob)
+            pc = pc + 1
         elif op == 61:
-            regs[a] = v_sub(regs[b], regs[c]); pc = pc + 1
+            ob = regs[b]; oc = regs[c]
+            regs[ra] = v_sub(ob, oc)
+            if fc == 1:
+                _free_v(oc)
+            if fb == 1:
+                _free_v(ob)
+            pc = pc + 1
         elif op == 62:
-            regs[a] = v_mul(st, regs[b], regs[c]); pc = pc + 1
+            ob = regs[b]; oc = regs[c]
+            regs[ra] = v_mul(st, ob, oc)
+            if fc == 1:
+                _free_v(oc)
+            if fb == 1:
+                _free_v(ob)
+            pc = pc + 1
         elif op == 63:
             regs[a] = v_bool(1 if v_cmp(regs[b], regs[c]) < 0 else 0); pc = pc + 1
         elif op == 64:
