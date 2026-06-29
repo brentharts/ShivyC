@@ -6,7 +6,7 @@ while i < 2000:
     i = i + 1
 total = 0
 r = 0
-while r < 4000:
+while r < 1200:
     k = 0
     while k < 2000:
         total = total + arr[k]
