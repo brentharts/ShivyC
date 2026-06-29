@@ -119,6 +119,29 @@ class CompileError(Exception):
     pass
 
 
+# The compiler packs free-operand hints into the high bits of `a` (bit 30 = free
+# reg c, bit 29 = free reg b). The native interpreter stores each instruction as a
+# packed 8-byte bit-field struct whose JSON decoder fills fields by name, so we emit
+# the already-split ra/fb/fc here. `a` is kept too: the pure-Python ref VM and the
+# disassembler read it (and do their own strip), so they need no changes.
+_FREE_C = 1073741824        # bit 30
+_FREE_B = 536870912         # bit 29
+
+
+def _instr_json(op, a, b, c):
+    ra = a
+    fc = 0
+    fb = 0
+    if ra >= _FREE_C:
+        fc = 1
+        ra -= _FREE_C
+    if ra >= _FREE_B:
+        fb = 1
+        ra -= _FREE_B
+    return {"op": op, "a": a, "b": b, "c": c, "ra": ra, "fb": fb, "fc": fc}
+
+
+
 # --- constant interning ----------------------------------------------------
 class _Consts:
     def __init__(self):
@@ -1619,7 +1642,7 @@ class Compiler:
                 "nparams": fr.nparams,
                 "nregs": fr.maxreg,
                 "nlocals": fr.base,
-                "code": [{"op": op, "a": a, "b": b, "c": c}
+                "code": [_instr_json(op, a, b, c)
                          for (op, a, b, c) in fr.code],
                 "defaults": fr.defaults,
             })
