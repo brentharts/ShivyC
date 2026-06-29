@@ -1867,3 +1867,39 @@ This unblocks a *correct* `with` (desugar to manager-protocol + `try/finally`, s
 the context-manager temp a real local slot: minipy collects locals up-front, so the
 desugaring must either run before local collection or hold the manager in a reserved
 register -- a small, self-contained next step.
+
+---
+
+## v30 -- `with` statement
+
+`with` now compiles, built entirely on v29's `try/finally` -- again with no new opcode and
+no interpreter change. An AST pass (`_WithDesugar`, run right after parse, before local
+collection) rewrites it to the manager protocol wrapped in try/finally:
+
+```
+with A as a:          _with_N = A
+    BODY        ->    a = _with_N.__enter__()
+                      try:
+                          BODY
+                      finally:
+                          _with_N.__exit__(None, None, None)
+```
+
+Running the desugaring before `_collect_locals` is what closes the wrinkle noted in v29:
+the `_with_N` manager temp is picked up as an ordinary local, so it gets a fixed register
+slot and is per-call / recursion-safe (rather than leaking to a global). Multiple items
+nest left-to-right, so `__exit__`s fire in reverse order; nested `with`s are handled by
+desugaring inner ones first.
+
+Because the body is under try/finally, `__exit__` runs on **every** exit path -- normal
+completion, a propagating exception, and `return` from inside the body. Verified
+byte-identical across CPython, the ref VM and the native interpreter
+(`tools/minipy/test_with.py`): normal, no-`as`, exception-in-body, return-in-body,
+multiple managers (LIFO exit order) and nested `with` all match, and the full regression
+plus the rast parser self-test still pass.
+
+**v0 limitation:** `__exit__` is called with `None, None, None` and its return value is
+ignored, so a manager always runs its cleanup but cannot inspect or *suppress* the
+exception. That is the standard cleanup case (locks, timers, buffers); exception-aware /
+suppressing managers would need the exception triple threaded into the finally, a later
+refinement.
