@@ -767,11 +767,15 @@ class Compiler:
         f.pop_to(r)
 
     def _emit_branch_false(self, f, test):
-        # Emit a jump taken when `test` is FALSE; return the instruction index.
-        # The jump target always lands at field [2] so callers patch uniformly.
-        # A single rich comparison (i < n, a == b, ...) fuses compare+branch into
-        # one opcode laid out [op, left, target, right]; anything else falls back to
-        # evaluating the test into a register and JUMP_IF_FALSE.
+        # Emit jump(s) taken when `test` is FALSE; return the list of jump
+        # instruction indices, each patched at field [2] to the false target.
+        # `a and b and ...` short-circuits: any false operand jumps to the target,
+        # so it lowers to one (fused) branch per operand with no boolean built.
+        if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+            jfs = []
+            for v in test.values:
+                jfs.extend(self._emit_branch_false(f, v))
+            return jfs
         if isinstance(test, ast.Compare) and len(test.ops) == 1:
             opn = {ast.Lt: "JF_LT", ast.LtE: "JF_LE", ast.Gt: "JF_GT",
                    ast.GtE: "JF_GE", ast.Eq: "JF_EQ", ast.NotEq: "JF_NE",
@@ -781,24 +785,34 @@ class Compiler:
                 rc = self.expr(f, test.comparators[0])
                 jf = len(f.code); f.emit(opn, ra, 0, rc)   # a=left, b=target, c=right
                 f.pop_to(ra)
-                return jf
+                return [jf]
         rc = self.expr(f, test)
         jf = len(f.code); f.emit("JUMP_IF_FALSE", rc, 0)
         f.pop_to(rc)
-        return jf
+        return [jf]
+
+    @staticmethod
+    def _is_simple_cmp(test):
+        return (isinstance(test, ast.Compare) and len(test.ops) == 1
+                and type(test.ops[0]) in (ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+                                          ast.Eq, ast.NotEq, ast.Is, ast.IsNot))
 
     def st_If(self, f, node):
-        jf = self._emit_branch_false(f, node.test)
+        jfs = self._emit_branch_false(f, node.test)
         for s in node.body:
             self.stmt(f, s)
         if node.orelse:
             jend = len(f.code); f.emit("JUMP", 0)
-            f.code[jf][2] = len(f.code)       # false -> else
+            tgt = len(f.code)                 # false -> else
+            for jf in jfs:
+                f.code[jf][2] = tgt
             for s in node.orelse:
                 self.stmt(f, s)
             f.code[jend][1] = len(f.code)
         else:
-            f.code[jf][2] = len(f.code)
+            tgt = len(f.code)
+            for jf in jfs:
+                f.code[jf][2] = tgt
 
     def _emit_branch_true(self, f, test, target):
         # Emit a jump taken when `test` is TRUE, to a known (backward) target.
@@ -818,25 +832,41 @@ class Compiler:
         f.pop_to(rc)
 
     def st_While(self, f, node):
-        # Loop rotation: a guard test at entry, then the body, then a copy of the
-        # test as a conditional back-edge. The steady state runs one (fused) branch
-        # per iteration instead of a separate test plus an unconditional JUMP, and
-        # the test is evaluated the same number of times as the top-test form.
-        guard = self._emit_branch_false(f, node.test)   # test false at entry -> end
-        top = len(f.code)
-        loop = _Loop(top); loop.rotated = True
-        self._loops.append(loop)
-        for s in node.body:
-            self.stmt(f, s)
-        cont = len(f.code)
-        self._emit_branch_true(f, node.test, top)        # back-edge: test true -> top
-        end = len(f.code)
-        f.code[guard][2] = end
-        self._loops.pop()
-        for pc in loop.breaks:
-            f.code[pc][1] = end
-        for pc in loop.conts:
-            f.code[pc][1] = cont
+        if self._is_simple_cmp(node.test):
+            # Loop rotation: guard test at entry, body, then a copy of the test as a
+            # conditional back-edge -- one fused branch per iteration, no JUMP.
+            guards = self._emit_branch_false(f, node.test)   # false at entry -> end
+            top = len(f.code)
+            loop = _Loop(top); loop.rotated = True
+            self._loops.append(loop)
+            for s in node.body:
+                self.stmt(f, s)
+            cont = len(f.code)
+            self._emit_branch_true(f, node.test, top)        # back-edge: true -> top
+            end = len(f.code)
+            for jf in guards:
+                f.code[jf][2] = end
+            self._loops.pop()
+            for pc in loop.breaks:
+                f.code[pc][1] = end
+            for pc in loop.conts:
+                f.code[pc][1] = cont
+        else:
+            # Compound/other test: top-test form. `and` still short-circuits into
+            # one branch per operand (no boolean built); continue re-tests at top.
+            top = len(f.code)
+            jfs = self._emit_branch_false(f, node.test)
+            loop = _Loop(top)
+            self._loops.append(loop)
+            for s in node.body:
+                self.stmt(f, s)
+            f.emit("JUMP", top)
+            end = len(f.code)
+            for jf in jfs:
+                f.code[jf][2] = end
+            self._loops.pop()
+            for pc in loop.breaks:
+                f.code[pc][1] = end
 
     def st_For(self, f, node):
         tgt = node.target

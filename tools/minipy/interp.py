@@ -2208,7 +2208,10 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
             regs[a] = v_bool(1 if truthy(regs[b]) == 0 else 0); pc = pc + 1
         elif op == 60:
             ob = regs[b]; oc = regs[c]
-            regs[ra] = v_add(st, ob, oc)
+            if ob.tag == 1 and oc.tag == 1:
+                regs[ra] = v_int(ob.iv + oc.iv)
+            else:
+                regs[ra] = v_add(st, ob, oc)
             if fc == 1:
                 _free_v(oc)
             if fb == 1:
@@ -2216,7 +2219,10 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
             pc = pc + 1
         elif op == 61:
             ob = regs[b]; oc = regs[c]
-            regs[ra] = v_sub(ob, oc)
+            if ob.tag == 1 and oc.tag == 1:
+                regs[ra] = v_int(ob.iv - oc.iv)
+            else:
+                regs[ra] = v_sub(ob, oc)
             if fc == 1:
                 _free_v(oc)
             if fb == 1:
@@ -2224,7 +2230,10 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
             pc = pc + 1
         elif op == 62:
             ob = regs[b]; oc = regs[c]
-            regs[ra] = v_mul(st, ob, oc)
+            if ob.tag == 1 and oc.tag == 1:
+                regs[ra] = v_int(ob.iv * oc.iv)
+            else:
+                regs[ra] = v_mul(st, ob, oc)
             if fc == 1:
                 _free_v(oc)
             if fb == 1:
