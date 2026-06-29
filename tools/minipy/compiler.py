@@ -197,6 +197,7 @@ class _Frame:
         for nm in ordered:
             self.locals[nm] = len(self.locals)
         self.nparams = len(params)
+        self.vararg = -1                 # reg index of a *args param, or -1
         self.base = len(self.locals)     # temps start above locals
         self.top = self.base             # register stack pointer
         self.maxreg = self.base
@@ -472,6 +473,15 @@ class Compiler:
         f.pop_to(r)                       # discard value
 
     def st_Pass(self, f, node):
+        pass
+
+    def st_Global(self, f, node):
+        # The declared names were excluded from this frame's locals by
+        # _collect_locals, so loads/stores already route to the global slot.
+        # Nothing to emit at the point of declaration.
+        pass
+
+    def st_Nonlocal(self, f, node):
         pass
 
     def st_Assert(self, f, node):
@@ -1106,11 +1116,18 @@ class Compiler:
         if not f.is_module:
             raise CompileError("v0: nested functions unsupported (line %s)" % node.lineno)
         params = [a.arg for a in node.args.args]
-        if node.args.vararg or node.args.kwarg or node.args.kwonlyargs:
-            raise CompileError("v0 def: no *args/**kwargs/kwonly (line %s)" % node.lineno)
+        if node.args.kwarg or node.args.kwonlyargs:
+            raise CompileError("v0 def: no **kwargs/kwonly (line %s)" % node.lineno)
+        va_index = -1
+        if node.args.vararg:                     # def f(a, b, *rest): rest collects
+            va_index = len(params)               # the trailing positional args
+            params.append(node.args.vararg.arg)
         extra = _collect_locals(node)
         frame = _Frame(node.name, params, extra, is_module=False)
-        frame.defaults = self._build_defaults(node, len(params))
+        frame.vararg = va_index
+        frame.defaults = self._build_defaults(node, len(node.args.args))
+        if va_index >= 0:
+            frame.defaults.append(-1)            # *args param has no default
         # annotation-driven typing: int/float params start known-numeric, so
         # arithmetic on them lowers to the *_NN fast ops (py2c annotates heavily)
         for ai, arg in enumerate(node.args.args):
@@ -1645,6 +1662,7 @@ class Compiler:
                 "code": [_instr_json(op, a, b, c)
                          for (op, a, b, c) in fr.code],
                 "defaults": fr.defaults,
+                "vararg": fr.vararg,
             })
         names = [None] * len(self.gnames)
         for nm, slot in self.gnames.items():
@@ -1690,28 +1708,36 @@ def _ann_name(node):
 # single-pass compiler can map them to fixed registers. Module scope skips this.
 def _collect_locals(node):
     found = []
+    declared_global = set()                  # names bound by `global x` -> not locals
+    for n in ast.walk(node):
+        if isinstance(n, ast.Global):
+            for gn in n.names:
+                declared_global.add(gn)
+        elif isinstance(n, ast.Nonlocal):
+            for gn in n.names:
+                declared_global.add(gn)
+    def add(name):
+        if name not in found and name not in declared_global:
+            found.append(name)
     for n in ast.walk(node):
         if isinstance(n, ast.Assign):
             for t in n.targets:
-                if isinstance(t, ast.Name) and t.id not in found:
-                    found.append(t.id)
+                if isinstance(t, ast.Name):
+                    add(t.id)
                 elif isinstance(t, (ast.Tuple, ast.List)):
                     for e in t.elts:
-                        if isinstance(e, ast.Name) and e.id not in found:
-                            found.append(e.id)
+                        if isinstance(e, ast.Name):
+                            add(e.id)
         elif isinstance(n, (ast.AugAssign, ast.For)) and isinstance(getattr(n, "target", None), ast.Name):
-            if n.target.id not in found:
-                found.append(n.target.id)
+            add(n.target.id)
         elif isinstance(n, (ast.For, ast.comprehension)) and isinstance(getattr(n, "target", None), (ast.Tuple, ast.List)):
             for e in n.target.elts:
-                if isinstance(e, ast.Name) and e.id not in found:
-                    found.append(e.id)
+                if isinstance(e, ast.Name):
+                    add(e.id)
         elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name):
-            if n.target.id not in found:
-                found.append(n.target.id)
+            add(n.target.id)
         elif isinstance(n, ast.comprehension) and isinstance(n.target, ast.Name):
-            if n.target.id not in found:
-                found.append(n.target.id)
+            add(n.target.id)
     return found
 
 
@@ -1777,10 +1803,18 @@ class VM:
     def _call(self, fidx, args):
         fn = self.funcs[fidx]
         regs = [None] * max(fn["nregs"], fn["nparams"])
-        for i, a in enumerate(args):
-            regs[i] = a
+        va = fn.get("vararg", -1)
+        if va >= 0:                             # *args: pack the rest into a tuple
+            for i in range(min(va, len(args))):
+                regs[i] = args[i]
+            regs[va] = tuple(args[va:])
+        else:
+            for i, a in enumerate(args):
+                regs[i] = a
         defs = fn.get("defaults", [])       # supply defaults for missing params
         for i in range(len(args), fn["nparams"]):
+            if i == va:
+                continue                        # *args already bound (possibly ())
             if i < len(defs) and defs[i] >= 0:
                 regs[i] = self._const(defs[i])
         code = fn["code"]

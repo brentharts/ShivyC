@@ -26,22 +26,31 @@ class Const:
 
 
 class Instr:
-    def __init__(self, op: "int", a: "int", b: "int", c: "int"):
-        self.op = op
-        self.a = a
-        self.b = b
-        self.c = c
+    # Fields are populated directly by the generated JSON decoder (which matches
+    # JSON keys to field names), so the compiler emits ra/fb/fc already split out
+    # of the encoded `a`. Stored as C bit fields: 8 bytes (two unsigned ints), half
+    # the size of four plain ints, and the hot loop reads ra/fb/fc with no decode.
+    def __init__(self, op: "int", fb: "int", fc: "int", ra: "int",
+                 b: "int", c: "int"):
+        self.op: "int(8)" = op       # opcode (<256)            -- unit 1:
+        self.fb: "int(1)" = fb       # free reg b hint            8+1+1+22
+        self.fc: "int(1)" = fc       # free reg c hint            = 32 bits
+        self.ra: "int(22)" = ra      # real dst/src register
+        self.b: "int(16)" = b        # operand b               -- unit 2:
+        self.c: "int(16)" = c        # operand c                 16+16 = 32 bits
 
 
 class Func:
     def __init__(self, name: "char*", nparams: "int", nregs: "int",
-                 nlocals: "int", code: "list[Instr]", defaults: "list[int]"):
+                 nlocals: "int", code: "list[Instr]", defaults: "list[int]",
+                 vararg: "int"):
         self.name = name
         self.nparams = nparams
         self.nregs = nregs
         self.nlocals = nlocals
         self.code = code
         self.defaults = defaults
+        self.vararg = vararg                 # reg index of *args param, or -1
 
 
 class MethEnt:
@@ -1854,9 +1863,17 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
         regs = new_v_list()
     na = len(args)
     np = fn.nparams
+    va = fn.vararg                           # reg of *args param, or -1
     k = 0
     while k < np:                            # parameters receive the arguments
-        if k < na:
+        if va >= 0 and k == va:              # *args: collect the rest into a tuple
+            rest = new_v_list()
+            m = va
+            while m < na:
+                rest.append(args[m])
+                m = m + 1
+            rv = v_container(st, 10, 0, rest)
+        elif k < na:
             rv = args[k]
         else:
             rv = v_none()
@@ -1890,20 +1907,12 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
     while pc < n:
         ins = code[pc]
         op = ins.op
-        a = ins.a
-        b = ins.b
-        c = ins.c
-        # Arithmetic ops may carry "free operand" hints in the high bits of a
-        # (bit 30 = free reg c, bit 29 = free reg b); ra is the real dst reg.
+        a = ins.ra                          # flags already separated at load time,
+        b = ins.b                           # so a is the real register; ra mirrors
+        c = ins.c                           # it for the ops that also test fb/fc
         ra = a
-        fb = 0
-        fc = 0
-        if ra >= 1073741824:
-            fc = 1
-            ra = ra - 1073741824
-        if ra >= 536870912:
-            fb = 1
-            ra = ra - 536870912
+        fb = ins.fb
+        fc = ins.fc
         if op == 1:
             regs[a] = const_to_v(st.prog, b); pc = pc + 1
         elif op == 2:
