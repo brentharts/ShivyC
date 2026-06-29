@@ -546,12 +546,25 @@ tree = ['And',
  ['rule', ['rule_name', 'spaces'], ['flags'], ['args'],
   ['quantified', ['apply', 'space'], ['quantifier', '*']]]]
 
+_PYI = None
+
+def _python_interp():
+    """Build (once) and cache the Python-grammar interpreter.  The two grammar
+    bootstrap stages are source-independent, so doing them per-parse is pure
+    waste -- and under minipy's free-once arena it is what made repeated parses
+    exhaust memory.  match() resets per-source state, so the interpreter is
+    safely reusable across calls."""
+    global _PYI
+    if _PYI is None:
+        i1 = Interpreter(simple_wrap_tree(tree))
+        mt1 = i1.match(i1.rules['grammar'].children[-1], grammar + extra)
+        i2 = Interpreter(mt1)
+        mt2 = i2.match(i2.rules['grammar'].children[-1], python_grammar + extra)
+        _PYI = Interpreter(mt2, "\t \\")
+    return _PYI
+
 def parse_python(source):
     """Parse Python `source` into a pymetaterp Node tree (the grammar covers a
     Python-2-flavoured subset)."""
-    i1 = Interpreter(simple_wrap_tree(tree))
-    mt1 = i1.match(i1.rules['grammar'].children[-1], grammar + extra)
-    i2 = Interpreter(mt1)
-    mt2 = i2.match(i2.rules['grammar'].children[-1], python_grammar + extra)
-    pyi = Interpreter(mt2, "\t \\")
+    pyi = _python_interp()
     return pyi.match(pyi.rules['file_input'].children[-1], source)
