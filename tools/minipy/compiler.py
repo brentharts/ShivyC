@@ -51,6 +51,7 @@ OPS = {
     "SETINDEX_INT":55,   # typed list[int] set: reg[a][reg[b]]=reg[c], no dispatch
     "ACC_ADD_GINT":56,   # fused: glob[a] += tlist(reg[b])[reg[c]] (typed accumulate)
     "ACC_MAC_GINT":57,   # fused: glob[a] += tA[k]*tB[j]; b,c pack (row*4096+idx)
+    "ACC_ADD_G":   58,   # fused: glob[a] = glob[a] + reg[b] (general accumulate)
     "ITER_NEW":    15,   # reg[a] = iter(reg[b])
     "ITER_NEXT":   16,   # if next: reg[a]=next, pc++ ; else pc=c
     "CONTAINS":    17,   # reg[a] = (reg[c] in reg[b])
@@ -483,6 +484,23 @@ class Compiler:
                 f.pop_to(rar)
                 return True
             f.pop_to(rar)
+        # g = g + <any pure expression>  (general accumulate). The fused opcode
+        # reads g *after* the right-hand side is evaluated, so this is only valid
+        # when the rhs cannot mutate g -- i.e. contains no calls. That covers every
+        # arithmetic accumulator while preserving CPython's left-to-right order.
+        if not self._has_call(rhs):
+            r = self.expr(f, rhs)
+            fr = 1 if self._is_fresh_arith(rhs) else 0
+            f.emit("ACC_ADD_G", self.gslot(tgt.id), r, fr)
+            f.pop_to(r)
+            return True
+        return False
+
+    @staticmethod
+    def _has_call(node):
+        for n in ast.walk(node):
+            if isinstance(n, ast.Call):
+                return True
         return False
 
     def st_Assign(self, f, node):
@@ -1502,6 +1520,8 @@ class VM:
             elif op == 57:                      # ACC_MAC_GINT (typed multiply-accumulate)
                 self.globals[a] = self.globals[a] + \
                     regs[b // 4096][regs[b % 4096]] * regs[c // 4096][regs[c % 4096]]
+            elif op == 58:                      # ACC_ADD_G (general accumulate)
+                self.globals[a] = self.globals[a] + regs[b]
             elif op == 14:                      # SETINDEX
                 regs[a][regs[b]] = regs[c]
             elif op == 15:                      # ITER_NEW

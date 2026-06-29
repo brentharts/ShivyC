@@ -1979,6 +1979,14 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
             st.glob[a] = v_int(ovm.iv + prod)
             _free_v(ovm)
             pc = pc + 1
+        elif op == 58:                     # ACC_ADD_G: glob[a] = glob[a] + reg[b]
+            oa = st.glob[a]
+            bb = regs[b]
+            st.glob[a] = v_add(st, oa, bb)
+            _free_v(oa)
+            if c == 1:                     # rhs was a fresh arith temp -> reclaim it
+                _free_v(bb)
+            pc = pc + 1
         elif op == 15:                     # ITER_NEW
             regs[a] = v_iter(st, regs[b]); pc = pc + 1
         elif op == 16:                     # ITER_NEXT
