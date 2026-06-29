@@ -195,6 +195,45 @@ further `.size` lowers to `->size` (type `int`). This chained resolution lives i
 both `static_type` (so coercion/boxing stays consistent) and `ex_Attribute` (so
 the emitted text matches).
 
+### Bit-field struct members — the `T(N)` annotation
+
+A field annotated `T(N)` (e.g. `int(3)`) is stored as a C bit field of `N`
+bits, so several small values pack into one machine word and a struct stays off
+the heap / small in the cache — the representation trick TPython uses for speed:
+
+```python
+class PackedData:
+    def __init__(self, a: int, b: int, c: int):
+        self.is_active  : int(1) = a    # unsigned int is_active  : 1;
+        self.status     : int(3) = b    # unsigned int status     : 3;
+        self.error_code : int(4) = c    # unsigned int error_code : 4;
+```
+
+The syntax reads as "a `T` value that occupies `N` bits". Mechanically:
+
+- `ann_text_to_ctype` strips the `(N)` and resolves the annotation to the plain
+  scalar `T`, so every *read* and *write* of the field behaves as an ordinary
+  `T` (no boxing, no special call sites). Field arithmetic, assignment, and
+  comparison are unchanged.
+- The width `N` is recorded separately, per class, by `discover_bitfields`
+  (`ClassInfo.bitfields: {field -> N}`). It is consumed *only* at struct
+  emission, where the member is written `unsigned int <field> : N;` at both
+  struct-emission sites instead of `T <field>;`.
+- Because `offsetof` is illegal on a bit field, such fields are omitted from the
+  per-type `FieldDesc` table, so they are not reachable through reflective
+  `rt_getattr`/`rt_setattr`. Fields used as bit fields are meant for the hot,
+  statically-typed path. A bit-field class that is only constructed and has its
+  members accessed directly stays POD (no header, no field table), which is the
+  intended shape for these small packed structs.
+
+Semantics follow C, not Python: a value wider than `N` bits keeps only its low
+`N` bits (a 3-bit `status` stores `12 & 7 == 4`), whereas CPython would keep
+`12`. Within range — the intended use, e.g. a 4-bit tag holding 0..15 — the
+native and CPython results agree. Mixing bit fields with ordinary fields in the
+same class is fine; only the annotated members are packed. No existing rpython
+uses the `T(N)` form, so adding it changed no existing output and self-hosting
+is unaffected.
+
 
 ## 3. The annotation convention for IL commands
 
