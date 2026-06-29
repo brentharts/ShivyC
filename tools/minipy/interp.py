@@ -1849,6 +1849,14 @@ def do_call(st: "St", callee: "V", args: "list[V]") -> "V":
 
 
 # ---- the dispatch loop ----
+def _lget(lst, i):
+    return lst[i]                            # py2c lowers calls to a raw data[i]
+
+
+def _lset(lst, i, v):
+    lst[i] = v                               # py2c lowers calls to a raw data[i]=
+
+
 def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
     fn = st.prog.funcs[fidx]
     nr = fn.nregs
@@ -1878,13 +1886,13 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
         else:
             rv = v_none()
         if k < len(regs):
-            regs[k] = rv
+            _lset(regs, k, rv)
         else:
             regs.append(rv)
         k = k + 1
     while k < nloc:                          # other named locals: clear to None so
         if k < len(regs):                    # an unbound read is None, not stale data
-            regs[k] = v_none()
+            _lset(regs, k, v_none())
         else:
             regs.append(v_none())
         k = k + 1
@@ -1895,7 +1903,7 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
         i = na
         while i < np:
             if i < len(defs) and defs[i] >= 0:
-                regs[i] = const_to_v(st.prog, defs[i])
+                _lset(regs, i, const_to_v(st.prog, defs[i]))
             i = i + 1
 
     code = fn.code
@@ -1905,7 +1913,7 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
     bn = 0                                  # block-stack depth (list[int].pop is
     pc = 0                                  # miscompiled by py2c, so index by bn)
     while pc < n:
-        ins = code[pc]
+        ins = _lget(code, pc)
         op = ins.op
         a = ins.ra                          # flags already separated at load time,
         b = ins.b                           # so a is the real register; ra mirrors
@@ -1914,97 +1922,97 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
         fb = ins.fb
         fc = ins.fc
         if op == 1:
-            regs[a] = const_to_v(st.prog, b); pc = pc + 1
+            _lset(regs, a, const_to_v(st.prog, b)); pc = pc + 1
         elif op == 2:
-            regs[a] = st.glob[b]; pc = pc + 1
+            _lset(regs, a, _lget(st.glob, b)); pc = pc + 1
         elif op == 3:
             if fb == 1:                    # reclaimable global: free old value
-                ov = st.glob[b]
-                st.glob[b] = regs[ra]
+                ov = _lget(st.glob, b)
+                _lset(st.glob, b, _lget(regs, ra))
                 _free_v(ov)
             else:
-                st.glob[b] = regs[ra]
+                _lset(st.glob, b, _lget(regs, ra))
             pc = pc + 1
         elif op == 4:
-            regs[a] = regs[b]; pc = pc + 1
+            _lset(regs, a, _lget(regs, b)); pc = pc + 1
         elif op == 5:
-            rret = regs[a]
+            rret = _lget(regs, a)
             st.regpool.append(regs)
             return rret
         elif op == 6:
             pc = a
         elif op == 7:
-            if truthy(regs[a]) != 0:
+            if truthy(_lget(regs, a)) != 0:
                 pc = pc + 1
             else:
                 pc = b
         elif op == 76:                     # JF_LT: if not(a < c) -> pc = b
-            if v_cmp(regs[a], regs[c]) < 0:
+            if v_cmp(_lget(regs, a), _lget(regs, c)) < 0:
                 pc = pc + 1
             else:
                 pc = b
         elif op == 77:                     # JF_LE
-            if v_cmp(regs[a], regs[c]) <= 0:
+            if v_cmp(_lget(regs, a), _lget(regs, c)) <= 0:
                 pc = pc + 1
             else:
                 pc = b
         elif op == 78:                     # JF_GT
-            if v_cmp(regs[a], regs[c]) > 0:
+            if v_cmp(_lget(regs, a), _lget(regs, c)) > 0:
                 pc = pc + 1
             else:
                 pc = b
         elif op == 79:                     # JF_GE
-            if v_cmp(regs[a], regs[c]) >= 0:
+            if v_cmp(_lget(regs, a), _lget(regs, c)) >= 0:
                 pc = pc + 1
             else:
                 pc = b
         elif op == 80:                     # JF_EQ: if not(a == c) -> pc = b
-            if v_eq_bool(regs[a], regs[c]) != 0:
+            if v_eq_bool(_lget(regs, a), _lget(regs, c)) != 0:
                 pc = pc + 1
             else:
                 pc = b
         elif op == 81:                     # JF_NE: if not(a != c) -> pc = b
-            if v_eq_bool(regs[a], regs[c]) == 0:
+            if v_eq_bool(_lget(regs, a), _lget(regs, c)) == 0:
                 pc = pc + 1
             else:
                 pc = b
         elif op == 82:                     # JUMP_IF_TRUE
-            if truthy(regs[a]) != 0:
+            if truthy(_lget(regs, a)) != 0:
                 pc = b
             else:
                 pc = pc + 1
         elif op == 83:                     # JT_LT: if (a < c) -> pc = b
-            if v_cmp(regs[a], regs[c]) < 0:
+            if v_cmp(_lget(regs, a), _lget(regs, c)) < 0:
                 pc = b
             else:
                 pc = pc + 1
         elif op == 84:                     # JT_LE
-            if v_cmp(regs[a], regs[c]) <= 0:
+            if v_cmp(_lget(regs, a), _lget(regs, c)) <= 0:
                 pc = b
             else:
                 pc = pc + 1
         elif op == 85:                     # JT_GT
-            if v_cmp(regs[a], regs[c]) > 0:
+            if v_cmp(_lget(regs, a), _lget(regs, c)) > 0:
                 pc = b
             else:
                 pc = pc + 1
         elif op == 86:                     # JT_GE
-            if v_cmp(regs[a], regs[c]) >= 0:
+            if v_cmp(_lget(regs, a), _lget(regs, c)) >= 0:
                 pc = b
             else:
                 pc = pc + 1
         elif op == 87:                     # JT_EQ: if (a == c) -> pc = b
-            if v_eq_bool(regs[a], regs[c]) != 0:
+            if v_eq_bool(_lget(regs, a), _lget(regs, c)) != 0:
                 pc = b
             else:
                 pc = pc + 1
         elif op == 88:                     # JT_NE: if (a != c) -> pc = b
-            if v_eq_bool(regs[a], regs[c]) == 0:
+            if v_eq_bool(_lget(regs, a), _lget(regs, c)) == 0:
                 pc = b
             else:
                 pc = pc + 1
         elif op == 8:
-            callee = regs[b]
+            callee = _lget(regs, b)
             if len(st.regpool) > 0:
                 cargs = st.regpool.pop()
                 while len(cargs) > 0:
@@ -2013,11 +2021,11 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
                 cargs = new_v_list()
             j = 0
             while j < c:
-                cargs.append(regs[b + 1 + j])
+                cargs.append(_lget(regs, b + 1 + j))
                 j = j + 1
             rcall = do_call(st, callee, cargs)
             st.regpool.append(cargs)
-            regs[a] = rcall; pc = pc + 1
+            _lset(regs, a, rcall); pc = pc + 1
         elif op == 89:                     # CALL_FUNC: direct call, c = fidx*256+nargs
             fnum = c // 256
             nargs = c % 256
@@ -2029,47 +2037,47 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
                 fargs = new_v_list()
             j = 0
             while j < nargs:
-                fargs.append(regs[b + j])
+                fargs.append(_lget(regs, b + j))
                 j = j + 1
             rfc = run_func(st, fnum, fargs)
             st.regpool.append(fargs)
-            regs[a] = rfc; pc = pc + 1
+            _lset(regs, a, rfc); pc = pc + 1
         elif op == 9:                      # BUILD_LIST
             items = new_v_list()
             j = 0
             while j < c:
-                items.append(regs[b + j]); j = j + 1
-            regs[a] = v_container(st, 7, 0, items); pc = pc + 1
+                items.append(_lget(regs, b + j)); j = j + 1
+            _lset(regs, a, v_container(st, 7, 0, items)); pc = pc + 1
         elif op == 10:                     # BUILD_TUPLE
             items = new_v_list()
             j = 0
             while j < c:
-                items.append(regs[b + j]); j = j + 1
-            regs[a] = v_container(st, 10, 3, items); pc = pc + 1
+                items.append(_lget(regs, b + j)); j = j + 1
+            _lset(regs, a, v_container(st, 10, 3, items)); pc = pc + 1
         elif op == 11:                     # BUILD_DICT
             dv = v_container(st, 8, 1, new_v_list())
             j = 0
             while j < c:
-                v_setindex(st, dv, regs[b + 2 * j], regs[b + 2 * j + 1])
+                v_setindex(st, dv, _lget(regs, b + 2 * j), _lget(regs, b + 2 * j + 1))
                 j = j + 1
-            regs[a] = dv; pc = pc + 1
+            _lset(regs, a, dv); pc = pc + 1
         elif op == 12:                     # BUILD_SET
             sv = v_container(st, 9, 2, new_v_list())
             j = 0
             while j < c:
-                _set_add(st, sv, regs[b + j]); j = j + 1
-            regs[a] = sv; pc = pc + 1
+                _set_add(st, sv, _lget(regs, b + j)); j = j + 1
+            _lset(regs, a, sv); pc = pc + 1
         elif op == 13:                     # INDEX
-            regs[a] = v_index(st, regs[b], regs[c]); pc = pc + 1
+            _lset(regs, a, v_index(st, _lget(regs, b), _lget(regs, c))); pc = pc + 1
         elif op == 14:                     # SETINDEX
-            v_setindex(st, regs[a], regs[b], regs[c]); pc = pc + 1
+            v_setindex(st, _lget(regs, a), _lget(regs, b), _lget(regs, c)); pc = pc + 1
         elif op == 54:                     # INDEX_INT (typed list[int], no dispatch)
-            regs[a] = st.heap[regs[b].iv].items[regs[c].iv]; pc = pc + 1
+            _lset(regs, a, st.heap[_lget(regs, b).iv].items[_lget(regs, c).iv]); pc = pc + 1
         elif op == 55:                     # SETINDEX_INT (typed list[int])
-            st.heap[regs[a].iv].items[regs[b].iv] = regs[c]; pc = pc + 1
+            st.heap[_lget(regs, a).iv].items[_lget(regs, b).iv] = _lget(regs, c); pc = pc + 1
         elif op == 56:                     # ACC_ADD_GINT: glob[a] += tlist[b][c]
-            ov = st.glob[a]
-            st.glob[a] = v_int(ov.iv + st.heap[regs[b].iv].items[regs[c].iv].iv)
+            ov = _lget(st.glob, a)
+            _lset(st.glob, a, v_int(ov.iv + st.heap[_lget(regs, b).iv].items[_lget(regs, c).iv].iv))
             _free_v(ov)
             pc = pc + 1
         elif op == 57:                     # ACC_MAC_GINT: glob[a] += tA[k]*tB[j]
@@ -2077,77 +2085,77 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
             rki = b % 4096
             rbr = c // 4096
             rji = c % 4096
-            prod = st.heap[regs[rar].iv].items[regs[rki].iv].iv * st.heap[regs[rbr].iv].items[regs[rji].iv].iv
-            ovm = st.glob[a]
-            st.glob[a] = v_int(ovm.iv + prod)
+            prod = st.heap[_lget(regs, rar).iv].items[_lget(regs, rki).iv].iv * st.heap[_lget(regs, rbr).iv].items[_lget(regs, rji).iv].iv
+            ovm = _lget(st.glob, a)
+            _lset(st.glob, a, v_int(ovm.iv + prod))
             _free_v(ovm)
             pc = pc + 1
         elif op == 58:                     # ACC_ADD_G: glob[a] = glob[a] + reg[b]
-            oa = st.glob[a]
-            bb = regs[b]
-            st.glob[a] = v_add(st, oa, bb)
+            oa = _lget(st.glob, a)
+            bb = _lget(regs, b)
+            _lset(st.glob, a, v_add(st, oa, bb))
             _free_v(oa)
             if c == 1:                     # rhs was a fresh arith temp -> reclaim it
                 _free_v(bb)
             pc = pc + 1
         elif op == 67:                     # ACC_ADD_L: reg[a] = reg[a] + reg[b]; reclaim
-            la = regs[a]
-            lb = regs[b]
-            regs[a] = v_add(st, la, lb)
+            la = _lget(regs, a)
+            lb = _lget(regs, b)
+            _lset(regs, a, v_add(st, la, lb))
             _free_v(la)
             if c == 1:
                 _free_v(lb)
             pc = pc + 1
         elif op == 68:                     # ACC_SUB_L: reg[a] = reg[a] - reg[b]; reclaim
-            la = regs[a]
-            lb = regs[b]
-            regs[a] = v_sub(la, lb)
+            la = _lget(regs, a)
+            lb = _lget(regs, b)
+            _lset(regs, a, v_sub(la, lb))
             _free_v(la)
             if c == 1:
                 _free_v(lb)
             pc = pc + 1
         elif op == 15:                     # ITER_NEW
-            regs[a] = v_iter(st, regs[b]); pc = pc + 1
+            _lset(regs, a, v_iter(st, _lget(regs, b))); pc = pc + 1
         elif op == 16:                     # ITER_NEXT
-            it = regs[b]
+            it = _lget(regs, b)
             cont = st.heap[it.iv]
             if cont.cursor < len(cont.items):
-                regs[a] = cont.items[cont.cursor]
+                _lset(regs, a, cont.items[cont.cursor])
                 cont.cursor = cont.cursor + 1
                 pc = pc + 1
             else:
                 pc = c
         elif op == 17:                     # CONTAINS
-            regs[a] = v_contains(st, regs[b], regs[c]); pc = pc + 1
+            _lset(regs, a, v_contains(st, _lget(regs, b), _lget(regs, c))); pc = pc + 1
         elif op == 18:                     # LIST_APPEND
-            items_of(st, regs[a]).append(regs[b]); pc = pc + 1
+            items_of(st, _lget(regs, a)).append(_lget(regs, b)); pc = pc + 1
         elif op == 19:                     # SET_ADD
-            _set_add(st, regs[a], regs[b]); pc = pc + 1
+            _set_add(st, _lget(regs, a), _lget(regs, b)); pc = pc + 1
         elif op == 50:                     # LOAD_ATTR
             cs = st.prog.consts
             nm = cs[c].s
-            regs[a] = inst_get(st, regs[b], nm); pc = pc + 1
+            _lset(regs, a, inst_get(st, _lget(regs, b), nm)); pc = pc + 1
         elif op == 51:                     # STORE_ATTR
             cs = st.prog.consts
             nm = cs[c].s
-            inst_set(st, regs[a], nm, regs[b]); pc = pc + 1
+            inst_set(st, _lget(regs, a), nm, _lget(regs, b)); pc = pc + 1
         elif op == 52:                     # LOAD_METHOD
             cs = st.prog.consts
             nm = cs[c].s
-            obj = regs[b]
+            obj = _lget(regs, b)
             if obj.tag == 12:              # instance -> bound user method
                 fidx = lookup_method(st, st.heap[obj.iv].cursor, nm)
-                regs[a] = V(14, obj.iv * _METH_SHIFT + fidx)   # packed, no alloc
+                _lset(regs, a, V(14, obj.iv * _METH_SHIFT + fidx))   # packed, no alloc
             else:                          # container/str -> bound builtin
                 bargs = new_v_list(); bargs.append(obj)
-                regs[a] = v_container(st, 15, 7, bargs)
-                st.heap[regs[a].iv].cursor = method_id(nm)
+                _lset(regs, a, v_container(st, 15, 7, bargs))
+                st.heap[_lget(regs, a).iv].cursor = method_id(nm)
             pc = pc + 1
         elif op == 53:                     # CALL_METHOD (fused load+call)
             cs = st.prog.consts
             nargs = c % 256
             nm = cs[c // 256].s
-            recv = regs[b]
+            recv = _lget(regs, b)
             if len(st.regpool) > 0:
                 callargs = st.regpool.pop()
                 while len(callargs) > 0:
@@ -2157,134 +2165,134 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
             callargs.append(recv)
             ka = 0
             while ka < nargs:
-                callargs.append(regs[b + 1 + ka])
+                callargs.append(_lget(regs, b + 1 + ka))
                 ka = ka + 1
             if recv.tag == 12:             # instance -> user method, no binding
                 fidx = lookup_method(st, st.heap[recv.iv].cursor, nm)
-                regs[a] = run_func(st, fidx, callargs)
+                _lset(regs, a, run_func(st, fidx, callargs))
             else:                          # container/str -> builtin method
-                regs[a] = do_builtin(st, method_id(nm), callargs)
+                _lset(regs, a, do_builtin(st, method_id(nm), callargs))
             st.regpool.append(callargs)
             pc = pc + 1
         elif op == 20:
-            ob = regs[b]; oc = regs[c]
-            regs[ra] = v_add(st, ob, oc)
+            ob = _lget(regs, b); oc = _lget(regs, c)
+            _lset(regs, ra, v_add(st, ob, oc))
             if fc == 1:
                 _free_v(oc)
             if fb == 1:
                 _free_v(ob)
             pc = pc + 1
         elif op == 21:
-            ob = regs[b]; oc = regs[c]
-            regs[ra] = v_sub(ob, oc)
+            ob = _lget(regs, b); oc = _lget(regs, c)
+            _lset(regs, ra, v_sub(ob, oc))
             if fc == 1:
                 _free_v(oc)
             if fb == 1:
                 _free_v(ob)
             pc = pc + 1
         elif op == 22:
-            ob = regs[b]; oc = regs[c]
-            regs[ra] = v_mul(st, ob, oc)
+            ob = _lget(regs, b); oc = _lget(regs, c)
+            _lset(regs, ra, v_mul(st, ob, oc))
             if fc == 1:
                 _free_v(oc)
             if fb == 1:
                 _free_v(ob)
             pc = pc + 1
         elif op == 23:
-            ob = regs[b]; oc = regs[c]
-            regs[ra] = v_div(ob, oc)
+            ob = _lget(regs, b); oc = _lget(regs, c)
+            _lset(regs, ra, v_div(ob, oc))
             if fc == 1:
                 _free_v(oc)
             if fb == 1:
                 _free_v(ob)
             pc = pc + 1
         elif op == 24:
-            ob = regs[b]; oc = regs[c]
-            regs[ra] = v_mod(st, ob, oc)
+            ob = _lget(regs, b); oc = _lget(regs, c)
+            _lset(regs, ra, v_mod(st, ob, oc))
             if fc == 1:
                 _free_v(oc)
             if fb == 1:
                 _free_v(ob)
             pc = pc + 1
         elif op == 25:
-            ob = regs[b]; oc = regs[c]
-            regs[ra] = v_floordiv(ob, oc)
+            ob = _lget(regs, b); oc = _lget(regs, c)
+            _lset(regs, ra, v_floordiv(ob, oc))
             if fc == 1:
                 _free_v(oc)
             if fb == 1:
                 _free_v(ob)
             pc = pc + 1
         elif op == 26:
-            regs[a] = v_pow(regs[b], regs[c]); pc = pc + 1
+            _lset(regs, a, v_pow(_lget(regs, b), _lget(regs, c))); pc = pc + 1
         elif op == 27:
-            regs[a] = v_bitor(st, regs[b], regs[c]); pc = pc + 1
+            _lset(regs, a, v_bitor(st, _lget(regs, b), _lget(regs, c))); pc = pc + 1
         elif op == 28:
-            regs[a] = v_bitand(st, regs[b], regs[c]); pc = pc + 1
+            _lset(regs, a, v_bitand(st, _lget(regs, b), _lget(regs, c))); pc = pc + 1
         elif op == 29:
-            regs[a] = v_bitxor(st, regs[b], regs[c]); pc = pc + 1
+            _lset(regs, a, v_bitxor(st, _lget(regs, b), _lget(regs, c))); pc = pc + 1
         elif op == 36:
-            regs[a] = v_int(regs[b].iv << regs[c].iv); pc = pc + 1
+            _lset(regs, a, v_int(_lget(regs, b).iv << _lget(regs, c).iv)); pc = pc + 1
         elif op == 37:
-            regs[a] = v_int(regs[b].iv >> regs[c].iv); pc = pc + 1
+            _lset(regs, a, v_int(_lget(regs, b).iv >> _lget(regs, c).iv)); pc = pc + 1
         elif op == 38:
-            regs[a] = v_slice(st, regs[a], regs[b], regs[b + 1], regs[b + 2]); pc = pc + 1
+            _lset(regs, a, v_slice(st, _lget(regs, a), _lget(regs, b), _lget(regs, b + 1), _lget(regs, b + 2))); pc = pc + 1
         elif op == 30:
-            regs[a] = v_bool(1 if v_cmp(regs[b], regs[c]) < 0 else 0); pc = pc + 1
+            _lset(regs, a, v_bool(1 if v_cmp(_lget(regs, b), _lget(regs, c)) < 0 else 0)); pc = pc + 1
         elif op == 31:
-            regs[a] = v_bool(1 if v_cmp(regs[b], regs[c]) <= 0 else 0); pc = pc + 1
+            _lset(regs, a, v_bool(1 if v_cmp(_lget(regs, b), _lget(regs, c)) <= 0 else 0)); pc = pc + 1
         elif op == 32:
-            regs[a] = v_bool(1 if v_cmp(regs[b], regs[c]) > 0 else 0); pc = pc + 1
+            _lset(regs, a, v_bool(1 if v_cmp(_lget(regs, b), _lget(regs, c)) > 0 else 0)); pc = pc + 1
         elif op == 33:
-            regs[a] = v_bool(1 if v_cmp(regs[b], regs[c]) >= 0 else 0); pc = pc + 1
+            _lset(regs, a, v_bool(1 if v_cmp(_lget(regs, b), _lget(regs, c)) >= 0 else 0)); pc = pc + 1
         elif op == 34:
-            regs[a] = v_bool(v_eq_bool(regs[b], regs[c])); pc = pc + 1
+            _lset(regs, a, v_bool(v_eq_bool(_lget(regs, b), _lget(regs, c)))); pc = pc + 1
         elif op == 35:
-            regs[a] = v_bool(1 if v_eq_bool(regs[b], regs[c]) == 0 else 0); pc = pc + 1
+            _lset(regs, a, v_bool(1 if v_eq_bool(_lget(regs, b), _lget(regs, c)) == 0 else 0)); pc = pc + 1
         elif op == 40:
-            regs[a] = v_neg(regs[b]); pc = pc + 1
+            _lset(regs, a, v_neg(_lget(regs, b))); pc = pc + 1
         elif op == 41:
-            regs[a] = v_bool(1 if truthy(regs[b]) == 0 else 0); pc = pc + 1
+            _lset(regs, a, v_bool(1 if truthy(_lget(regs, b)) == 0 else 0)); pc = pc + 1
         elif op == 60:
-            ob = regs[b]; oc = regs[c]
+            ob = _lget(regs, b); oc = _lget(regs, c)
             if ob.tag == 1 and oc.tag == 1:
-                regs[ra] = v_int(ob.iv + oc.iv)
+                _lset(regs, ra, v_int(ob.iv + oc.iv))
             else:
-                regs[ra] = v_add(st, ob, oc)
+                _lset(regs, ra, v_add(st, ob, oc))
             if fc == 1:
                 _free_v(oc)
             if fb == 1:
                 _free_v(ob)
             pc = pc + 1
         elif op == 61:
-            ob = regs[b]; oc = regs[c]
+            ob = _lget(regs, b); oc = _lget(regs, c)
             if ob.tag == 1 and oc.tag == 1:
-                regs[ra] = v_int(ob.iv - oc.iv)
+                _lset(regs, ra, v_int(ob.iv - oc.iv))
             else:
-                regs[ra] = v_sub(ob, oc)
+                _lset(regs, ra, v_sub(ob, oc))
             if fc == 1:
                 _free_v(oc)
             if fb == 1:
                 _free_v(ob)
             pc = pc + 1
         elif op == 62:
-            ob = regs[b]; oc = regs[c]
+            ob = _lget(regs, b); oc = _lget(regs, c)
             if ob.tag == 1 and oc.tag == 1:
-                regs[ra] = v_int(ob.iv * oc.iv)
+                _lset(regs, ra, v_int(ob.iv * oc.iv))
             else:
-                regs[ra] = v_mul(st, ob, oc)
+                _lset(regs, ra, v_mul(st, ob, oc))
             if fc == 1:
                 _free_v(oc)
             if fb == 1:
                 _free_v(ob)
             pc = pc + 1
         elif op == 63:
-            regs[a] = v_bool(1 if v_cmp(regs[b], regs[c]) < 0 else 0); pc = pc + 1
+            _lset(regs, a, v_bool(1 if v_cmp(_lget(regs, b), _lget(regs, c)) < 0 else 0)); pc = pc + 1
         elif op == 64:
-            regs[a] = v_bool(1 if v_cmp(regs[b], regs[c]) <= 0 else 0); pc = pc + 1
+            _lset(regs, a, v_bool(1 if v_cmp(_lget(regs, b), _lget(regs, c)) <= 0 else 0)); pc = pc + 1
         elif op == 65:
-            regs[a] = v_bool(1 if v_cmp(regs[b], regs[c]) > 0 else 0); pc = pc + 1
+            _lset(regs, a, v_bool(1 if v_cmp(_lget(regs, b), _lget(regs, c)) > 0 else 0)); pc = pc + 1
         elif op == 66:
-            regs[a] = v_bool(1 if v_cmp(regs[b], regs[c]) >= 0 else 0); pc = pc + 1
+            _lset(regs, a, v_bool(1 if v_cmp(_lget(regs, b), _lget(regs, c)) >= 0 else 0)); pc = pc + 1
         elif op == 70:                     # SETUP_EXCEPT
             if has_blocks == 0:            # leave the shared sentinel untouched
                 blocks = new_v_list()
@@ -2298,7 +2306,7 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
         elif op == 71:                     # POP_BLOCK
             bn = bn - 1; pc = pc + 1
         elif op == 72:                     # RAISE
-            ev = regs[a]
+            ev = _lget(regs, a)
             if ev.tag == 13:               # raising a bare class -> instantiate
                 ev = instantiate(st, ev.iv, new_v_list())
             st.exc_val = ev
@@ -2306,9 +2314,9 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
         elif op == 73:                     # RERAISE
             st.exc_flag = 1
         elif op == 74:                     # LOAD_EXC
-            regs[a] = st.exc_val; pc = pc + 1
+            _lset(regs, a, st.exc_val); pc = pc + 1
         elif op == 75:                     # EXC_MATCH
-            regs[a] = v_bool(is_instance(st, st.exc_val, regs[b])); pc = pc + 1
+            _lset(regs, a, v_bool(is_instance(st, st.exc_val, _lget(regs, b)))); pc = pc + 1
         else:
             pc = pc + 1
         if st.exc_flag != 0:               # an exception is in flight
