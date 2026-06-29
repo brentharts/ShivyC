@@ -1695,3 +1695,88 @@ Remaining toward parsing all of py2c.py: `With`, `Lambda` (needs nested-function
 closure support, which minipy does not yet have), generators (`Yield`), call-site
 `*expr` unpacking, and `Import`. Running py2c.py still additionally requires the
 stdlib layer (`ast`, `re`, `sys`, `os`) -- the long pole.
+
+---
+
+## v26 -- direct list access for the dispatch loop (`_lget`/`_lset`)
+
+With safe integer de-boxing exhausted (every index in `run_func` is now `int`/`long`,
+and `fn.*`/`ins.*` already compile to direct struct reads), the remaining
+per-instruction cost was the generic `subscript()` call used for every register and
+instruction-fetch access. Each `regs[a]` compiled to `subscript(regs, OBJ_INT(a))` --
+a cross-TU call that dispatches on container type and then calls `list_get()`, which
+itself handles negative indices and bounds. An arithmetic instruction pays this ~4
+times (fetch `code[pc]`, read `regs[b]`/`regs[c]`, write `regs[ra]`).
+
+LTO was tried first (let gcc inline `subscript`/`list_get` across translation units)
+and rejected: it was a wash-to-negative because cross-TU inlining bloats and reshuffles
+the fragile monolithic dispatch loop's codegen (fib +4% but collatz -8%, sieve -9%).
+
+Instead, two opt-in py2c intrinsics were added -- `_lget(lst, i)` and
+`_lset(lst, i, v)` -- that lower directly to `((List*)AS_OBJ(lst))->data[i]` (a raw
+array load/store), skipping the container dispatch and the negative/bounds handling.
+This is unchecked, so it is only valid where the index is provably non-negative and in
+range; the bytecode interpreter's register and pc accesses are exactly that (register
+indices `< nregs`, `pc < n`). The dispatch loop's `regs[...]` accesses (132 reads, 57
+writes) and the `code[pc]` fetch were rewritten to use them.
+
+### Result
+Removing the calls -- which *shrinks* the hot loop rather than inlining bodies into it
+-- helps uniformly, with no codegen-fragility penalty:
+
+| fib | loops | collatz | sort | dotsum | sieve | matmul | dicts | **avg** |
+|-----|-------|---------|------|--------|-------|--------|-------|---------|
+|+34% | +32%  | +37%    | +41% | +28%   | +28%  | +25%   | +11%  | **+32%** |
+
+All 52 regression programs stay byte-identical (cpython == native), nbody matches, and
+`make testfast` (self-host) passes -- the intrinsics only fire on literal `_lget`/`_lset`
+calls, which py2c.py itself never makes.
+
+Stacked on the v25 de-boxing, the dispatch loop is now roughly twice as fast as it was
+two versions ago. Extending the same rewrite to `st.heap`/`st.glob` *together* was a
+wash here -- but see v27: `st.glob` alone is a clean win, and `st.heap` is the part that
+hurts.
+
+---
+
+## v27 -- `as_long` typing fix + `st.glob` direct access
+
+Two more passes at the same lever, after confirming from the generated C that integer
+de-boxing is fully exhausted (the hot loop has *zero* `obj_add`/`obj_sub`/`obj_mul` and
+*zero* box/unbox roundtrips like `pyint(OBJ_INT(...))` left anywhere in `interp.c`).
+
+**`as_long` typing fix (py2c).** `as_long(node)` rendered any value whose C type was not
+literally `int`/`bool` by boxing then unboxing it -- `pyint(OBJ_INT(pc))` for a `long`.
+The fetch `code[pc]` runs every instruction, so this roundtrip sat on the single hottest
+line in the interpreter. The fix reuses the v25 signed-integer set: a value already typed
+as any C integer (`char`/`short`/`int`/`long`/`bool`) is emitted directly, so the fetch
+becomes a clean `data[pc]`. gcc was *not* folding the roundtrip away -- removing it gave
+a uniform **+13.6%** (dotsum +19.8%, fib +13%, loops +12%) with no regressions. This is a
+general py2c improvement (every long-typed index across all compiled code), and
+`make testfast` self-host stays green.
+
+**`st.glob` direct access.** With regs/code already direct (v26), the remaining
+`subscript()` calls were all on `st.glob` (every LOAD_GLOBAL/STORE_GLOBAL) and `st.heap`
+(object/dict ops). `st.glob` is fixed-size after program load, so the same unchecked
+`_lget`/`_lset` rewrite is safe there. Applied to `st.glob` alone it is a clean
+**+10.3%** (dotsum +22%, sort +15%, matmul +16%, loops +14% -- these keep accumulators or
+arrays in globals), with fib/collatz flat.
+
+`st.heap` was tried on top and *reverted*: it regressed fib by ~20% and even hurt the
+heap-heavy benchmarks it was meant to help (objects, wordfreq). The heap accesses live in
+branches whose inline expansion reshuffles the layout-sensitive dispatch loop badly. So
+the direct-access rewrite stays scoped to `regs`, `code`, and `st.glob` -- the three
+always-valid, non-growing index sites. `st.heap` would need a less layout-sensitive
+dispatch (e.g. threaded/computed-goto) to pay off.
+
+### Cumulative (this stage: v25 -> v27)
+
+| fib | loops | collatz | sort | dotsum | sieve | dicts | matmul | **avg** |
+|-----|-------|---------|------|--------|-------|-------|--------|---------|
+|1.79x|1.95x  |1.81x    |1.82x | 2.16x  |1.73x  |1.21x  |1.78x   |**1.88x** |
+
+De-boxing (v25) removed the per-instruction arithmetic *calls*; direct list access
+(v26/v27) removed the per-instruction indexing *calls*; the `as_long` fix removed the
+last per-instruction boxing roundtrip. Together they nearly halve dispatch time. All 52
+regression programs stay byte-identical to CPython, nbody matches (12982328), and
+self-host (`make testfast`) passes.
