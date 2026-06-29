@@ -1948,6 +1948,29 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
                 regs[a] = v_container(st, 15, 7, bargs)
                 st.heap[regs[a].iv].cursor = method_id(nm)
             pc = pc + 1
+        elif op == 53:                     # CALL_METHOD (fused load+call)
+            cs = st.prog.consts
+            nargs = c % 256
+            nm = cs[c // 256].s
+            recv = regs[b]
+            if len(st.regpool) > 0:
+                callargs = st.regpool.pop()
+                while len(callargs) > 0:
+                    callargs.pop()
+            else:
+                callargs = new_v_list()
+            callargs.append(recv)
+            ka = 0
+            while ka < nargs:
+                callargs.append(regs[b + 1 + ka])
+                ka = ka + 1
+            if recv.tag == 12:             # instance -> user method, no binding
+                fidx = lookup_method(st, st.heap[recv.iv].cursor, nm)
+                regs[a] = run_func(st, fidx, callargs)
+            else:                          # container/str -> builtin method
+                regs[a] = do_builtin(st, method_id(nm), callargs)
+            st.regpool.append(callargs)
+            pc = pc + 1
         elif op == 20:
             regs[a] = v_add(st, regs[b], regs[c]); pc = pc + 1
         elif op == 21:

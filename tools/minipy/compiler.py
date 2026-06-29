@@ -56,6 +56,7 @@ OPS = {
     "LOAD_ATTR":   50,   # reg[a] = reg[b].<consts[c]>
     "STORE_ATTR":  51,   # reg[a].<consts[c]> = reg[b]
     "LOAD_METHOD": 52,   # reg[a] = bound-method reg[b].<consts[c]>
+    "CALL_METHOD": 53,   # reg[a] = reg[b].<name>(reg[b+1..]); c = name*256+nargs
     # --- exceptions (70-75) ---
     "SETUP_EXCEPT": 70,  # push handler block; a = dispatch pc
     "POP_BLOCK":    71,  # pop handler block (try body finished normally)
@@ -731,14 +732,29 @@ class Compiler:
         # method call `recv.meth(args)`: callable = method-id builtin, receiver
         # is arg0, then the real args -- reuses the CALL window machinery.
         if isinstance(node.func, ast.Attribute):
-            # all `obj.meth(args)` go through LOAD_METHOD; the runtime resolves
-            # a user method (instance receiver) vs a builtin method (container/
-            # string receiver) by type, so names like .get/.pop/.add never clash.
+            # `obj.meth(args)`: fuse the method load and the call into one
+            # CALL_METHOD so no bound-method value is materialised. The receiver
+            # sits at the call base, args follow; c packs the name const and
+            # nargs (name*256 + nargs). Fall back to LOAD_METHOD+CALL only if
+            # those don't fit (>=256 args, or a very large const pool).
             meth = node.func.attr
+            cn = self.consts.add("str", meth)
+            n = len(node.args)
+            if n < 256 and cn < (1 << 23):
+                rbase = f.top
+                ro = self.expr(f, node.func.value)
+                assert ro == rbase
+                k = 0
+                for a in node.args:
+                    ra = self.expr(f, a)
+                    assert ra == rbase + 1 + k
+                    k += 1
+                f.emit("CALL_METHOD", rbase, rbase, cn * 256 + n)
+                f.pop_to(rbase + 1); f.numreg.discard(rbase)
+                return rbase
             rfun = f.push()
             ro = self.expr(f, node.func.value)
             assert ro == rfun + 1
-            cn = self.consts.add("str", meth)
             f.emit("LOAD_METHOD", rfun, ro, cn)   # bound method captures self
             f.pop_to(rfun + 1)
             n = 0
@@ -1152,6 +1168,15 @@ class VM:
                     regs[a] = ("bound", self._lookup_method(obj.cid, name), obj)
                 else:                            # builtin method on a container/str
                     regs[a] = ("boundb", METHODS[name], obj)
+            elif op == 53:                      # CALL_METHOD (fused load+call)
+                nargs = c % 256; name = self._const(c // 256)
+                recv = regs[b]
+                ca = [regs[b + 1 + k] for k in range(nargs)]
+                if isinstance(recv, _Inst):
+                    regs[a] = self._call(
+                        self._lookup_method(recv.cid, name), [recv] + ca)
+                else:
+                    regs[a] = self._method(METHODS[name], [recv] + ca)
             elif op == 20: regs[a] = regs[b] + regs[c]
             elif op == 21: regs[a] = regs[b] - regs[c]
             elif op == 22: regs[a] = regs[b] * regs[c]
