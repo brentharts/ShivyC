@@ -2144,6 +2144,13 @@ def set_local_module_dirs(paths):
 
 def ann_text_to_ctype(text):
     text = text.strip().strip("'\"")
+    # bit-field annotation `T(N)` (e.g. `int(3)`): a value of scalar type T that
+    # is stored packed into N bits. The value/expression type is simply T; the
+    # width N is recorded per-class by discover_bitfields and consumed only at
+    # struct emission, so reads and writes of the field behave as ordinary T.
+    mbf = re.match(r"^(\w[\w ]*?)\s*\(\s*\d+\s*\)$", text)
+    if mbf is not None:
+        return ann_text_to_ctype(mbf.group(1))
     simple = {"int": "int", "bool": "bool", "None": "void", "str": "char*",
               "float": "double", "bytes": "char*"}
     # numpy-style dtype aliases -> real C scalar types. f32 is a true 32-bit
@@ -2469,6 +2476,8 @@ class ClassInfo:
         self.classmethod_methods = set()  # @classmethod (cls as first arg)
         self.property_methods = set()  # @property: direct call, not vtable slot
         self.own_fields = []
+        self.bitfields = {}         # fieldname -> bit width N, from a `T(N)`
+                                    # annotation; emitted as a C bit field
         self.const_dicts = {}
         self.union_fields = []      # fields that share storage (anonymous C
                                     # union); declared via `_c_union_ = (...)`
@@ -2998,6 +3007,7 @@ def collect_classes(tree):
                     # in subclasses -> becomes an instance field set in the ctor
                     ci.class_attrs[nm] = val
         ci.own_fields = discover_fields(ci.node, set(ci.methods))
+        ci.bitfields = discover_bitfields(ci.node)
         for nm in ci.class_attrs:           # ensure they get a struct slot
             # A class constant assigned a numeric literal (e.g. `DEFINED = 3`)
             # is typed from its VALUE, not a name heuristic: otherwise an int
@@ -3138,6 +3148,38 @@ def discover_fields_from_ctor_locals(tree, classes):
         ctype = next(iter(types)) if (None not in types and len(types) == 1) \
             else OBJ
         ci.own_fields.append((attr, ctype))
+
+
+def discover_bitfields(classnode):
+    """Map fieldname -> bit width N for `self.x : T(N) = ...` annotations (and
+    class-level `x: T(N)`). The field's value type is the plain scalar T (see
+    ann_text_to_ctype); only the struct declaration needs the width."""
+    widths = {}
+
+    def _record(name, ann):
+        if ann is None:
+            return
+        try:
+            txt = ast.unparse(ann)
+        except Exception:
+            return
+        m = re.match(r"^\w[\w ]*?\(\s*(\d+)\s*\)$", txt.strip().strip("'\""))
+        if m is not None:
+            widths[name] = int(m.group(1))
+
+    for item in classnode.body:
+        if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+            _record(item.target.id, item.annotation)
+    for item in classnode.body:
+        if not isinstance(item, ast.FunctionDef):
+            continue
+        for sub in ast.walk(item):
+            if isinstance(sub, ast.AnnAssign) \
+                    and isinstance(sub.target, ast.Attribute) \
+                    and isinstance(sub.target.value, ast.Name) \
+                    and sub.target.value.id == "self":
+                _record(sub.target.attr, sub.annotation)
+    return widths
 
 
 def discover_fields(classnode, method_names=None):
@@ -4829,8 +4871,13 @@ class Transpiler:
         ff = ci.full_fields()
         if not ff:
             out.append("    char _empty;")
+        bf = getattr(ci, "bitfields", {})
         for fn, ft in ff:
-            out.append("    %s %s;" % (ft, self.fnsym(fn)))
+            if fn in bf:
+                out.append("    unsigned int %s : %d;"
+                           % (self.fnsym(fn), bf[fn]))
+            else:
+                out.append("    %s %s;" % (ft, self.fnsym(fn)))
         out.append("};")
         return out
 
@@ -6693,6 +6740,7 @@ class Transpiler:
         if not ff:
             self.emit("char _empty;")
         uset = set(getattr(ci, "union_fields", []))
+        bf = getattr(ci, "bitfields", {})
         emitted_union = False
         for fn, ft in ff:
             if fn in uset:
@@ -6707,6 +6755,9 @@ class Transpiler:
                     self.emit("};")
                     emitted_union = True
                 continue
+            if fn in bf:                 # `T(N)` annotation -> C bit field
+                self.emit("unsigned int %s : %d;" % (self.fnsym(fn), bf[fn]))
+                continue
             self.emit("%s %s;" % (self.ctype_csym(ft), self.fnsym(fn)))
         self.indent -= 1
         self.emit("} %s;" % ci.csym)
@@ -6718,9 +6769,10 @@ class Transpiler:
         self.emit()
 
     def emit_field_table(self, ci):
-        rows = ["{ %s, offsetof(%s, %s), '%s' }" % (
-            c_string(fn), ci.csym, self.fnsym(fn), self._field_tc(ft))
-            for fn, ft in ci.full_fields()]
+        bf = getattr(ci, "bitfields", {})   # offsetof is illegal on a bit field,
+        rows = ["{ %s, offsetof(%s, %s), '%s' }" % (  # so such fields are not
+            c_string(fn), ci.csym, self.fnsym(fn), self._field_tc(ft))  # reflectable
+            for fn, ft in ci.full_fields() if fn not in bf]
         rows.append("{ NULL, 0, 0 }")
         self.emit("static const FieldDesc %s__fields[] = { %s };" % (
             ci.csym, ", ".join(rows)))
