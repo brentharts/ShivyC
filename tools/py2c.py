@@ -2277,6 +2277,22 @@ def infer_type(name, ann=None):
     return ann_to_ctype(ann) or infer_from_name(name) or OBJ
 
 
+# Signed C integer types, narrowest to widest. When a local is assigned values
+# of two different integer types (e.g. `pc` gets both an `int` literal and a
+# `long` from `v.iv`), the wider type holds both -- so the local can stay an
+# unboxed integer instead of falling back to a boxed `obj`.
+_SIGNED_INT_RANK = {"bool": 0, "char": 1, "short": 2, "int": 3, "long": 4}
+
+
+def _int_widen(a, b):
+    """The integer type wide enough to hold both `a` and `b`, or None if either
+    is not a signed integer type. Used to reconcile a local's inferred type
+    across assignments without boxing."""
+    if a in _SIGNED_INT_RANK and b in _SIGNED_INT_RANK:
+        return a if _SIGNED_INT_RANK[a] >= _SIGNED_INT_RANK[b] else b
+    return None
+
+
 def _const_numeric_ctype(node):
     """ctype ("int"/"double") of a numeric literal class-constant value, or
     None. bool excluded (bool is an int subclass); str/None/containers return
@@ -7465,7 +7481,8 @@ class Transpiler:
             elif ctype == OBJ or types[name] == OBJ:
                 types[name] = OBJ
             elif types[name] != ctype:
-                types[name] = OBJ
+                w = _int_widen(types[name], ctype)   # int+long -> long, etc.,
+                types[name] = w if w else OBJ        # rather than boxing to obj
 
         # pre-scan typed-list annotations so a `for x in <list>` below can give
         # x the element type even when the list is a local declared earlier.
