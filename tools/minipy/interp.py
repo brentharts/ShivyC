@@ -1896,7 +1896,13 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
         elif op == 2:
             regs[a] = st.glob[b]; pc = pc + 1
         elif op == 3:
-            st.glob[b] = regs[a]; pc = pc + 1
+            if fb == 1:                    # reclaimable global: free old value
+                ov = st.glob[b]
+                st.glob[b] = regs[ra]
+                _free_v(ov)
+            else:
+                st.glob[b] = regs[ra]
+            pc = pc + 1
         elif op == 4:
             regs[a] = regs[b]; pc = pc + 1
         elif op == 5:

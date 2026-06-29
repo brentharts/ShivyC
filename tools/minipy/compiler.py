@@ -194,6 +194,7 @@ class Compiler:
         self._pending = []               # (FunctionDef, frame) to compile
         self.classes = []                # list of {name, base, methods:[...]}
         self._class_id = {}              # class name -> id
+        self.reclaimable_globals = set()
 
     # --- name/slot helpers ---
     def gslot(self, name):
@@ -202,7 +203,135 @@ class Compiler:
         return self.gnames[name]
 
     # ---- entry ----
+    # --- escape analysis: which module globals may free their old value ---
+    # A scalar global accumulator (total, loop counter, ...) discards its old
+    # value on every reassignment. That value is safe to reclaim only if the
+    # global never escapes: never aliased to another name, returned, stored into
+    # a container/attribute/another global, built into a container, or passed to
+    # a call that might retain it (print/len are known read-only exceptions).
+    # Uses outside those positions -- arithmetic/comparison operands, conditions,
+    # subscript indices -- only read the value and are safe. The analysis is
+    # conservative (any unrecognised position is treated as an escape) and the
+    # runtime _free_v gate is an independent backstop (only large ints/floats are
+    # ever actually recycled), so a missed case cannot corrupt a live binding.
+    _READONLY_BUILTINS = ("print", "len")
+
+    @staticmethod
+    def _scope_locals(fnode):
+        loc = set()
+        for a in fnode.args.args:
+            loc.add(a.arg)
+        for n in ast.walk(fnode):
+            if isinstance(n, ast.Assign):
+                for t in n.targets:
+                    if isinstance(t, ast.Name):
+                        loc.add(t.id)
+                    elif isinstance(t, (ast.Tuple, ast.List)):
+                        for e in t.elts:
+                            if isinstance(e, ast.Name):
+                                loc.add(e.id)
+            elif isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name):
+                loc.add(n.target.id)
+            elif isinstance(n, ast.For) and isinstance(n.target, ast.Name):
+                loc.add(n.target.id)
+        return loc
+
+    def _compute_reclaimable_globals(self, tree):
+        module_assigned = set()
+        for n in tree.body:
+            if isinstance(n, ast.Assign):
+                for t in n.targets:
+                    if isinstance(t, ast.Name):
+                        module_assigned.add(t.id)
+            elif isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name):
+                module_assigned.add(n.target.id)
+            elif isinstance(n, (ast.FunctionDef, ast.ClassDef)):
+                module_assigned.add(n.name)
+        escaped = set()
+
+        def is_glob(name, loc):
+            return name not in loc and name in module_assigned
+
+        def mark(node, escaping, loc):
+            if isinstance(node, ast.Name):
+                if escaping and is_glob(node.id, loc):
+                    escaped.add(node.id)
+            elif isinstance(node, ast.BinOp):
+                mark(node.left, False, loc); mark(node.right, False, loc)
+            elif isinstance(node, ast.UnaryOp):
+                mark(node.operand, False, loc)
+            elif isinstance(node, ast.BoolOp):
+                for v in node.values:
+                    mark(v, False, loc)
+            elif isinstance(node, ast.Compare):
+                mark(node.left, False, loc)
+                for c in node.comparators:
+                    mark(c, False, loc)
+            elif isinstance(node, ast.IfExp):
+                mark(node.test, False, loc)
+                mark(node.body, escaping, loc); mark(node.orelse, escaping, loc)
+            elif isinstance(node, ast.Call):
+                ro = (isinstance(node.func, ast.Name)
+                      and node.func.id in self._READONLY_BUILTINS)
+                if not ro:
+                    mark(node.func, True, loc)       # method/func base may retain
+                for a in node.args:
+                    mark(a, not ro, loc)
+            elif isinstance(node, ast.Subscript):
+                mark(node.value, True, loc)          # used as a container
+                mark(node.slice, False, loc)
+            elif isinstance(node, ast.Attribute):
+                mark(node.value, True, loc)          # used as an object
+            elif isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+                for e in node.elts:
+                    mark(e, True, loc)
+            elif isinstance(node, ast.Dict):
+                for k in node.keys:
+                    if k is not None:
+                        mark(k, True, loc)
+                for v in node.values:
+                    mark(v, True, loc)
+            elif isinstance(node, ast.Index):           # py<3.9 slice wrapper
+                mark(node.value, False, loc)
+
+        def visit(stmts, loc):
+            for s in stmts:
+                if isinstance(s, ast.Assign):
+                    mark(s.value, True, loc)            # value binds to target
+                    for t in s.targets:
+                        if isinstance(t, ast.Subscript):
+                            mark(t.value, True, loc); mark(t.slice, False, loc)
+                        elif isinstance(t, ast.Attribute):
+                            mark(t.value, True, loc)
+                elif isinstance(s, ast.AugAssign):
+                    mark(s.value, False, loc)
+                    if isinstance(s.target, ast.Subscript):
+                        mark(s.target.value, True, loc); mark(s.target.slice, False, loc)
+                    elif isinstance(s.target, ast.Attribute):
+                        mark(s.target.value, True, loc)
+                elif isinstance(s, ast.Return):
+                    if s.value is not None:
+                        mark(s.value, True, loc)
+                elif isinstance(s, ast.Expr):
+                    mark(s.value, False, loc)
+                elif isinstance(s, (ast.If, ast.While)):
+                    mark(s.test, False, loc)
+                    visit(s.body, loc); visit(s.orelse, loc)
+                elif isinstance(s, ast.For):
+                    mark(s.iter, True, loc)
+                    visit(s.body, loc); visit(s.orelse, loc)
+                elif isinstance(s, ast.FunctionDef):
+                    visit(s.body, self._scope_locals(s))
+                elif isinstance(s, ast.ClassDef):
+                    for item in s.body:
+                        if isinstance(item, ast.FunctionDef):
+                            visit(item.body, self._scope_locals(item))
+
+        visit(tree.body, set())
+        return module_assigned - escaped - set(BUILTINS.keys())
+
     def compile_module(self, tree, source_name="<module>"):
+        self.reclaimable_globals = self._compute_reclaimable_globals(tree)
         mod = _Frame(source_name, [], [], is_module=True)
         self.funcs.append(mod)
         # pre-bind builtins into globals so `print` etc. resolve as names
@@ -986,7 +1115,8 @@ class Compiler:
                 if r in f.numreg:
                     f.numreg.add(f.locals[name])
                 return
-        f.emit("STORE_GLOBAL", r, self.gslot(name))
+        renc = r + 536870912 if name in self.reclaimable_globals else r
+        f.emit("STORE_GLOBAL", renc, self.gslot(name))
 
     # ---- serialise ----
     def to_program(self, source_name):
