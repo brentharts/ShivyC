@@ -10903,6 +10903,19 @@ class Transpiler:
         if _jd is not None:
             return _jd
         f0 = node.func
+        # Unchecked direct list indexing, opt-in via _lget/_lset. For call sites
+        # where the index is provably valid and non-negative (e.g. the bytecode
+        # interpreter's register/pc accesses), this skips subscript()'s container
+        # dispatch and list_get()'s negative/bounds handling -- a raw array load.
+        if isinstance(f0, ast.Name) and f0.id in ("_lget", "_lset") \
+                and f0.id not in self.scope:
+            if f0.id == "_lget" and len(node.args) == 2:
+                return "(((List*)AS_OBJ(%s))->data[%s])" % (
+                    self.expr(node.args[0]), self.as_long(node.args[1]))
+            if f0.id == "_lset" and len(node.args) == 3:
+                return "(((List*)AS_OBJ(%s))->data[%s] = %s)" % (
+                    self.expr(node.args[0]), self.as_long(node.args[1]),
+                    self.wrap_obj(node.args[2]))
         if isinstance(f0, ast.Attribute) and f0.attr in MATH_FUNCS and \
                 isinstance(f0.value, ast.Name) and \
                 f0.value.id in ("math", "np", "numpy"):
@@ -12821,8 +12834,8 @@ class Transpiler:
     def as_long(self, node):
         """Render `node` as a long/int expression."""
         t = self.value_ctype(node)
-        if t in ("int", "bool"):
-            return self.expr(node)
+        if t in _SIGNED_INT_RANK:
+            return self.expr(node)           # already a C integer; no roundtrip
         if t == OBJ or self.is_obj_word(node):
             return "AS_INT(%s)" % self.expr(node)
         return "pyint(%s)" % self.wrap_obj(node)
