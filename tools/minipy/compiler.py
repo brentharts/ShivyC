@@ -39,6 +39,11 @@ OPS = {
     "RETURN":       5,   # return reg[a]
     "JUMP":         6,   # pc = a
     "JUMP_IF_FALSE": 7,  # if not truthy(reg[a]): pc = b
+    "JF_LT": 76, "JF_LE": 77, "JF_GT": 78,  # fused compare+branch:
+    "JF_GE": 79, "JF_EQ": 80, "JF_NE": 81,  # if not(reg[a] CMP reg[c]): pc=b
+    "JUMP_IF_TRUE": 82,                    # if truthy(reg[a]): pc=b
+    "JT_LT": 83, "JT_LE": 84, "JT_GT": 85,  # fused compare+branch:
+    "JT_GE": 86, "JT_EQ": 87, "JT_NE": 88,  # if (reg[a] CMP reg[c]): pc=b
     "CALL":         8,   # reg[a] = reg[b](reg[b+1..b+c]); c = argcount
     # --- containers (9-19) ---
     "BUILD_LIST":   9,   # reg[a] = [regs[b..b+c-1]]
@@ -761,10 +766,29 @@ class Compiler:
         f.emit("RETURN", r)
         f.pop_to(r)
 
-    def st_If(self, f, node):
-        rc = self.expr(f, node.test)
+    def _emit_branch_false(self, f, test):
+        # Emit a jump taken when `test` is FALSE; return the instruction index.
+        # The jump target always lands at field [2] so callers patch uniformly.
+        # A single rich comparison (i < n, a == b, ...) fuses compare+branch into
+        # one opcode laid out [op, left, target, right]; anything else falls back to
+        # evaluating the test into a register and JUMP_IF_FALSE.
+        if isinstance(test, ast.Compare) and len(test.ops) == 1:
+            opn = {ast.Lt: "JF_LT", ast.LtE: "JF_LE", ast.Gt: "JF_GT",
+                   ast.GtE: "JF_GE", ast.Eq: "JF_EQ", ast.NotEq: "JF_NE",
+                   ast.Is: "JF_EQ", ast.IsNot: "JF_NE"}.get(type(test.ops[0]))
+            if opn is not None:
+                ra = self.expr(f, test.left)
+                rc = self.expr(f, test.comparators[0])
+                jf = len(f.code); f.emit(opn, ra, 0, rc)   # a=left, b=target, c=right
+                f.pop_to(ra)
+                return jf
+        rc = self.expr(f, test)
         jf = len(f.code); f.emit("JUMP_IF_FALSE", rc, 0)
         f.pop_to(rc)
+        return jf
+
+    def st_If(self, f, node):
+        jf = self._emit_branch_false(f, node.test)
         for s in node.body:
             self.stmt(f, s)
         if node.orelse:
@@ -776,21 +800,43 @@ class Compiler:
         else:
             f.code[jf][2] = len(f.code)
 
-    def st_While(self, f, node):
-        top = len(f.code)
-        rc = self.expr(f, node.test)
-        jf = len(f.code); f.emit("JUMP_IF_FALSE", rc, 0)
+    def _emit_branch_true(self, f, test, target):
+        # Emit a jump taken when `test` is TRUE, to a known (backward) target.
+        # Mirror of _emit_branch_false; used for the rotated-loop back-edge.
+        if isinstance(test, ast.Compare) and len(test.ops) == 1:
+            opn = {ast.Lt: "JT_LT", ast.LtE: "JT_LE", ast.Gt: "JT_GT",
+                   ast.GtE: "JT_GE", ast.Eq: "JT_EQ", ast.NotEq: "JT_NE",
+                   ast.Is: "JT_EQ", ast.IsNot: "JT_NE"}.get(type(test.ops[0]))
+            if opn is not None:
+                ra = self.expr(f, test.left)
+                rc = self.expr(f, test.comparators[0])
+                f.emit(opn, ra, target, rc)            # a=left, b=target, c=right
+                f.pop_to(ra)
+                return
+        rc = self.expr(f, test)
+        f.emit("JUMP_IF_TRUE", rc, target)
         f.pop_to(rc)
-        loop = _Loop(top)
+
+    def st_While(self, f, node):
+        # Loop rotation: a guard test at entry, then the body, then a copy of the
+        # test as a conditional back-edge. The steady state runs one (fused) branch
+        # per iteration instead of a separate test plus an unconditional JUMP, and
+        # the test is evaluated the same number of times as the top-test form.
+        guard = self._emit_branch_false(f, node.test)   # test false at entry -> end
+        top = len(f.code)
+        loop = _Loop(top); loop.rotated = True
         self._loops.append(loop)
         for s in node.body:
             self.stmt(f, s)
-        f.emit("JUMP", top)
+        cont = len(f.code)
+        self._emit_branch_true(f, node.test, top)        # back-edge: test true -> top
         end = len(f.code)
-        f.code[jf][2] = end
+        f.code[guard][2] = end
         self._loops.pop()
         for pc in loop.breaks:
             f.code[pc][1] = end
+        for pc in loop.conts:
+            f.code[pc][1] = cont
 
     def st_For(self, f, node):
         tgt = node.target
@@ -874,7 +920,11 @@ class Compiler:
     def st_Continue(self, f, node):
         if not self._loops:
             raise CompileError("continue outside loop (line %s)" % node.lineno)
-        f.emit("JUMP", self._loops[-1].top)
+        loop = self._loops[-1]
+        if loop.rotated:                       # target (back-edge) is a forward ref
+            pc = len(f.code); f.emit("JUMP", 0); loop.conts.append(pc)
+        else:
+            f.emit("JUMP", loop.top)
 
     def st_Try(self, f, node):
         if node.finalbody:
@@ -1517,6 +1567,8 @@ class _Loop:
     def __init__(self, top):
         self.top = top
         self.breaks = []
+        self.rotated = False
+        self.conts = []
 
 
 def _ann_name(node):
@@ -1644,6 +1696,32 @@ class VM:
             elif op == 6:  pc = a
             elif op == 7:
                 if not regs[a]: pc = b
+            elif op == 76:
+                if not (regs[a] <  regs[c]): pc = b
+            elif op == 77:
+                if not (regs[a] <= regs[c]): pc = b
+            elif op == 78:
+                if not (regs[a] >  regs[c]): pc = b
+            elif op == 79:
+                if not (regs[a] >= regs[c]): pc = b
+            elif op == 80:
+                if not (regs[a] == regs[c]): pc = b
+            elif op == 81:
+                if not (regs[a] != regs[c]): pc = b
+            elif op == 82:
+                if regs[a]: pc = b
+            elif op == 83:
+                if regs[a] <  regs[c]: pc = b
+            elif op == 84:
+                if regs[a] <= regs[c]: pc = b
+            elif op == 85:
+                if regs[a] >  regs[c]: pc = b
+            elif op == 86:
+                if regs[a] >= regs[c]: pc = b
+            elif op == 87:
+                if regs[a] == regs[c]: pc = b
+            elif op == 88:
+                if regs[a] != regs[c]: pc = b
             elif op == 8:
                 callee = regs[b]; ca = [regs[b + 1 + k] for k in range(c)]
                 regs[a] = self._invoke(callee, ca)

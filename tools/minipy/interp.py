@@ -1916,6 +1916,71 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
                 pc = pc + 1
             else:
                 pc = b
+        elif op == 76:                     # JF_LT: if not(a < c) -> pc = b
+            if v_cmp(regs[a], regs[c]) < 0:
+                pc = pc + 1
+            else:
+                pc = b
+        elif op == 77:                     # JF_LE
+            if v_cmp(regs[a], regs[c]) <= 0:
+                pc = pc + 1
+            else:
+                pc = b
+        elif op == 78:                     # JF_GT
+            if v_cmp(regs[a], regs[c]) > 0:
+                pc = pc + 1
+            else:
+                pc = b
+        elif op == 79:                     # JF_GE
+            if v_cmp(regs[a], regs[c]) >= 0:
+                pc = pc + 1
+            else:
+                pc = b
+        elif op == 80:                     # JF_EQ: if not(a == c) -> pc = b
+            if v_eq_bool(regs[a], regs[c]) != 0:
+                pc = pc + 1
+            else:
+                pc = b
+        elif op == 81:                     # JF_NE: if not(a != c) -> pc = b
+            if v_eq_bool(regs[a], regs[c]) == 0:
+                pc = pc + 1
+            else:
+                pc = b
+        elif op == 82:                     # JUMP_IF_TRUE
+            if truthy(regs[a]) != 0:
+                pc = b
+            else:
+                pc = pc + 1
+        elif op == 83:                     # JT_LT: if (a < c) -> pc = b
+            if v_cmp(regs[a], regs[c]) < 0:
+                pc = b
+            else:
+                pc = pc + 1
+        elif op == 84:                     # JT_LE
+            if v_cmp(regs[a], regs[c]) <= 0:
+                pc = b
+            else:
+                pc = pc + 1
+        elif op == 85:                     # JT_GT
+            if v_cmp(regs[a], regs[c]) > 0:
+                pc = b
+            else:
+                pc = pc + 1
+        elif op == 86:                     # JT_GE
+            if v_cmp(regs[a], regs[c]) >= 0:
+                pc = b
+            else:
+                pc = pc + 1
+        elif op == 87:                     # JT_EQ: if (a == c) -> pc = b
+            if v_eq_bool(regs[a], regs[c]) != 0:
+                pc = b
+            else:
+                pc = pc + 1
+        elif op == 88:                     # JT_NE: if (a != c) -> pc = b
+            if v_eq_bool(regs[a], regs[c]) == 0:
+                pc = b
+            else:
+                pc = pc + 1
         elif op == 8:
             callee = regs[b]
             if len(st.regpool) > 0:
