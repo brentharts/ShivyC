@@ -461,7 +461,7 @@ def truthy(v: "V") -> "int":
     if v.tag == 2:
         return 1 if v.dv != 0.0 else 0
     if v.tag == 3:
-        return 1 if len(v.sv) != 0 else 0
+        return 1 if ord(v.sv[0]) != 0 else 0   # non-empty == first byte not NUL
     if v.tag == 4:
         return 1 if v.iv != 0 else 0
     return 1
@@ -469,21 +469,21 @@ def truthy(v: "V") -> "int":
 
 # ---- equality / ordering (value semantics for scalars) ----
 def _strcmp(a: "char*", b: "char*") -> "int":
+    # Single pass, null-terminated: stop at the first differing byte (the cheap
+    # "prefix compare" German strings get for free) instead of scanning both
+    # strings to length first. Most compares -- dict keys, attr/method names,
+    # grammar tokens -- differ in the first byte or two, so this exits early.
     i = 0
-    la = len(a)
-    lb = len(b)
-    while i < la and i < lb:
+    while 1:
         ca = ord(a[i])
         cb = ord(b[i])
-        if ca < cb:
-            return -1
-        if ca > cb:
+        if ca != cb:
+            if ca < cb:
+                return -1
             return 1
+        if ca == 0:                          # equal so far and both ended
+            return 0
         i = i + 1
-    if la < lb:
-        return -1
-    if la > lb:
-        return 1
     return 0
 
 
