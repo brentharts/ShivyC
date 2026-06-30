@@ -99,7 +99,7 @@ class Interpreter:
             self.input = [new_input, new_pos]
             self.indentation = [0]
             self.locals = {}
-        old_input = self.input[:]
+        old_pos = self.input[1]
         name = root.name
         if name in ["and", "args", "output"]:
             outputs = [self.match(child) for child in root.children]
@@ -115,11 +115,11 @@ class Interpreter:
             lower, upper = {"*": (0, inf), "+": (1, inf), "?": (0, 1)}[root.children[1].children[0]]
             outputs = []
             while len(outputs) < upper:
-                last_input = self.input[:]
+                last_pos = self.input[1]
                 try:
                     outputs.append(self.match(root.children[0]))
                 except MatchError:
-                    self.input = last_input[:]
+                    self.input[1] = last_pos
                     break
             if lower > len(outputs):
                 raise MatchError("Matched %s < %s times" % (len(outputs), lower))
@@ -128,7 +128,7 @@ class Interpreter:
                 try:
                     return self.match(child)
                 except MatchError:
-                    self.input = old_input[:]
+                    self.input[1] = old_pos
             raise MatchError("All Or matches failed")
         elif name in ["exactly", "token"]:
             if name == "token":
@@ -177,7 +177,7 @@ class Interpreter:
             try:
                 self.match(root.children[0])
             except MatchError:
-                self.input = old_input
+                self.input[1] = old_pos
                 return None
             raise MatchError("Negation true")
         elif name == "rule_value":
@@ -192,7 +192,7 @@ class Interpreter:
             return
         elif name == "lookahead":
             output = self.match(root.children[0])
-            self.input = old_input[:]
+            self.input[1] = old_pos
             return output
         else:
             raise Exception("Unknown operator %s" % name)
@@ -254,13 +254,12 @@ def _all_match(input, token):
 
 def any_token(input, binary=True):
     ops = binary_ops if binary else expr_ops
-    old_input = input[:]
+    old_pos = input[1]
     for tokens in ops:
         for token in tokens:
             if _all_match(input, token):
                 return token
-            input[0] = old_input[0]
-            input[1] = old_input[1]
+            input[1] = old_pos
     return False
 
 grammar = r"""
