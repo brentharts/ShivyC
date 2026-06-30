@@ -1941,3 +1941,34 @@ stored, so `str(e)` gives `<ValueError object>` rather than the message, and the
 separate, interp-side enhancement (`instantiate` storing args + `str`/`.args` reading them)
 and is the natural next step -- it is also what a *suppressing* `with` manager would want,
 alongside threading the live exception into `__exit__`.
+
+---
+
+## v32 -- exception messages (`str(e)` and `e.args`)
+
+The v31 limitation is gone: a raised exception now carries its message. When an exception
+class with no user `__init__` is instantiated, `instantiate` records the constructor
+arguments as `.args` (a tuple), so:
+
+- `str(ValueError("bad"))` -> `"bad"` (the message), `str(RuntimeError())` -> `""`,
+  `str(ValueError("a", "b"))` -> `"('a', 'b')"` -- matching CPython's rules (one arg ->
+  the message, none -> empty, many -> the args tuple).
+- `e.args` works (`e.args[0]`, `len(e.args)`), because `.args` is a real attribute.
+- The CPython `KeyError` quirk is reproduced: `str(KeyError("k"))` -> `"'k'"` (KeyError
+  alone stringifies via `repr` of its key).
+
+Both executors were updated to match: the native interpreter (`instantiate` stores `.args`;
+`to_disp` formats an exception instance from them, with a `KeyError` chain check) and the
+ref VM (`_invoke` stores `.args`; `_pystr` formats them). "Is this an exception?" is just
+"does the class's base chain reach `BaseException`", reusing the v31 hierarchy -- no new
+per-object state in the value model. Verified byte-identical CPython == ref == native
+(`tools/minipy/test_exc_msg.py`), with the full regression, nbody, and the rast parser
+still passing.
+
+*(Aside: the ref VM miscounts one string benchmark vs CPython -- a pre-existing ref-only
+bug, unaffected by this change; the native interpreter is correct there.)*
+
+This is the half of "exception-aware `with`" that concerns the exception *object*. The
+other half -- a *suppressing* manager -- is now well-defined: change the `with` desugaring
+from a plain `try/finally` to `try/except/else`, pass `(type(e), e, None)` to `__exit__` on
+the exception path, and skip the re-raise when `__exit__` returns truthy.
