@@ -2082,3 +2082,57 @@ All 55 regression programs stay byte-identical (cpython == native), the rast par
 3-way identical, and self-host passes. (Caching an explicit length -- the other German-
 string benefit -- would only help bare `len(s)` calls, which aren't hot once compares
 early-exit, so it isn't worth the representation churn yet.)
+
+---
+
+## v36 -- a minijit: repurposing the tag's dead bytes as an inline-cache key
+
+`V`'s tag only ever holds 0-15, yet it occupied a full 4-byte `int` (the other
+3 bytes pure padding). We split it the way the value-representation literature
+suggests: a 2-byte `tag` and a 2-byte **`jitcode`** scratch slot, union unchanged,
+so `V` stays exactly 16 bytes.
+
+```c
+typedef struct V { short tag; short jitcode; union { long iv; double dv; char* sv; }; } V;
+```
+
+The struct change alone is free (within noise on every benchmark) -- a `short` tag is a
+single 2-byte load, no worse than the `int`.
+
+**What the "jit" does.** A real machine-code JIT is a much larger thing; what pays here is
+the technique JITs use to make dispatch fast -- an **inline cache**. `jitcode` holds the
+*class id* of an object value, written once at object creation (`instantiate`, and the
+bound-method `self` reconstruction) and carried along for free by the by-value `V` copy
+(it can't drift, since an object never changes class -- which is exactly why a string
+*length* couldn't live here: by-value copies would desync). Method dispatch then keys a
+monomorphic cache by the method-name const id:
+
+```
+CALL_METHOD obj.m(...):  cls = obj.jitcode                 # class id, no heap deref
+                         if mcache[nameid].cls == cls: fidx = mcache[nameid].fidx   # hit
+                         else: fidx = lookup_method(cls, m); mcache[nameid] = (cls, fidx)
+```
+
+On a hit -- the overwhelming case for monomorphic call sites -- this skips `lookup_method`
+entirely: no base-chain walk, no `_strcmp` scan over the class's method table. The cache
+lives on `St` as two `list[V]` slabs sized to the consts table (struct-field `list[int]`
+is one of py2c's broken paths; boxed `V` with `_lget`/`_lset` is the proven one), filled
+with `-1` sentinels at startup.
+
+**Layout lesson.** Inlining the ~8-line cache check straight into the dispatch loop won
++11% on `objects` but cost `sort` -7% -- the monolithic loop is jump-table-layout
+sensitive, and the extra code shifted unrelated handlers. Moving the cache into a one-call
+helper (`mcache_lookup`) kept the loop footprint identical to the old single
+`lookup_method` call: the `objects` win held and `sort` returned to baseline.
+
+**Measured (native, best-of-15, same load):**
+
+| objects | dicts | fib | ack | (others) | total |
+|---------|-------|-----|-----|----------|-------|
+| +10.4%  | +4.2% | +2.7% | +1.0% | within noise | +3.0% |
+
+`objects` is the OOP-heavy case where `lookup_method` dominated; the gain is concentrated
+exactly there and costs nothing elsewhere. All 55 regression programs stay byte-identical
+(cpython == native == ref VM -- the cache is transparent), nbody = 12982328, rast is 3-way
+identical, and self-host passes. (`bintree` is flat: its single small class made
+`lookup_method` cheap already, so there was nothing to cache away.)
