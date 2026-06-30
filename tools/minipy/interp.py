@@ -698,40 +698,59 @@ def v_slice(st: "St", seq: "V", lo_v: "V", hi_v: "V", step_v: "V") -> "V":
     else:
         return v_none()
     step = step_v.iv
-    if step <= 0:                           # v0 supports positive step only
-        step = 1
-    lo = lo_v.iv
-    if lo < 0:
-        lo = lo + n
-    if lo < 0:
-        lo = 0
-    if lo > n:
-        lo = n
+    if step == 0:
+        step = 1                            # Python errors; v0 just guards
+    # CPython slice.indices(): clamp bounds, with defaults keyed off step sign.
+    # An omitted bound arrives as None (tag 0).
+    if step < 0:
+        lower = -1
+        upper = n - 1
+    else:
+        lower = 0
+        upper = n
+    if lo_v.tag == 0:
+        lo = upper if step < 0 else lower
+    else:
+        lo = lo_v.iv
+        if lo < 0:
+            lo = lo + n
+            if lo < lower:
+                lo = lower
+        elif lo > upper:
+            lo = upper
     if hi_v.tag == 0:
-        hi = n
+        hi = lower if step < 0 else upper
     else:
         hi = hi_v.iv
         if hi < 0:
             hi = hi + n
-        if hi < 0:
-            hi = 0
-        if hi > n:
-            hi = n
-    if hi < lo:
-        hi = lo
+            if hi < lower:
+                hi = lower
+        elif hi > upper:
+            hi = upper
     if seq.tag == 3:
         out = ""
         k = lo
-        while k < hi:
-            out = out + seq.sv[k]
-            k = k + step
+        if step > 0:
+            while k < hi:
+                out = out + seq.sv[k]
+                k = k + step
+        else:
+            while k > hi:
+                out = out + seq.sv[k]
+                k = k + step
         return v_str(out)
     src = items_of(st, seq)
     res = new_v_list()
     k = lo
-    while k < hi:
-        res.append(src[k])
-        k = k + step
+    if step > 0:
+        while k < hi:
+            res.append(src[k])
+            k = k + step
+    else:
+        while k > hi:
+            res.append(src[k])
+            k = k + step
     if seq.tag == 10:
         return v_container(st, 10, 3, res)
     return v_container(st, 7, 0, res)

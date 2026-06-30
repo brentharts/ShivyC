@@ -1,0 +1,14 @@
+w = "alphabet"
+nums = [0, 1, 2, 3, 4, 5]
+print("rev=" + w[::-1])
+print("revstep=" + w[::-2])
+print("revslice=" + w[5:1:-1])
+print("fwd=" + w[1:4])
+print("step2=" + w[::2])
+print("negidx=" + w[-3:])
+print("tail=" + w[-3:-1])
+print("listrev=" + str(nums[::-1]))
+print("listslice=" + str(nums[1:5:2]))
+print("listneg=" + str(nums[4:1:-1]))
+print("empty=[" + w[5:2] + "]")
+print("all=" + w[:])

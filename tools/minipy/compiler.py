@@ -1619,7 +1619,7 @@ class Compiler:
             sl = node.slice
             rb = self.expr(f, node.value)               # seq at rb
             if sl.lower is None:
-                rlo = self._const_reg(f, ("int", 0))
+                rlo = self._const_reg(f, ("none", None))  # sentinel -> step-aware default
             else:
                 rlo = self.expr(f, sl.lower)
             assert rlo == rb + 1
@@ -2147,7 +2147,7 @@ class VM:
             elif op == 37: regs[a] = regs[b] >> regs[c]
             elif op == 38:                                # SLICE seq[lo:hi:step]
                 seq = regs[a]; lo = regs[b]; hi = regs[b + 1]; step = regs[b + 2]
-                regs[a] = seq[lo:(len(seq) if hi is None else hi):step]
+                regs[a] = seq[lo:hi:step]                 # lo/hi may be None (sentinel)
             elif op == 30: regs[a] = regs[b] < regs[c]
             elif op == 31: regs[a] = regs[b] <= regs[c]
             elif op == 32: regs[a] = regs[b] > regs[c]
