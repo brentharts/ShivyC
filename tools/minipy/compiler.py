@@ -101,6 +101,53 @@ BUILTINS = {n: i for i, n in enumerate(
      "isinstance", "enumerate", "zip", "any", "all", "ord", "chr",
      "reversed", "getattr", "hasattr", "type"])}
 
+# Builtin exception hierarchy (name -> base name), parents before children so a
+# class's base is already registered when it is.  These are materialised as real
+# minipy classes (the interpreter's is_instance already walks the .base chain),
+# so `raise ValueError(...)` and `except Exception:` work like user classes.
+_BUILTIN_EXC = [
+    ("BaseException", None),
+    ("Exception", "BaseException"),
+    ("ArithmeticError", "Exception"),
+    ("ZeroDivisionError", "ArithmeticError"),
+    ("OverflowError", "ArithmeticError"),
+    ("AssertionError", "Exception"),
+    ("AttributeError", "Exception"),
+    ("LookupError", "Exception"),
+    ("IndexError", "LookupError"),
+    ("KeyError", "LookupError"),
+    ("NameError", "Exception"),
+    ("OSError", "Exception"),
+    ("IOError", "OSError"),
+    ("RuntimeError", "Exception"),
+    ("NotImplementedError", "RuntimeError"),
+    ("RecursionError", "RuntimeError"),
+    ("StopIteration", "Exception"),
+    ("TypeError", "Exception"),
+    ("ValueError", "Exception"),
+]
+_BUILTIN_EXC_BASE = {name: base for name, base in _BUILTIN_EXC}
+
+
+def _needed_builtin_excs(tree):
+    """Builtin exception names actually referenced (plus their ancestor chain,
+    needed for `except`-matching), excluding any the program defines itself.
+    Programs that never touch exceptions register none of these."""
+    user_classes = set()
+    used = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ClassDef):
+            user_classes.add(n.name)
+        elif isinstance(n, ast.Name):
+            used.add(n.id)
+    needed = set()
+    for nm in used:
+        cur = nm
+        while cur is not None and cur in _BUILTIN_EXC_BASE and cur not in user_classes:
+            needed.add(cur)
+            cur = _BUILTIN_EXC_BASE[cur]
+    return [nm for nm, _ in _BUILTIN_EXC if nm in needed]
+
 # Method ids (receiver passed as arg0). Distinct id band (100+) so do_builtin can
 # tell a global builtin from a bound method; invoked through the same CALL path.
 METHODS = {
@@ -439,6 +486,19 @@ class Compiler:
         # pre-bind builtins into globals so `print` etc. resolve as names
         for bname, bid in BUILTINS.items():
             ci = self.consts.add("builtin", bid)
+            r = mod.push()
+            mod.emit("LOAD_CONST", r, ci)
+            mod.emit("STORE_GLOBAL", r, self.gslot(bname))
+            mod.pop_to(mod.base)
+        # materialise referenced builtin exception classes (parents first) so
+        # they exist before any user `class Err(Exception)` / raise / except.
+        for bname in _needed_builtin_excs(tree):
+            base_name = _BUILTIN_EXC_BASE[bname]
+            base = self._class_id.get(base_name, -1) if base_name else -1
+            cid = len(self.classes)
+            self._class_id[bname] = cid
+            self.classes.append({"name": bname, "base": base, "methods": []})
+            ci = self.consts.add("class", cid)
             r = mod.push()
             mod.emit("LOAD_CONST", r, ci)
             mod.emit("STORE_GLOBAL", r, self.gslot(bname))
