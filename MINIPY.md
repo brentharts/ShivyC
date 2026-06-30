@@ -1903,3 +1903,41 @@ ignored, so a manager always runs its cleanup but cannot inspect or *suppress* t
 exception. That is the standard cleanup case (locks, timers, buffers); exception-aware /
 suppressing managers would need the exception triple threaded into the finally, a later
 refinement.
+
+---
+
+## v31 -- builtin exception types
+
+`raise ValueError(...)` and stdlib-style `except ValueError:` / `except Exception:` now
+work. Previously the only exceptions were user classes, and names like `ValueError`
+resolved to nothing (`raise ValueError(...)` failed with "not callable: None") -- and
+`class Err(Exception)` quietly got *no* base, because `Exception` itself wasn't a class.
+
+This is implemented **entirely in the compiler, with no interpreter change**: the
+interpreter's `is_instance` already walks a class's `.base` chain and `instantiate`
+already works for a class with no `__init__`, so builtin exceptions are just pre-registered
+classes. A hierarchy table (`_BUILTIN_EXC`: `BaseException` -> `Exception` -> `ValueError` /
+`TypeError` / `LookupError` -> `KeyError`/`IndexError`, etc.) is materialised as real
+classes at module start, before any user code, with their `.base` links wired up. So:
+
+- `raise ValueError("x")` instantiates a real `ValueError`; `raise RuntimeError` (bare)
+  works too.
+- `except ValueError:` matches by walking the instance's base chain; `except Exception:`
+  catches every builtin (and user) exception; clause order and propagation behave like
+  CPython.
+- `class Err(Exception)` now gets a real base, so a user exception deriving a builtin
+  (`class MyErr(ValueError)`) is caught by `except ValueError:`.
+
+Registration is **demand-driven**: a pre-scan registers only the builtin exception names a
+program actually references, plus their ancestor chain (needed for matching). Programs that
+never touch exceptions (e.g. the numeric benchmarks) register zero of them, so there is no
+bloat. Verified byte-identical across CPython, the ref VM and native
+(`tools/minipy/test_builtin_exc.py`), with all 55 regression programs -- including the
+existing user-exception suite -- and the rast parser still passing.
+
+**v0 limitation (unchanged from user exceptions):** the constructor argument is not
+stored, so `str(e)` gives `<ValueError object>` rather than the message, and there is no
+`e.args`. Control flow (raise / match / propagate) is exact; surfacing the message is a
+separate, interp-side enhancement (`instantiate` storing args + `str`/`.args` reading them)
+and is the natural next step -- it is also what a *suppressing* `with` manager would want,
+alongside threading the live exception into `__exit__`.
