@@ -1863,51 +1863,80 @@ def _collect_locals(node):
             add(n.target.id)
         elif isinstance(n, ast.comprehension) and isinstance(n.target, ast.Name):
             add(n.target.id)
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            add(n.name)                          # `except E as name:` binds a local
     return found
 
 
 class _WithDesugar(ast.NodeTransformer):
-    """Lower `with` to the manager protocol wrapped in `try/finally`, so it
-    needs no dedicated opcode and `__exit__` runs on the exception path too:
+    """Lower `with` to the manager protocol (PEP 343), wrapped so `__exit__`
+    runs on every exit path *and* can suppress an exception:
 
-        with A as a:        ->     _with_N = A
-            BODY                   a = _with_N.__enter__()
-                                   try:
-                                       BODY
-                                   finally:
-                                       _with_N.__exit__(None, None, None)
+        with A as a:        _with_N = A
+            BODY        ->  a = _with_N.__enter__()
+                            _hit_N = False
+                            try:
+                                BODY
+                            except BaseException as _exc_N:
+                                _hit_N = True
+                                if not _with_N.__exit__(type(_exc_N), _exc_N, None):
+                                    raise
+                            finally:
+                                if not _hit_N:
+                                    _with_N.__exit__(None, None, None)
 
-    Multiple items nest left-to-right.  Running before _collect_locals means the
-    `_with_N` manager temps are picked up as ordinary locals (so they get fixed
-    register slots and are per-call / recursion-safe).  v0 passes None/None/None
-    to __exit__ and ignores its result -- cleanup always runs, but the manager
-    cannot inspect or suppress the exception."""
+    The `_hit_N` flag is the PEP-343 trick: the finally calls `__exit__(None...)`
+    only when no exception was seen, so normal completion, `return`, `break` and
+    `continue` all get the clean-path `__exit__` (via the finally), while an
+    exception goes through the handler -- which passes the live exception triple
+    and re-raises only if `__exit__` returns falsy (so a truthy result suppresses
+    it). Running before _collect_locals gives `_with_N`/`_hit_N`/`_exc_N` real
+    local slots (per-call / recursion-safe). Multiple items nest left-to-right;
+    nested `with`s are desugared inner-first. (Traceback arg is None -- minipy
+    has no traceback objects.)"""
     def __init__(self):
         self.ctr = 0
 
     def visit_With(self, node):
         self.generic_visit(node)             # desugar any nested withs first
         body = node.body
-        items = list(node.items)
-        for item in reversed(items):
+        for item in reversed(list(node.items)):
             self.ctr += 1
-            tmp = "_with_%d" % self.ctr
-            mgr_store = ast.Name(id=tmp, ctx=ast.Store())
-            assign_mgr = ast.Assign(targets=[mgr_store], value=item.context_expr)
-            enter = ast.Call(func=ast.Attribute(value=ast.Name(id=tmp, ctx=ast.Load()),
-                                                attr="__enter__", ctx=ast.Load()),
-                             args=[], keywords=[])
+            mgr = "_with_%d" % self.ctr
+            hit = "_hit_%d" % self.ctr
+            exc = "_exc_%d" % self.ctr
+
+            def load(name):
+                return ast.Name(id=name, ctx=ast.Load())
+
+            assign_mgr = ast.Assign(targets=[ast.Name(id=mgr, ctx=ast.Store())],
+                                    value=item.context_expr)
+            enter = ast.Call(func=ast.Attribute(value=load(mgr), attr="__enter__",
+                                                ctx=ast.Load()), args=[], keywords=[])
             if item.optional_vars is not None:
                 enter_stmt = ast.Assign(targets=[item.optional_vars], value=enter)
             else:
                 enter_stmt = ast.Expr(value=enter)
-            none_args = [ast.Constant(value=None) for _ in range(3)]
-            exit_stmt = ast.Expr(value=ast.Call(
-                func=ast.Attribute(value=ast.Name(id=tmp, ctx=ast.Load()),
-                                   attr="__exit__", ctx=ast.Load()),
-                args=none_args, keywords=[]))
-            tryfin = ast.Try(body=body, handlers=[], orelse=[], finalbody=[exit_stmt])
-            body = [assign_mgr, enter_stmt, tryfin]
+            hit_false = ast.Assign(targets=[ast.Name(id=hit, ctx=ast.Store())],
+                                   value=ast.Constant(value=False))
+            exit_exc = ast.Call(
+                func=ast.Attribute(value=load(mgr), attr="__exit__", ctx=ast.Load()),
+                args=[ast.Call(func=load("type"), args=[load(exc)], keywords=[]),
+                      load(exc), ast.Constant(value=None)], keywords=[])
+            handler = ast.ExceptHandler(
+                type=load("BaseException"), name=exc,
+                body=[ast.Assign(targets=[ast.Name(id=hit, ctx=ast.Store())],
+                                 value=ast.Constant(value=True)),
+                      ast.If(test=ast.UnaryOp(op=ast.Not(), operand=exit_exc),
+                             body=[ast.Raise(exc=None, cause=None)], orelse=[])])
+            exit_none = ast.Expr(value=ast.Call(
+                func=ast.Attribute(value=load(mgr), attr="__exit__", ctx=ast.Load()),
+                args=[ast.Constant(value=None), ast.Constant(value=None),
+                      ast.Constant(value=None)], keywords=[]))
+            fin = [ast.If(test=ast.UnaryOp(op=ast.Not(), operand=load(hit)),
+                          body=[exit_none], orelse=[])]
+            tryx = ast.Try(body=body, handlers=[handler], orelse=[], finalbody=fin)
+            body = [assign_mgr, enter_stmt, hit_false, tryx]
         for s in body:
             ast.copy_location(s, node)
             ast.fix_missing_locations(s)
