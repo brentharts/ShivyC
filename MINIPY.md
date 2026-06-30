@@ -2013,3 +2013,31 @@ regression, rast parser and self-host all still pass.
 A small supporting fix: `except E as name:` now registers `name` as a real local (it was
 previously treated as a global), so the desugaring's `_exc_N` -- and any user `except ...
 as e` -- is per-call and recursion-safe.
+
+---
+
+## v34 -- negative-step slicing (`s[::-1]`), and a ref-VM oracle fix
+
+Chasing the one benchmark where the ref VM disagreed with CPython (`strings`: 480000 vs
+896000) turned up a real feature bug, not just an oracle glitch: **negative-step slicing
+was broken in every executor**, and the benchmark only happened to mask it because it
+checks slice *lengths*, not contents.
+
+- The native interpreter forced `step <= 0` to `1` ("v0: positive step only"), so
+  `"alpha"[::-1]` iterated *forwards* -> `"alpha"` (wrong content, right length).
+- The ref VM rewrote an omitted stop to `len(seq)`, which is the wrong default for a
+  negative step, so `"alpha"[::-1]` came out **empty** -> the 480000.
+- The compiler defaulted an omitted *start* to `0`, also only correct for positive step.
+
+Fixed across all three to CPython's `slice.indices()` semantics: an omitted bound is now
+emitted as a `None` sentinel (not a hardcoded `0`/end), and each runtime resolves the
+defaults from the **sign of the step** -- start defaults to `len-1` and stop to "before 0"
+when stepping backwards, and the iteration walks `while k > hi` for negative step. The ref
+VM, running on real Python values, simply passes the sentinels straight into Python's own
+slicing. So `s[::-1]`, `s[::-2]`, `s[5:1:-1]`, list reversal `xs[::-1]`, and the existing
+forward/`negative-index`/step cases all now agree byte-for-byte.
+
+Verified CPython == ref == native (`tools/minipy/test_slice.py`) across reverse, reverse-
+step, bounded-reverse, forward, step, negative-index and list slices; the full regression
+now passes **3-way with no exceptions** (the `strings` ref divergence noted in v32 is
+gone), and rast + self-host still pass.
