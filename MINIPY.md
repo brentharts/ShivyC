@@ -2136,3 +2136,76 @@ exactly there and costs nothing elsewhere. All 55 regression programs stay byte-
 (cpython == native == ref VM -- the cache is transparent), nbody = 12982328, rast is 3-way
 identical, and self-host passes. (`bintree` is flat: its single small class made
 `lookup_method` cheap already, so there was nothing to cache away.)
+
+---
+
+## v37 (investigated, not shipped) -- attribute inline cache doesn't pay
+
+The natural follow-on to the v36 method cache was to apply the same idea to `LOAD_ATTR`:
+cache `(class -> slot offset into items[])` keyed by the attr-name const id, so attribute
+reads skip `inst_get`'s linear `_strcmp` scan. I built it, measured it carefully, and
+reverted it. The negative result is worth recording.
+
+**Why methods and attributes are not symmetric.** A method is a property of the *class*:
+`lookup_method(class, name)` is deterministic, so caching `class -> fidx` is exact and needs
+no check on a hit -- that's why v36 wins ~10%. An attribute's *offset*, by contrast, is a
+property of the *instance*: two instances of one class can diverge in layout (e.g. a
+data-dependent `__init__` assigns attributes in different orders), so a cached offset must
+be re-confirmed with one `_strcmp` at that offset before it can be trusted. Because that
+verify is mandatory, the class/`jitcode` key adds nothing for attributes -- the offset cache
+plus verify is the whole mechanism, and dropping the class check was strictly faster.
+
+**Why even the verified offset cache loses.** The verify is itself a `_strcmp`. So the cache
+fast path costs `items_of + offset-load + bounds-check + one _strcmp`, versus a scan that
+costs `one _strcmp per attribute until found`. The cache only comes out ahead when the
+target sits *deep* in `items[]`. But minipy objects are small: `objects.py`'s `Account` has
+a single attribute at offset 0, so its scan is already one `_strcmp` found immediately, and
+the cache is pure overhead on top of that.
+
+**Measured (v36 -> v37, best-of-30, repeated):** `bintree` (deeper node access) gained a
+stable +6%, but `objects` (one attribute, the primary OOP benchmark) regressed -2% to -8%,
+and the monolithic dispatch's layout sensitivity added noise on unrelated benchmarks. A
+change that slows the common shallow-attribute case to speed a rarer deep one -- with no
+net win across the suite -- isn't worth the dispatch-loop real estate, so it stays out.
+
+The lesson generalizes: an inline cache pays only when the thing it replaces is *expensive*.
+`lookup_method` (base-walk + full method-table scan) was; a one-or-two element attribute
+scan with the v35 single-pass `_strcmp` already isn't. The jitcode class-id key remains
+exactly the right tool for v36's method dispatch, and the wrong tool here.
+
+---
+
+## v38 -- the real-app benchmark: minipy2c.py + rast.py (parse + transpile)
+
+The micro-benchmarks each stress one path, and at 0.02-0.4s their absolute times are small
+enough that dispatch-loop *layout* shifts (jump-table reordering from unrelated code changes)
+swamp real algorithmic effects -- which is exactly the noise that made the attribute-cache
+verdict hard to read. The fix is a single heavy, realistic workload that exercises the whole
+interpreter at once, so an optimization's effect on it actually reflects real-world impact.
+
+**minipy2c.py** is a *mini* version of tools/py2c.py: a Python->C transpiler written in the
+minipy subset. It consumes the Node tree that **rast.py** (the PEG Python parser) produces and
+walks it to emit C -- functions, params, `if/elif/else`, `while`, assignments (declare vs
+reassign, tracked in a list), `return`, calls and binary expressions. Because minipy has no
+imports, the runnable benchmark is the concatenation `rast.py + minipy2c.py + driver`, built
+by `tools/rpy_lib/build_minipy2c_bench.py` into `benchmarks/minipy/minipy2c.py`. The driver
+parses and transpiles a real four-function program (recursion, loops, branches, arithmetic)
+N=15 times and checksums the emitted C.
+
+This is the truest thing minipy runs: a parser and a compiler, end to end, entirely on the
+native interpreter -- classes, methods, deep recursion, list work and heavy string building
+all firing together. It validates 3-way like everything else:
+
+  * `tools/rpy_lib/minipy2c_test.py` -- prints the emitted C for five snippets and asserts
+    cpython == ref VM == native, byte-for-byte.
+  * `benchmarks/minipy/minipy2c.py` -- the checksum benchmark; cpython == ref == native = 6360.
+
+**Characteristics.** ~1.5s native, ~1.0% run-to-run noise (on par with the micro-benchmarks
+in *relative* terms, but exercising far more of the interpreter). N is capped at ~35 by the
+no-GC bump arena: each `parse_python` call leaves ~30 MB of PEG matcher state that is never
+reclaimed (a genuine minipy property this benchmark surfaces -- it is memory-bound in a way
+none of the micro-benchmarks are), so N=15 keeps a comfortable margin under 1 GiB. For larger
+N, build the interpreter with `-DSHIVYC_ARENA_LOG2=31` (2 GiB).
+
+From here, optimizations should be judged primarily on minipy2c: it is the workload that
+behaves like a real program, and the one where a real win shows up as a real number.
