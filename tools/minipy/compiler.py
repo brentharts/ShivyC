@@ -2165,16 +2165,29 @@ class VM:
         if isinstance(callee, tuple) and callee[0] == "builtin":
             return self._builtin(callee[1], args)
         if isinstance(callee, tuple) and callee[0] == "class":
-            inst = _Inst(callee[1], self.prog["classes"][callee[1]]["cname"])
-            init = self._lookup_method(callee[1], "__init__")
+            cid = callee[1]
+            inst = _Inst(cid, self.prog["classes"][cid]["cname"])
+            init = self._lookup_method(cid, "__init__")
             if init is not None:
                 self._call(init, [inst] + args)
+            elif self._chain_has(cid, "BaseException"):
+                inst.attrs["args"] = tuple(args)
+                inst.is_exc = True
+                inst.exc_keyerror = self._chain_has(cid, "KeyError")
             return inst
         if isinstance(callee, tuple) and callee[0] == "bound":
             return self._call(callee[1], [callee[2]] + args)
         if isinstance(callee, tuple) and callee[0] == "boundb":
             return self._method(callee[1], [callee[2]] + args)
         raise RuntimeError("not callable: %r" % (callee,))
+
+    def _chain_has(self, cid, name):
+        classes = self.prog["classes"]
+        while cid >= 0:
+            if classes[cid]["cname"] == name:
+                return True
+            cid = classes[cid]["base"]
+        return False
 
     def _lookup_method(self, cid, name):
         classes = self.prog["classes"]
@@ -2341,7 +2354,15 @@ def _pystr(x):
     if x is True:  return "True"
     if x is False: return "False"
     if x is None:  return "None"
-    if isinstance(x, _Inst): return "<%s object>" % x.name
+    if isinstance(x, _Inst):
+        if getattr(x, "is_exc", False):
+            a = x.attrs.get("args", ())
+            if len(a) == 0:
+                return ""
+            if len(a) == 1:
+                return repr(a[0]) if getattr(x, "exc_keyerror", False) else _pystr(a[0])
+            return _pystr(a)
+        return "<%s object>" % x.name
     return str(x)
 
 

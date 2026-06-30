@@ -358,6 +358,21 @@ def _fmt_float(d: "double") -> "char*":
     return str(d)
 
 
+def _cls_chain_has(st: "St", cid: "int", name: "char*") -> "int":
+    classes = st.prog.classes
+    c = cid
+    while c >= 0:
+        if _strcmp(classes[c].cname, name) == 0:
+            return 1
+        c = classes[c].base
+    return 0
+
+
+def _is_exc_class(st: "St", cid: "int") -> "int":
+    # an exception is any class whose base chain reaches BaseException
+    return _cls_chain_has(st, cid, "BaseException")
+
+
 def to_disp(st: "St", v: "V", use_repr: "int") -> "char*":
     if v.tag == 1:
         return str(v.iv)
@@ -416,7 +431,24 @@ def to_disp(st: "St", v: "V", use_repr: "int") -> "char*":
         return out + "}"
     if v.tag == 12:                      # instance
         classes = st.prog.classes
-        ci = classes[st.heap[v.iv].cursor]
+        cid = st.heap[v.iv].cursor
+        if _is_exc_class(st, cid) == 1:
+            items = st.heap[v.iv].items
+            j = 0
+            while j < len(items):
+                if items[j].tag == 3 and _strcmp(items[j].sv, "args") == 0:
+                    at = items[j + 1]
+                    ai = items_of(st, at)
+                    if len(ai) == 0:
+                        return ""                # str(Exception()) == ""
+                    if len(ai) == 1:
+                        if _cls_chain_has(st, cid, "KeyError") == 1:
+                            return to_disp(st, ai[0], 1)   # KeyError uses repr(key)
+                        return to_disp(st, ai[0], 0)   # the message
+                    return to_disp(st, at, 1)    # str(multi-arg) == repr(tuple)
+                j = j + 2
+            return ""
+        ci = classes[cid]
         return "<" + ci.cname + " object>"
     return "<callable>"
 
@@ -1085,6 +1117,13 @@ def instantiate(st: "St", classid: "int", args: "list[V]") -> "V":
         for a in args:
             callargs.append(a)
         run_func(st, fidx, callargs)
+    elif _is_exc_class(st, classid) == 1:
+        # BaseException with no user __init__: record .args so str(e) and e.args
+        # behave like CPython (str == message for one arg, "" for none).
+        argt = new_v_list()
+        for a in args:
+            argt.append(a)
+        inst_set(st, inst, "args", v_container(st, 10, 3, argt))
     return inst
 
 
