@@ -2041,3 +2041,44 @@ Verified CPython == ref == native (`tools/minipy/test_slice.py`) across reverse,
 step, bounded-reverse, forward, step, negative-index and list slices; the full regression
 now passes **3-way with no exceptions** (the `strings` ref divergence noted in v32 is
 gone), and rast + self-host still pass.
+
+---
+
+## v35 -- German-string-inspired string comparison (and why not the full thing)
+
+We looked at adopting "German strings" (the Umbra/CedarDB 16-byte view: a 4-byte length, a
+4-byte inline prefix, and either 8 inline bytes or a pointer) to speed minipy's string
+work. The conclusion: take the part that pays, skip the part that doesn't.
+
+**Why the full 16-byte representation is not a fit here.** minipy's `V` is *already* a
+16-byte tagged union (`tag` + an 8-byte slot holding `iv`/`dv`/`sv`). A German string needs
+all 16 bytes for the string itself, so it cannot live in the 8-byte `sv` slot. The options
+are both bad for this interpreter:
+- *Grow `V` to 24 bytes* -- every value (ints, floats, list elements, registers) gets
+  bigger and the dispatch loop moves more memory. The whole v24/v25 effort went the other
+  way (32B -> 16B) precisely because value size dominates.
+- *Point `sv` at a separate 16-byte string object* -- adds an indirection to every `s[i]`
+  and keeps two allocations for long strings. And minipy's strings are overwhelmingly
+  *constants* (literals, grammar tokens), already interned once by the loader, so the
+  inline-short-string allocation win mostly doesn't apply.
+
+**The part that pays: prefix comparison.** A German string's real speed win on
+comparison-heavy work is rejecting unequal strings without a full scan. minipy's `_strcmp`
+did the opposite -- it called `len()` (i.e. `strlen`) on *both* operands before comparing,
+two full scans up front -- and it is the hot core behind every `==`, dict-key probe, and
+attribute/method-name lookup (9 call sites). Rewritten as a single null-terminated pass it
+stops at the first differing byte, which for short keys is usually byte 0 or 1 -- the same
+early-out a prefix compare gives, with no representation change. `truthy("...")` likewise
+no longer `strlen`s just to test non-empty; it checks the first byte.
+
+**Measured (native, same-load):**
+
+| objects | bintree | wordfreq | dicts | rast parse | fib | sort |
+|---------|---------|----------|-------|-----------|-----|------|
+| +13.4%  | +13.3%  | +9.8%    | +2.7% | +4.7%     | +4.3% | +1.1% |
+
+The big movers are exactly the attribute / method / dict-key lookups that scan item names.
+All 55 regression programs stay byte-identical (cpython == native), the rast parser stays
+3-way identical, and self-host passes. (Caching an explicit length -- the other German-
+string benefit -- would only help bare `len(s)` calls, which aren't hot once compares
+early-exit, so it isn't worth the representation churn yet.)
