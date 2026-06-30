@@ -91,7 +91,13 @@ class V:
     # is exactly one of int/heap-index (iv), float (dv), or string (sv), chosen
     # by `tag`, so they never need to coexist. This makes V a 16-byte
     # tag+union POD (was ~32 bytes), halving allocation size and memory traffic.
-    tag: "int"
+    #
+    # `tag` only needs a handful of values, so it is a 2-byte short; the other
+    # 2 bytes of what used to be a 4-byte tag are `jitcode`, a free per-value
+    # scratch slot the interpreter uses as an inline-cache key (e.g. an object's
+    # class id, so method dispatch can skip the heap deref + method scan).
+    tag: "short"
+    jitcode: "short"
     iv: "long"
     dv: "double"
     sv: "char*"
@@ -156,13 +162,19 @@ class Cont:
 
 class St:
     def __init__(self, prog: "Program", glob: "list[V]", heap: "list[Cont]",
-                 exc_flag: "int", exc_val: "V", regpool: "list[list[V]]"):
+                 exc_flag: "int", exc_val: "V", regpool: "list[list[V]]",
+                 mcache_cls: "list[V]", mcache_fidx: "list[V]"):
         self.prog = prog
         self.glob = glob
         self.heap = heap
         self.exc_flag = exc_flag
         self.exc_val = exc_val
         self.regpool = regpool
+        # Monomorphic method inline cache, indexed by method-name const id:
+        # (class id seen last, resolved func idx). A CALL_METHOD whose receiver's
+        # class still matches skips lookup_method entirely (no base-walk/strcmp).
+        self.mcache_cls = mcache_cls
+        self.mcache_fidx = mcache_fidx
 
 
 def new_int_list() -> "list[int]":
@@ -1103,6 +1115,20 @@ def lookup_method(st: "St", cid: "int", name: "char*") -> "int":
     return -1
 
 
+def mcache_lookup(st: "St", cls: "int", nameid: "int", nm: "char*") -> "int":
+    # Monomorphic inline cache keyed by method-name const id: if the receiver's
+    # class still matches the slot, return the cached func idx; otherwise resolve
+    # via lookup_method (base-walk + strcmp scan) and refill the slot.
+    ccl = _lget(st.mcache_cls, nameid)
+    if ccl.iv == cls:
+        cfx = _lget(st.mcache_fidx, nameid)
+        return cfx.iv
+    fidx = lookup_method(st, cls, nm)
+    _lset(st.mcache_cls, nameid, v_int(cls))
+    _lset(st.mcache_fidx, nameid, v_int(fidx))
+    return fidx
+
+
 def inst_get(st: "St", obj: "V", name: "char*") -> "V":
     items = items_of(st, obj)
     j = 0
@@ -1129,6 +1155,7 @@ def inst_set(st: "St", obj: "V", name: "char*", val: "V") -> "int":
 def instantiate(st: "St", classid: "int", args: "list[V]") -> "V":
     inst = v_container(st, 12, 5, new_v_list())
     st.heap[inst.iv].cursor = classid
+    inst.jitcode = classid                  # inline-cache key: object's class id
     fidx = lookup_method(st, classid, "__init__")
     if fidx >= 0:
         callargs = new_v_list()
@@ -1883,7 +1910,9 @@ def do_call(st: "St", callee: "V", args: "list[V]") -> "V":
                 callargs.pop()
         else:
             callargs = new_v_list()
-        callargs.append(V(12, hidx))
+        recv12 = V(12, hidx)
+        recv12.jitcode = st.heap[hidx].cursor   # keep class-id cache valid for self
+        callargs.append(recv12)
         for a in args:
             callargs.append(a)
         r = run_func(st, fidx, callargs)
@@ -2226,7 +2255,7 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
                 callargs.append(_lget(regs, b + 1 + ka))
                 ka = ka + 1
             if recv.tag == 12:             # instance -> user method, no binding
-                fidx = lookup_method(st, st.heap[recv.iv].cursor, nm)
+                fidx = mcache_lookup(st, recv.jitcode, c // 256, nm)
                 _lset(regs, a, run_func(st, fidx, callargs))
             else:                          # container/str -> builtin method
                 _lset(regs, a, do_builtin(st, method_id(nm), callargs))
@@ -2402,7 +2431,15 @@ def interp_run(prog: "Program") -> "int":
     heap = []
     cz = Cont(0, 0, new_v_list(), new_v_list())
     heap.append(cz)                        # heap[0] reserved; anchors list[Cont]
-    st = St(prog, glob, heap, 0, v_none(), new_reg_pool())
+    mcc = new_v_list()
+    mcf = new_v_list()
+    ncon = len(prog.consts)
+    zc = 0
+    while zc < ncon:
+        mcc.append(v_int(-1))               # -1 == empty cache slot
+        mcf.append(v_int(-1))
+        zc = zc + 1
+    st = St(prog, glob, heap, 0, v_none(), new_reg_pool(), mcc, mcf)
     k = 0
     while k < prog.nglobals:
         glob.append(v_none())
