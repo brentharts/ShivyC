@@ -1972,3 +1972,44 @@ This is the half of "exception-aware `with`" that concerns the exception *object
 other half -- a *suppressing* manager -- is now well-defined: change the `with` desugaring
 from a plain `try/finally` to `try/except/else`, pass `(type(e), e, None)` to `__exit__` on
 the exception path, and skip the re-raise when `__exit__` returns truthy.
+
+---
+
+## v33 -- exception-aware / suppressing `with`
+
+The v30 `with` limitation is gone: a context manager's `__exit__` now receives the live
+exception and can suppress it. The desugaring moved from a plain `try/finally` to the full
+PEP-343 shape, built on v29's `try/except/finally` and v32's real exception objects:
+
+```
+with A as a:        _with_N = A
+    BODY        ->  a = _with_N.__enter__()
+                    _hit_N = False
+                    try:
+                        BODY
+                    except BaseException as _exc_N:
+                        _hit_N = True
+                        if not _with_N.__exit__(type(_exc_N), _exc_N, None):
+                            raise
+                    finally:
+                        if not _hit_N:
+                            _with_N.__exit__(None, None, None)
+```
+
+The `_hit_N` flag is the PEP-343 trick: the finally runs the clean
+`__exit__(None, None, None)` only when no exception was raised, so normal completion,
+`return`, `break` and `continue` all get it (via the finally), while an exception goes
+through the handler -- which passes `(type(e), e, None)` and re-raises **only if
+`__exit__` returns falsy**. A truthy result therefore suppresses the exception and
+execution continues after the `with`. (Traceback is `None`; minipy has no traceback
+objects.)
+
+Verified byte-identical CPython == ref == native (`tools/minipy/test_with_suppress.py`):
+clean exit, a suppressing manager (execution continues past the `with`), a non-suppressing
+manager (exception propagates and is caught outside), `__exit__` seeing the right
+exception object (`exc=boom`), and `return`-in-body still getting the clean exit. Full
+regression, rast parser and self-host all still pass.
+
+A small supporting fix: `except E as name:` now registers `name` as a real local (it was
+previously treated as a global), so the desugaring's `_exc_N` -- and any user `except ...
+as e` -- is per-call and recursion-safe.
