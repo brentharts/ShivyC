@@ -21,6 +21,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 RAST = os.path.join(HERE, "rast.py")
 RPY = os.path.join(ROOT, "tools", "rpy.py")
+RPY_AST = os.path.join(HERE, "rpy_ast.py")
+BUILD_RPY_AST = os.path.join(HERE, "build_rpy_ast.py")
+PY2C = os.path.join(ROOT, "tools", "py2c.py")
 
 # A spread of Python constructs -- precedence, defs, control flow, containers,
 # calls, comparisons -- enough to meaningfully exercise the grammar.
@@ -66,6 +69,102 @@ def build_combined():
     return path
 
 
+# The py2c-compiled parser (rpy_ast.py) is a standalone C program: module-level
+# statements are not executed, so the snippet parsing must live inside a
+# `main() -> "int":`.  We reuse rpy_ast.py's own parser code (stripping its
+# self-test) and append this driver with rast_test's canonical SNIPPETS.
+COMPILED_DRIVER = '''
+
+def _dump(node, depth):
+    if not is_node(node):
+        print(". " * depth + "leaf " + str(node))
+        return
+    print(". " * depth + node.name)
+    for ch in node.children:
+        _dump(ch, depth + 1)
+
+def _test(src):
+    print("### " + src)
+    _dump(parse_python(src), 0)
+
+def main() -> "int":
+%s
+    return 0
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def _strip_selftest(src):
+    """Return rpy_ast.py's parser code without its own self-test block."""
+    marker = "# Self-test entry point"
+    idx = src.find(marker)
+    if idx == -1:
+        return src.rstrip() + "\n"
+    start = src.rfind("\n# ---", 0, idx)
+    if start == -1:
+        start = src.rfind("\n\n", 0, idx)
+    return src[:start].rstrip() + "\n"
+
+
+def build_compiled(snippets):
+    """Compile rpy_ast.py to a native ELF that parses `snippets`.
+
+    Returns (binary_path, tmpdir) on success, or (None, reason) if the toolchain
+    is unavailable or a step fails -- callers treat that as a skip, not a failure.
+    """
+    if not os.path.isfile(PY2C):
+        return None, "py2c.py not found"
+    parser = _strip_selftest(open(RPY_AST).read())
+    calls = "\n".join("    _test(%r)" % s for s in snippets)
+    prog = parser + COMPILED_DRIVER % calls
+    tmpdir = tempfile.mkdtemp(prefix="rpy_ast_build_")
+    srcpy = os.path.join(tmpdir, "prog.py")
+    open(srcpy, "w").write(prog)
+    outdir = os.path.join(tmpdir, "c")
+    r = subprocess.run([sys.executable, PY2C, srcpy, "--out", outdir],
+                       capture_output=True, text=True, timeout=300)
+    if r.returncode != 0 or not os.path.isdir(outdir):
+        return None, "py2c failed"
+    subprocess.run([sys.executable, "-c",
+                    "import sys;sys.path.insert(0, %r);import py2c;"
+                    "py2c.write_runtime(%r)" % (os.path.join(ROOT, "tools"), outdir)],
+                   capture_output=True, text=True, timeout=120)
+    import glob
+    cfiles = glob.glob(os.path.join(outdir, "*.c"))
+    if not cfiles:
+        return None, "no C emitted"
+    binp = os.path.join(tmpdir, "prog")
+    gcc = subprocess.run(["gcc", "-std=c99", "-O2", "-DSHIVYC_ARENA_LOG2=31",
+                          "-I", outdir] + cfiles + ["-o", binp],
+                         capture_output=True, text=True, timeout=300)
+    if gcc.returncode != 0 or not os.path.isfile(binp):
+        return None, "gcc failed"
+    return binp, tmpdir
+
+
+def run_compiled(snippets):
+    """Build + run the py2c-compiled parser.
+
+    Returns (stdout, reason, stale).  stale=True means rpy_ast.py has drifted
+    from rast.py -- a real failure the caller should report.  reason set with
+    stale=False means the C toolchain was unavailable -- a skip, not a failure.
+    """
+    chk = subprocess.run([sys.executable, BUILD_RPY_AST, "--check"],
+                         capture_output=True, text=True)
+    if chk.returncode != 0:
+        return None, "rpy_ast.py is stale vs rast.py (run build_rpy_ast.py)", True
+    binp, info = build_compiled(snippets)
+    if binp is None:
+        return None, info, False
+    try:
+        return run([binp]), None, False
+    finally:
+        import shutil
+        shutil.rmtree(info, ignore_errors=True)
+
+
 def run(cmd):
     return subprocess.run(cmd, capture_output=True, text=True, timeout=180).stdout
 
@@ -83,18 +182,30 @@ def main(argv):
         else:
             print("combined file:", combined)
 
+    # Fourth executor: rast.py compiled straight to a native ELF via py2c
+    # (rpy_ast.py), rather than interpreted as minipy bytecode.  A stale
+    # rpy_ast.py fails; a missing C toolchain is skipped, not failed.
+    compiled, cerr, stale = run_compiled(SNIPPETS)
+
     ok = True
     if cpython != ref:
         print("MISMATCH: ref VM != CPython"); ok = False
     if cpython != native:
-        print("MISMATCH: native != CPython"); ok = False
+        print("MISMATCH: native (minipy bytecode) != CPython"); ok = False
+    if stale:
+        print("STALE: " + cerr); ok = False
+    elif compiled is not None and cpython != compiled:
+        print("MISMATCH: compiled (rpy_ast native ELF) != CPython"); ok = False
     lines = cpython.count("\n")
     if ok:
-        print("PASS: cpython == ref == native  (%d snippets, %d output lines)"
-              % (len(SNIPPETS), lines))
+        tail = "== compiled" if compiled is not None else "(compiled SKIPPED: %s)" % cerr
+        print("PASS: cpython == ref == native %s  (%d snippets, %d output lines)"
+              % (tail, len(SNIPPETS), lines))
         return 0
     print("--- CPython ---"); print(cpython)
     print("--- native ---"); print(native)
+    if compiled is not None:
+        print("--- compiled ---"); print(compiled)
     return 1
 
 
