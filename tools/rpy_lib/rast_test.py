@@ -43,6 +43,9 @@ SNIPPETS = [
     "doc = '''line one\nline two'''\nc = r'''raw\\nkeep'''\n",
     "s = {\n    \"a\",\n    \"b\",\n}\nk = (x if y\n     else z)\n",
     "r = (\n    \"p1\"\n    \"p2\"\n)\nv = foo(a +\n        b)\n",
+    "h = 0xff\nm = ord(c) & 0xff\nsh = (1 << 30) >> 2\nfd = 16 // n\n",
+    "print(\"x\", file=sys.stderr)\nj = os.path.join(base, *parts.split(\".\"), \"z\")\n",
+    "try:\n    pass\nexcept Exception as e:\n    raise Wrap(str(e)) from e\n",
 ]
 
 # Driver appended to a copy of rast.py: parse each snippet and print a canonical

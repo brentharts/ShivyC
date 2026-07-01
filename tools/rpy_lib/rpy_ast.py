@@ -79,6 +79,8 @@ class Interpreter:
         if code == 'int("".join(n[0] for n in s))':
             s = L['s']
             return int("".join(n[0] for n in s))
+        if code == "_hexval(h)":
+            return _hexval(L['h'])
         if code == "reformat_atom(atom, trailers)":
             return reformat_atom(L['atom'], L['trailers'])
         if code == "reformat_binary(start, oper_and_atoms)":
@@ -264,6 +266,22 @@ def reformat_binary(start: "obj", tokens):
         lhs, index = _rb_parse(lhs, pairs, index)
     return lhs
 
+def _hexval(h):
+    # Parse a list of matched hex-digit results into an int. int(s, 16) is
+    # avoided because the minipy int() builtin ignores a base argument, so the
+    # value is accumulated by hand (works identically on the compiled parser).
+    v = 0
+    for n in h:
+        c = n[0]
+        if c >= "0" and c <= "9":
+            d = ord(c) - 48
+        elif c >= "a" and c <= "f":
+            d = ord(c) - 87
+        else:
+            d = ord(c) - 55
+        v = v * 16 + d
+    return v
+
 def _all_match(input, token):
     # Short-circuiting replacement for all(pop(input) == c for c in token):
     # stops at the first mismatch so `pop` is not called extra times (minipy
@@ -277,11 +295,24 @@ def _all_match(input, token):
 def any_token(input, binary=True):
     ops = binary_ops if binary else binary_ops[1:]
     old_pos = input[1]
+    # Maximal munch: among every operator that matches at this position, keep the
+    # LONGEST. Operators live in precedence-ordered groups, so a plain first-match
+    # scan returns "<" for "<<" and "/" for "//" (the shorter op shadows the longer
+    # one, sometimes from an earlier group). Picking the longest match fixes that
+    # generally, then the winning token is re-consumed to advance the input.
+    have = False
+    best = ""
     for tokens in ops:
         for token in tokens:
-            if _all_match(input, token):
-                return token
+            matched = _all_match(input, token)
             input[1] = old_pos
+            if matched:
+                if (not have) or len(token) > len(best):
+                    best = token
+                    have = True
+    if have:
+        _all_match(input, best)
+        return best
     return False
 
 def _grammar():
@@ -334,7 +365,7 @@ fplist = {fpdef (comma {fpdef})*} comma?
 
 stmt = compound_stmt | simple_stmt
 simple_stmt = {small_stmt (";" {small_stmt})*} ";"? NEWLINE
-small_stmt = print_stmt | del_stmt | pass_stmt | flow_stmt | comment
+small_stmt = del_stmt | pass_stmt | flow_stmt | comment
            | import_stmt | global_stmt | exec_stmt | assert_stmt | expr_stmt
 
 expr_stmt = aug_assign | ann_assign | regular_assign | testlist
@@ -353,7 +384,7 @@ break_stmt! = "break" {}
 continue_stmt! = "continue" {}
 return_stmt! = "return" {testlist?}
 yield_stmt = yield_expr
-raise_stmt! = "raise" {(test ("," test ("," test))?)?}
+raise_stmt! = "raise" {(test ("from" {test} | ("," test ("," test))?)?)?}
 import_stmt = import_name | import_from
 import_name = "import" {import_names}
 import_names! = dotted_as_name ("," {dotted_as_name})*
@@ -437,7 +468,8 @@ arglist! = ({argument} comma)* ( "**" {test=kwargs}
                                comma?
 comma = "," spaces
 
-argument = keyword_arg | listcomp_arg
+argument = keyword_arg | star_arg | listcomp_arg
+star_arg! = "*" {test}
 keyword_arg = {test} "=" {test}
 listcomp_arg = test (list_for list_iter*)?
 
@@ -449,7 +481,8 @@ testlist_safe = or_test ((',' or_test)+ ','?)?
 testlist1 = test ("," test)*
 
 comment! = '#' {(~'\n' {anything})*}
-NUMBER! = hspaces digit+:s -> int("".join(n[0] for n in s))
+NUMBER! = hspaces '0' ('x' | 'X') hexdigit+:h -> _hexval(h)
+        | hspaces digit+:s -> int("".join(n[0] for n in s))
 # Probably need to check that the result isn't a reserved word.
 NAME! = hspaces {((letter | '_') (letter | digit | '_')*)}
 STRINGS = STRING (spaces {STRING})*
@@ -471,6 +504,7 @@ def _extra():
 escaped_char! = '\\' {'n'|'r'|'t'|'b'|'f'|'"'|'\''|'\\'}
 letter = 'a'|'b'|'c'|'d'|'e'|'f'|'g'|'h'|'i'|'j'|'k'|'l'|'m'|'n'|'o'|'p'|'q'|'r'|'s'|'t'|'u'|'v'|'w'|'x'|'y'|'z'|'A'|'B'|'C'|'D'|'E'|'F'|'G'|'H'|'I'|'J'|'K'|'L'|'M'|'N'|'O'|'P'|'Q'|'R'|'S'|'T'|'U'|'V'|'W'|'X'|'Y'|'Z'
 digit = '0'|'1'|'2'|'3'|'4'|'5'|'6'|'7'|'8'|'9'
+hexdigit = digit | 'a'|'b'|'c'|'d'|'e'|'f'|'A'|'B'|'C'|'D'|'E'|'F'
 hspaces = (' ' | '\t' | escaped_linebreak)*
 hspacesp = (' ' | '\t' | escaped_linebreak)+
 escaped_linebreak = '\\' {'\n'}
