@@ -488,7 +488,6 @@ thus making the entire project self contained.
 - C11 Specification — http://www.open-std.org/jtc1/sc22/wg14/www/docs/n1570.pdf
 - x86-64 ABI — https://github.com/hjl-tools/x86-psABI/wiki/x86-64-psABI-1.0.pdf
 - Iterated Register Coalescing (George and Appel) — https://www.cs.purdue.edu/homes/hosking/502/george.pdf
-- *Foundational Problems with Compilers and Operating Systems* (B. Hartshorn, viXra 2025).
-    - https://ai.vixra.org/abs/2507.0081
-    - Minipy inspired by https://gitlab.com/hartsantler/tpythonpp
-    - My old Rpython research: https://code.google.com/archive/p/rpythonic/
+- (B. Hartshorn, viXra 2025, 2026).
+    - *Foundational Problems with Compilers and Operating Systems* https://ai.vixra.org/abs/2507.0081
+    - *Rethinking Meta-Interpreters for High-Performance Execution* https://ai.vixra.org/abs/2606.0084
