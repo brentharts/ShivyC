@@ -535,6 +535,16 @@ class Compiler:
     def st_Pass(self, f, node):
         pass
 
+    def st_Import(self, f, node):
+        # minipy provides its supported modules (sys/os/re) directly at runtime;
+        # the import statement itself is a recognized no-op. CPython-only modules
+        # (e.g. pickle) are expected to be used only inside branches gated by a
+        # `sys.implementation.name` check, which folds away before this matters.
+        pass
+
+    def st_ImportFrom(self, f, node):
+        pass
+
     def st_Global(self, f, node):
         # The declared names were excluded from this frame's locals by
         # _collect_locals, so loads/stores already route to the global slot.
@@ -896,7 +906,52 @@ class Compiler:
                 and type(test.ops[0]) in (ast.Lt, ast.LtE, ast.Gt, ast.GtE,
                                           ast.Eq, ast.NotEq, ast.Is, ast.IsNot))
 
+    def _is_impl_name(self, node):
+        # Matches the attribute chain `sys.implementation.name`.
+        return (isinstance(node, ast.Attribute) and node.attr == "name"
+                and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "implementation"
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id == "sys")
+
+    def _const_impl_test(self, test):
+        # Statically evaluate `sys.implementation.name ==/!= 'str'` as if the
+        # running implementation is 'minipy'. Returns True/False when the test is
+        # this recognized identity check, else None. This lets scripts guard
+        # CPython-only code (pickle, etc.) behind
+        #   if sys.implementation.name != 'minipy':
+        # and have minipy drop that whole branch at compile time -- no bytecode,
+        # so the branch may freely use features minipy cannot compile.
+        if not (isinstance(test, ast.Compare) and len(test.ops) == 1
+                and len(test.comparators) == 1):
+            return None
+        left = test.left
+        right = test.comparators[0]
+        op = test.ops[0]
+        if self._is_impl_name(left) and isinstance(right, ast.Constant) \
+                and isinstance(right.value, str):
+            val = right.value
+        elif self._is_impl_name(right) and isinstance(left, ast.Constant) \
+                and isinstance(left.value, str):
+            val = left.value
+        else:
+            return None
+        if isinstance(op, ast.Eq):
+            return val == "minipy"
+        if isinstance(op, ast.NotEq):
+            return val != "minipy"
+        return None
+
     def st_If(self, f, node):
+        verdict = self._const_impl_test(node.test)
+        if verdict is True:                    # branch taken on minipy
+            for s in node.body:
+                self.stmt(f, s)
+            return
+        if verdict is False:                   # CPython-only branch: skip entirely
+            for s in node.orelse:
+                self.stmt(f, s)
+            return
         jfs = self._emit_branch_false(f, node.test)
         for s in node.body:
             self.stmt(f, s)
