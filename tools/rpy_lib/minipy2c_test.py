@@ -34,6 +34,10 @@ SNIPPETS = [
     "def neg(n):\n    return -n\n",
     "def logic(a, b):\n    if a and b:\n        return 1\n    if a or b:\n        return 2\n    if not a:\n        return 3\n    return 0\n",
     "def loop(n):\n    i = 0\n    while i < n:\n        if i == 3:\n            break\n        i += 1\n    return i\n",
+    "def flags(x):\n    if x:\n        return True\n    return False\n",
+    "class Counter:\n    def __init__(self):\n        self.n = 0\n    def add(self, k):\n        self.n = self.n + k\n    def get(self):\n        return self.n\n",
+    "class Acc:\n    def __init__(self):\n        self.t = 0\n    def step(self, x):\n        self.t = self.t + x\n    def run(self, a, b):\n        self.step(a)\n        self.step(b)\n        return self.t\n",
+    "class Point:\n    def __init__(self, x, y):\n        self.x = x\n        self.y = y\n    def sqmag(self):\n        return (self.x * self.x) + (self.y * self.y)\n",
 ]
 
 DRIVER = '''

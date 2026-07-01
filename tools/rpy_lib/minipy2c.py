@@ -12,14 +12,21 @@ class Transpiler:
     def __init__(self):
         self.out = ""
         self.declared = []          # names already declared in the current scope
+        self.cur_class = ""         # enclosing class name while emitting a method
 
     def emit(self, s):
         self.out = self.out + s
 
     def transpile(self, src):
+        return self.transpile_tree(parse_python(src))
+
+    # Transpile an already-parsed tree. Parsing (the PEG step) is the expensive,
+    # memory-heavy part under minipy's free-once arena, and a given source always
+    # parses to the same tree, so callers that transpile one program repeatedly
+    # parse it once and reuse the tree here.
+    def transpile_tree(self, tree):
         self.out = ""
         self.declared = []
-        tree = parse_python(src)
         self.gen_block(tree)
         return self.out
 
@@ -52,6 +59,8 @@ class Transpiler:
         nm = node.name
         if nm == "funcdef":
             self.gen_func(node)
+        elif nm == "classdef":
+            self.gen_class(node)
         elif nm == "regular_assign":
             self.gen_assign(node)
         elif nm == "return_stmt":
@@ -108,9 +117,139 @@ class Transpiler:
             j = j + 1
         self.emit("}\n")
 
+    # ---- classes ---------------------------------------------------------
+    # A class becomes a C struct plus one function per method (the receiver is
+    # passed explicitly as `ClassName* self`). Fields are discovered from every
+    # `self.X = ...` assignment in the class body; each is a `long` slot. Method
+    # bodies read/write them as `self->X`, and a call `self.m(...)` lowers to
+    # `ClassName_m(self, ...)`.
+    def method_defs(self, suite):
+        # The funcdefs directly inside a class suite.
+        out = []
+        stmts = self.body_stmts(suite)
+        i = 0
+        while i < len(stmts):
+            s = stmts[i]
+            if is_node(s) and s.name == "funcdef":
+                out.append(s)
+            i = i + 1
+        return out
+
+    def collect_fields(self, methods):
+        # Field names in first-assignment order across all methods: any target
+        # of the form `self.NAME = ...`.
+        fields = []
+        mi = 0
+        while mi < len(methods):
+            body = methods[mi].children[2]
+            stmts = self.body_stmts(body)
+            si = 0
+            while si < len(stmts):
+                self.scan_fields(stmts[si], fields)
+                si = si + 1
+            mi = mi + 1
+        return fields
+
+    def scan_fields(self, node, fields):
+        # Walk one statement, appending any newly seen `self.X` assignment field.
+        if not is_node(node):
+            return
+        if node.name == "regular_assign":
+            tgt = node.children[0]
+            if is_node(tgt) and tgt.name == "__getattr__":
+                base = tgt.children[0]
+                if is_node(base) and base.name == "NAME" and base.children[0] == "self":
+                    fn = tgt.children[1].children[0]
+                    if self.contains(fields, fn) == 0:
+                        fields.append(fn)
+        # recurse into nested blocks (if/while/for bodies) so fields assigned
+        # under control flow are still declared.
+        ch = node.children
+        k = 0
+        while k < len(ch):
+            if is_node(ch[k]):
+                self.scan_fields(ch[k], fields)
+            k = k + 1
+
+    def contains(self, xs, v):
+        i = 0
+        while i < len(xs):
+            if xs[i] == v:
+                return 1
+            i = i + 1
+        return 0
+
+    def has_return(self, node):
+        # True if the subtree contains a return_stmt (so a method returns long,
+        # otherwise void).
+        if not is_node(node):
+            return 0
+        if node.name == "return_stmt":
+            return 1
+        ch = node.children
+        i = 0
+        while i < len(ch):
+            if self.has_return(ch[i]) == 1:
+                return 1
+            i = i + 1
+        return 0
+
+    def gen_class(self, node):
+        name = node.children[0].children[0]
+        suite = node.children[2]
+        methods = self.method_defs(suite)
+        fields = self.collect_fields(methods)
+        # struct definition
+        self.emit("typedef struct " + name + " {")
+        fi = 0
+        while fi < len(fields):
+            self.emit(" long " + fields[fi] + ";")
+            fi = fi + 1
+        self.emit(" } " + name + ";\n")
+        # methods
+        self.cur_class = name
+        mi = 0
+        while mi < len(methods):
+            self.gen_method(name, methods[mi])
+            mi = mi + 1
+        self.cur_class = ""
+
+    def gen_method(self, cls, node):
+        mname = node.children[0].children[0]
+        params = node.children[1].children      # params[0] is `self`
+        body = node.children[2]
+        self.declared = []
+        if self.has_return(body) == 1:
+            self.emit("long ")
+        else:
+            self.emit("void ")
+        self.emit(cls + "_" + mname + "(" + cls + "* self")
+        i = 1                                    # skip self
+        while i < len(params):
+            pn = params[i].children[0]
+            self.declared.append(pn)
+            self.emit(", long " + pn)
+            i = i + 1
+        self.emit(") {\n")
+        bs = self.body_stmts(body)
+        j = 0
+        while j < len(bs):
+            self.gen_stmt(bs[j])
+            j = j + 1
+        self.emit("}\n")
+
     def gen_assign(self, node):
-        target = node.children[0].children[0]
+        tgt = node.children[0]
         self.emit("    ")
+        if tgt.name == "__getattr__":
+            # `obj.field = value` -> `obj->field = value;` (fields live in the
+            # struct, so there is no `long` declaration here).
+            self.gen_expr(tgt)
+            self.emit(" = ")
+            self.gen_expr(node.children[1])
+            self.emit(";\n")
+            return
+        target = tgt.children[0]
         if self.is_declared(target) == 0:
             self.declared.append(target)
             self.emit("long ")
@@ -194,7 +333,15 @@ class Transpiler:
             return
         nm = node.name
         if nm == "NAME":
-            self.emit(node.children[0])
+            nv = node.children[0]
+            if nv == "True":
+                self.emit("1")
+            elif nv == "False":
+                self.emit("0")
+            elif nv == "None":
+                self.emit("0")
+            else:
+                self.emit(nv)
         elif nm == "NUMBER":
             self.emit(str(node.children[0]))
         elif nm == "__binary__":
@@ -224,15 +371,48 @@ class Transpiler:
             self.emit("(!")
             self.gen_expr(node.children[0])
             self.emit(")")
+        elif nm == "__getattr__":
+            # obj.field -> obj->field  (self.n -> self->n)
+            base = node.children[0]
+            field = node.children[1].children[0]
+            if is_node(base) and base.name == "NAME":
+                self.emit(base.children[0] + "->" + field)
+            else:
+                self.emit("(")
+                self.gen_expr(base)
+                self.emit(")->" + field)
         elif nm == "__call__":
-            self.emit(node.children[0].children[0])
-            self.emit("(")
+            callee = node.children[0]
+            if is_node(callee) and callee.name == "__getattr__":
+                self.gen_method_call(node, callee)
+            else:
+                self.emit(callee.children[0])
+                self.emit("(")
+                if len(node.children) > 1:
+                    args = node.children[1].children
+                    i = 0
+                    while i < len(args):
+                        if i > 0:
+                            self.emit(", ")
+                        self.gen_expr(args[i])
+                        i = i + 1
+                self.emit(")")
+        else:
+            self.emit("0")
+
+    def gen_method_call(self, node, callee):
+        # self.m(args) -> ClassName_m(self, args). A call on any other receiver
+        # needs its struct type, which we do not infer yet, so it is left as a
+        # placeholder (0) rather than emitting an unresolved name.
+        base = callee.children[0]
+        meth = callee.children[1].children[0]
+        if is_node(base) and base.name == "NAME" and base.children[0] == "self":
+            self.emit(self.cur_class + "_" + meth + "(self")
             if len(node.children) > 1:
                 args = node.children[1].children
                 i = 0
                 while i < len(args):
-                    if i > 0:
-                        self.emit(", ")
+                    self.emit(", ")
                     self.gen_expr(args[i])
                     i = i + 1
             self.emit(")")
