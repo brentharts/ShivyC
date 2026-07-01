@@ -300,12 +300,12 @@ eval_input = testlist NEWLINE? EMPTY_LINE* ENDMARKER
 decorator! = "@" {dotted_name ("(" {arglist} ")")?} NEWLINE
 decorators! = decorator+
 decorated = decorators (classdef | funcdef)
-funcdef = "def" {NAME} "(" {parameters | void=parameters} ")" ":" {suite}
+funcdef = "def" {NAME} "(" {parameters | void=parameters} ")" {("->" {test})?=returns} ":" {suite}
 # Check order validity elsewhere (at most one remaining_args and one kwargs)
 parameters! = {fpdef_opt (comma {fpdef_opt})*} comma?
 
 fpdef = NAME | "(" fplist ")"
-fpdef_opt = fpdef ("=" {test})? | "*" {NAME=remaining_args} | "**" {NAME=kwargs}
+fpdef_opt = fpdef (":" {test=annotation})? ("=" {test})? | "*" {NAME=remaining_args} | "**" {NAME=kwargs}
 fplist = {fpdef (comma {fpdef})*} comma?
 
 stmt = compound_stmt | simple_stmt

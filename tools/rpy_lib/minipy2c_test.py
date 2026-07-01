@@ -38,6 +38,9 @@ SNIPPETS = [
     "class Counter:\n    def __init__(self):\n        self.n = 0\n    def add(self, k):\n        self.n = self.n + k\n    def get(self):\n        return self.n\n",
     "class Acc:\n    def __init__(self):\n        self.t = 0\n    def step(self, x):\n        self.t = self.t + x\n    def run(self, a, b):\n        self.step(a)\n        self.step(b)\n        return self.t\n",
     "class Point:\n    def __init__(self, x, y):\n        self.x = x\n        self.y = y\n    def sqmag(self):\n        return (self.x * self.x) + (self.y * self.y)\n",
+    "def addf(a: \"int\", b: \"int\") -> \"int\":\n    return a + b\n",
+    "def pick(s: \"char*\") -> \"char*\":\n    return s\n",
+    "class Box:\n    def __init__(self, v: \"int\"):\n        self.v = v\n    def scaled(self, k: \"int\") -> \"int\":\n        return self.v * k\n",
 ]
 
 DRIVER = '''

@@ -94,20 +94,80 @@ class Transpiler:
         else:
             self.emit("    /* stmt:" + nm + " */\n")
 
+    # ---- annotation-driven typing ---------------------------------------
+    # rast now parses `x: "int"` / `-> "char*"`. A parameter is either a bare
+    # NAME (untyped -> long) or `fpdef_opt(NAME, annotation(STRING), ...)`; a
+    # funcdef carries a `returns` node (empty when unannotated). We map the
+    # annotation string to a C type, defaulting to `long` for anything we do not
+    # model yet, so untyped code behaves exactly as before.
+    def map_ctype(self, a):
+        if a == "int":
+            return "long"
+        if a == "long":
+            return "long"
+        if a == "char*":
+            return "char*"
+        if a == "str":
+            return "char*"
+        if a == "float":
+            return "double"
+        if a == "double":
+            return "double"
+        if a == "bool":
+            return "long"
+        if a == "void":
+            return "void"
+        return "long"
+
+    def param_name(self, p):
+        if p.name == "fpdef_opt":
+            return p.children[0].children[0]
+        return p.children[0]
+
+    def annot_of(self, p):
+        # the annotation type string of a param, or "" when unannotated
+        if p.name != "fpdef_opt":
+            return ""
+        ch = p.children
+        k = 0
+        while k < len(ch):
+            c = ch[k]
+            if is_node(c) and c.name == "annotation":
+                return c.children[0].children[0]
+            k = k + 1
+        return ""
+
+    def param_ctype(self, p):
+        a = self.annot_of(p)
+        if a == "":
+            return "long"
+        return self.map_ctype(a)
+
+    def ret_ctype(self, returns, has_ret):
+        # returns: the funcdef's `returns` child (empty node when unannotated)
+        if is_node(returns) and len(returns.children) > 0:
+            st = returns.children[0]
+            if is_node(st) and st.name == "STRING":
+                return self.map_ctype(st.children[0])
+        if has_ret == 1:
+            return "long"
+        return "void"
+
     def gen_func(self, node):
         name = node.children[0].children[0]
         params = node.children[1]
-        body = node.children[2]
+        returns = node.children[2]
+        body = node.children[3]
         self.declared = []
-        self.emit("long " + name + "(")
+        self.emit(self.ret_ctype(returns, 1) + " " + name + "(")
         ps = params.children
         i = 0
         while i < len(ps):
             if i > 0:
                 self.emit(", ")
-            pn = ps[i].children[0]
+            pn = self.param_name(ps[i])
             self.declared.append(pn)
-            self.emit("long " + pn)
+            self.emit(self.param_ctype(ps[i]) + " " + pn)
             i = i + 1
         self.emit(") {\n")
         bs = self.body_stmts(body)
@@ -141,7 +201,7 @@ class Transpiler:
         fields = []
         mi = 0
         while mi < len(methods):
-            body = methods[mi].children[2]
+            body = methods[mi].children[3]
             stmts = self.body_stmts(body)
             si = 0
             while si < len(stmts):
@@ -217,18 +277,16 @@ class Transpiler:
     def gen_method(self, cls, node):
         mname = node.children[0].children[0]
         params = node.children[1].children      # params[0] is `self`
-        body = node.children[2]
+        returns = node.children[2]
+        body = node.children[3]
         self.declared = []
-        if self.has_return(body) == 1:
-            self.emit("long ")
-        else:
-            self.emit("void ")
+        self.emit(self.ret_ctype(returns, self.has_return(body)) + " ")
         self.emit(cls + "_" + mname + "(" + cls + "* self")
         i = 1                                    # skip self
         while i < len(params):
-            pn = params[i].children[0]
+            pn = self.param_name(params[i])
             self.declared.append(pn)
-            self.emit(", long " + pn)
+            self.emit(", " + self.param_ctype(params[i]) + " " + pn)
             i = i + 1
         self.emit(") {\n")
         bs = self.body_stmts(body)

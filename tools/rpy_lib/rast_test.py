@@ -38,6 +38,7 @@ SNIPPETS = [
     "d = {1: 2, 3: 4}\n",
     "r = f(a, b) + g(c)\n",
     "ok = a == b and c != d\n",
+    "def typed(x: \"int\", s: \"char*\") -> \"int\":\n    return x\n",
 ]
 
 # Driver appended to a copy of rast.py: parse each snippet and print a canonical
