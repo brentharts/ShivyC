@@ -2348,3 +2348,24 @@ invalidates a transform, generation fails loudly instead of emitting a broken pa
 The generated body is byte-identical to the reviewed parser; only the module docstring is
 replaced with a "GENERATED -- do not edit" banner. Do not edit `rpy_ast.py` by hand; edit
 `rast.py` and regenerate.
+
+## Regression test: a four-way agreement check
+
+`tools/rpy_lib/rast_test.py` parses the same spread of snippets under **four** executors and
+asserts their canonical tree dumps are byte-identical:
+
+1. **CPython** -- `rast.py` run directly (ground truth).
+2. **ref VM** -- the pure-Python minipy reference VM (`rpy.py --ref`).
+3. **native (bytecode)** -- `rast.py` as minipy bytecode on the py2c-compiled minipy
+   interpreter (`rpy.py`).
+4. **compiled (native ELF)** -- `rpy_ast.py` compiled straight to C by py2c and run as a
+   standalone binary (the port).
+
+    python3 tools/rpy_lib/rast_test.py
+    # PASS: cpython == ref == native == compiled  (10 snippets, 172 output lines)
+
+The fourth executor first runs `build_rpy_ast.py --check`: if `rpy_ast.py` has drifted from
+`rast.py` the test **fails** (drift is a real bug). If the C toolchain (py2c + gcc) is
+unavailable the fourth executor is **skipped**, not failed, so the test still runs in
+environments without a compiler. This makes the compiled parser a first-class, continuously
+checked executor: any py2c regression or source drift that changes a parse tree is caught.
