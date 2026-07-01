@@ -3403,6 +3403,8 @@ int setsockopt(int, int, int, void*, unsigned int);
 int close(int);
 unsigned short htons(unsigned short);
 unsigned int inet_addr(const char*);
+int fork(void);
+void _exit(int);
 struct __py_sin { unsigned short fam; unsigned short port;
                   unsigned int addr; unsigned char zero[8]; };
 static int __py_sock_connect(int fd, char* host, int port) {
