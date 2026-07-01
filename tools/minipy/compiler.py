@@ -1999,8 +1999,130 @@ class _WithDesugar(ast.NodeTransformer):
         return body
 
 
+# ---- module linking -------------------------------------------------------
+# minipy has no runtime module objects. Instead, a small set of library modules
+# written in the minipy subset are *linked in at compile time*: when a program
+# does `import re`, the module's source is parsed, its top-level names are given
+# a `$mod$` prefix (so they cannot collide with the importing program), its body
+# is prepended to the program, and every `re.member` reference in the program is
+# rewritten to the corresponding prefixed name. `re.match(x)` therefore becomes
+# an ordinary direct call to the linked `$re$match` function -- no code-generator
+# or interpreter changes are needed. Modules not in the registry keep the
+# recognised-no-op import behavior (e.g. CPython-only modules gated behind a
+# `sys.implementation.name` check).
+def _module_registry():
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    lib = os.path.join(here, "..", "rpy_lib")
+    return {
+        "re": os.path.join(lib, "minire.py"),
+    }
+
+
+def _module_bound_names(body):
+    names = set()
+    for s in body:
+        if isinstance(s, (ast.FunctionDef, ast.ClassDef)):
+            names.add(s.name)
+        elif isinstance(s, ast.Assign):
+            for t in s.targets:
+                if isinstance(t, ast.Name):
+                    names.add(t.id)
+        elif isinstance(s, ast.AnnAssign) and isinstance(s.target, ast.Name):
+            names.add(s.target.id)
+    return names
+
+
+class _RefPrefixer(ast.NodeTransformer):
+    """Prefix references to a linked module's own top-level names. Guards against
+    any function/method local or parameter shadowing one of those names, since
+    the rename is name-based (that shadowing never occurs in the small library
+    modules we link, and erroring is safer than silently miscompiling)."""
+    def __init__(self, names, prefix):
+        self.names = names
+        self.prefix = prefix
+
+    def _check_no_shadow(self, node):
+        loc = set(_collect_locals(node))
+        for a in node.args.args:
+            loc.add(a.arg)
+        if node.args.vararg:
+            loc.add(node.args.vararg.arg)
+        bad = loc & self.names
+        if bad:
+            raise CompileError("module link: local(s) %s shadow module globals"
+                               % sorted(bad))
+
+    def visit_FunctionDef(self, node):
+        self._check_no_shadow(node)
+        self.generic_visit(node)
+        return node
+
+    def visit_Name(self, node):
+        if node.id in self.names:
+            node.id = self.prefix + node.id
+        return node
+
+
+def _namespace_module(mtree, prefix):
+    names = _module_bound_names(mtree.body)
+    for s in mtree.body:                      # rename top-level def/class names
+        if isinstance(s, (ast.FunctionDef, ast.ClassDef)) and s.name in names:
+            s.name = prefix + s.name
+    _RefPrefixer(names, prefix).visit(mtree)  # prefix references + shadow guard
+    member_map = {}
+    for n in names:
+        member_map[n] = prefix + n
+    return member_map
+
+
+class _ModuleAttrRewriter(ast.NodeTransformer):
+    """Rewrite `alias.member` (of a linked module) to its prefixed global name."""
+    def __init__(self, alias_members):
+        self.am = alias_members
+
+    def visit_Attribute(self, node):
+        self.generic_visit(node)
+        v = node.value
+        if isinstance(v, ast.Name) and v.id in self.am:
+            mm = self.am[v.id]
+            if node.attr in mm:
+                return ast.copy_location(
+                    ast.Name(id=mm[node.attr], ctx=node.ctx), node)
+        return node
+
+
+def _link_modules(tree):
+    reg = _module_registry()
+    aliases = {}                              # alias name -> module key
+    for s in tree.body:
+        if isinstance(s, ast.Import):
+            for al in s.names:
+                if al.name in reg:
+                    aliases[al.asname or al.name] = al.name
+    if not aliases:
+        return tree
+    prepend = []
+    linked = set()
+    alias_members = {}
+    for alias in aliases:
+        mod = aliases[alias]
+        prefix = "$" + mod + "$"
+        with open(reg[mod], encoding="utf-8") as fh:
+            mtree = ast.parse(fh.read(), filename=reg[mod])
+        alias_members[alias] = _namespace_module(mtree, prefix)
+        if mod not in linked:                 # inline each module body once
+            prepend = prepend + mtree.body
+            linked.add(mod)
+    _ModuleAttrRewriter(alias_members).visit(tree)
+    tree.body = prepend + tree.body
+    ast.fix_missing_locations(tree)
+    return tree
+
+
 def compile_source(src, source_name="<module>"):
     tree = ast.parse(src, filename=source_name)
+    tree = _link_modules(tree)               # inline supported library imports
     tree = _WithDesugar().visit(tree)        # with -> manager-protocol + try/finally
     ast.fix_missing_locations(tree)
     c = Compiler()
