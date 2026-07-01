@@ -2332,11 +2332,19 @@ Each is a real py2c limitation worth knowing for future ports.
    it. AddressSanitizer was clean (valid pointer, wrong *tag*: `isinstance(x, int)` was true).
    Fix: annotate the parameter — `def reformat_binary(start: "obj", tokens):`.
 
-## Hand-maintained vs generated
+## Generated from rast.py
 
-`rpy_ast.py` is currently a hand-edited copy of `rast.py`. The delta is small and mechanical:
-`isinstance`-not-`type` (#1), lazy-init tables + grammar-as-functions (#2), int `inf` (#3),
-explicit escaped-char dict (#4), the `isinstance(pyi, Interpreter)` narrowing (#6), and the
-`start: "obj"` annotation (#7), plus a `main() -> "int":` self-test. A future step could
-generate `rpy_ast.py` from `rast.py` by applying exactly these transforms (as the minipy2c
-benchmark is generated), keeping `rast.py` as the single source of truth.
+`rpy_ast.py` is **generated** from `rast.py` by `tools/rpy_lib/build_rpy_ast.py`, so `rast.py`
+stays the single source of truth and the two cannot drift. The generator applies exactly the
+transforms above -- `isinstance`-not-`type` (#1), lazy-init tables + grammar-as-functions (#2),
+int `inf` (#3), explicit escaped-char dict (#4), the `isinstance(pyi, Interpreter)` narrowing
+(#6), the `start: "obj"` annotation (#7), plus a `main() -> "int":` self-test -- each as a
+string substitution that asserts its input is present, so if `rast.py` changes in a way that
+invalidates a transform, generation fails loudly instead of emitting a broken parser.
+
+    python3 tools/rpy_lib/build_rpy_ast.py            # regenerate rpy_ast.py after editing rast.py
+    python3 tools/rpy_lib/build_rpy_ast.py --check    # CI check: fail if rpy_ast.py is stale
+
+The generated body is byte-identical to the reviewed parser; only the module docstring is
+replaced with a "GENERATED -- do not edit" banner. Do not edit `rpy_ast.py` by hand; edit
+`rast.py` and regenerate.
