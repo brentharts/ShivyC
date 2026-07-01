@@ -60,6 +60,20 @@ class Transpiler:
             self.emit(";\n")
         elif nm == "if_stmt":
             self.gen_if(node)
+        elif nm == "single_if":
+            # a bare `if` with no elif/else parses as a lone single_if,
+            # not wrapped in if_stmt; treat it as a one-branch if.
+            one = []
+            one.append(node)
+            self.gen_if_branches(one)
+        elif nm == "aug_assign":
+            self.gen_aug_assign(node)
+        elif nm == "for_stmt":
+            self.gen_for(node)
+        elif nm == "break_stmt":
+            self.emit("    break;\n")
+        elif nm == "continue_stmt":
+            self.emit("    continue;\n")
         elif nm == "while_stmt":
             self.gen_while(node)
         elif nm == "__call__":
@@ -105,7 +119,9 @@ class Transpiler:
         self.emit(";\n")
 
     def gen_if(self, node):
-        branches = node.children
+        self.gen_if_branches(node.children)
+
+    def gen_if_branches(self, branches):
         i = 0
         while i < len(branches):
             si = branches[i]
@@ -127,6 +143,39 @@ class Transpiler:
                 j = j + 1
             self.emit("    }\n")
             i = i + 1
+
+    def gen_aug_assign(self, node):
+        # aug_assign(NAME target, operation('+='), expr) -> `target += expr;`
+        target = node.children[0].children[0]
+        op = node.children[1].children[0]
+        self.emit("    " + target + " " + op + " ")
+        self.gen_expr(node.children[2])
+        self.emit(";\n")
+
+    def gen_for(self, node):
+        # for VAR in range(...): BODY  ->  a counted C for loop.
+        # children: [NAME loop-var, __call__(range, arglist), body]
+        var = node.children[0].children[0]
+        call = node.children[1]
+        args = call.children[1].children
+        self.declared.append(var)
+        self.emit("    for (long " + var + " = ")
+        if len(args) == 1:
+            self.emit("0")
+        else:
+            self.gen_expr(args[0])
+        self.emit("; " + var + " < ")
+        if len(args) == 1:
+            self.gen_expr(args[0])
+        else:
+            self.gen_expr(args[1])
+        self.emit("; " + var + " = " + var + " + 1) {\n")
+        bs = self.body_stmts(node.children[2])
+        j = 0
+        while j < len(bs):
+            self.gen_stmt(bs[j])
+            j = j + 1
+        self.emit("    }\n")
 
     def gen_while(self, node):
         self.emit("    while (")
@@ -153,6 +202,27 @@ class Transpiler:
             self.gen_expr(node.children[1])
             self.emit(" " + node.children[0] + " ")
             self.gen_expr(node.children[2])
+            self.emit(")")
+        elif nm == "factor":
+            # unary op: factor(LEAF op, operand)
+            self.emit("(" + node.children[0])
+            self.gen_expr(node.children[1])
+            self.emit(")")
+        elif nm == "and_test":
+            self.emit("(")
+            self.gen_expr(node.children[0])
+            self.emit(" && ")
+            self.gen_expr(node.children[1])
+            self.emit(")")
+        elif nm == "or_test":
+            self.emit("(")
+            self.gen_expr(node.children[0])
+            self.emit(" || ")
+            self.gen_expr(node.children[1])
+            self.emit(")")
+        elif nm == "not_test":
+            self.emit("(!")
+            self.gen_expr(node.children[0])
             self.emit(")")
         elif nm == "__call__":
             self.emit(node.children[0].children[0])
