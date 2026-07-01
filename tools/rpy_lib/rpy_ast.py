@@ -1,0 +1,629 @@
+"""Python parser ported from pymetaterp (asrp/pymetaterp single_file.py).
+Converted to Python 3 and de-eval'd (semantic actions dispatched
+explicitly in Interpreter._action) as the first step toward an RPython
+port that minipy can compile.  Produces a pymetaterp Node tree.
+"""
+NAME, FLAGS, ARGS, BODY = [0, 1, 2, 3]
+inf = None   # built in _ensure_tables (py2c defers non-const module globals)
+
+class MatchError(Exception):
+    pass
+
+class Node:
+    def __init__(self, name=None, value=None):
+        self.name = name
+        self.children = list(value) if value is not None else []
+
+    def __repr__(self):
+        return "%s%s" % (self.name, self.children)
+
+    def pprint(self, indent=0):
+        print(" "*indent + self.name)
+        for child in self.children:
+            if not is_node(child):
+                print(" "*(indent + 1), type(child).__name__, repr(child))
+            else:
+                child.pprint(indent + 2)
+
+def is_node(x):
+    return isinstance(x, Node)
+
+def simple_wrap_tree(root):
+    if not isinstance(root, list):
+        return root
+    return Node(root[0], [simple_wrap_tree(c) for c in root[1:]])
+
+def pop(input):
+    input[1] += 1
+    if input[1] >= len(input[0]):
+        raise MatchError("EOF")
+    return input[0][input[1]]
+
+def to_list(output):
+    if is_node(output) and output.name == "And":
+        return output.children
+    if output is None:
+        return []
+    return [output]
+
+def to_node(outputs):
+    flat = [elem for output in outputs for elem in to_list(output)]
+    if len(flat) == 1:
+        return flat[0]
+    if len(flat) == 0:
+        return None
+    if all(isinstance(x, str) for x in flat):
+        return "".join(flat)
+    return Node("And", flat)
+
+class Interpreter:
+    def __init__(self, grammar_tree, whitespace="\t\n\r \\"):
+        self.rules = {}
+        for rule in grammar_tree.children:
+            self.rules[rule.children[0].children[0]] = rule
+        self.whitespace = whitespace
+
+    def eval(self, root):
+        return self._action(root)
+
+    def _action(self, code):
+        # Explicit dispatch replacing host-language eval()/exec(); the Python
+        # grammar invokes exactly this fixed set of semantic actions.  Keeping
+        # them enumerated (instead of eval) is what makes an RPython port viable.
+        L = self.locals
+        if code == "any_token(self.input)":
+            return any_token(self.input)
+        if code == "any_token(self.input, False)":
+            return any_token(self.input, False)
+        if code == 'int("".join(n[0] for n in s))':
+            s = L['s']
+            return int("".join(n[0] for n in s))
+        if code == "reformat_atom(atom, trailers)":
+            return reformat_atom(L['atom'], L['trailers'])
+        if code == "reformat_binary(start, oper_and_atoms)":
+            return reformat_binary(L['start'], L['oper_and_atoms'])
+        if code == "self.indentation[-1] == (len(s) if s else 0)":
+            s = L['s']
+            return self.indentation[-1] == (len(s) if s else 0)
+        if code == "self.indentation.append(len(s) if s else 0)":
+            s = L['s']
+            self.indentation.append(len(s) if s else 0)
+            return None
+        if code == "self.indentation.pop()":
+            self.indentation.pop()
+            return None
+        raise Exception("unknown action: %r" % (code,))
+
+    def match(self, root, new_input=None, new_pos=-1):
+        """ >>> g.match(g.rules['grammar'][-1], "x='y'") """
+        if new_input is not None:
+            self.input = [new_input, new_pos]
+            self.indentation = [0]
+            self.locals = {}
+        old_pos = self.input[1]
+        name = root.name
+        if name in ["and", "args", "output"]:
+            outputs = [self.match(child) for child in root.children]
+            if any(child.name == "output" for child in root.children):
+                outputs = [output for child, output in zip(root.children, outputs)
+                           if child.name == "output"]
+            elif any(child.name == "rule_value" for child in root.children):
+                outputs = [output for child, output in zip(root.children, outputs)
+                           if child.name == "rule_value"]
+                assert(len(outputs) == 1)
+        elif name == "quantified":
+            assert(root.children[1].name == "quantifier")
+            lower, upper = {"*": (0, inf), "+": (1, inf), "?": (0, 1)}[root.children[1].children[0]]
+            outputs = []
+            while len(outputs) < upper:
+                last_pos = self.input[1]
+                try:
+                    outputs.append(self.match(root.children[0]))
+                except MatchError:
+                    self.input[1] = last_pos
+                    break
+            if lower > len(outputs):
+                raise MatchError("Matched %s < %s times" % (len(outputs), lower))
+        elif name == "or":
+            for child in root.children:
+                try:
+                    return self.match(child)
+                except MatchError:
+                    self.input[1] = old_pos
+            raise MatchError("All Or matches failed")
+        elif name in ["exactly", "token"]:
+            if name == "token":
+                while pop(self.input) in self.whitespace:
+                    if self.input[0][self.input[1]] == '\\':
+                        pop(self.input)
+                self.input[1] -= 1
+            for char in root.children[0]:
+                if pop(self.input) != char:
+                    raise MatchError("Not exactly %s" % root.children[0])
+            if name == "token" and root.children[0].isalpha():
+                top = pop(self.input)
+                if top.isalnum() or top == '_':
+                    raise MatchError("Prefix matched but didn't end.")
+                self.input[1] -= 1
+            return root.children[0]
+        elif name == "apply":
+            if root.children[0] == "anything":
+                return pop(self.input)
+            elif root.children[0] == "void":
+                return
+            old_locals = self.locals
+            self.locals = {}
+            try:
+                outputs = self.match(self.rules[root.children[0]].children[3])
+            except MatchError:
+                self.locals = old_locals
+                raise
+            self.locals = old_locals
+            if root.children[0] == "escaped_char":
+                chars = {"'": "'", '"': '"', "t": "\t", "n": "\n", "r": "\r",
+                         "b": "\b", "f": "\f", "\\": "\\"}
+                return chars[outputs[-1]]
+            and_node = is_node(outputs) and outputs.name == "And"
+            make_node = "!" in self.rules[root.children[0]].children[1].children or\
+                        (and_node and len(outputs.children) > 1)
+            if not make_node:
+                return outputs
+            return Node(root.children[0], to_list(outputs))
+        elif name == "bound":
+            if root.children[1].name == "inline":
+                return Node(root.children[1].children[0], to_list(self.match(root.children[0])))
+            else:  # bind
+                self.locals[root.children[1].children[0]] = self.match(root.children[0])
+                return
+        elif name == "negation":
+            try:
+                self.match(root.children[0])
+            except MatchError:
+                self.input[1] = old_pos
+                return None
+            raise MatchError("Negation true")
+        elif name == "rule_value":
+            return self.eval(root.children[0])
+        elif name == "predicate":
+            output = self.eval(root.children[0])
+            if not output:
+                raise MatchError("Predicate evaluates to false")
+            return None if output == True else Node("predicate", [output])
+        elif name == "action":
+            self._action(root.children[0])
+            return
+        elif name == "lookahead":
+            output = self.match(root.children[0])
+            self.input[1] = old_pos
+            return output
+        else:
+            raise Exception("Unknown operator %s" % name)
+        return to_node(outputs)
+
+def reformat_atom(atom, trailers):
+    output = atom
+    for trailer in to_list(trailers):
+        if trailer.name == "arglist":
+            output = Node("__call__", [output, trailer])
+        elif trailer.name == "NAME":
+            output = Node("__getattr__", [output, Node("NAME", trailer.children)])
+        elif trailer.name == "subscriptlist":
+            output = Node("__getitem__", [output] + trailer.children)
+        else:
+            raise Exception("Unknown trailer %s" % trailer.name)
+    return output
+
+# Non-constant module globals are left None here: py2c does not run a module
+# initializer for a standalone main() program, but a static obj defaults to
+# None, so the lazy builder below (same idea as _PYI) populates them on first
+# use.  _ensure_tables() runs before any parsing, so reformat_binary / any_token
+# see filled-in tables.
+binary_ops = None
+priority = None
+
+def _ensure_tables():
+    global binary_ops, priority, inf
+    if binary_ops is not None:
+        return
+    inf = 1000000000
+    binary_ops = ((">=", "<=", "<>", "<", ">", "==", "!=",
+                   "in", "not in", "is not", "is"),
+                  ("|",), ("^",), ("&",), ("<<", ">>"), ("+", "-"),
+                  ("*", "/", "%", "//"), ("**",))
+    pri = {}
+    idx = 0
+    for ops in binary_ops:
+        for op in ops:
+            pri[op] = idx
+        idx = idx + 1
+    priority = pri
+
+def _rb_parse(lhs: "obj", tokens, index):
+    threshold = priority[tokens[index][0].children[0]]
+    while index < len(tokens):
+        op, rhs = tokens[index]
+        op = op.children[0]
+        if priority[op] < threshold:
+            break
+        index += 1
+        while index < len(tokens) and\
+              priority[tokens[index][0].children[0]] > priority[op]:
+            rhs, index = _rb_parse(rhs, tokens, index)
+        lhs = Node("__binary__", [op, lhs, rhs])
+    return (lhs, index)
+
+def reformat_binary(start: "obj", tokens):
+    if tokens is None:
+        return start
+    toks = tokens.children
+    pairs = list(zip(toks[::2], toks[1::2]))
+    lhs = start
+    index = 0
+    while index < len(pairs):
+        lhs, index = _rb_parse(lhs, pairs, index)
+    return lhs
+
+def _all_match(input, token):
+    # Short-circuiting replacement for all(pop(input) == c for c in token):
+    # stops at the first mismatch so `pop` is not called extra times (minipy
+    # materialises generator expressions, so a side-effecting genexp would
+    # over-advance the input).
+    for char in token:
+        if pop(input) != char:
+            return False
+    return True
+
+def any_token(input, binary=True):
+    ops = binary_ops if binary else binary_ops[1:]
+    old_pos = input[1]
+    for tokens in ops:
+        for token in tokens:
+            if _all_match(input, token):
+                return token
+            input[1] = old_pos
+    return False
+
+def _grammar():
+    return r"""
+expr = apply | exactly | token | parenthesis | output | list
+     | rule_value | predicate | action
+
+exactly! = "'" {(escaped_char | ~'\'' anything)*} "'"
+token! = "\"" {(escaped_char | ~'"' anything)*} "\""
+apply! = indentation? {name ('(' {balanced=args} ')')?}
+parenthesis = "(" {or} ")"
+output! = "{" {or} "}"
+list! = "[" {or} "]"
+predicate! = "?(" {balanced} ')'
+action! = "!(" {balanced} ')'
+rule_value! = "->" hspaces {(escaped_char | ~'\n' anything)*}
+
+not = "~" "~" {expr=lookahead} | "~" {expr=negation} | expr
+quantified = not (('*' | '+' | '?')=quantifier)?
+bound = ":" {name=bind}
+      | quantified (':' {name=bind} | '=' {name=inline})?
+and = bound*
+or = and ("|" {and})*
+
+rule = spaces {name=rule_name '!'?=flags and=args ("=" {or})}
+grammar = {rule*} spaces
+
+comment = '#' (~'\n' anything)*
+indentation = (hspaces ('\r' '\n' | '\r' | '\n'))* hspacesp
+name = (letter | '_') (letter | digit | '_')*
+balanced = (escaped_char | '(' balanced ')' | ~')' anything)*
+"""
+
+def _python_grammar():
+    return r"""
+single_input = EMPTY_LINE | simple_stmt | (compound_stmt EMPTY_LINE)
+file_input = (EMPTY_LINE | SAME_INDENT stmt)* ENDMARKER
+eval_input = testlist NEWLINE? EMPTY_LINE* ENDMARKER
+
+decorator! = "@" {dotted_name ("(" {arglist} ")")?} NEWLINE
+decorators! = decorator+
+decorated = decorators (classdef | funcdef)
+funcdef = "def" {NAME} "(" {parameters | void=parameters} ")" ":" {suite}
+# Check order validity elsewhere (at most one remaining_args and one kwargs)
+parameters! = {fpdef_opt (comma {fpdef_opt})*} comma?
+
+fpdef = NAME | "(" fplist ")"
+fpdef_opt = fpdef ("=" {test})? | "*" {NAME=remaining_args} | "**" {NAME=kwargs}
+fplist = {fpdef (comma {fpdef})*} comma?
+
+stmt = compound_stmt | simple_stmt
+simple_stmt = {small_stmt (";" {small_stmt})*} ";"? NEWLINE
+small_stmt = print_stmt | del_stmt | pass_stmt | flow_stmt | comment
+           | import_stmt | global_stmt | exec_stmt | assert_stmt | expr_stmt
+
+expr_stmt = aug_assign | regular_assign | testlist
+aug_assign_symbol = "+=" | "-=" | "*=" | "/=" | "%=" | "&="
+                  | "|=" | "^=" | "<<=" | ">>=" | "**=" | "//="
+aug_assign = testlist aug_assign_symbol=operation (yield_expr|testlist)
+regular_assign = testlist ("=" {yield_expr|testlist})+
+# For normal assignments, additional restrictions enforced by the interpreter
+print_stmt! = "print" { {test ("," {test})*} ","?
+                      | ">>" test ( ("," test)+ ","? )? | void}
+del_stmt! = "del" hspacesp {exprlist}
+pass_stmt! = "pass" {}
+flow_stmt = break_stmt | continue_stmt | return_stmt | raise_stmt | yield_stmt
+break_stmt! = "break" {}
+continue_stmt! = "continue" {}
+return_stmt! = "return" {testlist?}
+yield_stmt = yield_expr
+raise_stmt! = "raise" {(test ("," test ("," test))?)?}
+import_stmt = import_name | import_from
+import_name = "import" {import_names}
+import_names! = dotted_as_name ("," {dotted_as_name})*
+import_from! = "from" {"."* dotted_name | "."+}
+               "import" {"*" | "(" {import_as_names} ")" | import_as_names}
+import_as_name = NAME ("as" {NAME})?
+dotted_as_name = dotted_name ("as" {NAME})?
+import_as_names! = {import_as_name ("," {import_as_name})*} ","?
+dotted_name = NAME ("." {NAME})*
+global_stmt = "global" NAME ("," NAME)*
+exec_stmt! = "exec" {expr ("in" {test} ("," {test})?)?}
+assert_stmt! = "assert" {test ("," test)?}
+
+compound_stmt = if_stmt | while_stmt | for_stmt | try_stmt | with_stmt
+              | funcdef | classdef | decorated
+if_stmt = ("if" {test} ":" {suite})=single_if 
+          (("elif" {test} ":" {suite})=single_if)*
+          (("else" ":" {void=gen_true suite})=single_if)?
+while_stmt = "while" {test} ":" {suite ("else" ":" {suite})?}
+for_stmt = "for" {exprlist} "in" {testlist} ":" {suite} {{"else"} ":" {suite=elseblock}}?
+try_stmt! = "try" ":" {suite}
+            {(({exception} ":" {suite})=except_clause)+=except_clauses
+             ("else" ":" suite)?
+             ("finally" ":" suite)?
+             | "finally" ":" suite}
+with_stmt = "with" with_item ("," with_item)* ":" suite
+with_item = test ("as" expr)?
+exception! = "except" {(test (("as" | ",") {test})?)?}
+suite = NEWLINE INDENT {(SAME_INDENT stmt | EMPTY_LINE)+} DEDENT | simple_stmt
+
+testlist = {test ("," {test})*} ","?
+yield_expr! = "yield" {testlist?}
+
+test = lambdef | or_test ("if" {or_test} {("else" {test})?})?
+or_test = and_test ("or" {and_test})*
+and_test = not_test ("and" {not_test})*
+not_test = ("not" {not_test})=not_test | comparison
+
+comparison = factor:start (hspaces {?(any_token(self.input))}
+                           hspaces {factor})*:oper_and_atoms
+             -> reformat_binary(start, oper_and_atoms)
+expr = factor:start (hspaces {?(any_token(self.input, False))}
+                     hspaces {factor})*:oper_and_atoms
+     -> reformat_binary(start, oper_and_atoms)
+
+factor = ("+"|"-"|"~")* power
+power = trailed_atom ("**" factor)?
+trailed_atom = atom:atom trailer*:trailers -> reformat_atom(atom, trailers)
+atom = "(" spaces {parenthesis} spaces ")"
+     | "[" spaces {listmaker | void=listmaker} spaces "]"
+     | "{" spaces {dictmaker} spaces "}"
+     | "{" {setmaker} spaces "}"
+     | "`" {(stmt | small_stmt)=thunk} "`"
+     | STRINGS | NAME | NUMBER
+parenthesis = yield_expr | testlist_comp=generator | tuple 
+            | test | void=no_param
+listmaker! = (test list_for list_iter*)=listcomp
+           | {test (comma {test})*} comma?
+testlist_comp = test list_for list_iter*
+tuple! = ({test} comma)+ test?
+lambdef! = "lambda" {parameters? | void=parameters} ":" {test}
+trailer = "(" spaces {arglist} spaces ")"
+        | "[" spaces {subscriptlist} spaces "]"
+        | "." {NAME}
+subscriptlist! = subscript=subscript ("," subscript=subscript)* ","?
+subscript = "..." | ({test?=start} ":" {test?=stop} {step?})=slice | test
+exprlist = {expr ("," {expr})*} ","?
+step! = ":" {test?}
+dictmaker! = ({test} ":" {test} {list_for} {list_iter*})=dictcomp
+           | {({test} ":" {test})=pair ((comma {test} ":" {test})=pair)*} comma?
+           | void
+
+setmaker! = test (list_for list_iter* | (("," test)* ","?))
+
+classdef = "class" {NAME} {("(" {testlist?} ")")?=parents} ":" {suite}
+
+arglist! = ({argument} comma)* ( "**" {test=kwargs}
+                               | "*" {test=remaining_args ("," keyword_arg)* 
+                                      ("," "**" {test=kwargs})?}
+                               | {argument | void} )
+                               comma?
+comma = "," spaces
+
+argument = keyword_arg | listcomp_arg
+keyword_arg = {test} "=" {test}
+listcomp_arg = test (list_for list_iter*)?
+
+list_iter = list_for | list_if
+list_for = spaces "for" {exprlist} "in" {or_test} # {testlist_safe}
+list_if! = spaces "if" {or_test}
+
+testlist_safe = or_test ((',' or_test)+ ','?)?
+testlist1 = test ("," test)*
+
+comment! = '#' {(~'\n' {anything})*}
+NUMBER! = hspaces digit+:s -> int("".join(n[0] for n in s))
+# Probably need to check that the result isn't a reserved word.
+NAME! = hspaces {((letter | '_') (letter | digit | '_')*)}
+STRINGS = STRING (spaces {STRING})*
+STRING! = hspaces stype? '"' '"' '"' {(escaped_char | ~('"' '"' '"') {anything})*} '"' '"' '"'
+       | hspaces stype? '\'' {(escaped_char | ~'\'' anything)*} '\''
+       | hspaces stype? '"' {(escaped_char | ~'"' anything)*} '"'
+stype! = 'r'|'b'
+EMPTY_LINE = (hspaces comment? ('\n' | '\r'))=EMPTY_LINE
+NEWLINE = hspaces (comment hspaces)? ('\n' | '\r')
+SAME_INDENT = hspaces:s ?(self.indentation[-1] == (len(s) if s else 0))
+ENDMARKER = ~anything
+INDENT = ~~hspaces:s !(self.indentation.append(len(s) if s else 0))
+DEDENT = !(self.indentation.pop())
+"""
+
+def _extra():
+    return r"""
+escaped_char! = '\\' {'n'|'r'|'t'|'b'|'f'|'"'|'\''|'\\'}
+letter = 'a'|'b'|'c'|'d'|'e'|'f'|'g'|'h'|'i'|'j'|'k'|'l'|'m'|'n'|'o'|'p'|'q'|'r'|'s'|'t'|'u'|'v'|'w'|'x'|'y'|'z'|'A'|'B'|'C'|'D'|'E'|'F'|'G'|'H'|'I'|'J'|'K'|'L'|'M'|'N'|'O'|'P'|'Q'|'R'|'S'|'T'|'U'|'V'|'W'|'X'|'Y'|'Z'
+digit = '0'|'1'|'2'|'3'|'4'|'5'|'6'|'7'|'8'|'9'
+hspaces = (' ' | '\t' | escaped_linebreak)*
+hspacesp = (' ' | '\t' | escaped_linebreak)+
+escaped_linebreak = '\\' {'\n'}
+space = '\t'|'\n'|'\r'|' '|comment
+spaces = space*
+"""
+
+def _meta_tree():
+    return ['And',
+ ['rule', ['rule_name', 'name'], ['flags'], ['args'],
+  ['and',
+   ['or', ['apply', 'letter'], ['exactly', '_']],
+   ['quantified',
+    ['or', ['apply', 'letter'], ['apply', 'digit'], ['exactly', '_']],
+    ['quantifier', '*']]]],
+ ['rule', ['rule_name', 'expr'], ['flags'], ['args'],
+  ['or',
+   ['apply', 'apply'], ['apply', 'exactly'], ['apply', 'token'],
+   ['apply', 'parenthesis'], ['apply', 'output']]],
+ ['rule', ['rule_name', 'exactly'], ['flags', '!'], ['args'],
+  ['and',
+   ['token', "'"],
+   ['output',
+    ['quantified',
+     ['or', ['apply', 'escaped_char'],
+            ['and', ['negation', ['exactly', "'"]], ['apply', 'anything']]],
+     ['quantifier', '*']]],
+   ['token', "'"]]],
+ ['rule', ['rule_name', 'token'], ['flags', '!'], ['args'],
+  ['and',
+   ['token', '"'],
+   ['output',
+    ['quantified',
+     ['or',
+      ['apply', 'escaped_char'],
+      ['and', ['negation', ['exactly', '"']], ['apply', 'anything']]],
+     ['quantifier', '*']]],
+   ['token', '"']]],
+ ['rule', ['rule_name', 'escaped_char'], ['flags', '!'], ['args'], ['and',
+   ['exactly', '\\'],
+   ['output', ['or'] + [['exactly', s] for s in 'nrtbf"\'\\']]]],
+ ['rule', ['rule_name', 'apply'], ['flags', '!'], ['args'],
+  ['and', ['quantified', ['or', ['exactly', '\t'], ['exactly', ' ']],
+                         ['quantifier', '*']],
+          ['output', ['apply', 'name']]]],
+ ['rule', ['rule_name', 'parenthesis'], ['flags'], ['args'],
+  ['and', ['token', '('], ['output', ['apply', 'or']], ['token', ')']]],
+ ['rule', ['rule_name', 'output'], ['flags', '!'], ['args'],
+  ['and', ['token', '{'], ['output', ['apply', 'or']], ['token', '}']]],
+ ['rule', ['rule_name', 'not'], ['flags'], ['args'], ['or',
+   ['and',
+    ['token', '~'],
+    ['output', ['bound', ['apply', 'expr'], ['inline', 'negation']]]],
+   ['apply', 'expr']]],
+ ['rule', ['rule_name', 'quantified'], ['flags'], ['args'],
+  ['and',
+   ['apply', 'not'],
+   ['quantified',
+    ['bound',
+     ['or', ['exactly', '*'], ['exactly', '+'], ['exactly', '?']],
+     ['inline', 'quantifier']],
+    ['quantifier', '?']]]],
+ ['rule', ['rule_name', 'bound'], ['flags'], ['args'],
+  ['and',
+   ['apply', 'quantified'],
+   ['quantified',
+    ['and',
+     ['exactly', '='],
+     ['output', ['bound', ['apply', 'name'], ['inline', 'inline']]]],
+    ['quantifier', '?']]]],
+ ['rule', ['rule_name', 'and'], ['flags'], ['args'],
+  ['quantified', ['apply', 'bound'], ['quantifier', '*']]],
+ ['rule', ['rule_name', 'or'], ['flags'], ['args'], ['and',
+   ['apply', 'and'],
+   ['quantified',
+    ['and', ['token', '|'], ['output', ['apply', 'and']]],
+    ['quantifier', '*']]]],
+ ['rule', ['rule_name', 'rule'], ['flags'], ['args'],
+  ['and',
+   ['apply', 'spaces'],
+   ['output',
+    ['and',
+     ['bound', ['apply', 'name'], ['inline', 'rule_name']],
+     ['bound',
+      ['quantified', ['exactly', '!'], ['quantifier', '?']],
+      ['inline', 'flags']],
+     ['bound', ['apply', 'and'], ['inline', 'args']],
+     ['and', ['token', '='], ['output', ['apply', 'or']]]]]]],
+ ['rule', ['rule_name', 'grammar'], ['flags'], ['args'],
+  ['and',
+   ['output', ['quantified', ['apply', 'rule'], ['quantifier', '*']]],
+   ['apply', 'spaces']]],
+ ['rule', ['rule_name', 'letter'], ['flags'], ['args'],
+  ['or'] + [['exactly', s]
+            for s in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ']],
+ ['rule', ['rule_name', 'digit'], ['flags'], ['args'],
+  ['or'] + [['exactly', s] for s in '0123456789']],
+ ['rule', ['rule_name', 'space'], ['flags'], ['args'],
+  ['or'] + [['exactly', s] for s in '\t\n\r ']],
+ ['rule', ['rule_name', 'spaces'], ['flags'], ['args'],
+  ['quantified', ['apply', 'space'], ['quantifier', '*']]]]
+
+_PYI = None
+
+def _python_interp():
+    """Build (once) and cache the Python-grammar interpreter.  The two grammar
+    bootstrap stages are source-independent, so doing them per-parse is pure
+    waste -- and under minipy's free-once arena it is what made repeated parses
+    exhaust memory.  match() resets per-source state, so the interpreter is
+    safely reusable across calls."""
+    global _PYI
+    if _PYI is None:
+        _ensure_tables()
+        ex = _extra()
+        i1 = Interpreter(simple_wrap_tree(_meta_tree()))
+        mt1 = i1.match(i1.rules['grammar'].children[-1], _grammar() + ex)
+        i2 = Interpreter(mt1)
+        mt2 = i2.match(i2.rules['grammar'].children[-1], _python_grammar() + ex)
+        _PYI = Interpreter(mt2, "\t \\")
+    return _PYI
+
+def parse_python(source):
+    """Parse Python `source` into a pymetaterp Node tree (the grammar covers a
+    Python-2-flavoured subset)."""
+    pyi = _python_interp()
+    if isinstance(pyi, Interpreter):
+        return pyi.match(pyi.rules['file_input'].children[-1], source)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Self-test entry point.  Compiled to a native `main` by py2c; also runnable
+# under CPython (`python3 rpy_ast.py`).  Parses a spread of Python snippets and
+# prints a canonical pre-order dump of each tree -- byte-identical to CPython.
+# ---------------------------------------------------------------------------
+
+def _dump(node, depth):
+    if not is_node(node):
+        print(". " * depth + "leaf " + str(node))
+        return
+    print(". " * depth + node.name)
+    for ch in node.children:
+        _dump(ch, depth + 1)
+
+def main() -> "int":
+    srcs = ["x = 1 + 2 * 3\n", "y = (1 + 2) * 3\n",
+            "def f(a, b):\n    return a + b\n",
+            "if x > 0:\n    y = 1\nelse:\n    y = 2\n",
+            "while n:\n    n = n - 1\n",
+            "for i in items:\n    total = total + i\n",
+            "vals = [1, 2, 3]\n", "d = {1: 2, 3: 4}\n",
+            "r = f(a, b) + g(c)\n", "ok = a == b and c != d\n"]
+    for src in srcs:
+        print("### " + src)
+        _dump(parse_python(src), 0)
+    return 0
+
+if __name__ == "__main__":
+    main()
