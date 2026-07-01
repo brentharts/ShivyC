@@ -745,20 +745,26 @@ def _conv_list(children):
     return out
 
 
+def _fill_arglist(arglist, args, kwargs):
+    for a in arglist.children:
+        if _is(a, "keyword_arg"):
+            kwargs.append(keyword(_leaf(a.children[0]), _conv(a.children[1])))
+        elif _is(a, "star_arg"):
+            args.append(Starred(_conv(a.children[0]), Load()))
+        elif _is(a, "remaining_args"):
+            args.append(Starred(_conv(a.children[0]), Load()))
+        elif _is(a, "kwargs"):
+            kwargs.append(keyword(None, _conv(a.children[0])))
+        elif is_node(a):
+            args.append(_conv(a))
+
+
 def _conv_call(node):
     func = _conv(node.children[0])
     args = []
     kwargs = []
     if len(node.children) > 1:
-        arglist = node.children[1]
-        for a in arglist.children:
-            if _is(a, "keyword_arg"):
-                kwargs.append(keyword(_leaf(a.children[0]),
-                                      _conv(a.children[1])))
-            elif _is(a, "star_arg"):
-                args.append(Starred(_conv(a.children[0]), Load()))
-            else:
-                args.append(_conv(a))
+        _fill_arglist(node.children[1], args, kwargs)
     return Call(func, args, kwargs)
 
 
@@ -1080,14 +1086,24 @@ def _conv_stmt(node):
     if nm == "import_names":
         names = []
         for c in node.children:
-            names.append(alias(_dotted(c), None))
+            if not is_node(c):
+                continue
+            if c.name == "dotted_as_name":
+                names.append(alias(_dotted(c.children[0]),
+                                   _leaf(c.children[1])))
+            else:
+                names.append(alias(_dotted(c), None))
         return Import(names)
     if nm == "import_from":
         module = _dotted(node.children[0])
         names = []
         asnames = node.children[1]
         for c in asnames.children:
-            if is_node(c):
+            if not is_node(c):
+                continue
+            if c.name == "import_as_name":
+                names.append(alias(_leaf(c.children[0]), _leaf(c.children[1])))
+            elif c.name == "NAME":
                 names.append(alias(_leaf(c), None))
         return ImportFrom(module, names, 0)
     if nm == "pass_stmt":
@@ -1132,8 +1148,12 @@ def _conv_stmt(node):
             if is_node(c):
                 targets.append(_delctx(_conv(c)))
         return _delete(targets)
-    if nm == "try_stmt" or nm == "with_stmt":
-        raise ValueError("stmt not yet converted: " + nm)
+    if nm == "decorated":
+        return _conv_decorated(node)
+    if nm == "try_stmt":
+        return _conv_try(node)
+    if nm == "with_stmt":
+        return _conv_with(node)
     # fall through: a bare expression used as a statement
     return Expr(_conv(node))
 
@@ -1189,9 +1209,181 @@ class Delete(AST):
         self.targets = targets
 
 
+class Try(AST):
+    def __init__(self, body, handlers, orelse, finalbody):
+        self._fields = ("body", "handlers", "orelse", "finalbody")
+        self._init_loc()
+        self.body = body
+        self.handlers = handlers
+        self.orelse = orelse
+        self.finalbody = finalbody
+
+
+class ExceptHandler(AST):
+    def __init__(self, etype, name, body):
+        self._fields = ("type", "name", "body")
+        self._init_loc()
+        self.type = etype
+        self.name = name
+        self.body = body
+
+
+class With(AST):
+    def __init__(self, items, body):
+        self._fields = ("items", "body", "type_comment")
+        self._init_loc()
+        self.items = items
+        self.body = body
+        self.type_comment = None
+
+
+class withitem(AST):
+    def __init__(self, context_expr, optional_vars):
+        self._fields = ("context_expr", "optional_vars")
+        self.context_expr = context_expr
+        self.optional_vars = optional_vars
+
+
+# ---------------------------------------------------------------------------
+# try / with conversion.  Both rast forms are leaf-laden: try_stmt delimits its
+# sections with an except_clauses node plus bare 'else'/'finally' leaves, and
+# with_stmt lists its items before a bare ':' leaf.  A small state machine walks
+# the children and routes statements into the right bucket.
+# ---------------------------------------------------------------------------
+
+def _flatten_stmt(c):
+    if c.name == "suite":
+        out = []
+        for sc in c.children:
+            if is_node(sc) and not _skip_noise(sc.name):
+                out.append(_conv_stmt(sc))
+        return out
+    if _skip_noise(c.name):
+        return []
+    return [_conv_stmt(c)]
+
+
+def _conv_excepthandler(ec):
+    etype = None
+    ename = None
+    exc = ec.children[0]
+    if is_node(exc) and exc.name == "exception":
+        if len(exc.children) >= 1:
+            etype = _conv(exc.children[0])
+        if len(exc.children) >= 2:
+            ename = _leaf(exc.children[1])
+    body = []
+    i = 1
+    while i < len(ec.children):
+        c = ec.children[i]
+        if is_node(c):
+            for s in _flatten_stmt(c):
+                body.append(s)
+        i = i + 1
+    return ExceptHandler(etype, ename, body)
+
+
+def _conv_try(node):
+    body = []
+    handlers = []
+    orelse = []
+    finalbody = []
+    section = "body"
+    for c in node.children:
+        if is_node(c):
+            if c.name == "except_clauses":
+                for ec in c.children:
+                    if is_node(ec):
+                        handlers.append(_conv_excepthandler(ec))
+            else:
+                stmts = _flatten_stmt(c)
+                if section == "body":
+                    for s in stmts:
+                        body.append(s)
+                elif section == "else":
+                    for s in stmts:
+                        orelse.append(s)
+                else:
+                    for s in stmts:
+                        finalbody.append(s)
+        else:
+            if c == "else":
+                section = "else"
+            elif c == "finally":
+                section = "finally"
+    return Try(body, handlers, orelse, finalbody)
+
+
+def _conv_with(node):
+    items = []
+    body = []
+    seen_colon = False
+    for c in node.children:
+        if not is_node(c):
+            if c == ":":
+                seen_colon = True
+            continue
+        if not seen_colon:
+            if c.name == "with_item":
+                ctx_expr = _conv(c.children[0])
+                optvars = None
+                if len(c.children) >= 3:
+                    optvars = _store(_conv(c.children[2]))
+                items.append(withitem(ctx_expr, optvars))
+            else:
+                items.append(withitem(_conv(c), None))
+        else:
+            for s in _flatten_stmt(c):
+                body.append(s)
+    return With(items, body)
+
+
 # ---------------------------------------------------------------------------
 # Entry point.
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Decorators.  rast wraps a decorated def/class in `decorated` -> [decorators,
+# funcdef|classdef]; each `decorator` is a bare name, a dotted attribute, or a
+# call.  We rebuild the decorator expression and attach it to decorator_list.
+# ---------------------------------------------------------------------------
+
+def _dotted_expr(node):
+    if node.name == "NAME":
+        return _conv(node)
+    expr = _conv(node.children[0])
+    i = 1
+    while i < len(node.children):
+        expr = Attribute(expr, _leaf(node.children[i]), Load())
+        i = i + 1
+    return expr
+
+
+def _conv_decorator(dec):
+    head = dec.children[0]
+    if is_node(head) and head.name == "dotted_name":
+        func = _dotted_expr(head)
+    else:
+        func = _conv(head)
+    if len(dec.children) >= 2 and _is(dec.children[1], "arglist"):
+        args = []
+        kwargs = []
+        _fill_arglist(dec.children[1], args, kwargs)
+        return Call(func, args, kwargs)
+    return func
+
+
+def _conv_decorated(node):
+    decs = []
+    dnode = node.children[0]
+    for d in dnode.children:
+        if is_node(d) and d.name == "decorator":
+            decs.append(_conv_decorator(d))
+    inner = node.children[1]
+    result = _conv_stmt(inner)
+    result.decorator_list = decs
+    return result
+
 
 def parse(source):
     tree = parse_python(source)
