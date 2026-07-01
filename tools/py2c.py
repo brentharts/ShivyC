@@ -3483,6 +3483,13 @@ def cname(name):
     return name + "_" if name in C_KEYWORDS or name in RUNTIME_API_NAMES else name
 
 
+def _fdef_name(f):
+    # Sort key for FunctionDef / object-with-.name lists. A named module
+    # function rather than a lambda so the source parses under rast (and mirrors
+    # how the translator itself rewrites lambdas to defs).
+    return f.name
+
+
 def method_cname(mname):
     return mname + "_" if mname in METHOD_TYPEINFO_COLLISION else mname
 
@@ -4454,7 +4461,7 @@ class Transpiler:
             L.append("")
             L.append("-" * 72)
             L.append("functions: parameter typing  (name:ctype [kind/source])")
-            for fn in sorted(funcs, key=lambda f: f.name):
+            for fn in sorted(funcs, key=_fdef_name):
                 params = []
                 for a in (list(getattr(fn.args, "posonlyargs", [])) +
                           list(fn.args.args)):
@@ -4484,7 +4491,7 @@ class Transpiler:
                     review.append("field  %s.%s -> %s" % (ci.name, fn, ft))
         for fn in sorted((n for n in ast.walk(tree)
                           if isinstance(n, ast.FunctionDef)),
-                         key=lambda f: f.name):
+                         key=_fdef_name):
             for a in (list(getattr(fn.args, "posonlyargs", [])) +
                       list(fn.args.args)):
                 if a.arg == "self" or a.annotation is not None:
@@ -9736,10 +9743,10 @@ class Transpiler:
                     return True
         return False
 
-    def _loop_wrap(self, node, impl):
-        """Run a loop body codegen `impl` with a loop marker on the try-stack so
-        break/continue inside an enclosed try restore the exception-frame
-        pointer to the loop's level."""
+    def _loop_wrap(self, node, which):
+        """Run a loop body codegen (`which` is "while" or "for") with a loop
+        marker on the try-stack so break/continue inside an enclosed try restore
+        the exception-frame pointer to the loop's level."""
         esp = None
         pre = []
         if self._body_has_try(node.body):
@@ -9760,7 +9767,10 @@ class Transpiler:
             pre = pre + ["int %s = 1;" % fe]
         self.try_stack.append({"kind": "loop", "esp": esp, "fe": fe})
         try:
-            lines = impl()
+            if which == "while":
+                lines = self._st_While_impl(node)
+            else:
+                lines = self._st_For_impl(node)
         finally:
             self.try_stack.pop()
         if fe:
@@ -9769,7 +9779,7 @@ class Transpiler:
         return pre + lines
 
     def st_While(self, node):
-        return self._loop_wrap(node, lambda: self._st_While_impl(node))
+        return self._loop_wrap(node, "while")
 
     def _st_While_impl(self, node):
         lines = ["while (%s) {" % self.bool_expr(node.test)]
@@ -9778,7 +9788,7 @@ class Transpiler:
         return lines
 
     def st_For(self, node):
-        return self._loop_wrap(node, lambda: self._st_For_impl(node))
+        return self._loop_wrap(node, "for")
 
     def _st_For_impl(self, node):
         it, tgt = node.iter, node.target
@@ -10731,6 +10741,11 @@ class Transpiler:
             "for (long _i=0;_i<_n;_i++) list_set(_lst,_i,_es[_i]); OBJ_NONE; })"
             % (lst, bind, keyobj, cmp_sign))
 
+    def _coerce_str_arg(self, node, i):
+        # char* coercion of the i-th call argument (replaces a local lambda so
+        # the source parses under rast).
+        return self.coerce_to("char*", node.args[i], self.expr(node.args[i]))
+
     def _io_call(self, node):
         """Lower simple I/O to C stdio (all handles are opaque void*):
             open(path, mode)        -> fopen
@@ -10751,25 +10766,23 @@ class Transpiler:
             if isinstance(recv, ast.Attribute) and \
                     isinstance(recv.value, ast.Name) and \
                     recv.value.id == "os" and recv.attr == "path" and node.args:
-                cs = lambda i: self.coerce_to(
-                    "char*", node.args[i], self.expr(node.args[i]))
                 if f.attr == "dirname":
                     self._ossys_used = True
-                    return "_ospath_dirname(%s)" % cs(0)
+                    return "_ospath_dirname(%s)" % self._coerce_str_arg(node, 0)
                 if f.attr == "basename":
                     self._ossys_used = True
-                    return "_ospath_basename(%s)" % cs(0)
+                    return "_ospath_basename(%s)" % self._coerce_str_arg(node, 0)
                 if f.attr == "abspath":
                     self._ossys_used = True
-                    return "_ospath_abspath(%s)" % cs(0)
+                    return "_ospath_abspath(%s)" % self._coerce_str_arg(node, 0)
                 if f.attr == "exists":
                     self._ossys_used = True
-                    return "_ospath_exists(%s)" % cs(0)
+                    return "_ospath_exists(%s)" % self._coerce_str_arg(node, 0)
                 if f.attr == "join" and len(node.args) >= 2:
                     self._ossys_used = True
-                    e = "_ospath_join(%s, %s)" % (cs(0), cs(1))
+                    e = "_ospath_join(%s, %s)" % (self._coerce_str_arg(node, 0), self._coerce_str_arg(node, 1))
                     for i in range(2, len(node.args)):
-                        e = "_ospath_join(%s, %s)" % (e, cs(i))
+                        e = "_ospath_join(%s, %s)" % (e, self._coerce_str_arg(node, i))
                     return e
             # a few os.* filesystem ops
             if isinstance(recv, ast.Name) and recv.id == "os" and node.args:
@@ -12808,30 +12821,34 @@ class Transpiler:
             return "(%s)AS_OBJ(%s)" % (t, v)
         return v
 
-    def _dyn_switch(self, ci, arm):
-        """`switch(_dk[0]){...}` over ci's fields grouped by name initial.
-        `arm(name, ctype)` returns the matched-field C statement."""
+    def _dyn_switch(self, ci, mode):
+        """`switch(_dk[0]){...}` over ci's fields grouped by name initial. `mode`
+        is "get" or "set", selecting the matched-field C statement (inlined here
+        rather than passed as a lambda so the source parses under rast)."""
         groups = {}
         for n, t in ci.full_fields():
             groups.setdefault(n[0], []).append((n, t))
         cases = []
         for c in sorted(groups):
-            arms = " else ".join('if (!strcmp(_dk, "%s")) %s' % (n, arm(n, t))
-                                 for (n, t) in groups[c])
+            arm_parts = []
+            for (n, t) in groups[c]:
+                if mode == "get":
+                    a = "_dr = %s;" % self._dyn_box(t, "_ds->%s" % cname(n))
+                else:
+                    a = "{ _ds->%s = %s; }" % (cname(n), self._dyn_unbox(t, "_dv"))
+                arm_parts.append('if (!strcmp(_dk, "%s")) %s' % (n, a))
+            arms = " else ".join(arm_parts)
             cases.append("case '%s': %s break;" % (c, arms))
         return "switch (_dk[0]) { %s }" % " ".join(cases)
 
     def _emit_dynget(self, recv_node, ci, key_node, dflt):
-        sw = self._dyn_switch(
-            ci, lambda n, t: "_dr = %s;" % self._dyn_box(t, "_ds->%s" % cname(n)))
+        sw = self._dyn_switch(ci, "get")
         return ("({ %s* _ds = %s; const char* _dk = %s; obj _dr = %s; %s _dr; })"
                 % (ci.csym, self._class_ptr_expr(recv_node, ci.name),
                    self.as_str(key_node), dflt, sw))
 
     def _emit_dynset(self, recv_node, ci, key_node, val_node):
-        sw = self._dyn_switch(
-            ci, lambda n, t: "{ _ds->%s = %s; }" % (
-                cname(n), self._dyn_unbox(t, "_dv")))
+        sw = self._dyn_switch(ci, "set")
         return ("({ %s* _ds = %s; const char* _dk = %s; obj _dv = %s; %s "
                 "OBJ_NONE; })" % (ci.csym,
                                   self._class_ptr_expr(recv_node, ci.name),
@@ -12850,41 +12867,40 @@ class Transpiler:
     def lower_str_method(self, func, node):
         """Lower a string method call; returns C or None if not a str method."""
         m = func.attr
-        recv = lambda: self.as_str(func.value)
         a = node.args
         if m == "startswith":
-            return "str_startswith(%s, %s)" % (recv(), self.as_str(a[0]))
+            return "str_startswith(%s, %s)" % (self.as_str(func.value), self.as_str(a[0]))
         if m == "endswith":
-            return "str_endswith(%s, %s)" % (recv(), self.as_str(a[0]))
+            return "str_endswith(%s, %s)" % (self.as_str(func.value), self.as_str(a[0]))
         if m in ("strip", "lstrip", "rstrip"):
             mode = {"strip": 0, "lstrip": 1, "rstrip": 2}[m]
-            return "str_strip(%s, %d)" % (recv(), mode)
+            return "str_strip(%s, %d)" % (self.as_str(func.value), mode)
         if m == "split":
             sep = self.as_str(a[0]) if a else "NULL"
-            return "str_split(%s, %s)" % (recv(), sep)
+            return "str_split(%s, %s)" % (self.as_str(func.value), sep)
         if m == "partition":
-            return "str_partition(%s, %s)" % (recv(), self.as_str(a[0]))
+            return "str_partition(%s, %s)" % (self.as_str(func.value), self.as_str(a[0]))
         if m == "splitlines":
-            return "str_splitlines(%s)" % recv()
+            return "str_splitlines(%s)" % self.as_str(func.value)
         if m == "replace":
             if len(a) < 2:
                 return None
-            return "str_replace(%s, %s, %s)" % (recv(), self.as_str(a[0]),
+            return "str_replace(%s, %s, %s)" % (self.as_str(func.value), self.as_str(a[0]),
                                                 self.as_str(a[1]))
         if m == "find":
-            return "str_find(%s, %s, false)" % (recv(), self.as_str(a[0]))
+            return "str_find(%s, %s, false)" % (self.as_str(func.value), self.as_str(a[0]))
         if m == "rfind":
-            return "str_find(%s, %s, true)" % (recv(), self.as_str(a[0]))
+            return "str_find(%s, %s, true)" % (self.as_str(func.value), self.as_str(a[0]))
         if m in ("isdigit", "isalpha", "isspace", "isalnum"):
-            return "str_%s(%s)" % (m, recv())
+            return "str_%s(%s)" % (m, self.as_str(func.value))
         if m == "lower":
-            return "str_lower(%s)" % recv()
+            return "str_lower(%s)" % self.as_str(func.value)
         if m == "upper":
-            return "str_upper(%s)" % recv()
+            return "str_upper(%s)" % self.as_str(func.value)
         if m == "join":
-            return "pyjoin(%s, %s)" % (recv(), self.wrap_obj(a[0]))
+            return "pyjoin(%s, %s)" % (self.as_str(func.value), self.wrap_obj(a[0]))
         if m == "encode":
-            return recv()
+            return self.as_str(func.value)
         return None
 
     STR_METHODS = {"startswith", "endswith", "strip", "lstrip", "rstrip",
@@ -12902,6 +12918,12 @@ class Transpiler:
         if t and t.endswith("*"):
             return "(%s != NULL)" % rendered
         return "(%s)" % rendered
+
+    def _truth_test_expr(self, v):
+        # v -> C truth test of v. A named method (passed like the sibling
+        # render(self.expr)/render(self.wrap_obj) callbacks) rather than a lambda,
+        # so the source parses under rast.
+        return self.truth_test(v, self.expr(v))
 
     def ex_BoolOp(self, node):
         vals = node.values
@@ -12929,8 +12951,7 @@ class Transpiler:
         same = len(set(types)) == 1 and types[0] in ("int", "bool", "char*")
         if same:
             rend = render(self.expr)
-            tests = render(lambda v: self.truth_test(
-                v, self.expr(v)))
+            tests = render(self._truth_test_expr)
         else:                                # unify to Tier-2 obj
             rend = render(self.wrap_obj)
             tests = ["truthy(%s)" % r for r in rend]
