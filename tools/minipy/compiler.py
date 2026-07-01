@@ -1516,7 +1516,7 @@ class Compiler:
             meth = node.func.attr
             cn = self.consts.add("str", meth)
             n = len(node.args)
-            if n < 256 and cn < (1 << 23):
+            if n < 256 and cn < 256:
                 rbase = f.top
                 ro = self.expr(f, node.func.value)
                 assert ro == rbase
@@ -1550,6 +1550,7 @@ class Compiler:
                 and node.func.id in self.func_names
                 and node.func.id not in self.reassigned_names
                 and node.func.id not in f.locals
+                and self.func_names[node.func.id] < 256
                 and len(node.args) < 256):
             fidx = self.func_names[node.func.id]
             rbase = f.push()                   # dst slot (no callee loaded)
