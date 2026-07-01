@@ -2209,3 +2209,134 @@ N, build the interpreter with `-DSHIVYC_ARENA_LOG2=31` (2 GiB).
 
 From here, optimizations should be judged primarily on minipy2c: it is the workload that
 behaves like a real program, and the one where a real win shows up as a real number.
+
+---
+
+## v39 -- fixing rast.py's per-parse memory, and a parser speedup
+
+v38 noted minipy2c was memory-bound: each `parse_python` left ~30 MB the free-once arena
+never reclaims, capping the loop near N=35. Two fixes, one structural and one in rast.py
+itself.
+
+**Do the PEG step once.** The benchmark re-parsed the *same* source every iteration, but a
+fixed source always yields the same tree, so the parse only needs to happen once. minipy2c
+now exposes `transpile_tree(tree)` (the parse-free half of `transpile`), and the benchmark
+parses the sample a single time and transpiles the cached tree N times. The dominant
+allocation -- the PEG matcher's backtracking garbage (every failed alternative builds
+`outputs` lists and Nodes that are never freed) -- is inherent to a GC-less PEG parse and
+can't be cheaply reclaimed, so the fix is simply not to pay it per iteration. The arena
+ceiling went from ~35 to tens of thousands; the benchmark now runs N=5000 with ~10x headroom.
+
+**Stop copying the input list in match().** Independently, rast.py's `match()` carried the
+parse position as `self.input = [source_string, position]` and snapshotted it with
+`self.input[:]` at the top of *every* recursive call and at every backtrack point -- a fresh
+two-element list per match, hundreds of thousands per parse. But the source string is
+invariant; only the integer position moves. Saving and restoring just that int (by value,
+no allocation) is semantically identical and removes all those list copies. Since the
+grammar bootstrap and the parse are themselves heavy `match()` users, this sped the whole
+benchmark up **+9.4%** with byte-identical output, and validates 3-way (rast_test,
+minipy2c_test, the benchmark itself: cpython == ref == native).
+
+**The benchmark now.** ~1.7s native, ~1.7% noise, not memory-bound. Its time is dominated by
+the one-time grammar bootstrap + parse (~1.2s of dense PEG matching -- real interpreter work)
+plus the N-iteration transpile loop; both are interpreter-bound, so a faster interpreter
+moves the whole number. This is the workload to optimize against. (A still-open lever: the
+transpiler builds output with `out = out + s`, which is O(n^2); a list+join would cut the
+per-transpile allocation and raise the loop ceiling further, but it isn't the bottleneck yet.)
+
+---
+
+# Porting rast.py to native code: `tools/rpy_lib/rpy_ast.py` (the py2c-compiled parser)
+
+`tools/rpy_lib/rast.py` is a pymetaterp-derived PEG parser for a Python subset. Until now it
+ran as *minipy bytecode* on the native minipy interpreter — i.e. the PEG matching logic was
+itself interpreted. `rpy_ast.py` is `rast.py` compiled **directly to native C via py2c**,
+bypassing the bytecode layer entirely. Same algorithm, same `parse_python(source)` entry
+point, same pymetaterp `Node` tree — but as a standalone ELF.
+
+## Result
+
+Native `rpy_ast` is **byte-identical to CPython** on 18 diverse snippets (assignments,
+precedence, `def`/`class`, `if`/`while`/`for`, lists, dicts, list/dict comprehensions,
+chained method calls, `try`/`except`, boolean logic, nested calls, slicing and negative
+indexing). The two-stage grammar bootstrap plus a parse matches CPython for **328,024+**
+`match()` operations before producing the identical tree.
+
+Speed, parsing the same 10 snippets 30× (300 parses, one grammar bootstrap):
+
+    rast.py as minipy bytecode (on the py2c minipy interp) : 3.62 s
+    rpy_ast.py, py2c-compiled to a native ELF               : 0.50 s   -> ~7.3x faster
+
+(The py2c-compiled parser is still ~1.8x slower than the same code under CPython itself —
+py2c's fully-boxed dynamic dispatch can't beat CPython's C interpreter on this dynamic-heavy
+workload — but it decisively beats the bytecode-on-interpreter baseline, which is the point.)
+
+Build / run:
+
+    rm -rf /tmp/ra && python3 tools/py2c.py tools/rpy_lib/rpy_ast.py --out /tmp/ra
+    python3 -c "import sys;sys.path.insert(0,'tools');import py2c;py2c.write_runtime('/tmp/ra')"
+    gcc -std=c99 -O2 -DSHIVYC_ARENA_LOG2=31 -I/tmp/ra /tmp/ra/*.c -o /tmp/ra/rpy_ast
+    /tmp/ra/rpy_ast                    # native self-test (dumps 10 trees)
+    python3 tools/rpy_lib/rpy_ast.py   # same under CPython (must match byte-for-byte)
+
+Note the `-DSHIVYC_ARENA_LOG2=31` (2 GiB arena): the bootstrap generates a lot of PEG
+backtracking garbage and there is no GC, only a bump arena.
+
+## The py2c blocker catalog (what the port had to work around)
+
+py2c compiles `rast.py`'s fully-dynamic code (heterogeneous `Node` children boxed as generic
+`obj`, runtime type tags) surprisingly well, but seven concrete gaps had to be worked around.
+Each is a real py2c limitation worth knowing for future ports.
+
+1. **`type(x) == list` / `type(x) == str` does not compile** (emits an undeclared C `list`/
+   `str`). Use `isinstance(x, list)` / `isinstance(x, str)` instead — these lower to a tag
+   check and work.
+
+2. **Non-constant `obj` module globals are never initialized in a standalone `main()`
+   program.** py2c defers list/dict/tuple/string/float module globals to a `<mod>_init()`
+   that is never called (not from C `main`, not via a `__main__` guard). Symptoms: a list
+   global reads as `None`, a string global reads as empty. A `None`-initialized global is
+   fine (a static `obj` zero-inits to `None`). **Pattern that works:** declare the global as
+   `X = None` and build it lazily on first use (exactly how the interpreter cache `_PYI`
+   already worked). In `rpy_ast.py`, `binary_ops`, `priority` and `inf` are `None`-globals
+   filled by `_ensure_tables()`, and `tree`/`grammar`/`python_grammar`/`extra` became
+   functions `_meta_tree()`/`_grammar()`/`_python_grammar()`/`_extra()`.
+
+3. **`float("inf")` does not produce infinity** (`pyfloat("inf")` yields a small/zero value;
+   every comparison against it is false, so a `*` quantifier loops zero times). Since `inf`
+   is only ever an unbounded-quantifier ceiling and the loops always break on `MatchError`
+   first, a large int (`1000000000`) is a correct drop-in.
+
+4. **`dict(["t\t", "n\n", ...])` — building a dict from an iterable of 2-char strings (a real
+   CPython feature where each string is a key/value pair) — creates the keys but leaves the
+   values null.** This silently corrupted every escaped char (`\t`, `\n`, ...) in the grammar,
+   which zero-widthed a quantifier and exhausted the arena. Fix: an explicit dict literal.
+
+5. **`def main()` must be annotated `def main() -> "int":`** or py2c emits no C entry point.
+   (Param annotations work too, see #7.)
+
+6. **Virtual method dispatch on a class with no `TypeInfo`.** py2c compiled `pyi.match(...)`
+   as a *vtable* call `TYPE(pyi)->match(...)` because `pyi` came back as generic `obj` (the
+   cache getter returns `obj`). But `Interpreter` was never used with `isinstance`, so py2c
+   emitted **no `Interpreter_type` TypeInfo** and `Interpreter_new` never set `->type` — the
+   vtable pointer was uninitialized garbage and the call jumped into hyperspace *before*
+   `match` ran (the crash was in the call, not the body — a dead giveaway). Fix: add
+   `if isinstance(pyi, Interpreter):` before the call. That single `isinstance` forces py2c to
+   emit the TypeInfo (populating the `.match` slot) and to set `->type` in the constructor.
+
+7. **Parameter type inference can silently pick `int` for an `obj` parameter.** py2c typed
+   `reformat_binary(start, tokens)`'s `start` as `int` (it flows through `lhs = start` into an
+   accumulator that also holds a loop index). Passing a `Node` then coerced the pointer to an
+   int, so `return start` handed back a garbage integer exactly where a `NAME`/`NUMBER` token
+   node belonged — and because it was heap-layout-sensitive, merely adding a `print` "fixed"
+   it. AddressSanitizer was clean (valid pointer, wrong *tag*: `isinstance(x, int)` was true).
+   Fix: annotate the parameter — `def reformat_binary(start: "obj", tokens):`.
+
+## Hand-maintained vs generated
+
+`rpy_ast.py` is currently a hand-edited copy of `rast.py`. The delta is small and mechanical:
+`isinstance`-not-`type` (#1), lazy-init tables + grammar-as-functions (#2), int `inf` (#3),
+explicit escaped-char dict (#4), the `isinstance(pyi, Interpreter)` narrowing (#6), and the
+`start: "obj"` annotation (#7), plus a `main() -> "int":` self-test. A future step could
+generate `rpy_ast.py` from `rast.py` by applying exactly these transforms (as the minipy2c
+benchmark is generated), keeping `rast.py` as the single source of truth.
