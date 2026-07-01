@@ -2016,6 +2016,7 @@ def _module_registry():
     lib = os.path.join(here, "..", "rpy_lib")
     return {
         "re": os.path.join(lib, "minire.py"),
+        "os": os.path.join(lib, "minios.py"),
     }
 
 
