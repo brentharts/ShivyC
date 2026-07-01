@@ -13,6 +13,9 @@ class Transpiler:
         self.out = ""
         self.declared = []          # names already declared in the current scope
         self.cur_class = ""         # enclosing class name while emitting a method
+        self.tv_names = []          # parallel arrays: local name -> C type, used to
+        self.tv_types = []          # tell `long` arithmetic from `char*` concatenation
+        self.need_str = 0           # a string concat was emitted -> prepend the helper
 
     def emit(self, s):
         self.out = self.out + s
@@ -27,8 +30,90 @@ class Transpiler:
     def transpile_tree(self, tree):
         self.out = ""
         self.declared = []
+        self.tv_names = []
+        self.tv_types = []
+        self.need_str = 0
         self.gen_block(tree)
+        if self.need_str == 1:
+            return self.str_prelude() + self.out
         return self.out
+
+    # ---- local type tracking (long vs char*) ----------------------------
+    def set_vtype(self, name, ty):
+        i = 0
+        while i < len(self.tv_names):
+            if self.tv_names[i] == name:
+                self.tv_types[i] = ty
+                return
+            i = i + 1
+        self.tv_names.append(name)
+        self.tv_types.append(ty)
+
+    def vtype(self, name):
+        i = 0
+        while i < len(self.tv_names):
+            if self.tv_names[i] == name:
+                return self.tv_types[i]
+            i = i + 1
+        return "long"
+
+    # Static C type of an expression: "char*" for strings/string-typed names and
+    # `a + b` where either side is a string; "long" otherwise. Used to pick
+    # arithmetic vs concatenation and to declare locals with the right type.
+    def type_of(self, node):
+        if not is_node(node):
+            return "long"
+        nm = node.name
+        if nm == "STRING":
+            return "char*"
+        if nm == "NAME":
+            n = node.children[0]
+            if n == "True" or n == "False" or n == "None":
+                return "long"
+            return self.vtype(n)
+        if nm == "__binary__":
+            if node.children[0] == "+":
+                lt = self.type_of(node.children[1])
+                rt = self.type_of(node.children[2])
+                if lt == "char*" or rt == "char*":
+                    return "char*"
+            return "long"
+        return "long"
+
+    # Emit a C string literal from decoded content (the parser has already
+    # resolved escapes), re-escaping the C-significant characters.
+    def c_string(self, s):
+        out = "\""
+        i = 0
+        while i < len(s):
+            c = s[i]
+            if c == "\\":
+                out = out + "\\\\"
+            elif c == "\"":
+                out = out + "\\\""
+            elif c == "\n":
+                out = out + "\\n"
+            elif c == "\t":
+                out = out + "\\t"
+            elif c == "\r":
+                out = out + "\\r"
+            else:
+                out = out + c
+            i = i + 1
+        return out + "\""
+
+    def str_prelude(self):
+        return ("#include <stdlib.h>\n"
+                "#include <string.h>\n"
+                "static char* _pystr_cat(const char* a, const char* b) {\n"
+                "    long la = strlen(a);\n"
+                "    long lb = strlen(b);\n"
+                "    char* r = (char*)malloc(la + lb + 1);\n"
+                "    memcpy(r, a, la);\n"
+                "    memcpy(r + la, b, lb);\n"
+                "    r[la + lb] = 0;\n"
+                "    return r;\n"
+                "}\n")
 
     # `suite` and `And` wrap a list of statements; anything else is a lone stmt.
     def body_stmts(self, node):
@@ -159,6 +244,8 @@ class Transpiler:
         returns = node.children[2]
         body = node.children[3]
         self.declared = []
+        self.tv_names = []
+        self.tv_types = []
         self.emit(self.ret_ctype(returns, 1) + " " + name + "(")
         ps = params.children
         i = 0
@@ -166,8 +253,10 @@ class Transpiler:
             if i > 0:
                 self.emit(", ")
             pn = self.param_name(ps[i])
+            ct = self.param_ctype(ps[i])
             self.declared.append(pn)
-            self.emit(self.param_ctype(ps[i]) + " " + pn)
+            self.set_vtype(pn, ct)
+            self.emit(ct + " " + pn)
             i = i + 1
         self.emit(") {\n")
         bs = self.body_stmts(body)
@@ -280,13 +369,17 @@ class Transpiler:
         returns = node.children[2]
         body = node.children[3]
         self.declared = []
+        self.tv_names = []
+        self.tv_types = []
         self.emit(self.ret_ctype(returns, self.has_return(body)) + " ")
         self.emit(cls + "_" + mname + "(" + cls + "* self")
         i = 1                                    # skip self
         while i < len(params):
             pn = self.param_name(params[i])
+            ct = self.param_ctype(params[i])
             self.declared.append(pn)
-            self.emit(", " + self.param_ctype(params[i]) + " " + pn)
+            self.set_vtype(pn, ct)
+            self.emit(", " + ct + " " + pn)
             i = i + 1
         self.emit(") {\n")
         bs = self.body_stmts(body)
@@ -310,7 +403,9 @@ class Transpiler:
         target = tgt.children[0]
         if self.is_declared(target) == 0:
             self.declared.append(target)
-            self.emit("long ")
+            ty = self.type_of(node.children[1])
+            self.set_vtype(target, ty)
+            self.emit(ty + " ")
         self.emit(target + " = ")
         self.gen_expr(node.children[1])
         self.emit(";\n")
@@ -402,12 +497,23 @@ class Transpiler:
                 self.emit(nv)
         elif nm == "NUMBER":
             self.emit(str(node.children[0]))
+        elif nm == "STRING":
+            self.emit(self.c_string(node.children[0]))
         elif nm == "__binary__":
-            self.emit("(")
-            self.gen_expr(node.children[1])
-            self.emit(" " + node.children[0] + " ")
-            self.gen_expr(node.children[2])
-            self.emit(")")
+            if node.children[0] == "+" and self.type_of(node) == "char*":
+                # string concatenation -> runtime helper (see str_prelude)
+                self.need_str = 1
+                self.emit("_pystr_cat(")
+                self.gen_expr(node.children[1])
+                self.emit(", ")
+                self.gen_expr(node.children[2])
+                self.emit(")")
+            else:
+                self.emit("(")
+                self.gen_expr(node.children[1])
+                self.emit(" " + node.children[0] + " ")
+                self.gen_expr(node.children[2])
+                self.emit(")")
         elif nm == "factor":
             # unary op: factor(LEAF op, operand)
             self.emit("(" + node.children[0])

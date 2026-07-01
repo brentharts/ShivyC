@@ -41,6 +41,9 @@ SNIPPETS = [
     "def addf(a: \"int\", b: \"int\") -> \"int\":\n    return a + b\n",
     "def pick(s: \"char*\") -> \"char*\":\n    return s\n",
     "class Box:\n    def __init__(self, v: \"int\"):\n        self.v = v\n    def scaled(self, k: \"int\") -> \"int\":\n        return self.v * k\n",
+    "def lit() -> \"char*\":\n    return \"hello\"\n",
+    "def greet(n: \"char*\") -> \"char*\":\n    return \"hi \" + n\n",
+    "def build() -> \"char*\":\n    s = \"a\"\n    s = s + \"b\"\n    s = s + \"c\"\n    return s\n",
 ]
 
 DRIVER = '''
