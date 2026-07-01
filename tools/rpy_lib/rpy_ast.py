@@ -405,7 +405,7 @@ trailed_atom = atom:atom trailer*:trailers -> reformat_atom(atom, trailers)
 atom = "(" spaces {parenthesis} spaces ")"
      | "[" spaces {listmaker | void=listmaker} spaces "]"
      | "{" spaces {dictmaker} spaces "}"
-     | "{" {setmaker} spaces "}"
+     | "{" spaces {setmaker} spaces "}"
      | "`" {(stmt | small_stmt)=thunk} "`"
      | STRINGS | NAME | NUMBER
 parenthesis = yield_expr | testlist_comp=generator | tuple 
@@ -426,7 +426,7 @@ dictmaker! = ({test} ":" {test} {list_for} {list_iter*})=dictcomp
            | {({test} ":" {test})=pair ((comma {test} ":" {test})=pair)*} comma?
            | void
 
-setmaker! = test (list_for list_iter* | (("," test)* ","?))
+setmaker! = test (list_for list_iter* | ((comma test)* comma?))
 
 classdef = "class" {NAME} {("(" {testlist?} ")")?=parents} ":" {suite}
 
@@ -592,9 +592,72 @@ def _python_interp():
         _PYI = Interpreter(mt2, "\t \\")
     return _PYI
 
+def _join_continuations(source):
+    """Collapse Python's implicit line continuation: a newline inside (), [] or
+    {} is not a statement boundary, so replace it (and any comment before it)
+    with a space. The scanner is string- and comment-aware -- brackets inside
+    string literals or comments are not counted, and newlines inside triple-
+    quoted strings are preserved verbatim. This lets the single-line expression
+    rules parse multi-line ternaries, boolean/binary chains, comprehensions and
+    adjacent-string concatenations without the grammar tracking bracket depth.
+    (The tree carries no line information, so joining loses nothing.)"""
+    out = []
+    depth = 0
+    i = 0
+    n = len(source)
+    while i < n:
+        c = source[i]
+        if c == '"' or c == "'":
+            q = c
+            if i + 2 < n and source[i + 1] == q and source[i + 2] == q:
+                out.append(source[i:i + 3])          # triple-quoted: copy verbatim
+                i = i + 3
+                while i < n:
+                    if source[i] == "\\" and i + 1 < n:
+                        out.append(source[i:i + 2]); i = i + 2; continue
+                    if i + 2 < n and source[i] == q and source[i + 1] == q \
+                            and source[i + 2] == q:
+                        out.append(source[i:i + 3]); i = i + 3; break
+                    out.append(source[i]); i = i + 1
+                continue
+            out.append(c); i = i + 1                  # single-line string
+            while i < n:
+                if source[i] == "\\" and i + 1 < n:
+                    out.append(source[i:i + 2]); i = i + 2; continue
+                if source[i] == q:
+                    out.append(q); i = i + 1; break
+                if source[i] == "\n":
+                    break
+                out.append(source[i]); i = i + 1
+            continue
+        if c == "#":
+            if depth > 0:                             # comment inside brackets: drop
+                while i < n and source[i] != "\n":
+                    i = i + 1
+                continue                              # newline handled below (-> space)
+            while i < n and source[i] != "\n":        # top-level comment: keep verbatim
+                out.append(source[i]); i = i + 1
+            continue
+        if c == "(" or c == "[" or c == "{":
+            depth = depth + 1; out.append(c); i = i + 1; continue
+        if c == ")" or c == "]" or c == "}":
+            if depth > 0:
+                depth = depth - 1
+            out.append(c); i = i + 1; continue
+        if c == "\n":
+            if depth > 0:
+                out.append(" ")                       # implicit continuation
+            else:
+                out.append("\n")
+            i = i + 1; continue
+        out.append(c); i = i + 1
+    return "".join(out)
+
+
 def parse_python(source):
     """Parse Python `source` into a pymetaterp Node tree (the grammar covers a
     Python-2-flavoured subset)."""
+    source = _join_continuations(source)
     pyi = _python_interp()
     if isinstance(pyi, Interpreter):
         return pyi.match(pyi.rules['file_input'].children[-1], source)

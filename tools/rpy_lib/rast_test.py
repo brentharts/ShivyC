@@ -41,6 +41,8 @@ SNIPPETS = [
     "def typed(x: \"int\", s: \"char*\") -> \"int\":\n    return x\n",
     "n: int = 1\ncache: dict[str, int] = {}\nflag: bool\n",
     "doc = '''line one\nline two'''\nc = r'''raw\\nkeep'''\n",
+    "s = {\n    \"a\",\n    \"b\",\n}\nk = (x if y\n     else z)\n",
+    "r = (\n    \"p1\"\n    \"p2\"\n)\nv = foo(a +\n        b)\n",
 ]
 
 # Driver appended to a copy of rast.py: parse each snippet and print a canonical
