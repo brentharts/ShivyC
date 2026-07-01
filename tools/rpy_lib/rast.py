@@ -313,10 +313,11 @@ simple_stmt = {small_stmt (";" {small_stmt})*} ";"? NEWLINE
 small_stmt = print_stmt | del_stmt | pass_stmt | flow_stmt | comment
            | import_stmt | global_stmt | exec_stmt | assert_stmt | expr_stmt
 
-expr_stmt = aug_assign | regular_assign | testlist
+expr_stmt = aug_assign | ann_assign | regular_assign | testlist
 aug_assign_symbol = "+=" | "-=" | "*=" | "/=" | "%=" | "&="
                   | "|=" | "^=" | "<<=" | ">>=" | "**=" | "//="
 aug_assign = testlist aug_assign_symbol=operation (yield_expr|testlist)
+ann_assign = {NAME} ":" {test} {("=" {yield_expr|testlist})?=value}
 regular_assign = testlist ("=" {yield_expr|testlist})+
 # For normal assignments, additional restrictions enforced by the interpreter
 print_stmt! = "print" { {test ("," {test})*} ","?
@@ -429,6 +430,7 @@ NUMBER! = hspaces digit+:s -> int("".join(n[0] for n in s))
 NAME! = hspaces {((letter | '_') (letter | digit | '_')*)}
 STRINGS = STRING (spaces {STRING})*
 STRING! = hspaces stype? '"' '"' '"' {(escaped_char | ~('"' '"' '"') {anything})*} '"' '"' '"'
+       | hspaces stype? '\'' '\'' '\'' {(escaped_char | ~('\'' '\'' '\'') {anything})*} '\'' '\'' '\''
        | hspaces stype? '\'' {(escaped_char | ~'\'' anything)*} '\''
        | hspaces stype? '"' {(escaped_char | ~'"' anything)*} '"'
 stype! = 'r'|'b'
