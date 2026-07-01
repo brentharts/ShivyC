@@ -313,6 +313,26 @@ testfast:
 	if [ $$fail = 0 ]; then echo "testfast: PASS"; \
 	else echo "testfast: FAIL"; fi; exit $$fail
 
+# Differential check for the minipy pipeline (rast.py parser + minipy2c.py
+# transpiler + interpreter unit tests), three ways: CPython ground truth, the
+# pure-Python reference VM, and the py2c-compiled native interpreter. Mirrors
+# testfast but adds minipy as a third executor, per MINIPY.md section 9.
+testminipy:
+	@fail=0; \
+	run3() { s="$$1"; \
+	  c=`python3 "$$s" 2>&1 | md5sum | cut -c1-12`; \
+	  r=`python3 tools/rpy.py --ref "$$s" 2>&1 | md5sum | cut -c1-12`; \
+	  n=`python3 tools/rpy.py "$$s" 2>&1 | md5sum | cut -c1-12`; \
+	  if [ "$$c" = "$$r" ] && [ "$$c" = "$$n" ]; then echo "  ok    $$s"; \
+	  else echo "  FAIL  $$s (cpython=$$c ref=$$r native=$$n)"; fail=1; fi; }; \
+	echo "-- minipy interpreter unit tests (3-way) --"; \
+	for t in tools/minipy/test_*.py; do run3 "$$t"; done; \
+	echo "-- parser + transpiler agreement --"; \
+	if python3 tools/rpy_lib/rast_test.py    >/dev/null 2>&1; then echo "  ok    rast_test (4-way)"; else echo "  FAIL  rast_test"; fail=1; fi; \
+	if python3 tools/rpy_lib/minipy2c_test.py >/dev/null 2>&1; then echo "  ok    minipy2c_test (3-way)"; else echo "  FAIL  minipy2c_test"; fail=1; fi; \
+	if [ $$fail = 0 ]; then echo "testminipy: PASS"; \
+	else echo "testminipy: FAIL"; fi; exit $$fail
+
 # Native self-host regression check, three ways: compile
 # tests/fast/selfhost_regressions.c with the native self-hosted binary, with
 # gcc, and with the CPython oracle, and require all three exit codes to agree.
@@ -653,7 +673,7 @@ run-irq: baremetal-irq
 self:
 	cd tools && pypy3 py2c.py
 
-.PHONY: default test testfast testfast_native testpromote testpgo testfuse testtorch shim install install_deps clean baremetal baremetal-hello \
+.PHONY: default test testfast testminipy testfast_native testpromote testpgo testfuse testtorch shim install install_deps clean baremetal baremetal-hello \
         bootstrap bootstrap2 \
         selfhost selfhost_objcore selfhost_bench selfhost_coverage \
         selfhost_coverage_musl selfhost_link selfhost_build selfhost_compiler \
