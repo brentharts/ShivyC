@@ -29,6 +29,11 @@ SNIPPETS = [
     "def sumto(n):\n    total = 0\n    i = 0\n    while i < n:\n        total = total + i\n        i = i + 1\n    return total\n",
     "def grade(x):\n    if x < 60:\n        r = 0\n    else:\n        r = 1\n    return r\n",
     "def poly(x):\n    return ((x * x) + (x * 3)) + 1\n",
+    "def sumrange(n):\n    s = 0\n    for i in range(n):\n        s += i\n    return s\n",
+    "def between(a, b):\n    t = 0\n    for i in range(a, b):\n        t += i\n    return t\n",
+    "def neg(n):\n    return -n\n",
+    "def logic(a, b):\n    if a and b:\n        return 1\n    if a or b:\n        return 2\n    if not a:\n        return 3\n    return 0\n",
+    "def loop(n):\n    i = 0\n    while i < n:\n        if i == 3:\n            break\n        i += 1\n    return i\n",
 ]
 
 DRIVER = '''
