@@ -330,6 +330,7 @@ testminipy:
 	echo "-- parser + transpiler agreement --"; \
 	if python3 tools/rpy_lib/rast_test.py    >/dev/null 2>&1; then echo "  ok    rast_test (4-way)"; else echo "  FAIL  rast_test"; fail=1; fi; \
 	if python3 tools/rpy_lib/minipy2c_test.py >/dev/null 2>&1; then echo "  ok    minipy2c_test (3-way)"; else echo "  FAIL  minipy2c_test"; fail=1; fi; \
+	if python3 tools/rpy_lib/minast_native_test.py >/dev/null 2>&1; then echo "  ok    minast_native_test (3-way)"; else echo "  FAIL  minast_native_test"; fail=1; fi; \
 	if [ $$fail = 0 ]; then echo "testminipy: PASS"; \
 	else echo "testminipy: FAIL"; fi; exit $$fail
 
