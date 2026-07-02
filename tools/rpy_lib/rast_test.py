@@ -46,6 +46,8 @@ SNIPPETS = [
     "h = 0xff\nm = ord(c) & 0xff\nsh = (1 << 30) >> 2\nfd = 16 // n\n",
     "print(\"x\", file=sys.stderr)\nj = os.path.join(base, *parts.split(\".\"), \"z\")\n",
     "try:\n    pass\nexcept Exception as e:\n    raise Wrap(str(e)) from e\n",
+    "a = r\"x\\ty\\nz\"\nb = r'''p\\nq\\tr'''\nc = \"esc\\there\"\n",
+    "for i in xs:\n    if i:\n        a = 1\nelse:\n    a = 2\nwhile a:\n    a = a - 1\nelse:\n    b = 0\n",
 ]
 
 # Driver appended to a copy of rast.py: parse each snippet and print a canonical

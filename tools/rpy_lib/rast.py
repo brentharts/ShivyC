@@ -377,10 +377,10 @@ assert_stmt! = "assert" {test ("," test)?}
 compound_stmt = if_stmt | while_stmt | for_stmt | try_stmt | with_stmt
               | funcdef | classdef | decorated
 if_stmt = ("if" {test} ":" {suite})=single_if 
-          (("elif" {test} ":" {suite})=single_if)*
-          (("else" ":" {void=gen_true suite})=single_if)?
-while_stmt = "while" {test} ":" {suite ("else" ":" {suite})?}
-for_stmt = "for" {exprlist} "in" {testlist} ":" {suite} {{"else"} ":" {suite=elseblock}}?
+          ((SAME_INDENT "elif" {test} ":" {suite})=single_if)*
+          ((SAME_INDENT "else" ":" {void=gen_true suite})=single_if)?
+while_stmt = "while" {test} ":" {suite} {((SAME_INDENT "else" ":" {suite})=elseblock)?}
+for_stmt = "for" {exprlist} "in" {testlist} ":" {suite} {((SAME_INDENT "else" ":" {suite})=elseblock)?}
 try_stmt! = "try" ":" {suite}
             {(({exception} ":" {suite})=except_clause)+=except_clauses
              ("else" ":" suite)?
@@ -462,7 +462,11 @@ NUMBER! = hspaces '0' ('x' | 'X') hexdigit+:h -> _hexval(h)
 # Probably need to check that the result isn't a reserved word.
 NAME! = hspaces {((letter | '_') (letter | digit | '_')*)}
 STRINGS = STRING (spaces {STRING})*
-STRING! = hspaces stype? '"' '"' '"' {(escaped_char | ~('"' '"' '"') {anything})*} '"' '"' '"'
+STRING! = hspaces ('r'|'R') '"' '"' '"' {(~('"' '"' '"') {anything})*} '"' '"' '"'
+       | hspaces ('r'|'R') '\'' '\'' '\'' {(~('\'' '\'' '\'') {anything})*} '\'' '\'' '\''
+       | hspaces ('r'|'R') '\'' {(~'\'' {anything})*} '\''
+       | hspaces ('r'|'R') '"' {(~'"' {anything})*} '"'
+       | hspaces stype? '"' '"' '"' {(escaped_char | ~('"' '"' '"') {anything})*} '"' '"' '"'
        | hspaces stype? '\'' '\'' '\'' {(escaped_char | ~('\'' '\'' '\'') {anything})*} '\'' '\'' '\''
        | hspaces stype? '\'' {(escaped_char | ~'\'' anything)*} '\''
        | hspaces stype? '"' {(escaped_char | ~'"' anything)*} '"'
