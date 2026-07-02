@@ -99,7 +99,7 @@ BUILTINS = {n: i for i, n in enumerate(
     ["print", "len", "range", "int", "str", "float", "abs", "bool",
      "list", "dict", "set", "tuple", "repr", "sorted", "sum", "min", "max",
      "isinstance", "enumerate", "zip", "any", "all", "ord", "chr",
-     "reversed", "getattr", "hasattr", "type"])}
+     "reversed", "getattr", "hasattr", "type", "setattr"])}
 
 # Builtin exception hierarchy (name -> base name), parents before children so a
 # class's base is already registered when it is.  These are materialised as real
@@ -268,6 +268,11 @@ class _Frame:
         for r in range(mark, self.top):
             self.numreg.discard(r)
         self.top = mark
+        # A kept register at mark-1 (e.g. the result of an *empty* container
+        # literal, whose destination was never push()ed) must be counted, or the
+        # frame is allocated too few registers and BUILD_LIST/etc. overflow.
+        if mark > self.maxreg:
+            self.maxreg = mark
 
     def emit(self, op, a=0, b=0, c=0):
         self.code.append([OPS[op], a, b, c])
@@ -2453,6 +2458,7 @@ class VM:
         if name == "chr":   return chr(args[0])
         if name == "reversed": return list(reversed(args[0]))
         if name == "getattr":  return self._getattr(args)
+        if name == "setattr":  return self._setattr(args)
         if name == "hasattr":
             obj = args[0]
             return (isinstance(obj, _Inst)
@@ -2511,6 +2517,12 @@ class VM:
                 return ("bound", fidx, obj)
         if len(args) >= 3:
             return args[2]
+        return None
+
+    def _setattr(self, args):
+        obj = args[0]
+        if isinstance(obj, _Inst):
+            obj.attrs[args[1]] = args[2]
         return None
 
     def _method(self, mid, args):

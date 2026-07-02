@@ -1620,6 +1620,12 @@ def do_builtin(st: "St", bid: "long", args: "list[V]") -> "V":
             if t == 10:
                 return v_builtin(11)
         return v_builtin(-1)
+    if bid == 28:              # setattr
+        if len(args) >= 3:
+            obj = args[0]
+            if obj.tag == 12:
+                inst_set(st, obj, args[1].sv, args[2])
+        return v_none()
     return v_none()
 
 
