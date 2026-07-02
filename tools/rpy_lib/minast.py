@@ -1604,11 +1604,28 @@ def _up_call(node):
     return _up(node.func) + "(" + ", ".join(parts) + ")"
 
 
+def _up_target(node):
+    if node._typename == "Tuple":
+        if len(node.elts) == 0:
+            return "()"
+        if len(node.elts) == 1:
+            return _up(node.elts[0]) + ","
+        return _up_join(node.elts, ", ")
+    return _up(node)
+
+
+def _up_target_list(nodes):
+    out = []
+    for n in nodes:
+        out.append(_up_target(n))
+    return out
+
+
 def _up_comp(node):
     # generators: "for t in it if c ..."
     out = ""
     for g in node.generators:
-        out = out + " for " + _up(g.target) + " in " + _up(g.iter)
+        out = out + " for " + _up_target(g.target) + " in " + _up(g.iter)
         for c in g.ifs:
             out = out + " if " + _up(c)
     return out
@@ -1705,8 +1722,239 @@ def _up_list(nodes):
     return out
 
 
+def _up_arg(a):
+    s = a.arg
+    if a.annotation is not None:
+        s = s + ": " + _up(a.annotation)
+    return s
+
+
+def _up_args(a):
+    parts = []
+    allpos = a.posonlyargs + a.args
+    ndef = len(a.defaults)
+    npos = len(allpos)
+    nposonly = len(a.posonlyargs)
+    i = 0
+    while i < npos:
+        seg = _up_arg(allpos[i])
+        di = i - (npos - ndef)
+        if di >= 0:
+            seg = seg + "=" + _up(a.defaults[di])
+        parts.append(seg)
+        if i + 1 == nposonly and nposonly > 0:
+            parts.append("/")
+        i = i + 1
+    if a.vararg is not None:
+        parts.append("*" + _up_arg(a.vararg))
+    elif len(a.kwonlyargs) > 0:
+        parts.append("*")
+    j = 0
+    while j < len(a.kwonlyargs):
+        seg = _up_arg(a.kwonlyargs[j])
+        d = a.kw_defaults[j]
+        if d is not None:
+            seg = seg + "=" + _up(d)
+        parts.append(seg)
+        j = j + 1
+    if a.kwarg is not None:
+        parts.append("**" + _up_arg(a.kwarg))
+    return ", ".join(parts)
+
+
+def _up_keyword(k):
+    if k.arg is None:
+        return "**" + _up(k.value)
+    return k.arg + "=" + _up(k.value)
+
+
+def _emit_stmts(stmts, ind, lines):
+    i = 0
+    while i < len(stmts):
+        _emit_stmt(stmts[i], ind, lines)
+        i = i + 1
+
+
+def _emit_stmt(node, ind, lines):
+    nm = node._typename
+    pad = "    " * ind
+    if nm == "FunctionDef" or nm == "AsyncFunctionDef":
+        if len(lines) > 0:
+            lines.append("")
+        for deco in node.decorator_list:
+            lines.append(pad + "@" + _up(deco))
+        pre = "def "
+        if nm == "AsyncFunctionDef":
+            pre = "async def "
+        sig = pad + pre + node.name + "(" + _up_args(node.args) + ")"
+        if node.returns is not None:
+            sig = sig + " -> " + _up(node.returns)
+        lines.append(sig + ":")
+        _emit_stmts(node.body, ind + 1, lines)
+        return
+    if nm == "ClassDef":
+        if len(lines) > 0:
+            lines.append("")
+        for deco in node.decorator_list:
+            lines.append(pad + "@" + _up(deco))
+        parts = []
+        for b in node.bases:
+            parts.append(_up(b))
+        for k in node.keywords:
+            parts.append(_up_keyword(k))
+        head = pad + "class " + node.name
+        if len(parts) > 0:
+            head = head + "(" + ", ".join(parts) + ")"
+        lines.append(head + ":")
+        _emit_stmts(node.body, ind + 1, lines)
+        return
+    if nm == "If":
+        lines.append(pad + "if " + _up(node.test) + ":")
+        _emit_stmts(node.body, ind + 1, lines)
+        orelse = node.orelse
+        while len(orelse) == 1 and orelse[0]._typename == "If":
+            e = orelse[0]
+            lines.append(pad + "elif " + _up(e.test) + ":")
+            _emit_stmts(e.body, ind + 1, lines)
+            orelse = e.orelse
+        if len(orelse) > 0:
+            lines.append(pad + "else:")
+            _emit_stmts(orelse, ind + 1, lines)
+        return
+    if nm == "For" or nm == "AsyncFor":
+        pre = "for "
+        if nm == "AsyncFor":
+            pre = "async for "
+        lines.append(pad + pre + _up_target(node.target) + " in " + _up(node.iter) + ":")
+        _emit_stmts(node.body, ind + 1, lines)
+        if len(node.orelse) > 0:
+            lines.append(pad + "else:")
+            _emit_stmts(node.orelse, ind + 1, lines)
+        return
+    if nm == "While":
+        lines.append(pad + "while " + _up(node.test) + ":")
+        _emit_stmts(node.body, ind + 1, lines)
+        if len(node.orelse) > 0:
+            lines.append(pad + "else:")
+            _emit_stmts(node.orelse, ind + 1, lines)
+        return
+    if nm == "With" or nm == "AsyncWith":
+        pre = "with "
+        if nm == "AsyncWith":
+            pre = "async with "
+        parts = []
+        for it in node.items:
+            seg = _up(it.context_expr)
+            if it.optional_vars is not None:
+                seg = seg + " as " + _up(it.optional_vars)
+            parts.append(seg)
+        lines.append(pad + pre + ", ".join(parts) + ":")
+        _emit_stmts(node.body, ind + 1, lines)
+        return
+    if nm == "Try":
+        lines.append(pad + "try:")
+        _emit_stmts(node.body, ind + 1, lines)
+        for h in node.handlers:
+            head = "except"
+            if h.type is not None:
+                head = head + " " + _up(h.type)
+                if h.name is not None:
+                    head = head + " as " + h.name
+            lines.append(pad + head + ":")
+            _emit_stmts(h.body, ind + 1, lines)
+        if len(node.orelse) > 0:
+            lines.append(pad + "else:")
+            _emit_stmts(node.orelse, ind + 1, lines)
+        if len(node.finalbody) > 0:
+            lines.append(pad + "finally:")
+            _emit_stmts(node.finalbody, ind + 1, lines)
+        return
+    if nm == "Import":
+        parts = []
+        for a in node.names:
+            seg = a.name
+            if a.asname is not None:
+                seg = seg + " as " + a.asname
+            parts.append(seg)
+        lines.append(pad + "import " + ", ".join(parts))
+        return
+    if nm == "ImportFrom":
+        mod = node.module
+        if mod is None:
+            mod = ""
+        dots = "." * node.level
+        parts = []
+        for a in node.names:
+            seg = a.name
+            if a.asname is not None:
+                seg = seg + " as " + a.asname
+            parts.append(seg)
+        lines.append(pad + "from " + dots + mod + " import " + ", ".join(parts))
+        return
+    if nm == "AugAssign":
+        lines.append(pad + _up_target(node.target) + " " + _op_sym(node.op) + "= " + _up(node.value))
+        return
+    if nm == "AnnAssign":
+        seg = _up_target(node.target) + ": " + _up(node.annotation)
+        if node.value is not None:
+            seg = seg + " = " + _up(node.value)
+        lines.append(pad + seg)
+        return
+    if nm == "Raise":
+        seg = "raise"
+        if node.exc is not None:
+            seg = seg + " " + _up(node.exc)
+            if node.cause is not None:
+                seg = seg + " from " + _up(node.cause)
+        lines.append(pad + seg)
+        return
+    if nm == "Assert":
+        seg = "assert " + _up(node.test)
+        if node.msg is not None:
+            seg = seg + ", " + _up(node.msg)
+        lines.append(pad + seg)
+        return
+    if nm == "Global":
+        lines.append(pad + "global " + ", ".join(node.names))
+        return
+    if nm == "Nonlocal":
+        lines.append(pad + "nonlocal " + ", ".join(node.names))
+        return
+    if nm == "Delete":
+        lines.append(pad + "del " + ", ".join(_up_target_list(node.targets)))
+        return
+    if nm == "Assign":
+        lines.append(pad + " = ".join(_up_target_list(node.targets)) + " = " + _up(node.value))
+        return
+    if nm == "Return":
+        if node.value is None:
+            lines.append(pad + "return")
+        else:
+            lines.append(pad + "return " + _up(node.value))
+        return
+    if nm == "Expr":
+        lines.append(pad + _up(node.value))
+        return
+    if nm == "Pass":
+        lines.append(pad + "pass")
+        return
+    if nm == "Break":
+        lines.append(pad + "break")
+        return
+    if nm == "Continue":
+        lines.append(pad + "continue")
+        return
+    lines.append(pad + _up(node))
+
+
 def unparse(node):
-    return _up(node)
+    if node._typename == "Module":
+        lines = []
+        _emit_stmts(node.body, 0, lines)
+        return "\n".join(lines)
+    lines = []
+    _emit_stmt(node, 0, lines)
+    return "\n".join(lines)
 
 
 def parse(source):

@@ -240,9 +240,35 @@ def run_unparse_tests():
             ann_ok += 1
         else:
             print("ANN-DIFF %r" % s)
-    print("unparse: %d/%d exprs, %d/%d annotations matched"
-          % (ok, len(exprs), ann_ok, len(anns)))
-    return (len(exprs) - ok) + (len(anns) - ann_ok)
+    # statement-level programs: minast.unparse of a full module must match
+    # CPython's ast.unparse byte-for-byte (funcdef/class/if/for/while/try/with/
+    # import/raise/assert/global/del/annotations/aug-assign, incl. elif chains,
+    # decorators, else/finally, tuple targets).
+    progs = [
+        "def f(a, b=1, *c, **kw) -> list:\n    return a\n",
+        "@deco\nclass C(A, B):\n    x = 0\n\n    def m(self):\n        return self.x\n",
+        "try:\n    x = 1\nexcept (A, B) as e:\n    y = 2\nexcept C:\n    z = 3\nelse:\n    w = 4\nfinally:\n    cleanup()\n",
+        "with open('f') as a, ctx() as b:\n    read(a)\n",
+        "with x as (a, b):\n    pass\n",
+        "if a:\n    p()\nelif b:\n    q()\nelif c:\n    r()\nelse:\n    s()\n",
+        "for i in items:\n    del x, y\n    global g\n",
+        "raise ValueError('x') from err\nassert cond, 'message'\n",
+        "x: int\ny: dict[str, int] = {}\na, b = (b, a)\nlst[0], lst[1] = (1, 2)\n",
+        "while True:\n    break\nelse:\n    pass\n",
+        "import a.b.c\nimport a.b.c as abc\nfrom pkg import y as z, w\n",
+        "for i, it in enumerate(xs):\n    total += it\n",
+    ]
+    prog_ok = 0
+    for s in progs:
+        want = real.unparse(real.parse(s))
+        got = minast.unparse(minast.parse(s))
+        if want == got:
+            prog_ok += 1
+        else:
+            print("PROG-UNPARSE-DIFF for %r\n  want=%r\n  got =%r" % (s[:30], want, got))
+    print("unparse: %d/%d exprs, %d/%d annotations, %d/%d programs matched"
+          % (ok, len(exprs), ann_ok, len(anns), prog_ok, len(progs)))
+    return ((len(exprs) - ok) + (len(anns) - ann_ok) + (len(progs) - prog_ok))
 
 
 if __name__ == "__main__":
