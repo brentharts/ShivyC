@@ -38,15 +38,15 @@ class AST:
 
 
 class Module(AST):
-    def __init__(self, body):
+    def __init__(self, body=None, type_ignores=None):
         self._fields = ("body", "type_ignores")
         self._typename = "Module"
         self.body = body
-        self.type_ignores = []
+        self.type_ignores = type_ignores if type_ignores is not None else []
 
 
 class FunctionDef(AST):
-    def __init__(self, name, args, body, decorator_list, returns):
+    def __init__(self, name=None, args=None, body=None, decorator_list=None, returns=None):
         self._fields = ("name", "args", "body", "decorator_list", "returns",
                         "type_comment", "type_params")
         self._typename = "FunctionDef"
@@ -75,7 +75,7 @@ class ClassDef(AST):
 
 
 class Return(AST):
-    def __init__(self, value):
+    def __init__(self, value=None):
         self._fields = ("value",)
         self._typename = "Return"
         self._init_loc()
@@ -83,13 +83,13 @@ class Return(AST):
 
 
 class Assign(AST):
-    def __init__(self, targets, value):
+    def __init__(self, targets=None, value=None, type_comment=None):
         self._fields = ("targets", "value", "type_comment")
         self._typename = "Assign"
         self._init_loc()
         self.targets = targets
         self.value = value
-        self.type_comment = None
+        self.type_comment = type_comment
 
 
 class AugAssign(AST):
@@ -103,7 +103,7 @@ class AugAssign(AST):
 
 
 class AnnAssign(AST):
-    def __init__(self, target, annotation, value, simple):
+    def __init__(self, target=None, annotation=None, value=None, simple=None):
         self._fields = ("target", "annotation", "value", "simple")
         self._typename = "AnnAssign"
         self._init_loc()
@@ -146,7 +146,7 @@ class If(AST):
 
 
 class Expr(AST):
-    def __init__(self, value):
+    def __init__(self, value=None):
         self._fields = ("value",)
         self._typename = "Expr"
         self._init_loc()
@@ -257,7 +257,7 @@ class Compare(AST):
 
 
 class Call(AST):
-    def __init__(self, func, args, keywords):
+    def __init__(self, func=None, args=None, keywords=None):
         self._fields = ("func", "args", "keywords")
         self._typename = "Call"
         self._init_loc()
@@ -285,25 +285,25 @@ class IfExp(AST):
 
 
 class Constant(AST):
-    def __init__(self, value):
+    def __init__(self, value=None, kind=None):
         self._fields = ("value", "kind")
         self._typename = "Constant"
         self._init_loc()
         self.value = value
-        self.kind = None
+        self.kind = kind
 
 
 class Name(AST):
-    def __init__(self, id_, ctx):
+    def __init__(self, id=None, ctx=None):
         self._fields = ("id", "ctx")
         self._typename = "Name"
         self._init_loc()
-        self.id = id_
+        self.id = id
         self.ctx = ctx
 
 
 class Attribute(AST):
-    def __init__(self, value, attr, ctx):
+    def __init__(self, value=None, attr=None, ctx=None):
         self._fields = ("value", "attr", "ctx")
         self._typename = "Attribute"
         self._init_loc()
@@ -1397,6 +1397,83 @@ class withitem(AST):
 
 
 # ---------------------------------------------------------------------------
+# Node types the rast grammar does not (yet) produce, but that py2c references
+# in isinstance() checks to detect / reject / special-case unsupported syntax
+# (lambdas, generators, f-strings, async).  They must exist as classes so those
+# checks resolve to False instead of raising AttributeError; the converter never
+# instantiates them.
+# ---------------------------------------------------------------------------
+class Lambda(AST):
+    def __init__(self, args, body):
+        self._fields = ("args", "body")
+        self._typename = "Lambda"
+        self._init_loc()
+        self.args = args
+        self.body = body
+
+
+class Yield(AST):
+    def __init__(self, value):
+        self._fields = ("value",)
+        self._typename = "Yield"
+        self._init_loc()
+        self.value = value
+
+
+class YieldFrom(AST):
+    def __init__(self, value):
+        self._fields = ("value",)
+        self._typename = "YieldFrom"
+        self._init_loc()
+        self.value = value
+
+
+class JoinedStr(AST):
+    def __init__(self, values):
+        self._fields = ("values",)
+        self._typename = "JoinedStr"
+        self._init_loc()
+        self.values = values
+
+
+class FormattedValue(AST):
+    def __init__(self, value, conversion, format_spec):
+        self._fields = ("value", "conversion", "format_spec")
+        self._typename = "FormattedValue"
+        self._init_loc()
+        self.value = value
+        self.conversion = conversion
+        self.format_spec = format_spec
+
+
+class AsyncFunctionDef(AST):
+    def __init__(self, name, args, body, decorator_list, returns):
+        self._fields = ("name", "args", "body", "decorator_list", "returns",
+                        "type_comment", "type_params")
+        self._typename = "AsyncFunctionDef"
+        self._init_loc()
+        self.name = name
+        self.args = args
+        self.body = body
+        self.decorator_list = decorator_list
+        self.returns = returns
+        self.type_comment = None
+        self.type_params = []
+
+
+class AsyncFor(AST):
+    def __init__(self, target, iter, body, orelse):
+        self._fields = ("target", "iter", "body", "orelse", "type_comment")
+        self._typename = "AsyncFor"
+        self._init_loc()
+        self.target = target
+        self.iter = iter
+        self.body = body
+        self.orelse = orelse
+        self.type_comment = None
+
+
+# ---------------------------------------------------------------------------
 # try / with conversion.  Both rast forms are leaf-laden: try_stmt delimits its
 # sections with an except_clauses node plus bare 'else'/'finally' leaves, and
 # with_stmt lists its items before a bare ':' leaf.  A small state machine walks
@@ -2081,7 +2158,7 @@ def unparse(node):
     return "\n".join(lines)
 
 
-def parse(source):
+def parse(source, filename="<unknown>", mode="exec", type_comments=0, feature_version=0):
     tree = parse_python(source)
     body = []
     if _is(tree, "And"):
