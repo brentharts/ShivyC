@@ -88,6 +88,8 @@ OPS = {
     "SHL":         36, "SHR": 37,        # reg[a] = reg[b] << / >> reg[c]
     "SLICE":       38,                   # reg[a] = reg[a][lo:hi:step], (lo,hi,
                                          # step) = reg[b],reg[b+1],reg[b+2]
+    "SLICE_STORE":  39,                  # reg[a][lo:hi] = value; (lo,hi,value)
+                                         # = reg[b],reg[b+1],reg[b+2]
     # --- unary (40-49): reg[a] = OP reg[b] ---
     "NEG":         40, "NOT": 41,
     # --- AOT-specialised numeric fast paths (60-89): no tag check ---
@@ -771,7 +773,12 @@ class Compiler:
 
     def st_Assign(self, f, node):
         if len(node.targets) != 1:
-            raise CompileError("v0 assign: single target (line %s)" % node.lineno)
+            # chained `a = b = value`: evaluate the value once, store into each
+            rval = self.expr(f, node.value)
+            for tgt in node.targets:
+                self._store_target_reg(f, tgt, rval)
+            f.pop_to(rval)
+            return
         tgt = node.targets[0]
         if isinstance(tgt, ast.Name):
             if self._try_acc_gint(f, tgt, node.value):
@@ -791,7 +798,26 @@ class Compiler:
             return
         if isinstance(tgt, ast.Subscript):
             if isinstance(tgt.slice, ast.Slice):
-                raise CompileError("v0: slice assignment unsupported (line %s)" % node.lineno)
+                sl = tgt.slice
+                if sl.step is not None:
+                    raise CompileError("v0: step in slice assignment unsupported "
+                                       "(line %s)" % node.lineno)
+                rseq = self.expr(f, tgt.value)                   # seq at rseq
+                if sl.lower is None:
+                    rlo = self._const_reg(f, ("none", None))
+                else:
+                    rlo = self.expr(f, sl.lower)
+                assert rlo == rseq + 1
+                if sl.upper is None:
+                    rhi = self._const_reg(f, ("none", None))
+                else:
+                    rhi = self.expr(f, sl.upper)
+                assert rhi == rseq + 2
+                rval = self.expr(f, node.value)                 # value at rseq+3
+                assert rval == rseq + 3
+                f.emit("SLICE_STORE", rseq, rseq + 1, 0)
+                f.pop_to(rseq)
+                return
             robj = self.expr(f, tgt.value)
             ridx = self.expr(f, tgt.slice)
             rval = self.expr(f, node.value)
@@ -800,19 +826,49 @@ class Compiler:
             f.pop_to(robj)
             return
         if isinstance(tgt, (ast.Tuple, ast.List)):
-            # a, b = <iterable>: index the (materialised) value positionally
+            # a, b = <iterable>: index the (materialised) value positionally, then
+            # store each element into its target (Name / attr / subscript / nested)
             rseq = self.expr(f, node.value)
             for i, elt in enumerate(tgt.elts):
-                if not isinstance(elt, ast.Name):
-                    raise CompileError("v0 unpack: Name targets only (line %s)" % node.lineno)
                 ridx = self._const_reg(f, ("int", i))
                 f.emit("INDEX", ridx, rseq, ridx)
-                self._store_name(f, elt.id, ridx)
+                self._store_target_reg(f, elt, ridx)
                 f.pop_to(ridx)
             f.pop_to(rseq)
             return
         raise CompileError("v0 assign: unsupported target %s (line %s)"
                            % (type(tgt).__name__, node.lineno))
+
+    def _store_target_reg(self, f, tgt, rval):
+        # store the value already in register `rval` into an assignment target;
+        # supports Name, Attribute, Subscript, and nested Tuple/List unpacking.
+        if isinstance(tgt, ast.Name):
+            self._store_name(f, tgt.id, rval)
+            return
+        if isinstance(tgt, ast.Attribute):
+            robj = self.expr(f, tgt.value)
+            cn = self.consts.add("str", tgt.attr)
+            f.emit("STORE_ATTR", robj, rval, cn)
+            f.pop_to(robj)
+            return
+        if isinstance(tgt, ast.Subscript):
+            if isinstance(tgt.slice, ast.Slice):
+                raise CompileError("v0: slice assignment unsupported")
+            robj = self.expr(f, tgt.value)
+            ridx = self.expr(f, tgt.slice)
+            op = "SETINDEX_INT" if self._type_of(f, tgt.value) == "tintlist" else "SETINDEX"
+            f.emit(op, robj, ridx, rval)
+            f.pop_to(robj)
+            return
+        if isinstance(tgt, (ast.Tuple, ast.List)):
+            for i, elt in enumerate(tgt.elts):
+                ridx = self._const_reg(f, ("int", i))
+                f.emit("INDEX", ridx, rval, ridx)
+                self._store_target_reg(f, elt, ridx)
+                f.pop_to(ridx)
+            return
+        raise CompileError("v0 assign: unsupported target %s"
+                           % type(tgt).__name__)
 
     def st_AnnAssign(self, f, node):
         # `x: T = v` (annotation ignored); bare `x: T` is a no-op declaration
@@ -1052,13 +1108,11 @@ class Compiler:
         if isinstance(tgt, ast.Name):
             self._store_name(f, tgt.id, rx)
             f.pop_to(rit + 1)
-        else:                                # unpack tuple element into names
+        else:                                # unpack tuple element into targets
             for i, elt in enumerate(tgt.elts):
-                if not isinstance(elt, ast.Name):
-                    raise CompileError("v0 for-unpack: Name targets only (line %s)" % node.lineno)
                 ridx = self._const_reg(f, ("int", i))
                 f.emit("INDEX", ridx, rx, ridx)
-                self._store_name(f, elt.id, ridx)
+                self._store_target_reg(f, elt, ridx)
                 f.pop_to(ridx)
             f.pop_to(rit + 1)
         loop = _Loop(top); self._loops.append(loop)
@@ -1495,7 +1549,19 @@ class Compiler:
 
     def ex_Compare(self, f, node):
         if len(node.ops) != 1:
-            raise CompileError("v0 compare: single comparator only (line %s)" % node.lineno)
+            # chained `a < b < c` -> `a < b and b < c`. Middle operands are
+            # re-evaluated, which is fine for the side-effect-free comparison
+            # subset minipy targets (names, constants, attribute reads).
+            clauses = []
+            left = node.left
+            for op, comp in zip(node.ops, node.comparators):
+                cmp1 = ast.Compare(left=left, ops=[op], comparators=[comp])
+                ast.copy_location(cmp1, node)
+                clauses.append(cmp1)
+                left = comp
+            conj = ast.BoolOp(op=ast.And(), values=clauses)
+            ast.copy_location(conj, node)
+            return self.expr(f, conj)
         op = node.ops[0]
         # membership: `x in seq` / `x not in seq`
         if isinstance(op, (ast.In, ast.NotIn)):
@@ -1801,13 +1867,11 @@ class Compiler:
         if isinstance(tgt, ast.Name):
             self._store_name(f, tgt.id, rx)
             f.pop_to(rit + 1)
-        else:                               # unpack tuple element into names
+        else:                               # unpack tuple element into targets
             for i, elt in enumerate(tgt.elts):
-                if not isinstance(elt, ast.Name):
-                    raise CompileError("v0 comp-unpack: Name targets only")
                 ridx = self._const_reg(f, ("int", i))
                 f.emit("INDEX", ridx, rx, ridx)
-                self._store_name(f, elt.id, ridx)
+                self._store_target_reg(f, elt, ridx)
                 f.pop_to(ridx)
             f.pop_to(rit + 1)
         skip_jumps = []
@@ -1951,21 +2015,23 @@ def _collect_locals(node):
     def add(name):
         if name not in found and name not in declared_global:
             found.append(name)
+
+    def add_target(t):                       # recurse through nested tuple/list
+        if isinstance(t, ast.Name):
+            add(t.id)
+        elif isinstance(t, (ast.Tuple, ast.List)):
+            for e in t.elts:
+                add_target(e)
+        # Attribute / Subscript targets do not bind a local
+
     for n in ast.walk(node):
         if isinstance(n, ast.Assign):
             for t in n.targets:
-                if isinstance(t, ast.Name):
-                    add(t.id)
-                elif isinstance(t, (ast.Tuple, ast.List)):
-                    for e in t.elts:
-                        if isinstance(e, ast.Name):
-                            add(e.id)
+                add_target(t)
         elif isinstance(n, (ast.AugAssign, ast.For)) and isinstance(getattr(n, "target", None), ast.Name):
             add(n.target.id)
         elif isinstance(n, (ast.For, ast.comprehension)) and isinstance(getattr(n, "target", None), (ast.Tuple, ast.List)):
-            for e in n.target.elts:
-                if isinstance(e, ast.Name):
-                    add(e.id)
+            add_target(n.target)
         elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name):
             add(n.target.id)
         elif isinstance(n, ast.comprehension) and isinstance(n.target, ast.Name):
@@ -2068,6 +2134,8 @@ def _module_registry():
     return {
         "re": os.path.join(lib, "minire.py"),
         "os": os.path.join(lib, "minios.py"),
+        "rast": os.path.join(lib, "rast.py"),
+        "ast": os.path.join(lib, "minast.py"),
     }
 
 
@@ -2086,46 +2154,40 @@ def _module_bound_names(body):
 
 
 class _RefPrefixer(ast.NodeTransformer):
-    """Prefix references to a linked module's own top-level names. Guards against
-    any function/method local or parameter shadowing one of those names, since
-    the rename is name-based (that shadowing never occurs in the small library
-    modules we link, and erroring is safer than silently miscompiling)."""
-    def __init__(self, names, prefix):
-        self.names = names
-        self.prefix = prefix
+    """Rewrite references to a set of names to replacement names, skipping any
+    scope where a local/param shadows the name (so a function local named `arg`
+    is not mistaken for a module-global `arg`). Driven by a rename map, it serves
+    both to namespace a linked module's own top-level names ($mod$name) and to
+    bind `from X import name` references to the linked source ($X$name). This lets
+    large modules (e.g. minast, which defines `class arg` yet also uses `arg` as a
+    local) link cleanly."""
+    def __init__(self, rename):
+        self.rename = rename              # name -> replacement name
+        self.shadowed = set()
 
-    def _check_no_shadow(self, node):
+    def _locals_of(self, node):
         loc = set(_collect_locals(node))
         for a in node.args.args:
             loc.add(a.arg)
         if node.args.vararg:
             loc.add(node.args.vararg.arg)
-        bad = loc & self.names
-        if bad:
-            raise CompileError("module link: local(s) %s shadow module globals"
-                               % sorted(bad))
+        if node.args.kwarg:
+            loc.add(node.args.kwarg.arg)
+        for a in node.args.kwonlyargs:
+            loc.add(a.arg)
+        return loc
 
     def visit_FunctionDef(self, node):
-        self._check_no_shadow(node)
+        sh = (self._locals_of(node) & set(self.rename)) - self.shadowed
+        self.shadowed |= sh
         self.generic_visit(node)
+        self.shadowed -= sh
         return node
 
     def visit_Name(self, node):
-        if node.id in self.names:
-            node.id = self.prefix + node.id
+        if node.id in self.rename and node.id not in self.shadowed:
+            node.id = self.rename[node.id]
         return node
-
-
-def _namespace_module(mtree, prefix):
-    names = _module_bound_names(mtree.body)
-    for s in mtree.body:                      # rename top-level def/class names
-        if isinstance(s, (ast.FunctionDef, ast.ClassDef)) and s.name in names:
-            s.name = prefix + s.name
-    _RefPrefixer(names, prefix).visit(mtree)  # prefix references + shadow guard
-    member_map = {}
-    for n in names:
-        member_map[n] = prefix + n
-    return member_map
 
 
 class _ModuleAttrRewriter(ast.NodeTransformer):
@@ -2144,30 +2206,222 @@ class _ModuleAttrRewriter(ast.NodeTransformer):
         return node
 
 
+# Library modules written in the minipy subset are linked in at compile time.
+# Linking is transitive and handles both `import X` (rewriting `X.member` to the
+# prefixed global) and `from X import a, b` (rewriting bare `a`/`b`), so minast --
+# which does `from rast import parse_python` -- pulls in rast automatically. Each
+# module body is inlined once; its own top-level names get a `$mod$` prefix so
+# they cannot collide with the importing program.
 def _link_modules(tree):
     reg = _module_registry()
-    aliases = {}                              # alias name -> module key
+    linked = {}                               # mod key -> {member: $mod$member}
+    prepend = []
+
+    def rewrite_body(mbody, own, prefix):
+        # combined rename map: own names -> $mod$name (unless prefix is None, i.e.
+        # the main program keeps its own names), plus `from X import a` -> $X$a.
+        rename = {}
+        if prefix is not None:
+            for n in own:
+                rename[n] = prefix + n
+        alias_members = {}
+        for s in mbody:
+            if isinstance(s, ast.Import):
+                for al in s.names:
+                    if al.name in reg:
+                        alias_members[al.asname or al.name] = link(al.name)
+            elif isinstance(s, ast.ImportFrom):
+                if s.module in reg:
+                    link(s.module)
+                    srcpref = "$" + s.module + "$"
+                    for al in s.names:
+                        rename[al.asname or al.name] = srcpref + al.name
+        holder = ast.Module(body=mbody, type_ignores=[])
+        if rename:
+            _RefPrefixer(rename).visit(holder)
+        if alias_members:
+            _ModuleAttrRewriter(alias_members).visit(holder)
+        return holder.body
+
+    def link(mod_key):
+        if mod_key in linked:
+            return linked[mod_key]
+        with open(reg[mod_key], encoding="utf-8") as fh:
+            mtree = ast.parse(fh.read(), filename=reg[mod_key])
+        prefix = "$" + mod_key + "$"
+        own = _module_bound_names(mtree.body)
+        member_map = {}
+        for n in own:
+            member_map[n] = prefix + n
+        linked[mod_key] = member_map          # register before recursing (cycles)
+        for s in mtree.body:                  # rename own def/class definitions
+            if isinstance(s, (ast.FunctionDef, ast.ClassDef)) and s.name in own:
+                s.name = prefix + s.name
+        body = rewrite_body(mtree.body, own, prefix)
+        prepend.extend(body)
+        return member_map
+
+    has_link = False
     for s in tree.body:
         if isinstance(s, ast.Import):
             for al in s.names:
                 if al.name in reg:
-                    aliases[al.asname or al.name] = al.name
-    if not aliases:
+                    has_link = True
+        elif isinstance(s, ast.ImportFrom):
+            if s.module in reg:
+                has_link = True
+    if not has_link:
         return tree
-    prepend = []
-    linked = set()
-    alias_members = {}
-    for alias in aliases:
-        mod = aliases[alias]
-        prefix = "$" + mod + "$"
-        with open(reg[mod], encoding="utf-8") as fh:
-            mtree = ast.parse(fh.read(), filename=reg[mod])
-        alias_members[alias] = _namespace_module(mtree, prefix)
-        if mod not in linked:                 # inline each module body once
-            prepend = prepend + mtree.body
-            linked.add(mod)
-    _ModuleAttrRewriter(alias_members).visit(tree)
+    tree.body = rewrite_body(tree.body, set(), None)
     tree.body = prepend + tree.body
+    ast.fix_missing_locations(tree)
+    return tree
+
+
+def _fn_paramnames(fn):
+    ps = [a.arg for a in fn.args.args]
+    if fn.args.vararg:
+        ps.append(fn.args.vararg.arg)
+    if fn.args.kwarg:
+        ps.append(fn.args.kwarg.arg)
+    ps += [a.arg for a in fn.args.kwonlyargs]
+    return ps
+
+
+def _child_stmt_lists(stmt):
+    """Statement-list bodies directly under a control-flow statement (not the
+    bodies of nested def/class, which introduce their own scope)."""
+    lists = []
+    for field in ("body", "orelse", "finalbody"):
+        v = getattr(stmt, field, None)
+        if isinstance(v, list):
+            lists.append(v)
+    if isinstance(stmt, ast.Try):
+        for h in stmt.handlers:
+            lists.append(h.body)
+    return lists
+
+
+def _nested_funcs_of(enc):
+    """(nested FunctionDef, containing list) for functions nested directly in enc,
+    recursing through control-flow blocks but not into nested class/def scopes."""
+    result = []
+
+    def scan(body):
+        for s in body:
+            if isinstance(s, ast.FunctionDef):
+                result.append((s, body))          # a nested function to lift
+            elif isinstance(s, ast.ClassDef):
+                pass                              # nested classes: left alone
+            else:
+                for sub in _child_stmt_lists(s):
+                    scan(sub)
+    scan(enc.body)
+    return result
+
+
+def _loaded_names(node):
+    out = set()
+    for n in ast.walk(node):
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+            out.add(n.id)
+    return out
+
+
+def _direct_calls(fn):
+    """Names called directly (`name(...)`) anywhere in fn's body."""
+    out = set()
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+            out.add(n.func.id)
+    return out
+
+
+class _CallArgPrepender(ast.NodeTransformer):
+    """Rewrite `name(...)` -> `newname(capt..., ...)` for a lifted nested func."""
+    def __init__(self, mapping):
+        self.mapping = mapping                    # name -> (newname, [capt names])
+
+    def visit_Call(self, node):
+        self.generic_visit(node)
+        if isinstance(node.func, ast.Name) and node.func.id in self.mapping:
+            newname, capt = self.mapping[node.func.id]
+            node.func = ast.Name(id=newname, ctx=ast.Load())
+            node.args = [ast.Name(id=c, ctx=ast.Load()) for c in capt] + node.args
+        return node
+
+
+def _lift_closures(tree):
+    """Lift non-escaping nested functions to module level, threading captured
+    enclosing locals through as leading parameters. C (py2c) and minipy's register
+    VM both lack closures; this mirrors py2c's own closure conversion for the
+    subset that matters here: functions only ever *called* (never used as values),
+    with captured variables read or mutated-in-place but not rebound (no nonlocal).
+    Nested classes are left untouched."""
+    module_globals = _module_bound_names(tree.body) | set(BUILTINS.keys())
+    new_top = []
+    counter = [0]
+
+    def lift_enclosing(enc):
+        nested = _nested_funcs_of(enc)
+        if not nested:
+            return
+        names = set(fn.name for fn, _ in nested)
+        enc_locals = set(_fn_paramnames(enc)) | set(_collect_locals(enc))
+        # base captures: enclosing locals each nested func reads
+        base = {}
+        bound = {}
+        for fn, _ in nested:
+            fnbound = set(_fn_paramnames(fn)) | set(_collect_locals(fn))
+            bound[fn.name] = fnbound
+            free = _loaded_names(fn) - fnbound
+            base[fn.name] = (free & enc_locals) - module_globals
+        # escaping / unsupported guards
+        for fn, _ in nested:
+            if fn.name in (_loaded_names(enc) - _direct_calls(enc)):
+                raise CompileError("v0 closure: nested function %r used as a value "
+                                   "(line %s)" % (fn.name, fn.lineno))
+        # fixpoint: a nested func that calls a sibling must also carry its captures
+        capt = dict((k, set(v)) for k, v in base.items())
+        changed = True
+        while changed:
+            changed = False
+            for fn, _ in nested:
+                for callee in _direct_calls(fn):
+                    if callee in names and callee != fn.name:
+                        add = capt[callee] - capt[fn.name] - bound[fn.name]
+                        if add:
+                            capt[fn.name] |= add
+                            changed = True
+        # assign lifted names and build the call rewrite map
+        newname = {}
+        for fn, _ in nested:
+            newname[fn.name] = "_clo%d_%s" % (counter[0], fn.name)
+            counter[0] += 1
+        mapping = {}
+        for fn, _ in nested:
+            mapping[fn.name] = (newname[fn.name], sorted(capt[fn.name]))
+        rewriter = _CallArgPrepender(mapping)
+        # produce the lifted top-level functions
+        for fn, container in nested:
+            caps = sorted(capt[fn.name])
+            fn.name = newname_of = newname[fn.name]
+            fn.args.args = [ast.arg(arg=c, annotation=None) for c in caps] + fn.args.args
+            rewriter.visit(fn)                    # fix sibling/self calls inside
+            new_top.append(fn)
+        # remove the nested defs from their containers and fix calls in enc
+        for fn, container in nested:
+            container[:] = [s for s in container if s is not fn]
+        rewriter.visit(enc)
+
+    for top in list(tree.body):
+        if isinstance(top, ast.FunctionDef):
+            lift_enclosing(top)
+        elif isinstance(top, ast.ClassDef):
+            for s in list(top.body):          # methods can nest functions too
+                if isinstance(s, ast.FunctionDef):
+                    lift_enclosing(s)
+    tree.body = tree.body + new_top
     ast.fix_missing_locations(tree)
     return tree
 
@@ -2176,6 +2430,7 @@ def compile_source(src, source_name="<module>"):
     tree = ast.parse(src, filename=source_name)
     tree = _link_modules(tree)               # inline supported library imports
     tree = _WithDesugar().visit(tree)        # with -> manager-protocol + try/finally
+    tree = _lift_closures(tree)              # nested funcs -> top-level + captures
     ast.fix_missing_locations(tree)
     c = Compiler()
     c._loops = []
@@ -2386,6 +2641,9 @@ class VM:
             elif op == 38:                                # SLICE seq[lo:hi:step]
                 seq = regs[a]; lo = regs[b]; hi = regs[b + 1]; step = regs[b + 2]
                 regs[a] = seq[lo:hi:step]                 # lo/hi may be None (sentinel)
+            elif op == 39:                                # SLICE_STORE seq[lo:hi]=val
+                seq = regs[a]; lo = regs[b]; hi = regs[b + 1]; val = regs[b + 2]
+                seq[lo:hi] = val                          # lo/hi may be None (sentinel)
             elif op == 30: regs[a] = regs[b] < regs[c]
             elif op == 31: regs[a] = regs[b] <= regs[c]
             elif op == 32: regs[a] = regs[b] > regs[c]

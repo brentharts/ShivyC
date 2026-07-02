@@ -773,6 +773,60 @@ def v_slice(st: "St", seq: "V", lo_v: "V", hi_v: "V", step_v: "V") -> "V":
     return v_container(st, 7, 0, res)
 
 
+def v_slice_store(st: "St", seq: "V", lo_v: "V", hi_v: "V", value: "V") -> None:
+    # `seq[lo:hi] = value` for lists (step 1). Splices value's items in place so
+    # aliases of the list observe the change. Bounds clamp like CPython.
+    if seq.tag != 7:
+        return
+    items = items_of(st, seq)
+    n = len(items)
+    if lo_v.tag == 0:
+        lo = 0
+    else:
+        lo = lo_v.iv
+        if lo < 0:
+            lo = lo + n
+        if lo < 0:
+            lo = 0
+        if lo > n:
+            lo = n
+    if hi_v.tag == 0:
+        hi = n
+    else:
+        hi = hi_v.iv
+        if hi < 0:
+            hi = hi + n
+        if hi < 0:
+            hi = 0
+        if hi > n:
+            hi = n
+    if hi < lo:
+        hi = lo
+    if value.tag == 7 or value.tag == 10:
+        vitems = items_of(st, value)
+    else:
+        vitems = new_v_list()
+    newlist = new_v_list()
+    k = 0
+    while k < lo:
+        newlist.append(items[k])
+        k = k + 1
+    k = 0
+    while k < len(vitems):
+        newlist.append(vitems[k])
+        k = k + 1
+    k = hi
+    while k < n:
+        newlist.append(items[k])
+        k = k + 1
+    while len(items) > 0:
+        items.pop()
+    k = 0
+    while k < len(newlist):
+        items.append(newlist[k])
+        k = k + 1
+
+
 # ---- subscript / membership / iteration ----
 def _norm_index(i: "long", n: "long") -> "long":
     if i < 0:
@@ -2414,6 +2468,8 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
             _lset(regs, a, v_int(_lget(regs, b).iv >> _lget(regs, c).iv)); pc = pc + 1
         elif op == 38:
             _lset(regs, a, v_slice(st, _lget(regs, a), _lget(regs, b), _lget(regs, b + 1), _lget(regs, b + 2))); pc = pc + 1
+        elif op == 39:
+            v_slice_store(st, _lget(regs, a), _lget(regs, b), _lget(regs, b + 1), _lget(regs, b + 2)); pc = pc + 1
         elif op == 30:
             _lset(regs, a, v_bool(1 if v_cmp(_lget(regs, b), _lget(regs, c)) < 0 else 0)); pc = pc + 1
         elif op == 31:
