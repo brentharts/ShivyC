@@ -45,6 +45,8 @@ OPS = {
     "JT_LT": 83, "JT_LE": 84, "JT_GT": 85,  # fused compare+branch:
     "JT_GE": 86, "JT_EQ": 87, "JT_NE": 88,  # if (reg[a] CMP reg[c]): pc=b
     "CALL_FUNC": 89,                       # direct call: c = fidx*256 + nargs
+    "CALL_KW":     90,   # reg[a]=reg[b](pos+kw); c=npos*256+nkw; window carries
+                         # positional values, keyword values, then keyword-name strs
     "CALL":         8,   # reg[a] = reg[b](reg[b+1..b+c]); c = argcount
     # --- containers (9-19) ---
     "BUILD_LIST":   9,   # reg[a] = [regs[b..b+c-1]]
@@ -253,6 +255,7 @@ class _Frame:
         self.vartype = {}                # name -> 'tintlist'/'listtint' (typed)
         self.reclaimable_locals = set()  # locals whose old value may be freed on reassign
         self.params = set(params)        # parameter names (never reclaimable: alias args)
+        self.param_order = list(params)  # parameter names in positional order (kw binding)
         self.defaults = []               # per-param const index, -1 = required
 
     # register stack discipline
@@ -1562,9 +1565,51 @@ class Compiler:
                 tgt(node.target)
         return names
 
+    def _call_kw(self, f, node):
+        # keyword-argument call: lay out the register window as
+        #   rfun=callee, positional values, keyword values, keyword-name strings
+        # and let the VM (CALL_KW) resolve names to positions at runtime.
+        for kw in node.keywords:
+            if kw.arg is None:
+                raise CompileError("v0 call: no **kwargs (line %s)" % node.lineno)
+        npos = len(node.args)
+        nkw = len(node.keywords)
+        if npos >= 256 or nkw >= 256:
+            raise CompileError("v0 call: too many args (line %s)" % node.lineno)
+        if isinstance(node.func, ast.Attribute):
+            # method keyword call `recv.meth(...)`: materialise a bound method
+            # (captures the receiver as self) then resolve keywords against it.
+            cn = self.consts.add("str", node.func.attr)
+            rfun = f.push()
+            ro = self.expr(f, node.func.value)
+            assert ro == rfun + 1
+            f.emit("LOAD_METHOD", rfun, ro, cn)
+            f.pop_to(rfun + 1)
+        else:
+            rfun = self.expr(f, node.func)         # callee
+        k = 0
+        for a in node.args:                    # positional arg values
+            ra = self.expr(f, a)
+            assert ra == rfun + 1 + k
+            k += 1
+        for kw in node.keywords:               # keyword arg values
+            rv = self.expr(f, kw.value)
+            assert rv == rfun + 1 + k
+            k += 1
+        for kw in node.keywords:               # keyword names (as string consts)
+            cn = self.consts.add("str", kw.arg)
+            r = f.push()
+            assert r == rfun + 1 + k
+            f.emit("LOAD_CONST", r, cn)
+            k += 1
+        f.emit("CALL_KW", rfun, rfun, npos * 256 + nkw)
+        f.pop_to(rfun + 1)
+        f.numreg.discard(rfun)
+        return rfun
+
     def ex_Call(self, f, node):
         if node.keywords:
-            raise CompileError("v0 call: no keyword args (line %s)" % node.lineno)
+            return self._call_kw(f, node)
         # method call `recv.meth(args)`: callable = method-id builtin, receiver
         # is arg0, then the real args -- reuses the CALL window machinery.
         if isinstance(node.func, ast.Attribute):
@@ -1849,6 +1894,7 @@ class Compiler:
                          for (op, a, b, c) in fr.code],
                 "defaults": fr.defaults,
                 "vararg": fr.vararg,
+                "params": fr.param_order,
             })
         names = [None] * len(self.gnames)
         for nm, slot in self.gnames.items():
@@ -2250,6 +2296,14 @@ class VM:
             elif op == 8:
                 callee = regs[b]; ca = [regs[b + 1 + k] for k in range(c)]
                 regs[a] = self._invoke(callee, ca)
+            elif op == 90:                      # CALL_KW: c = npos*256 + nkw
+                npos = c // 256; nkw = c % 256
+                callee = regs[b]
+                posvals = [regs[b + 1 + k] for k in range(npos)]
+                kwvals = [regs[b + 1 + npos + k] for k in range(nkw)]
+                kwnames = [regs[b + 1 + npos + nkw + k] for k in range(nkw)]
+                fullargs = self._bind_kwargs(callee, posvals, kwnames, kwvals)
+                regs[a] = self._invoke(callee, fullargs)
             elif op == 89:                      # CALL_FUNC (direct)
                 fnum = c // 256; nargs = c % 256
                 ca = [regs[b + k] for k in range(nargs)]
@@ -2371,6 +2425,42 @@ class VM:
                 else:
                     return None                 # propagate to caller
         return None
+
+    def _bind_kwargs(self, callee, posvals, kwnames, kwvals):
+        # resolve positional + keyword args into a complete positional list,
+        # mirroring interp.bind_kwargs (self is prepended later by _invoke)
+        fidx = None
+        self_off = 0
+        if isinstance(callee, tuple):
+            if callee[0] == "func":
+                fidx = callee[1]; self_off = 0
+            elif callee[0] == "class":
+                fidx = self._lookup_method(callee[1], "__init__"); self_off = 1
+            elif callee[0] == "bound":
+                fidx = callee[1]; self_off = 1
+        if fidx is None or fidx < 0:
+            return list(posvals) + list(kwvals)
+        fn = self.funcs[fidx]
+        params = fn.get("params", [])
+        nvis = fn["nparams"] - self_off
+        defs = fn.get("defaults", [])
+        out = []
+        for p in range(nvis):
+            if p < len(posvals):
+                out.append(posvals[p])
+            else:
+                found = -1
+                for j in range(len(kwnames)):
+                    if self_off + p < len(params) and params[self_off + p] == kwnames[j]:
+                        found = j
+                        break
+                if found >= 0:
+                    out.append(kwvals[found])
+                elif self_off + p < len(defs) and defs[self_off + p] >= 0:
+                    out.append(self._const(defs[self_off + p]))
+                else:
+                    out.append(None)
+        return out
 
     def _invoke(self, callee, args):
         if isinstance(callee, tuple) and callee[0] == "func":

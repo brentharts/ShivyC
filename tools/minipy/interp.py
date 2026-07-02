@@ -43,7 +43,7 @@ class Instr:
 class Func:
     def __init__(self, name: "char*", nparams: "int", nregs: "int",
                  nlocals: "int", code: "list[Instr]", defaults: "list[int]",
-                 vararg: "int"):
+                 vararg: "int", params: "list[str]"):
         self.name = name
         self.nparams = nparams
         self.nregs = nregs
@@ -51,6 +51,7 @@ class Func:
         self.code = code
         self.defaults = defaults
         self.vararg = vararg                 # reg index of *args param, or -1
+        self.params = params                 # parameter names in positional order
 
 
 class MethEnt:
@@ -1904,6 +1905,64 @@ def do_method(st: "St", mid: "long", args: "list[V]") -> "V":
     return v_none()
 
 
+def bind_kwargs(st: "St", callee: "V", posvals: "list[V]",
+                kwnames: "list[V]", kwvals: "list[V]") -> "list[V]":
+    # Resolve a mix of positional + keyword arguments into a complete positional
+    # args list (excluding self, which do_call/instantiate prepends per callee
+    # kind). Needs the callee's parameter names, so it resolves the target func:
+    #   tag 5  plain function        -> its own params, no self
+    #   tag 13 class (constructor)   -> __init__ params, param 0 is self
+    #   tag 14 bound user method     -> method params, param 0 is self
+    fidx = -1
+    self_off = 0
+    if callee.tag == 5:
+        fidx = callee.iv
+        self_off = 0
+    elif callee.tag == 13:
+        fidx = lookup_method(st, callee.iv, "__init__")
+        self_off = 1
+    elif callee.tag == 14:
+        fidx = callee.iv % _METH_SHIFT
+        self_off = 1
+    if fidx < 0:
+        # no parameter metadata (e.g. builtin, or class without __init__):
+        # best-effort positional pass-through, keyword values appended in order
+        out = new_v_list()
+        i = 0
+        while i < len(posvals):
+            out.append(posvals[i]); i = i + 1
+        i = 0
+        while i < len(kwvals):
+            out.append(kwvals[i]); i = i + 1
+        return out
+    fn = st.prog.funcs[fidx]
+    nvis = fn.nparams - self_off
+    out = new_v_list()
+    p = 0
+    while p < nvis:
+        if p < len(posvals):                 # positional args fill leftmost params
+            out.append(posvals[p])
+        else:
+            found = -1                        # else look for a matching keyword
+            j = 0
+            while j < len(kwnames):
+                if _strcmp(fn.params[self_off + p], kwnames[j].sv) == 0:
+                    found = j
+                    j = len(kwnames)
+                else:
+                    j = j + 1
+            if found >= 0:
+                out.append(kwvals[found])
+            else:                             # else the param's default, else None
+                di = self_off + p
+                if di < len(fn.defaults) and fn.defaults[di] >= 0:
+                    out.append(const_to_v(st.prog, fn.defaults[di]))
+                else:
+                    out.append(v_none())
+        p = p + 1
+    return out
+
+
 def do_call(st: "St", callee: "V", args: "list[V]") -> "V":
     if callee.tag == 5:
         return run_func(st, callee.iv, args)
@@ -2122,6 +2181,28 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
                 j = j + 1
             rcall = do_call(st, callee, cargs)
             st.regpool.append(cargs)
+            _lset(regs, a, rcall); pc = pc + 1
+        elif op == 90:                     # CALL_KW: c = npos*256 + nkw
+            # window: reg[b]=callee, [b+1..b+npos]=positional values,
+            # [b+1+npos..b+npos+nkw]=keyword values,
+            # [b+1+npos+nkw..b+npos+2*nkw]=keyword-name strings
+            npos = c // 256
+            nkw = c % 256
+            callee = _lget(regs, b)
+            posvals = new_v_list()
+            j = 0
+            while j < npos:
+                posvals.append(_lget(regs, b + 1 + j)); j = j + 1
+            kwvals = new_v_list()
+            j = 0
+            while j < nkw:
+                kwvals.append(_lget(regs, b + 1 + npos + j)); j = j + 1
+            kwnames = new_v_list()
+            j = 0
+            while j < nkw:
+                kwnames.append(_lget(regs, b + 1 + npos + nkw + j)); j = j + 1
+            fullargs = bind_kwargs(st, callee, posvals, kwnames, kwvals)
+            rcall = do_call(st, callee, fullargs)
             _lset(regs, a, rcall); pc = pc + 1
         elif op == 89:                     # CALL_FUNC: direct call, c = fidx*256+nargs
             fnum = c // 256
