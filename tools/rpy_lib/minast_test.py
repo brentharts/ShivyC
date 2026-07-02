@@ -265,6 +265,10 @@ def run_unparse_tests():
         "for i, it in enumerate(xs):\n    total += it\n",
         "def f(a, b=1, *c, d, e=2, **kw) -> list:\n    return a\n",
         "def g(*args, x, y=2, **kw):\n    return x\n",
+        '"""module doc"""\nx = 1\n',
+        'def f():\n    """one liner"""\n    return 1\n',
+        'class C:\n    """class doc\n\n    detail with unicode \u2014 dash.\n    """\n\n    def m(self):\n        """method doc"""\n        pass\n',
+        'def f():\n    if x:\n        "not a docstring"\n    return 1\n',
     ]
     prog_ok = 0
     for s in progs:

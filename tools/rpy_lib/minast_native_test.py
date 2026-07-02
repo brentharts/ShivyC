@@ -67,6 +67,7 @@ PROGRAMS = [
     "def f() -> int:\n    return 1\n",
     "def f(a, b, *c, k=1):\n    return a + b\n",
     "def f(a, b=1, *c, d, e=2, **kw) -> list:\n    return a\n",
+    'class C:\n    """doc"""\n\n    def m(self):\n        """method"""\n        return 1\n',
     "class C:\n    pass\n",
     "class C(B):\n    x = 1\n",
     "class C(B, D):\n    def m(self):\n        return self.x\n",

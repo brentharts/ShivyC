@@ -1845,6 +1845,53 @@ def _up_keyword(k):
     return k.arg + "=" + _up(k.value)
 
 
+def _is_docstring(node):
+    if node._typename != "Expr":
+        return 0
+    v = node.value
+    if v._typename != "Constant":
+        return 0
+    return 1 if isinstance(v.value, str) else 0
+
+
+def _emit_docstring(node, ind, lines):
+    pad = "    " * ind
+    val = node.value.value
+    esc = ""
+    can = 1
+    for c in val:
+        o = ord(c)
+        if c == "\\":
+            esc = esc + "\\\\"
+        elif c == "\n" or c == "\t":
+            esc = esc + c
+        elif o >= 32 and o != 127:
+            esc = esc + c                 # printable (incl. non-ASCII) -> literal
+        else:
+            can = 0                       # control char (ord<32 non-\n\t, or DEL) -> fall back
+    if can == 0:
+        lines.append(pad + repr(val))
+        return
+    q = "\"\"\""
+    if q in esc:
+        q = "'''"
+        if q in esc:
+            lines.append(pad + repr(val))
+            return
+    if len(esc) > 0 and esc[len(esc) - 1] == q[0]:
+        esc = esc[0:len(esc) - 1] + "\\" + esc[len(esc) - 1]
+    lines.append(pad + q + esc + q)
+
+
+def _emit_body(stmts, ind, lines):
+    # module/def/class body: a leading string-constant Expr is a docstring
+    if len(stmts) > 0 and _is_docstring(stmts[0]):
+        _emit_docstring(stmts[0], ind, lines)
+        _emit_stmts(stmts[1:], ind, lines)
+    else:
+        _emit_stmts(stmts, ind, lines)
+
+
 def _emit_stmts(stmts, ind, lines):
     i = 0
     while i < len(stmts):
@@ -1867,7 +1914,7 @@ def _emit_stmt(node, ind, lines):
         if node.returns is not None:
             sig = sig + " -> " + _up(node.returns)
         lines.append(sig + ":")
-        _emit_stmts(node.body, ind + 1, lines)
+        _emit_body(node.body, ind + 1, lines)
         return
     if nm == "ClassDef":
         if len(lines) > 0:
@@ -1883,7 +1930,7 @@ def _emit_stmt(node, ind, lines):
         if len(parts) > 0:
             head = head + "(" + ", ".join(parts) + ")"
         lines.append(head + ":")
-        _emit_stmts(node.body, ind + 1, lines)
+        _emit_body(node.body, ind + 1, lines)
         return
     if nm == "If":
         lines.append(pad + "if " + _up(node.test) + ":")
@@ -2027,7 +2074,7 @@ def _emit_stmt(node, ind, lines):
 def unparse(node):
     if node._typename == "Module":
         lines = []
-        _emit_stmts(node.body, 0, lines)
+        _emit_body(node.body, 0, lines)
         return "\n".join(lines)
     lines = []
     _emit_stmt(node, 0, lines)

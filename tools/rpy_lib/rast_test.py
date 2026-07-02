@@ -29,6 +29,10 @@ PY2C = os.path.join(ROOT, "tools", "py2c.py")
 # calls, comparisons -- enough to meaningfully exercise the grammar.
 SNIPPETS = [
     "x = 1 + 2 * 3\n",
+    # blank line immediately after a block header (as ast.unparse emits before
+    # a first nested def) previously mis-measured INDENT and broke the suite rule
+    "class C:\n\n    def a(self):\n        pass\n\n    def b(self):\n        return 1\n",
+    "def f():\n\n    x = 1\n\n    return x\n",
     "y = (1 + 2) * 3\n",
     "def f(a, b):\n    return a + b\n",
     "if x > 0:\n    y = 1\nelse:\n    y = 2\n",

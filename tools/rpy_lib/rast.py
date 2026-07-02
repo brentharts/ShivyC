@@ -389,7 +389,7 @@ try_stmt! = "try" ":" {suite}
 with_stmt = "with" with_item ("," with_item)* ":" suite
 with_item = test ("as" expr)?
 exception! = "except" {(test (("as" | ",") {test})?)?}
-suite = NEWLINE INDENT {(SAME_INDENT stmt | EMPTY_LINE)+} DEDENT | simple_stmt
+suite = NEWLINE EMPTY_LINE* INDENT {(SAME_INDENT stmt | EMPTY_LINE)+} DEDENT | simple_stmt
 
 testlist = {test ("," {test})*} ","?
 yield_expr! = "yield" {testlist?}
