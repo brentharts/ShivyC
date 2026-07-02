@@ -11,11 +11,12 @@ unparse -- the exact pipeline py2c drives -- entirely on minipy.
 minast.py normally does `from rast import parse_python, is_node`; here rast.py is
 concatenated ahead of it (minipy has no module import), so that line is stripped.
 
-Scope note: this exercises the expression pipeline (converter + NodeTransformer +
-NodeVisitor + unparse) end-to-end on minipy. Statement-level conversion
-(funcdef/class bodies) is validated on CPython + the ref VM by minast_test.py, but
-currently triggers a native-runtime memory-corruption bug under minast's heavy
-allocation, so it is not yet part of this 3-way native check.
+Scope: this exercises both the expression pipeline (converter + NodeTransformer +
+NodeVisitor + unparse) and statement-level conversion (funcdef/class/if/for/while
+bodies) end-to-end on minipy, 3-way. Statement conversion previously tripped a
+native-runtime crash -- minast's `if node.children:` guard on an empty child list
+mis-evaluated because `truthy()` treated every container as truthy; empty
+containers are now correctly falsy, so `def`/`class` conversion runs natively.
 
     python3 tools/rpy_lib/minast_native_test.py          # run all three, compare
     python3 tools/rpy_lib/minast_native_test.py --keep   # also leave combined file
@@ -53,6 +54,22 @@ SNIPPETS = [
     "obj.method(a).attr[b]",
 ]
 
+# Statement-level programs: the funcdef/class forms that exercise the
+# `if node.children:` guards (empty return-annotation, empty bases) that the
+# truthy() fix unblocked, plus if/for/while suites and nesting.
+PROGRAMS = [
+    "def f():\n    pass\n",
+    "def f() -> int:\n    return 1\n",
+    "def f(a, b, *c, k=1):\n    return a + b\n",
+    "class C:\n    pass\n",
+    "class C(B):\n    x = 1\n",
+    "class C(B, D):\n    def m(self):\n        return self.x\n",
+    "if a:\n    b = 1\nelse:\n    b = 2\n",
+    "for i in xs:\n    total = total + i\n",
+    "while a < b:\n    a = a + 1\n",
+    "def outer():\n    def inner():\n        return 1\n    return inner\n",
+]
+
 DRIVER = '''
 
 class _Renamer(NodeTransformer):
@@ -81,6 +98,18 @@ def _emit(src):
     print("IDS  " + " ".join(coll.ids))
 
 
+def _emit_prog(src):
+    tree = parse(src)
+    print("PROG")
+    print(unparse(tree))
+    _Renamer().visit(tree)
+    print("PXFM")
+    print(unparse(tree))
+    coll = _Collector()
+    coll.visit(tree)
+    print("PIDS " + " ".join(coll.ids))
+
+
 %s
 '''
 
@@ -92,6 +121,7 @@ def build_combined():
         ln for ln in minast.split("\n")
         if not ln.strip().startswith("from rast import"))
     calls = "\n".join("_emit(%r)" % s for s in SNIPPETS)
+    calls += "\n" + "\n".join("_emit_prog(%r)" % s for s in PROGRAMS)
     combined = rast + "\n" + minast + "\n" + DRIVER % calls
     fd, path = tempfile.mkstemp(prefix="minast_native_combined_", suffix=".py")
     os.write(fd, combined.encode())
@@ -118,8 +148,8 @@ def main(argv):
 
     if cpython == ref == native:
         nlines = len(cpython.splitlines())
-        print("PASS: cpython == ref == native  (%d snippets, %d output lines)"
-              % (len(SNIPPETS), nlines))
+        print("PASS: cpython == ref == native  (%d snippets, %d programs, %d output lines)"
+              % (len(SNIPPETS), len(PROGRAMS), nlines))
         return 0
     print("FAIL: executors disagree")
     for name, out in (("cpython", cpython), ("ref", ref), ("native", native)):
