@@ -1522,6 +1522,193 @@ def _conv_decorated(node):
     return result
 
 
+# ---------------------------------------------------------------------------
+# unparse: node tree -> Python source text.  py2c calls ast.unparse mainly on
+# type annotations (Name/Constant/Subscript/Attribute/Tuple -- reproduced
+# exactly) and, best-effort, on arbitrary nodes for source comments (every
+# py2c call site is wrapped in try/except with a fallback).  Expression output
+# matches CPython's ast.unparse for the common cases.
+# ---------------------------------------------------------------------------
+
+def _op_sym(op):
+    t = op._typename
+    if t == "Add": return "+"
+    if t == "Sub": return "-"
+    if t == "Mult": return "*"
+    if t == "Div": return "/"
+    if t == "FloorDiv": return "//"
+    if t == "Mod": return "%"
+    if t == "Pow": return "**"
+    if t == "LShift": return "<<"
+    if t == "RShift": return ">>"
+    if t == "BitOr": return "|"
+    if t == "BitXor": return "^"
+    if t == "BitAnd": return "&"
+    if t == "Eq": return "=="
+    if t == "NotEq": return "!="
+    if t == "Lt": return "<"
+    if t == "LtE": return "<="
+    if t == "Gt": return ">"
+    if t == "GtE": return ">="
+    if t == "Is": return "is"
+    if t == "IsNot": return "is not"
+    if t == "In": return "in"
+    if t == "NotIn": return "not in"
+    if t == "And": return "and"
+    if t == "Or": return "or"
+    if t == "USub": return "-"
+    if t == "UAdd": return "+"
+    if t == "Invert": return "~"
+    if t == "Not": return "not"
+    return "?"
+
+
+def _up_join(nodes, sep):
+    parts = []
+    for n in nodes:
+        parts.append(_up(n))
+    return sep.join(parts)
+
+
+def _up_sub(node):
+    # subscript index: a Tuple slice renders without parentheses (dict[str, str])
+    if node._typename == "Tuple":
+        return _up_join(node.elts, ", ")
+    return _up(node)
+
+
+def _up_slice(node):
+    lo = ""
+    hi = ""
+    st = ""
+    if node.lower is not None:
+        lo = _up(node.lower)
+    if node.upper is not None:
+        hi = _up(node.upper)
+    out = lo + ":" + hi
+    if node.step is not None:
+        st = _up(node.step)
+        out = out + ":" + st
+    return out
+
+
+def _up_call(node):
+    parts = []
+    for a in node.args:
+        parts.append(_up(a))
+    for k in node.keywords:
+        if k.arg is None:
+            parts.append("**" + _up(k.value))
+        else:
+            parts.append(k.arg + "=" + _up(k.value))
+    return _up(node.func) + "(" + ", ".join(parts) + ")"
+
+
+def _up_comp(node):
+    # generators: "for t in it if c ..."
+    out = ""
+    for g in node.generators:
+        out = out + " for " + _up(g.target) + " in " + _up(g.iter)
+        for c in g.ifs:
+            out = out + " if " + _up(c)
+    return out
+
+
+def _up(node):
+    nm = node._typename
+    if nm == "Name":
+        return node.id
+    if nm == "Constant":
+        return repr(node.value)
+    if nm == "Attribute":
+        return _up(node.value) + "." + node.attr
+    if nm == "Subscript":
+        return _up(node.value) + "[" + _up_sub(node.slice) + "]"
+    if nm == "Starred":
+        return "*" + _up(node.value)
+    if nm == "Slice":
+        return _up_slice(node)
+    if nm == "Tuple":
+        if len(node.elts) == 1:
+            return "(" + _up(node.elts[0]) + ",)"
+        return "(" + _up_join(node.elts, ", ") + ")"
+    if nm == "List":
+        return "[" + _up_join(node.elts, ", ") + "]"
+    if nm == "Set":
+        if len(node.elts) == 0:
+            return "set()"
+        return "{" + _up_join(node.elts, ", ") + "}"
+    if nm == "Dict":
+        parts = []
+        i = 0
+        while i < len(node.keys):
+            k = node.keys[i]
+            v = node.values[i]
+            if k is None:
+                parts.append("**" + _up(v))
+            else:
+                parts.append(_up(k) + ": " + _up(v))
+            i = i + 1
+        return "{" + ", ".join(parts) + "}"
+    if nm == "Call":
+        return _up_call(node)
+    if nm == "BinOp":
+        return _up(node.left) + " " + _op_sym(node.op) + " " + _up(node.right)
+    if nm == "BoolOp":
+        return (" " + _op_sym(node.op) + " ").join(_up_list(node.values))
+    if nm == "UnaryOp":
+        sym = _op_sym(node.op)
+        if node.op._typename == "Not":
+            return "not " + _up(node.operand)
+        return sym + _up(node.operand)
+    if nm == "Compare":
+        out = _up(node.left)
+        i = 0
+        while i < len(node.ops):
+            out = out + " " + _op_sym(node.ops[i]) + " " + _up(node.comparators[i])
+            i = i + 1
+        return out
+    if nm == "IfExp":
+        return _up(node.body) + " if " + _up(node.test) + " else " + _up(node.orelse)
+    if nm == "ListComp":
+        return "[" + _up(node.elt) + _up_comp(node) + "]"
+    if nm == "SetComp":
+        return "{" + _up(node.elt) + _up_comp(node) + "}"
+    if nm == "GeneratorExp":
+        return "(" + _up(node.elt) + _up_comp(node) + ")"
+    if nm == "DictComp":
+        return "{" + _up(node.key) + ": " + _up(node.value) + _up_comp(node) + "}"
+    # ---- statements (best-effort; py2c falls back on failure) ----
+    if nm == "Expr":
+        return _up(node.value)
+    if nm == "Assign":
+        return _up_join(node.targets, " = ") + " = " + _up(node.value)
+    if nm == "Return":
+        if node.value is None:
+            return "return"
+        return "return " + _up(node.value)
+    if nm == "Pass":
+        return "pass"
+    if nm == "Break":
+        return "break"
+    if nm == "Continue":
+        return "continue"
+    if nm == "Module":
+        return "\n".join(_up_list(node.body))
+    return nm
+
+
+def _up_list(nodes):
+    out = []
+    for n in nodes:
+        out.append(_up(n))
+    return out
+
+
+def unparse(node):
+    return _up(node)
+
+
 def parse(source):
     tree = parse_python(source)
     body = []

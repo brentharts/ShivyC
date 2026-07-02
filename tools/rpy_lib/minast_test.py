@@ -210,8 +210,44 @@ def run_transformer_tests():
     return failures
 
 
+def run_unparse_tests():
+    # minast.unparse must match CPython's ast.unparse for expressions (the
+    # annotation forms py2c relies on for ctype inference are the critical path)
+    # and for the best-effort statement cases.
+    exprs = [
+        "int", "list[int]", "dict[str, str]", '"MyClass"', "Optional[int]",
+        "tuple[int, str]", "a.b.C", 'list["Foo"]', "x + y * z", "a and b or c",
+        "-x", "~y", "a < b <= c", "v if c else w", "f(1, *xs, k=2, **kw)",
+        "[i for i in xs if i]", "{k: v for k in ys}", "(i for i in xs)",
+        "x[1:2]", "x[::2]", "{1, 2}", "set()", "not a", "a is not b", "x[a, b]",
+    ]
+    ok = 0
+    for s in exprs:
+        want = real.unparse(real.parse(s, mode="eval").body)
+        got = minast.unparse(minast.parse(s + "\n").body[0].value)
+        if want == got:
+            ok += 1
+        else:
+            print("UNPARSE-DIFF %-22s want=%r got=%r" % (s, want, got))
+    # annotation ctype-text extraction, exactly as py2c does it
+    anns = ["int", "list[int]", "dict[str, str]", '"MyClass"', 'list["Foo"]',
+            "tuple[int, str]"]
+    ann_ok = 0
+    for s in anns:
+        m = minast.parse("x: " + s + " = 0\n").body[0].annotation
+        c = real.parse("x: " + s + " = 0\n").body[0].annotation
+        if minast.unparse(m).strip().strip("'\"") == real.unparse(c).strip().strip("'\""):
+            ann_ok += 1
+        else:
+            print("ANN-DIFF %r" % s)
+    print("unparse: %d/%d exprs, %d/%d annotations matched"
+          % (ok, len(exprs), ann_ok, len(anns)))
+    return (len(exprs) - ok) + (len(anns) - ann_ok)
+
+
 if __name__ == "__main__":
-    bad = run_snippets() + run_py2c_sweep() + run_transformer_tests()
+    bad = (run_snippets() + run_py2c_sweep() + run_transformer_tests()
+           + run_unparse_tests())
     if bad:
         print("FAIL")
         sys.exit(1)
