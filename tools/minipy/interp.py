@@ -465,7 +465,7 @@ def to_disp(st: "St", v: "V", use_repr: "int") -> "char*":
     return "<callable>"
 
 
-def truthy(v: "V") -> "int":
+def truthy(st: "St", v: "V") -> "int":
     if v.tag == 0:
         return 0
     if v.tag == 1:
@@ -476,7 +476,11 @@ def truthy(v: "V") -> "int":
         return 1 if ord(v.sv[0]) != 0 else 0   # non-empty == first byte not NUL
     if v.tag == 4:
         return 1 if v.iv != 0 else 0
-    return 1
+    if v.tag == 7 or v.tag == 9 or v.tag == 10:   # list / set / tuple: empty is falsy
+        return 1 if len(items_of(st, v)) > 0 else 0
+    if v.tag == 8:                                 # dict: empty is falsy
+        return 1 if len(items_of(st, v)) > 0 else 0
+    return 1                                        # func/builtin/iter/instance: truthy
 
 
 # ---- equality / ordering (value semantics for scalars) ----
@@ -1451,7 +1455,7 @@ def do_builtin(st: "St", bid: "long", args: "list[V]") -> "V":
         return v_int(0)
     if bid == 7:               # bool
         if len(args) > 0:
-            return v_bool(truthy(args[0]))
+            return v_bool(truthy(st, args[0]))
         return v_bool(0)
     if bid == 8:               # list
         if len(args) > 0:
@@ -1548,13 +1552,13 @@ def do_builtin(st: "St", bid: "long", args: "list[V]") -> "V":
     if bid == 20:              # any
         if len(args) > 0:
             for e in materialize(st, args[0]):
-                if truthy(e) != 0:
+                if truthy(st, e) != 0:
                     return v_bool(1)
         return v_bool(0)
     if bid == 21:              # all
         if len(args) > 0:
             for e in materialize(st, args[0]):
-                if truthy(e) == 0:
+                if truthy(st, e) == 0:
                     return v_bool(0)
         return v_bool(1)
     if bid == 22:              # ord
@@ -2035,7 +2039,7 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
         elif op == 6:
             pc = a
         elif op == 7:
-            if truthy(_lget(regs, a)) != 0:
+            if truthy(st, _lget(regs, a)) != 0:
                 pc = pc + 1
             else:
                 pc = b
@@ -2070,7 +2074,7 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
             else:
                 pc = b
         elif op == 82:                     # JUMP_IF_TRUE
-            if truthy(_lget(regs, a)) != 0:
+            if truthy(st, _lget(regs, a)) != 0:
                 pc = b
             else:
                 pc = pc + 1
@@ -2344,7 +2348,7 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
         elif op == 40:
             _lset(regs, a, v_neg(_lget(regs, b))); pc = pc + 1
         elif op == 41:
-            _lset(regs, a, v_bool(1 if truthy(_lget(regs, b)) == 0 else 0)); pc = pc + 1
+            _lset(regs, a, v_bool(1 if truthy(st, _lget(regs, b)) == 0 else 0)); pc = pc + 1
         elif op == 60:
             ob = _lget(regs, b); oc = _lget(regs, c)
             if ob.tag == 1 and oc.tag == 1:
