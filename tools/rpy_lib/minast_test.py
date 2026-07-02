@@ -220,6 +220,12 @@ def run_unparse_tests():
         "-x", "~y", "a < b <= c", "v if c else w", "f(1, *xs, k=2, **kw)",
         "[i for i in xs if i]", "{k: v for k in ys}", "(i for i in xs)",
         "x[1:2]", "x[::2]", "{1, 2}", "set()", "not a", "a is not b", "x[a, b]",
+        # operator-precedence parenthesization (CPython-exact)
+        "a % (b or c)", "(a or b) and c", "a and b or (c and d)",
+        "isinstance(x, A) and isinstance(y, B) and (n == 1)",
+        "(a.asname or a.name).split('.')[0]", "(a + b) * c", "a + b * c",
+        "-(a + b)", "(a or b)(x)", "(a and b).method()", "not (a or b)",
+        "2 ** -1", "-2 ** 2", "a < b and c",
     ]
     ok = 0
     for s in exprs:
@@ -257,6 +263,8 @@ def run_unparse_tests():
         "while True:\n    break\nelse:\n    pass\n",
         "import a.b.c\nimport a.b.c as abc\nfrom pkg import y as z, w\n",
         "for i, it in enumerate(xs):\n    total += it\n",
+        "def f(a, b=1, *c, d, e=2, **kw) -> list:\n    return a\n",
+        "def g(*args, x, y=2, **kw):\n    return x\n",
     ]
     prog_ok = 0
     for s in progs:

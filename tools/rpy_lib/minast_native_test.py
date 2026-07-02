@@ -52,6 +52,11 @@ SNIPPETS = [
     "dict[str, str]",
     "tuple[int, str]",
     "obj.method(a).attr[b]",
+    "a % (b or c)",
+    "a and b or (c and d)",
+    "(a or b).c(d)[e]",
+    "x ** 2 ** z",
+    "-x ** 2",
 ]
 
 # Statement-level programs: the funcdef/class forms that exercise the
@@ -61,6 +66,7 @@ PROGRAMS = [
     "def f():\n    pass\n",
     "def f() -> int:\n    return 1\n",
     "def f(a, b, *c, k=1):\n    return a + b\n",
+    "def f(a, b=1, *c, d, e=2, **kw) -> list:\n    return a\n",
     "class C:\n    pass\n",
     "class C(B):\n    x = 1\n",
     "class C(B, D):\n    def m(self):\n        return self.x\n",

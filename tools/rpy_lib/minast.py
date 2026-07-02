@@ -804,6 +804,8 @@ def _conv(node):
         return _conv_call(node)
     if nm == "__binary__":
         return _conv_binary(node)
+    if nm == "power":                          # a ** b  (right child may nest / be unary)
+        return BinOp(_conv(node.children[0]), Pow(), _conv(node.children[2]))
     if nm == "__getitem__":
         return _conv_subscript(node)
     if nm == "or_test":
@@ -1081,12 +1083,19 @@ def _conv_arguments(pnode):
     posonly = []
     args = []
     defaults = []
+    kwonlyargs = []
+    kw_defaults = []
     vararg = None
     kwarg = None
+    seen_star = False
     if pnode is not None:
         for p in pnode.children:
             if p.name == "NAME":
-                args.append(arg(_leaf(p), None))
+                if seen_star:                       # keyword-only, no default
+                    kwonlyargs.append(arg(_leaf(p), None))
+                    kw_defaults.append(None)
+                else:
+                    args.append(arg(_leaf(p), None))
             elif p.name == "fpdef_opt":
                 name = _leaf(p.children[0])
                 ann = None
@@ -1099,14 +1108,20 @@ def _conv_arguments(pnode):
                     else:
                         dflt = _conv(extra)
                     j = j + 1
-                args.append(arg(name, ann))
-                if dflt is not None:
-                    defaults.append(dflt)
+                if seen_star:                       # keyword-only (dflt may be None)
+                    kwonlyargs.append(arg(name, ann))
+                    kw_defaults.append(dflt)
+                else:
+                    args.append(arg(name, ann))
+                    if dflt is not None:
+                        defaults.append(dflt)
             elif p.name == "remaining_args":
-                vararg = arg(_leaf(p.children[0]), None)
+                if len(p.children) > 0:             # *args (named)
+                    vararg = arg(_leaf(p.children[0]), None)
+                seen_star = True                    # subsequent params are keyword-only
             elif p.name == "kwargs":
                 kwarg = arg(_leaf(p.children[0]), None)
-    return arguments(posonly, args, vararg, [], [], kwarg, defaults)
+    return arguments(posonly, args, vararg, kwonlyargs, kw_defaults, kwarg, defaults)
 
 
 def _skip_noise(nm):
@@ -1601,7 +1616,7 @@ def _up_call(node):
             parts.append("**" + _up(k.value))
         else:
             parts.append(k.arg + "=" + _up(k.value))
-    return _up(node.func) + "(" + ", ".join(parts) + ")"
+    return _up_p(node.func, 18) + "(" + ", ".join(parts) + ")"
 
 
 def _up_target(node):
@@ -1621,6 +1636,54 @@ def _up_target_list(nodes):
     return out
 
 
+def _binop_prec(op):
+    t = op._typename
+    if t == "BitOr":
+        return 9
+    if t == "BitXor":
+        return 10
+    if t == "BitAnd":
+        return 11
+    if t == "LShift" or t == "RShift":
+        return 12
+    if t == "Add" or t == "Sub":
+        return 13
+    if t == "Mult" or t == "Div" or t == "FloorDiv" or t == "Mod" or t == "MatMult":
+        return 14
+    if t == "Pow":
+        return 16
+    return 13
+
+
+def _prec(node):
+    # expression precedence, mirroring CPython ast._Precedence (atoms high)
+    nm = node._typename
+    if nm == "BoolOp":
+        if node.op._typename == "Or":
+            return 5
+        return 6
+    if nm == "UnaryOp":
+        if node.op._typename == "Not":
+            return 7
+        return 15
+    if nm == "Compare":
+        return 8
+    if nm == "BinOp":
+        return _binop_prec(node.op)
+    if nm == "IfExp":
+        return 4
+    if nm == "Lambda":
+        return 4
+    return 18                                  # atoms / self-delimiting
+
+
+def _up_p(node, min_prec):
+    s = _up(node)
+    if _prec(node) < min_prec:
+        return "(" + s + ")"
+    return s
+
+
 def _up_comp(node):
     # generators: "for t in it if c ..."
     out = ""
@@ -1638,9 +1701,9 @@ def _up(node):
     if nm == "Constant":
         return repr(node.value)
     if nm == "Attribute":
-        return _up(node.value) + "." + node.attr
+        return _up_p(node.value, 18) + "." + node.attr
     if nm == "Subscript":
-        return _up(node.value) + "[" + _up_sub(node.slice) + "]"
+        return _up_p(node.value, 18) + "[" + _up_sub(node.slice) + "]"
     if nm == "Starred":
         return "*" + _up(node.value)
     if nm == "Slice":
@@ -1670,23 +1733,37 @@ def _up(node):
     if nm == "Call":
         return _up_call(node)
     if nm == "BinOp":
-        return _up(node.left) + " " + _op_sym(node.op) + " " + _up(node.right)
+        p = _binop_prec(node.op)
+        if node.op._typename == "Pow":       # right-associative
+            lhs = _up_p(node.left, p + 1)
+            rhs = _up_p(node.right, p)
+        else:                                # left-associative
+            lhs = _up_p(node.left, p)
+            rhs = _up_p(node.right, p + 1)
+        return lhs + " " + _op_sym(node.op) + " " + rhs
     if nm == "BoolOp":
-        return (" " + _op_sym(node.op) + " ").join(_up_list(node.values))
+        p = _prec(node)
+        parts = []
+        i = 0
+        while i < len(node.values):
+            parts.append(_up_p(node.values[i], p + 1 + i))   # CPython: each operand needs a higher level
+            i = i + 1
+        return (" " + _op_sym(node.op) + " ").join(parts)
     if nm == "UnaryOp":
         sym = _op_sym(node.op)
+        p = _prec(node)
         if node.op._typename == "Not":
-            return "not " + _up(node.operand)
-        return sym + _up(node.operand)
+            return "not " + _up_p(node.operand, p)
+        return sym + _up_p(node.operand, p)
     if nm == "Compare":
-        out = _up(node.left)
+        out = _up_p(node.left, 9)
         i = 0
         while i < len(node.ops):
-            out = out + " " + _op_sym(node.ops[i]) + " " + _up(node.comparators[i])
+            out = out + " " + _op_sym(node.ops[i]) + " " + _up_p(node.comparators[i], 9)
             i = i + 1
         return out
     if nm == "IfExp":
-        return _up(node.body) + " if " + _up(node.test) + " else " + _up(node.orelse)
+        return _up_p(node.body, 5) + " if " + _up_p(node.test, 5) + " else " + _up_p(node.orelse, 4)
     if nm == "ListComp":
         return "[" + _up(node.elt) + _up_comp(node) + "]"
     if nm == "SetComp":
