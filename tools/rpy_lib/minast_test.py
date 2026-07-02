@@ -168,8 +168,50 @@ def run_py2c_sweep():
     return exc + badconv
 
 
+def run_transformer_tests():
+    # NodeVisitor collection order and NodeTransformer rewrites must match the
+    # real ast module's semantics (dispatch by type, generic_visit recursion,
+    # in-place field/list rewrite).
+    def renamer(base):
+        class R(base.NodeTransformer):
+            def visit_Name(self, node):
+                if node.id == "a":
+                    node.id = "Q"
+                return node
+        return R
+
+    def collector(base):
+        class C(base.NodeVisitor):
+            def __init__(self):
+                self.ids = []
+            def visit_Name(self, node):
+                self.ids.append(node.id)
+                self.generic_visit(node)
+        return C
+
+    cases = [
+        "def f(a, b):\n    c = a + b * a\n    return g(a, c, [a, a.x])\n",
+        "x = {a: a for a in items if a}\n",
+        "for a in xs:\n    print(a, b)\n",
+    ]
+    failures = 0
+    for src in cases:
+        rt = real.parse(src); renamer(real)().visit(rt)
+        mt = minast.parse(src); renamer(minast)().visit(mt)
+        if dump(rt) != dump(mt):
+            print("TRANSFORM-DIFF %r" % src); failures += 1
+        rc = collector(real)(); rc.visit(real.parse(src))
+        mc = collector(minast)(); mc.visit(minast.parse(src))
+        if rc.ids != mc.ids:
+            print("VISIT-DIFF %r  real=%s minast=%s" % (src, rc.ids, mc.ids))
+            failures += 1
+    print("transformer/visitor: %d/%d cases matched"
+          % (len(cases) - failures, len(cases)))
+    return failures
+
+
 if __name__ == "__main__":
-    bad = run_snippets() + run_py2c_sweep()
+    bad = run_snippets() + run_py2c_sweep() + run_transformer_tests()
     if bad:
         print("FAIL")
         sys.exit(1)

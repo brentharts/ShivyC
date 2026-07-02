@@ -40,6 +40,7 @@ class AST:
 class Module(AST):
     def __init__(self, body):
         self._fields = ("body", "type_ignores")
+        self._typename = "Module"
         self.body = body
         self.type_ignores = []
 
@@ -48,6 +49,7 @@ class FunctionDef(AST):
     def __init__(self, name, args, body, decorator_list, returns):
         self._fields = ("name", "args", "body", "decorator_list", "returns",
                         "type_comment", "type_params")
+        self._typename = "FunctionDef"
         self._init_loc()
         self.name = name
         self.args = args
@@ -62,6 +64,7 @@ class ClassDef(AST):
     def __init__(self, name, bases, keywords, body, decorator_list):
         self._fields = ("name", "bases", "keywords", "body", "decorator_list",
                         "type_params")
+        self._typename = "ClassDef"
         self._init_loc()
         self.name = name
         self.bases = bases
@@ -74,6 +77,7 @@ class ClassDef(AST):
 class Return(AST):
     def __init__(self, value):
         self._fields = ("value",)
+        self._typename = "Return"
         self._init_loc()
         self.value = value
 
@@ -81,6 +85,7 @@ class Return(AST):
 class Assign(AST):
     def __init__(self, targets, value):
         self._fields = ("targets", "value", "type_comment")
+        self._typename = "Assign"
         self._init_loc()
         self.targets = targets
         self.value = value
@@ -90,6 +95,7 @@ class Assign(AST):
 class AugAssign(AST):
     def __init__(self, target, op, value):
         self._fields = ("target", "op", "value")
+        self._typename = "AugAssign"
         self._init_loc()
         self.target = target
         self.op = op
@@ -99,6 +105,7 @@ class AugAssign(AST):
 class AnnAssign(AST):
     def __init__(self, target, annotation, value, simple):
         self._fields = ("target", "annotation", "value", "simple")
+        self._typename = "AnnAssign"
         self._init_loc()
         self.target = target
         self.annotation = annotation
@@ -109,6 +116,7 @@ class AnnAssign(AST):
 class For(AST):
     def __init__(self, target, itr, body, orelse):
         self._fields = ("target", "iter", "body", "orelse", "type_comment")
+        self._typename = "For"
         self._init_loc()
         self.target = target
         self.iter = itr
@@ -120,6 +128,7 @@ class For(AST):
 class While(AST):
     def __init__(self, test, body, orelse):
         self._fields = ("test", "body", "orelse")
+        self._typename = "While"
         self._init_loc()
         self.test = test
         self.body = body
@@ -129,6 +138,7 @@ class While(AST):
 class If(AST):
     def __init__(self, test, body, orelse):
         self._fields = ("test", "body", "orelse")
+        self._typename = "If"
         self._init_loc()
         self.test = test
         self.body = body
@@ -138,6 +148,7 @@ class If(AST):
 class Expr(AST):
     def __init__(self, value):
         self._fields = ("value",)
+        self._typename = "Expr"
         self._init_loc()
         self.value = value
 
@@ -145,24 +156,28 @@ class Expr(AST):
 class Pass(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "Pass"
         self._init_loc()
 
 
 class Break(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "Break"
         self._init_loc()
 
 
 class Continue(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "Continue"
         self._init_loc()
 
 
 class Global(AST):
     def __init__(self, names):
         self._fields = ("names",)
+        self._typename = "Global"
         self._init_loc()
         self.names = names
 
@@ -170,6 +185,7 @@ class Global(AST):
 class Nonlocal(AST):
     def __init__(self, names):
         self._fields = ("names",)
+        self._typename = "Nonlocal"
         self._init_loc()
         self.names = names
 
@@ -177,6 +193,7 @@ class Nonlocal(AST):
 class Import(AST):
     def __init__(self, names):
         self._fields = ("names",)
+        self._typename = "Import"
         self._init_loc()
         self.names = names
 
@@ -184,6 +201,7 @@ class Import(AST):
 class ImportFrom(AST):
     def __init__(self, module, names, level):
         self._fields = ("module", "names", "level")
+        self._typename = "ImportFrom"
         self._init_loc()
         self.module = module
         self.names = names
@@ -193,6 +211,7 @@ class ImportFrom(AST):
 class alias(AST):
     def __init__(self, name, asname):
         self._fields = ("name", "asname")
+        self._typename = "alias"
         self.name = name
         self.asname = asname
 
@@ -202,6 +221,7 @@ class alias(AST):
 class BoolOp(AST):
     def __init__(self, op, values):
         self._fields = ("op", "values")
+        self._typename = "BoolOp"
         self._init_loc()
         self.op = op
         self.values = values
@@ -210,6 +230,7 @@ class BoolOp(AST):
 class BinOp(AST):
     def __init__(self, left, op, right):
         self._fields = ("left", "op", "right")
+        self._typename = "BinOp"
         self._init_loc()
         self.left = left
         self.op = op
@@ -219,6 +240,7 @@ class BinOp(AST):
 class UnaryOp(AST):
     def __init__(self, op, operand):
         self._fields = ("op", "operand")
+        self._typename = "UnaryOp"
         self._init_loc()
         self.op = op
         self.operand = operand
@@ -227,6 +249,7 @@ class UnaryOp(AST):
 class Compare(AST):
     def __init__(self, left, ops, comparators):
         self._fields = ("left", "ops", "comparators")
+        self._typename = "Compare"
         self._init_loc()
         self.left = left
         self.ops = ops
@@ -236,6 +259,7 @@ class Compare(AST):
 class Call(AST):
     def __init__(self, func, args, keywords):
         self._fields = ("func", "args", "keywords")
+        self._typename = "Call"
         self._init_loc()
         self.func = func
         self.args = args
@@ -245,6 +269,7 @@ class Call(AST):
 class keyword(AST):
     def __init__(self, arg, value):
         self._fields = ("arg", "value")
+        self._typename = "keyword"
         self.arg = arg
         self.value = value
 
@@ -252,6 +277,7 @@ class keyword(AST):
 class IfExp(AST):
     def __init__(self, test, body, orelse):
         self._fields = ("test", "body", "orelse")
+        self._typename = "IfExp"
         self._init_loc()
         self.test = test
         self.body = body
@@ -261,6 +287,7 @@ class IfExp(AST):
 class Constant(AST):
     def __init__(self, value):
         self._fields = ("value", "kind")
+        self._typename = "Constant"
         self._init_loc()
         self.value = value
         self.kind = None
@@ -269,6 +296,7 @@ class Constant(AST):
 class Name(AST):
     def __init__(self, id_, ctx):
         self._fields = ("id", "ctx")
+        self._typename = "Name"
         self._init_loc()
         self.id = id_
         self.ctx = ctx
@@ -277,6 +305,7 @@ class Name(AST):
 class Attribute(AST):
     def __init__(self, value, attr, ctx):
         self._fields = ("value", "attr", "ctx")
+        self._typename = "Attribute"
         self._init_loc()
         self.value = value
         self.attr = attr
@@ -286,6 +315,7 @@ class Attribute(AST):
 class Subscript(AST):
     def __init__(self, value, slce, ctx):
         self._fields = ("value", "slice", "ctx")
+        self._typename = "Subscript"
         self._init_loc()
         self.value = value
         self.slice = slce
@@ -295,6 +325,7 @@ class Subscript(AST):
 class Starred(AST):
     def __init__(self, value, ctx):
         self._fields = ("value", "ctx")
+        self._typename = "Starred"
         self._init_loc()
         self.value = value
         self.ctx = ctx
@@ -303,6 +334,7 @@ class Starred(AST):
 class Slice(AST):
     def __init__(self, lower, upper, step):
         self._fields = ("lower", "upper", "step")
+        self._typename = "Slice"
         self._init_loc()
         self.lower = lower
         self.upper = upper
@@ -312,6 +344,7 @@ class Slice(AST):
 class List(AST):
     def __init__(self, elts, ctx):
         self._fields = ("elts", "ctx")
+        self._typename = "List"
         self._init_loc()
         self.elts = elts
         self.ctx = ctx
@@ -320,6 +353,7 @@ class List(AST):
 class Tuple(AST):
     def __init__(self, elts, ctx):
         self._fields = ("elts", "ctx")
+        self._typename = "Tuple"
         self._init_loc()
         self.elts = elts
         self.ctx = ctx
@@ -328,6 +362,7 @@ class Tuple(AST):
 class Set(AST):
     def __init__(self, elts):
         self._fields = ("elts",)
+        self._typename = "Set"
         self._init_loc()
         self.elts = elts
 
@@ -335,6 +370,7 @@ class Set(AST):
 class Dict(AST):
     def __init__(self, keys, values):
         self._fields = ("keys", "values")
+        self._typename = "Dict"
         self._init_loc()
         self.keys = keys
         self.values = values
@@ -343,6 +379,7 @@ class Dict(AST):
 class comprehension(AST):
     def __init__(self, target, itr, ifs, is_async):
         self._fields = ("target", "iter", "ifs", "is_async")
+        self._typename = "comprehension"
         self.target = target
         self.iter = itr
         self.ifs = ifs
@@ -352,6 +389,7 @@ class comprehension(AST):
 class ListComp(AST):
     def __init__(self, elt, generators):
         self._fields = ("elt", "generators")
+        self._typename = "ListComp"
         self._init_loc()
         self.elt = elt
         self.generators = generators
@@ -360,6 +398,7 @@ class ListComp(AST):
 class SetComp(AST):
     def __init__(self, elt, generators):
         self._fields = ("elt", "generators")
+        self._typename = "SetComp"
         self._init_loc()
         self.elt = elt
         self.generators = generators
@@ -368,6 +407,7 @@ class SetComp(AST):
 class GeneratorExp(AST):
     def __init__(self, elt, generators):
         self._fields = ("elt", "generators")
+        self._typename = "GeneratorExp"
         self._init_loc()
         self.elt = elt
         self.generators = generators
@@ -376,6 +416,7 @@ class GeneratorExp(AST):
 class DictComp(AST):
     def __init__(self, key, value, generators):
         self._fields = ("key", "value", "generators")
+        self._typename = "DictComp"
         self._init_loc()
         self.key = key
         self.value = value
@@ -385,6 +426,7 @@ class DictComp(AST):
 class arg(AST):
     def __init__(self, argname, annotation):
         self._fields = ("arg", "annotation", "type_comment")
+        self._typename = "arg"
         self._init_loc()
         self.arg = argname
         self.annotation = annotation
@@ -396,6 +438,7 @@ class arguments(AST):
                  kwarg, defaults):
         self._fields = ("posonlyargs", "args", "vararg", "kwonlyargs",
                         "kw_defaults", "kwarg", "defaults")
+        self._typename = "arguments"
         self.posonlyargs = posonlyargs
         self.args = args
         self.vararg = vararg
@@ -410,126 +453,157 @@ class arguments(AST):
 class Load(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "Load"
 
 class Store(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "Store"
 
 class Del(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "Del"
 
 class And(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "And"
 
 class Or(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "Or"
 
 class Add(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "Add"
 
 class Sub(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "Sub"
 
 class Mult(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "Mult"
 
 class Div(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "Div"
 
 class FloorDiv(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "FloorDiv"
 
 class Mod(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "Mod"
 
 class Pow(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "Pow"
 
 class LShift(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "LShift"
 
 class RShift(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "RShift"
 
 class BitOr(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "BitOr"
 
 class BitXor(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "BitXor"
 
 class BitAnd(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "BitAnd"
 
 class USub(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "USub"
 
 class UAdd(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "UAdd"
 
 class Invert(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "Invert"
 
 class Not(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "Not"
 
 class Eq(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "Eq"
 
 class NotEq(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "NotEq"
 
 class Lt(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "Lt"
 
 class LtE(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "LtE"
 
 class Gt(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "Gt"
 
 class GtE(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "GtE"
 
 class In(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "In"
 
 class NotIn(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "NotIn"
 
 class Is(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "Is"
 
 class IsNot(AST):
     def __init__(self):
         self._fields = ()
+        self._typename = "IsNot"
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +663,62 @@ def fix_missing_locations(node):
         for k in iter_child_nodes(cur):
             todo.append(k)
     return node
+
+
+# ---------------------------------------------------------------------------
+# NodeVisitor / NodeTransformer.  Dispatch is by the node's _typename (minipy
+# has no type(x).__name__), looked up with getattr(self, "visit_"+name) -- which
+# returns a callable bound method on both minipy backends.  NodeTransformer's
+# generic_visit rewrites in place using setattr for scalar fields and a rebuilt
+# list for sequence fields (both minipy-supported).
+# ---------------------------------------------------------------------------
+
+class NodeVisitor:
+    def visit(self, node):
+        m = getattr(self, "visit_" + node._typename, None)
+        if m is None:
+            return self.generic_visit(node)
+        return m(node)
+
+    def generic_visit(self, node):
+        for name in node._fields:
+            if not hasattr(node, name):
+                continue
+            value = getattr(node, name)
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, AST):
+                        self.visit(item)
+            elif isinstance(value, AST):
+                self.visit(value)
+        return None
+
+
+class NodeTransformer(NodeVisitor):
+    def generic_visit(self, node):
+        for name in node._fields:
+            if not hasattr(node, name):
+                continue
+            old = getattr(node, name)
+            if isinstance(old, list):
+                new = []
+                for item in old:
+                    if isinstance(item, AST):
+                        r = self.visit(item)
+                        if r is None:
+                            continue
+                        if isinstance(r, list):
+                            for x in r:
+                                new.append(x)
+                        else:
+                            new.append(r)
+                    else:
+                        new.append(item)
+                setattr(node, name, new)
+            elif isinstance(old, AST):
+                r = self.visit(old)
+                setattr(node, name, r)
+        return node
 
 
 # ---------------------------------------------------------------------------
@@ -1189,6 +1319,7 @@ def _delete(targets):
 class Raise(AST):
     def __init__(self, exc, cause):
         self._fields = ("exc", "cause")
+        self._typename = "Raise"
         self._init_loc()
         self.exc = exc
         self.cause = cause
@@ -1197,6 +1328,7 @@ class Raise(AST):
 class Assert(AST):
     def __init__(self, test, msg):
         self._fields = ("test", "msg")
+        self._typename = "Assert"
         self._init_loc()
         self.test = test
         self.msg = msg
@@ -1205,6 +1337,7 @@ class Assert(AST):
 class Delete(AST):
     def __init__(self, targets):
         self._fields = ("targets",)
+        self._typename = "Delete"
         self._init_loc()
         self.targets = targets
 
@@ -1212,6 +1345,7 @@ class Delete(AST):
 class Try(AST):
     def __init__(self, body, handlers, orelse, finalbody):
         self._fields = ("body", "handlers", "orelse", "finalbody")
+        self._typename = "Try"
         self._init_loc()
         self.body = body
         self.handlers = handlers
@@ -1222,6 +1356,7 @@ class Try(AST):
 class ExceptHandler(AST):
     def __init__(self, etype, name, body):
         self._fields = ("type", "name", "body")
+        self._typename = "ExceptHandler"
         self._init_loc()
         self.type = etype
         self.name = name
@@ -1231,6 +1366,7 @@ class ExceptHandler(AST):
 class With(AST):
     def __init__(self, items, body):
         self._fields = ("items", "body", "type_comment")
+        self._typename = "With"
         self._init_loc()
         self.items = items
         self.body = body
@@ -1240,6 +1376,7 @@ class With(AST):
 class withitem(AST):
     def __init__(self, context_expr, optional_vars):
         self._fields = ("context_expr", "optional_vars")
+        self._typename = "withitem"
         self.context_expr = context_expr
         self.optional_vars = optional_vars
 
