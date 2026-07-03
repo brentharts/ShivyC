@@ -40,13 +40,15 @@ _REG16 = ["ax", "cx", "dx", "bx", "sp", "bp", "si", "di",
 _REG8 = ["al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil",
          "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b"]
 # legacy high-byte names (ah/ch/dh/bh) are not emitted by ShivyCX; omit them.
+_XMM = ["xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+        "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15"]
 
 # name -> (val, bits)
 REGISTERS = {}
 
 
 def _init_registers():
-    tables = [(_REG64, 64), (_REG32, 32), (_REG16, 16), (_REG8, 8)]
+    tables = [(_REG64, 64), (_REG32, 32), (_REG16, 16), (_REG8, 8), (_XMM, 128)]
     for pair in tables:
         names = pair[0]
         bits = pair[1]
@@ -338,6 +340,31 @@ _JCC = {
 # shift mnemonic -> ext (/N in 0xC1 /N ib, 0xD3 /N cl, 0xD1 /N by-1)
 _SHIFT = {"rol": 0, "ror": 1, "sal": 4, "shl": 4, "shr": 5, "sar": 7}
 
+# SSE scalar arithmetic: mnem -> (mandatory prefix, 0F opcode). reg=dst(xmm),
+# rm=src; no REX.W (size implied by the prefix).
+_SSE_ARITH = {
+    "addsd": (0xF2, 0x58), "subsd": (0xF2, 0x5C),
+    "mulsd": (0xF2, 0x59), "divsd": (0xF2, 0x5E),
+    "addss": (0xF3, 0x58), "subss": (0xF3, 0x5C),
+    "mulss": (0xF3, 0x59), "divss": (0xF3, 0x5E),
+    "sqrtsd": (0xF2, 0x51), "sqrtss": (0xF3, 0x51),
+    "minsd": (0xF2, 0x5D), "maxsd": (0xF2, 0x5F),
+    "minss": (0xF3, 0x5D), "maxss": (0xF3, 0x5F),
+    "cvtsd2ss": (0xF2, 0x5A), "cvtss2sd": (0xF3, 0x5A),
+}
+# SSE compare (set EFLAGS): reg=dst(xmm), rm=src.
+_SSE_CMP = {
+    "ucomisd": (0x66, 0x2E), "ucomiss": (0x00, 0x2E),
+    "comisd": (0x66, 0x2F), "comiss": (0x00, 0x2F),
+}
+# packed logic used for float sign/zero tricks.
+_SSE_LOGIC = {
+    "xorps": (0x00, 0x57), "xorpd": (0x66, 0x57),
+    "andps": (0x00, 0x54), "andpd": (0x66, 0x54),
+    "orps": (0x00, 0x56), "orpd": (0x66, 0x56),
+    "pxor": (0x66, 0xEF),
+}
+
 
 def _pfx_size(size):
     if size == 16:
@@ -345,7 +372,13 @@ def _pfx_size(size):
     return []
 
 
-def _assemble(size, rex, opcode_bytes, mrm, imm_bytes, rl):
+def _needs_rex8(op):
+    """spl/bpl/sil/dil (8-bit regs with value 4..7) require a REX prefix to be
+    encodable at all; without one, values 4..7 decode as ah/ch/dh/bh."""
+    return op.kind == "reg" and op.size == 8 and 4 <= op.reg_v <= 7
+
+
+def _assemble(size, rex, opcode_bytes, mrm, imm_bytes, rl, force=False):
     """Build a full instruction from parts and fix reloc offsets.
 
     Layout: [66 prefix?] [REX?] [opcode...] [ModRM/SIB/disp] [imm]. Relocations
@@ -354,7 +387,7 @@ def _assemble(size, rex, opcode_bytes, mrm, imm_bytes, rl):
     """
     out = []
     out.extend(_pfx_size(size))
-    out.extend(emit_rex(rex, size, False))
+    out.extend(emit_rex(rex, size, force))
     out.extend(opcode_bytes)
     pre = len(out)
     out.extend(mrm)
@@ -423,23 +456,56 @@ def encode(mnem, ops):
     if mnem == "movzx":
         return _encode_movx(ops[0], ops[1], False)
 
+    # ---- SSE scalar floating point ----
+    if mnem == "movsd":
+        return _encode_sse_mov(0xF2, ops[0], ops[1])
+    if mnem == "movss":
+        return _encode_sse_mov(0xF3, ops[0], ops[1])
+    if mnem == "movaps":
+        return _encode_sse_movalign(0x00, ops[0], ops[1])
+    if mnem == "movapd":
+        return _encode_sse_movalign(0x66, ops[0], ops[1])
+    if mnem in _SSE_ARITH:
+        p = _SSE_ARITH[mnem]
+        return _sse(p[0], p[1], ops[0], ops[1], False)
+    if mnem in _SSE_CMP:
+        p = _SSE_CMP[mnem]
+        return _sse(p[0], p[1], ops[0], ops[1], False)
+    if mnem in _SSE_LOGIC:
+        p = _SSE_LOGIC[mnem]
+        return _sse(p[0], p[1], ops[0], ops[1], False)
+    if mnem == "cvtsi2sd" or mnem == "cvtsi2ss":
+        prefix = 0xF2 if mnem == "cvtsi2sd" else 0xF3
+        return _sse(prefix, 0x2A, ops[0], ops[1], ops[1].size == 64)
+    if mnem in ("cvttsd2si", "cvttss2si", "cvtsd2si", "cvtss2si"):
+        prefix = 0xF2 if (mnem == "cvttsd2si" or mnem == "cvtsd2si") else 0xF3
+        opc = 0x2C if mnem[0:4] == "cvtt" else 0x2D
+        return _sse(prefix, opc, ops[0], ops[1], ops[0].size == 64)
+    if mnem == "movq":
+        return _encode_movq(ops[0], ops[1])
+    if mnem == "movd":
+        return _encode_movd(ops[0], ops[1])
+
     raise AssemblerError("unsupported mnemonic: %s" % mnem)
 
 
 def _encode_alu(mnem, dst, src):
     tri = _ALU[mnem]
+    f8 = _needs_rex8(dst) or _needs_rex8(src)
     if src.kind == "reg" and (dst.kind == "reg" or dst.kind == "mem"):
+        op = tri[0] - 1 if dst.size == 8 else tri[0]
         rex, mrm, rl = encode_rm(src.reg_v, dst, 0)
-        return _assemble(dst.size, rex, [tri[0]], mrm, [], rl)
+        return _assemble(dst.size, rex, [op], mrm, [], rl, f8)
     if dst.kind == "reg" and src.kind == "mem":
+        op = tri[1] - 1 if dst.size == 8 else tri[1]
         rex, mrm, rl = encode_rm(dst.reg_v, src, 0)
-        return _assemble(dst.size, rex, [tri[1]], mrm, [], rl)
+        return _assemble(dst.size, rex, [op], mrm, [], rl, f8)
     if src.kind == "imm":
         size = dst.size
         ext = tri[2]
         if size != 8 and fits_int8(src.imm):
             rex, mrm, rl = encode_rm(ext, dst, 0)
-            return _assemble(size, rex, [0x83], mrm, pack_le(src.imm, 1), rl)
+            return _assemble(size, rex, [0x83], mrm, pack_le(src.imm, 1), rl, f8)
         # accumulator short form: AL/AX/EAX/RAX, imm  (no ModRM)
         if dst.kind == "reg" and dst.reg_v == 0:
             acc = tri[3]
@@ -457,30 +523,40 @@ def _encode_alu(mnem, dst, src):
         opc = 0x80 if size == 8 else 0x81
         immn = 1 if size == 8 else 4
         rex, mrm, rl = encode_rm(ext, dst, 0)
-        return _assemble(size, rex, [opc], mrm, pack_le(src.imm, immn), rl)
+        return _assemble(size, rex, [opc], mrm, pack_le(src.imm, immn), rl, f8)
     raise AssemblerError("bad operands for %s" % mnem)
 
 
 def _encode_mov(dst, src):
+    f8 = _needs_rex8(dst) or _needs_rex8(src)
     if src.kind == "reg" and (dst.kind == "reg" or dst.kind == "mem"):
         opc = 0x88 if dst.size == 8 else 0x89
         rex, mrm, rl = encode_rm(src.reg_v, dst, 0)
-        return _assemble(dst.size, rex, [opc], mrm, [], rl)
+        return _assemble(dst.size, rex, [opc], mrm, [], rl, f8)
     if dst.kind == "reg" and src.kind == "mem":
         opc = 0x8A if dst.size == 8 else 0x8B
         rex, mrm, rl = encode_rm(dst.reg_v, src, 0)
-        return _assemble(dst.size, rex, [opc], mrm, [], rl)
+        return _assemble(dst.size, rex, [opc], mrm, [], rl, f8)
     if src.kind == "imm":
         if dst.kind == "reg":
             size = dst.size
             if size == 64:
-                # gas: mov r64, imm32 -> REX.W C7 /0 id (sign-extended)
-                rex, mrm, rl = encode_rm(0, dst, 0)
-                return _assemble(size, rex, [0xC7], mrm, pack_le(src.imm, 4), rl)
+                if fits_int32(src.imm):
+                    # gas: mov r64, imm32 -> REX.W C7 /0 id (sign-extended)
+                    rex, mrm, rl = encode_rm(0, dst, 0)
+                    return _assemble(size, rex, [0xC7], mrm,
+                                     pack_le(src.imm, 4), rl)
+                # movabs r64, imm64 : REX.W B8+r io (full 64-bit immediate)
+                out = []
+                rex = REX_B if dst.reg_v >= 8 else 0
+                out.extend(emit_rex(rex, 64, False))
+                out.append(0xB8 + (dst.reg_v & 7))
+                out.extend(pack_le(src.imm, 8))
+                return out, []
             out = []
             out.extend(_pfx_size(size))
             rex = REX_B if dst.reg_v >= 8 else 0
-            out.extend(emit_rex(rex, size, False))
+            out.extend(emit_rex(rex, size, _needs_rex8(dst)))
             base_op = 0xB0 if size == 8 else 0xB8
             out.append(base_op + (dst.reg_v & 7))
             immn = 1 if size == 8 else (2 if size == 16 else 4)
@@ -489,7 +565,7 @@ def _encode_mov(dst, src):
         opc = 0xC6 if dst.size == 8 else 0xC7
         immn = 1 if dst.size == 8 else 4
         rex, mrm, rl = encode_rm(0, dst, 0)
-        return _assemble(dst.size, rex, [opc], mrm, pack_le(src.imm, immn), rl)
+        return _assemble(dst.size, rex, [opc], mrm, pack_le(src.imm, immn), rl, f8)
     raise AssemblerError("bad operands for mov")
 
 
@@ -605,7 +681,7 @@ def _encode_movx(dst, src, signed):
     else:
         opc2 = 0xBF if signed else 0xB7
     rex, mrm, rl = encode_rm(dst.reg_v, src, 0)
-    return _assemble(dst.size, rex, [0x0F, opc2], mrm, [], rl)
+    return _assemble(dst.size, rex, [0x0F, opc2], mrm, [], rl, _needs_rex8(src))
 
 
 # --------------------------------------------------------------------------
@@ -818,3 +894,65 @@ def parse_line(raw):
             ops.append(parse_operand(p))
         i += 1
     return ("insn", mnem, ops)
+
+
+# --------------------------------------------------------------------------
+# SSE scalar-float encoders
+# --------------------------------------------------------------------------
+# General two-operand SSE form: [prefix] [REX] 0F <opc> ModRM. `reg_op` fills
+# ModRM.reg (an xmm or GP register), `rm_op` is the r/m (xmm/GP register or
+# memory). REX.W is set only when `w` (used by the int<->float conversions and
+# 64-bit movq).
+
+def _sse(prefix, opc, reg_op, rm_op, w):
+    rex, mrm, rl = encode_rm(reg_op.reg_v, rm_op, 0)
+    out = []
+    if prefix != 0:
+        out.append(prefix)
+    size = 64 if w else 0
+    out.extend(emit_rex(rex, size, False))
+    out.append(0x0F)
+    out.append(opc)
+    pre = len(out)
+    out.extend(mrm)
+    relocs = []
+    i = 0
+    while i < len(rl):
+        r = rl[i]
+        relocs.append(Reloc(r.where + pre, r.sym, r.size, r.pcrel, r.add))
+        i += 1
+    return out, relocs
+
+
+def _encode_sse_mov(prefix, dst, src):
+    # movsd/movss: load form (10, reg=dst) vs store form (11, reg=src).
+    if dst.kind == "mem":
+        return _sse(prefix, 0x11, src, dst, False)
+    return _sse(prefix, 0x10, dst, src, False)
+
+
+def _encode_sse_movalign(prefix, dst, src):
+    # movaps/movapd: 28 (load, reg=dst) / 29 (store, reg=src)
+    if dst.kind == "mem":
+        return _sse(prefix, 0x29, src, dst, False)
+    return _sse(prefix, 0x28, dst, src, False)
+
+
+def _encode_movq(dst, src):
+    # movq between xmm and 64-bit GP/mem, or xmm<-xmm/m64.
+    if dst.size == 128 and src.size == 128:
+        return _sse(0xF3, 0x7E, dst, src, False)      # xmm <- xmm
+    if dst.size == 128 and src.kind == "mem":
+        return _sse(0xF3, 0x7E, dst, src, False)      # xmm <- m64
+    if dst.size == 128:
+        return _sse(0x66, 0x6E, dst, src, True)       # xmm <- r64
+    if src.size == 128 and dst.kind == "mem":
+        return _sse(0x66, 0xD6, src, dst, False)      # m64 <- xmm
+    return _sse(0x66, 0x7E, src, dst, True)           # r64 <- xmm
+
+
+def _encode_movd(dst, src):
+    # movd between xmm and 32-bit GP/mem (no REX.W).
+    if dst.size == 128:
+        return _sse(0x66, 0x6E, dst, src, False)      # xmm <- r/m32
+    return _sse(0x66, 0x7E, src, dst, False)          # r/m32 <- xmm

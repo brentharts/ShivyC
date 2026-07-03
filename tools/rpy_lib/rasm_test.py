@@ -50,6 +50,15 @@ CASES = [
     "ret", "leave", "nop",
     "call rax", "jmp rax", "call QWORD PTR [rax]",
     "neg eax", "not rax", "test eax, eax", "test rax, rbx",
+    # SSE scalar float
+    "movsd xmm0, QWORD PTR [rbp-16]", "movsd QWORD PTR [rbp-8], xmm0",
+    "movsd xmm1, xmm0", "movss xmm0, DWORD PTR [rbp-4]",
+    "addsd xmm0, xmm1", "subsd xmm0, QWORD PTR [rbp-16]", "mulsd xmm0, xmm3",
+    "divsd xmm1, xmm2", "ucomisd xmm0, xmm1", "ucomiss xmm0, xmm1",
+    "cvtsi2sd xmm0, edi", "cvtsi2sd xmm0, rax", "cvttsd2si ebx, xmm0",
+    "cvttsd2si rax, xmm1", "cvtsd2ss xmm0, xmm1", "cvtss2sd xmm1, xmm0",
+    "movq xmm0, rax", "movq rbx, xmm1", "xorps xmm0, xmm0", "pxor xmm2, xmm2",
+    "sqrtsd xmm0, xmm1", "movsd xmm8, QWORD PTR [rbp-16]", "addsd xmm9, xmm10",
 ]
 
 # Symbolic cases: (instruction, expected_opcode_prefix_bytes, reloc_pcrel).

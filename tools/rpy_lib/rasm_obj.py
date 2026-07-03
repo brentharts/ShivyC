@@ -74,6 +74,7 @@ class Assembler(object):
         return self.symbols[name]
 
     def assemble(self, text):
+        self.att_mode = False
         lines = text.split("\n")
         i = 0
         while i < len(lines):
@@ -95,6 +96,9 @@ class Assembler(object):
             self._directive(a)
             return
         # instruction
+        if self.att_mode:
+            raise AsmError("AT&T-syntax inline asm not supported by rasm: %r"
+                           % raw.strip())
         body, relocs = rasm.encode(a, ops)
         base = self.cur.offset()
         self.cur.emit(body)
@@ -109,6 +113,7 @@ class Assembler(object):
         parts = line.split()
         d = parts[0]
         if d == ".intel_syntax" or d == ".att_syntax":
+            self.att_mode = (d == ".att_syntax")
             return
         if d == ".section":
             name = parts[1] if len(parts) > 1 else ".text"
@@ -293,6 +298,28 @@ def write_elf(asm):
         secsym_index[sn] = idx
         syms.append({"name": 0, "info": (STB_LOCAL << 4) | STT_SECTION,
                      "shndx": sec_index[sn], "value": 0, "size": 0})
+
+    # local: any defined non-global label that a relocation references (e.g.
+    # ShivyCX's float literals `__fltlitN` in .data). These must precede the
+    # first global so sh_info stays correct.
+    referenced = {}
+    for sn in data_secs:
+        sec = asm.sections.get(sn, None)
+        if sec is None:
+            continue
+        for r in sec.relocs:
+            referenced[r.sym] = True
+    local_names = sorted(referenced.keys())
+    for nm in local_names:
+        s = asm.symbols.get(nm, None)
+        if s is not None and s.defined and not s.is_global and not s.common:
+            idx = len(syms)
+            symindex[nm] = idx
+            styp = STT_FUNC if s.section == ".text" else STT_OBJECT
+            syms.append({"name": strtab.add(nm),
+                         "info": (STB_LOCAL << 4) | styp,
+                         "shndx": sec_index.get(s.section, 0),
+                         "value": s.value, "size": 0})
 
     first_global = len(syms)
 

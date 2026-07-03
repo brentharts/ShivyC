@@ -66,6 +66,11 @@ int data[6] = {5, 9, 2, 7, 1, 8};
 int maxv(int* a, int n){ int m = a[0], i; for(i=1;i<n;i++){ if(a[i]>m) m=a[i]; } return m; }
 int main(){ int s=0,i; for(i=0;i<6;i++) s += data[i]; return s + maxv(data,6); }
 """,
+    "floats": """
+double addd(double a, double b){ return a + b; }
+int cmp(double a, double b){ return a < b ? 1 : 0; }
+int main(){ double d = 3.5; int k = (int)(addd(d, 2.0) * 2.0); return k + cmp(1.0, 2.0); }
+""",
     "ptr_struct": """
 struct P { int x; long y; };
 long sum(struct P* p){ return p->x + p->y; }
