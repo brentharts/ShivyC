@@ -63,7 +63,6 @@ import ast
 import os
 import re
 import sys
-from pathlib import Path
 
 
 # ==========================================================================
@@ -90,16 +89,18 @@ def build_stdlib_index(stdlib_root):
     if stdlib_root in _STDLIB_INDEX_CACHE:
         return _STDLIB_INDEX_CACHE[stdlib_root]
     index = {}
-    root = Path(stdlib_root)
-    for pkg_dir in sorted(root.iterdir()):
-        if not pkg_dir.is_dir():
+    for pkg_name in sorted(os.listdir(stdlib_root)):
+        pkg_dir = os.path.join(stdlib_root, pkg_name)
+        if not os.path.isdir(pkg_dir):
             continue
-        manifest = pkg_dir / "manifest.py"
-        if not manifest.is_file():
+        manifest = os.path.join(pkg_dir, "manifest.py")
+        if not os.path.isfile(manifest):
             continue
         package = None
         module_files = []
-        for line in manifest.read_text(encoding="utf-8").splitlines():
+        with open(manifest, encoding="utf-8") as _mfh:
+            manifest_text = _mfh.read()
+        for line in manifest_text.splitlines():
             line = line.split("#")[0].strip()
             m = re.match(r'package\("([^"]+)"\)', line)
             if m:
@@ -108,27 +109,31 @@ def build_stdlib_index(stdlib_root):
             if m:
                 module_files.append(m.group(1))
         if package:
-            for py in pkg_dir.rglob("*.py"):
-                if py.name == "manifest.py":
-                    continue
-                rel = py.relative_to(pkg_dir)
-                if not rel.parts or rel.parts[0] != package:
-                    continue
-                if py.name == "__init__.py":
-                    mod = ".".join(rel.parts[:-1])
-                else:
-                    mod = ".".join(rel.with_suffix("").parts)
-                index[mod] = str(py)
+            for walk_root, _dirs, filenames in os.walk(pkg_dir):
+                for fn in sorted(filenames):
+                    if not fn.endswith(".py") or fn == "manifest.py":
+                        continue
+                    py = os.path.join(walk_root, fn)
+                    rel = os.path.relpath(py, pkg_dir)
+                    rel_parts = rel.split(os.sep)
+                    if not rel_parts or rel_parts[0] != package:
+                        continue
+                    if fn == "__init__.py":
+                        mod = ".".join(rel_parts[:-1])
+                    else:
+                        rel_parts[-1] = os.path.splitext(rel_parts[-1])[0]
+                        mod = ".".join(rel_parts)
+                    index[mod] = py
         for mf in module_files:
-            path = pkg_dir / mf
-            if path.is_file():
-                index[Path(mf).stem] = str(path)
+            path = os.path.join(pkg_dir, mf)
+            if os.path.isfile(path):
+                index[os.path.splitext(os.path.basename(mf))[0]] = path
     _STDLIB_INDEX_CACHE[stdlib_root] = index
     return index
 
 
-MICROPYTHON_TOP = Path(__file__).resolve().parents[1]
-DEFAULT_STDLIB = MICROPYTHON_TOP / "lib" / "micropython-lib" / "python-stdlib"
+MICROPYTHON_TOP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_STDLIB = os.path.join(MICROPYTHON_TOP, "lib", "micropython-lib", "python-stdlib")
 
 
 # ==========================================================================
@@ -13849,8 +13854,12 @@ def write_runtime(out_dir, mp_bridge=False, minipy_eval=False):
 
 
 def relative_stdlib_slug(stdlib_dir, py_path):
-    rel = Path(py_path).resolve().relative_to(Path(stdlib_dir).resolve())
-    return rel.as_posix().replace("/", "_").replace("-", "_").removesuffix(".py")
+    rel = os.path.relpath(os.path.abspath(py_path), os.path.abspath(stdlib_dir))
+    rel = rel.replace(os.sep, "/")
+    slug = rel.replace("/", "_").replace("-", "_")
+    if slug.endswith(".py"):
+        slug = slug[:-3]
+    return slug
 
 
 def _stdlib_context(path, stdlib_dir=None):
@@ -13960,19 +13969,23 @@ def transpile_file(path, out_dir, stdlib_dir=None):
 
 
 def translate_stdlib(stdlib_dir, out_dir, report_path):
-    stdlib_dir = Path(stdlib_dir)
-    out_dir = Path(out_dir)
-    report_path = Path(report_path)
+    stdlib_dir = os.fspath(stdlib_dir)
+    out_dir = os.fspath(out_dir)
+    report_path = os.fspath(report_path)
     ok, failed = [], []
-    files = sorted(stdlib_dir.rglob("*.py"))
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for old in out_dir.glob("*.c"):
-        old.unlink()
-    for old in out_dir.glob("*.h"):
-        old.unlink()
+    files = []
+    for walk_root, _dirs, filenames in os.walk(stdlib_dir):
+        for fn in filenames:
+            if fn.endswith(".py"):
+                files.append(os.path.join(walk_root, fn))
+    files = sorted(files)
+    os.makedirs(out_dir, exist_ok=True)
+    for old in os.listdir(out_dir):
+        if old.endswith(".c") or old.endswith(".h"):
+            os.remove(os.path.join(out_dir, old))
     write_runtime(str(out_dir), mp_bridge=True)
     for py_path in files:
-        rel = py_path.relative_to(stdlib_dir).as_posix()
+        rel = os.path.relpath(py_path, stdlib_dir).replace(os.sep, "/")
         res, err = transpile_file(str(py_path), str(out_dir), str(stdlib_dir))
         if res is None:
             failed.append((rel, err or "unknown error"))
@@ -13997,7 +14010,8 @@ def translate_stdlib(stdlib_dir, out_dir, report_path):
             lines.append("  %s" % name)
             lines.append("    %s" % err)
         lines.append("")
-    report_path.write_text("\n".join(lines), encoding="utf-8")
+    with open(report_path, "w", encoding="utf-8") as _rf:
+        _rf.write("\n".join(lines))
     return ok, failed
 
 
