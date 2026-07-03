@@ -1204,7 +1204,28 @@ def write_asm(asm_source, asm_filename):
 
 
 def assemble(asm_name, obj_name):
-    """Assemble the given assembly file into an object file."""
+    """Assemble the given assembly file into an object file.
+
+    With SHIVYC_RASM set, use the self-hosted rasm assembler (written in the
+    restricted-Python dialect) instead of the external GNU assembler, taking a
+    step toward a fully self-contained toolchain.
+    """
+    import os
+    if os.environ.get("SHIVYC_RASM"):
+        try:
+            _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            _rlib = os.path.join(_root, "tools", "rpy_lib")
+            if _rlib not in sys.path:
+                sys.path.insert(0, _rlib)
+            import rasm_obj
+            with open(asm_name) as _f:
+                _elf = rasm_obj.assemble_to_elf(_f.read())
+            with open(obj_name, "wb") as _o:
+                _o.write(bytes(_elf))
+            return True
+        except Exception as _e:
+            error_collector.add(CompilerError("rasm assembler failed: %s" % _e))
+            return False
     if sys.implementation.name != 'shivyc':
         try:
             subprocess.check_call(["as", "-o", obj_name, asm_name])
