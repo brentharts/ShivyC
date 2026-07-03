@@ -2236,6 +2236,28 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
             rcall = do_call(st, callee, cargs)
             st.regpool.append(cargs)
             _lset(regs, a, rcall); pc = pc + 1
+        elif op == 91:                     # CALL_SPREAD: reg[a]=reg[b](fixed,*iter)
+            callee = _lget(regs, b)
+            cargs = new_v_list()
+            j = 0
+            while j < c:
+                cargs.append(_lget(regs, b + 1 + j))
+                j = j + 1
+            it = _lget(regs, b + 1 + c)
+            if it.tag == 7 or it.tag == 10:
+                iitems = items_of(st, it)
+                m = 0
+                while m < len(iitems):
+                    cargs.append(iitems[m])
+                    m = m + 1
+            elif it.tag == 3:              # spread a string into its characters
+                s = it.sv
+                m = 0
+                while m < len(s):
+                    cargs.append(v_str(s[m]))
+                    m = m + 1
+            rcall = do_call(st, callee, cargs)
+            _lset(regs, a, rcall); pc = pc + 1
         elif op == 90:                     # CALL_KW: c = npos*256 + nkw
             # window: reg[b]=callee, [b+1..b+npos]=positional values,
             # [b+1+npos..b+npos+nkw]=keyword values,

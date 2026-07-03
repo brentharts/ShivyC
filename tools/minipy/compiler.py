@@ -47,6 +47,7 @@ OPS = {
     "CALL_FUNC": 89,                       # direct call: c = fidx*256 + nargs
     "CALL_KW":     90,   # reg[a]=reg[b](pos+kw); c=npos*256+nkw; window carries
                          # positional values, keyword values, then keyword-name strs
+    "CALL_SPREAD": 91,   # reg[a]=reg[b](reg[b+1..b+c], *reg[b+c+1]); c = #fixed
     "CALL":         8,   # reg[a] = reg[b](reg[b+1..b+c]); c = argcount
     # --- containers (9-19) ---
     "BUILD_LIST":   9,   # reg[a] = [regs[b..b+c-1]]
@@ -1273,8 +1274,8 @@ class Compiler:
         if node.exc is None:
             f.emit("RERAISE")
             return
-        if node.cause is not None:
-            raise CompileError("v0 raise: no `from` cause (line %s)" % node.lineno)
+        # `raise X from Y`: minipy does not track exception chaining, so the
+        # cause is accepted and ignored (the exception itself is raised as-is).
         r = self.expr(f, node.exc)
         f.emit("RAISE", r)
         f.pop_to(r)
@@ -1673,7 +1674,51 @@ class Compiler:
         f.numreg.discard(rfun)
         return rfun
 
+    def _call_spread(self, f, node):
+        # `f(a, *s, b, ...)`: build the full positional list at runtime by
+        # concatenating list literals (runs of plain args) with the starred
+        # iterables in order, then do a single spread call f(*combined). Starred
+        # sources must be lists (py2c only ever spreads list results such as
+        # str.split()); list concatenation composes them.
+        if node.keywords:
+            raise CompileError("v0 call: *args with keywords unsupported (line %s)"
+                               % node.lineno)
+        pieces = []
+        run = []
+        for a in node.args:
+            if isinstance(a, ast.Starred):
+                if run:
+                    pieces.append(ast.List(elts=run, ctx=ast.Load()))
+                    run = []
+                pieces.append(a.value)
+            else:
+                run.append(a)
+        if run:
+            pieces.append(ast.List(elts=run, ctx=ast.Load()))
+        combined = pieces[0]
+        for p in pieces[1:]:
+            combined = ast.BinOp(left=combined, op=ast.Add(), right=p)
+        ast.copy_location(combined, node)
+        ast.fix_missing_locations(combined)
+        if isinstance(node.func, ast.Attribute):
+            cn = self.consts.add("str", node.func.attr)
+            rfun = f.push()
+            ro = self.expr(f, node.func.value)
+            assert ro == rfun + 1
+            f.emit("LOAD_METHOD", rfun, ro, cn)   # materialise a bound method
+            f.pop_to(rfun + 1)
+        else:
+            rfun = self.expr(f, node.func)
+        rit = self.expr(f, combined)              # full arg list at rfun+1
+        assert rit == rfun + 1
+        f.emit("CALL_SPREAD", rfun, rfun, 0)      # 0 fixed; spread the whole list
+        f.pop_to(rfun + 1)
+        f.numreg.discard(rfun)
+        return rfun
+
     def ex_Call(self, f, node):
+        if any(isinstance(a, ast.Starred) for a in node.args):
+            return self._call_spread(f, node)
         if node.keywords:
             return self._call_kw(f, node)
         # method call `recv.meth(args)`: callable = method-id builtin, receiver
@@ -2550,6 +2595,11 @@ class VM:
                 if regs[a] != regs[c]: pc = b
             elif op == 8:
                 callee = regs[b]; ca = [regs[b + 1 + k] for k in range(c)]
+                regs[a] = self._invoke(callee, ca)
+            elif op == 91:                      # CALL_SPREAD: f(fixed..., *iter)
+                callee = regs[b]
+                ca = [regs[b + 1 + k] for k in range(c)]
+                ca = ca + list(regs[b + 1 + c])
                 regs[a] = self._invoke(callee, ca)
             elif op == 90:                      # CALL_KW: c = npos*256 + nkw
                 npos = c // 256; nkw = c % 256
