@@ -543,12 +543,20 @@ def _encode_imul(ops):
     if len(ops) == 1:
         return _encode_unary_group3(ops[0], 5)
     dst = ops[0]
+    # imul reg, imm  is shorthand for  imul reg, reg, imm
+    if len(ops) == 2 and ops[1].kind == "imm":
+        imm = ops[1]
+        if fits_int8(imm.imm):
+            rex, mrm, rl = encode_rm(dst.reg_v, dst, 0)
+            return _assemble(dst.size, rex, [0x6B], mrm, pack_le(imm.imm, 1), rl)
+        rex, mrm, rl = encode_rm(dst.reg_v, dst, 0)
+        return _assemble(dst.size, rex, [0x69], mrm, pack_le(imm.imm, 4), rl)
     src = ops[1]
     if len(ops) == 2:
         # imul r, r/m : 0F AF /r
         rex, mrm, rl = encode_rm(dst.reg_v, src, 0)
-        return _assemble(dst.size, rex, [0x0F, 0xAF], mrm, rl_imm([]), rl)
-    # imul r, r/m, imm : 69 /r id  (or 6B /r ib when imm8)
+        return _assemble(dst.size, rex, [0x0F, 0xAF], mrm, [], rl)
+    # imul r, r/m, imm : 6B /r ib (imm8) or 69 /r id
     imm = ops[2]
     if fits_int8(imm.imm):
         rex, mrm, rl = encode_rm(dst.reg_v, src, 0)
@@ -556,9 +564,6 @@ def _encode_imul(ops):
     rex, mrm, rl = encode_rm(dst.reg_v, src, 0)
     return _assemble(dst.size, rex, [0x69], mrm, pack_le(imm.imm, 4), rl)
 
-
-def rl_imm(x):
-    return x
 
 
 def _encode_unary_group3(o, ext):
@@ -699,9 +704,14 @@ def parse_memory(inner, size):
         sign = t[0]
         body = t[1:]
         if "*" in body:
-            # index*scale or scale*index
-            a, _, b = body.partition("*")
-            if _looks_int(a):
+            # index*scale, scale*index, or a constant product used as disp
+            a, star, b = body.partition("*")
+            if _looks_int(a) and _looks_int(b):
+                d = _parse_int(a) * _parse_int(b)
+                if sign == "-":
+                    d = -d
+                disp += d
+            elif _looks_int(a):
                 scale = _parse_int(a)
                 index = reg_val(b)
             else:
