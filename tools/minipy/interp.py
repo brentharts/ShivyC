@@ -2404,7 +2404,21 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
         elif op == 50:                     # LOAD_ATTR
             cs = st.prog.consts
             nm = cs[c].s
-            _lset(regs, a, inst_get(st, _lget(regs, b), nm)); pc = pc + 1
+            ob = _lget(regs, b)
+            if ob.tag == 13 and _strcmp(nm, "__name__") == 0:
+                cn = st.prog.classes[ob.iv].cname
+                di = len(cn) - 1               # strip any link prefix ($ast$Name)
+                cut = -1
+                while di >= 0:
+                    if cn[di] == "$":
+                        cut = di
+                        break
+                    di = di - 1
+                if cut >= 0:
+                    cn = cn[cut + 1:len(cn)]
+                _lset(regs, a, v_str(cn)); pc = pc + 1
+            else:
+                _lset(regs, a, inst_get(st, ob, nm)); pc = pc + 1
         elif op == 51:                     # STORE_ATTR
             cs = st.prog.consts
             nm = cs[c].s

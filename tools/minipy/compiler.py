@@ -2667,7 +2667,19 @@ class VM:
             elif op == 19:                      # SET_ADD
                 regs[a].add(regs[b])
             elif op == 50:                      # LOAD_ATTR
-                regs[a] = regs[b].attrs[self._const(c)]
+                obj = regs[b]; nm = self._const(c)
+                if isinstance(obj, tuple) and len(obj) == 2 and nm == "__name__":
+                    if obj[0] == "class":
+                        cn = self.prog["classes"][obj[1]]["cname"]
+                        di = cn.rfind("$")          # strip any link prefix ($ast$)
+                        regs[a] = cn[di + 1:] if di >= 0 else cn
+                    elif obj[0] == "builtin":
+                        regs[a] = [k for k, v in BUILTINS.items()
+                                   if v == obj[1]][0]
+                    else:
+                        regs[a] = obj.attrs[nm]
+                else:
+                    regs[a] = obj.attrs[nm]
             elif op == 51:                      # STORE_ATTR
                 regs[a].attrs[self._const(c)] = regs[b]
             elif op == 52:                      # LOAD_METHOD
