@@ -104,7 +104,7 @@ BUILTINS = {n: i for i, n in enumerate(
     ["print", "len", "range", "int", "str", "float", "abs", "bool",
      "list", "dict", "set", "tuple", "repr", "sorted", "sum", "min", "max",
      "isinstance", "enumerate", "zip", "any", "all", "ord", "chr",
-     "reversed", "getattr", "hasattr", "type", "setattr"])}
+     "reversed", "getattr", "hasattr", "type", "setattr", "frozenset"])}
 
 # Builtin exception hierarchy (name -> base name), parents before children so a
 # class's base is already registered when it is.  These are materialised as real
@@ -2181,6 +2181,7 @@ def _module_registry():
         "os": os.path.join(lib, "minios.py"),
         "rast": os.path.join(lib, "rast.py"),
         "ast": os.path.join(lib, "minast.py"),
+        "pathlib": os.path.join(lib, "minipathlib.py"),
     }
 
 
@@ -2473,6 +2474,14 @@ def _lift_closures(tree):
 
 def compile_source(src, source_name="<module>"):
     tree = ast.parse(src, filename=source_name)
+    # expose __file__ so programs that introspect their own path work (pathlib)
+    fileassign = ast.Assign(
+        targets=[ast.Name(id="__file__", ctx=ast.Store())],
+        value=ast.Constant(value=source_name))
+    fileassign.lineno = 1
+    fileassign.col_offset = 0
+    ast.fix_missing_locations(fileassign)
+    tree.body.insert(0, fileassign)
     tree = _link_modules(tree)               # inline supported library imports
     tree = _WithDesugar().visit(tree)        # with -> manager-protocol + try/finally
     tree = _lift_closures(tree)              # nested funcs -> top-level + captures
@@ -2679,7 +2688,13 @@ class VM:
             elif op == 20: regs[a] = regs[b] + regs[c]
             elif op == 21: regs[a] = regs[b] - regs[c]
             elif op == 22: regs[a] = regs[b] * regs[c]
-            elif op == 23: regs[a] = regs[b] / regs[c]
+            elif op == 23:
+                lb = regs[b]
+                if isinstance(lb, _Inst):
+                    m = self._lookup_method(lb.cid, "__truediv__")
+                    regs[a] = self._call(m, [lb, regs[c]])
+                else:
+                    regs[a] = lb / regs[c]
             elif op == 24: regs[a] = regs[b] % regs[c]
             elif op == 25: regs[a] = regs[b] // regs[c]
             elif op == 26: regs[a] = regs[b] ** regs[c]
@@ -2810,6 +2825,15 @@ class VM:
             cid = ci["base"]
         return None
 
+    def _disp(self, x):
+        # str()/print of an instance dispatches to __str__ when the class defines
+        # one (falling back to the default <Class object> rendering otherwise)
+        if isinstance(x, _Inst) and not getattr(x, "is_exc", False):
+            m = self._lookup_method(x.cid, "__str__")
+            if m is not None:
+                return _pystr(self._call(m, [x]))
+        return _pystr(x)
+
     def _isinstance(self, exc, classval):
         if not isinstance(exc, _Inst):
             return False
@@ -2829,18 +2853,19 @@ class VM:
             return self._method(bid, args)
         name = [k for k, v in BUILTINS.items() if v == bid][0]
         if name == "print":
-            self.out.write(" ".join(_pystr(x) for x in args) + "\n")
+            self.out.write(" ".join(self._disp(x) for x in args) + "\n")
             return None
         if name == "len":   return len(args[0])
         if name == "range": return list(range(*args))
         if name == "int":   return int(args[0]) if args else 0
-        if name == "str":   return _pystr(args[0]) if args else ""
+        if name == "str":   return self._disp(args[0]) if args else ""
         if name == "float": return float(args[0]) if args else 0.0
         if name == "abs":   return abs(args[0])
         if name == "bool":  return bool(args[0]) if args else False
         if name == "list":  return list(args[0]) if args else []
         if name == "dict":  return dict(args[0]) if args else {}
         if name == "set":   return set(args[0]) if args else set()
+        if name == "frozenset": return set(args[0]) if args else set()
         if name == "tuple": return tuple(args[0]) if args else ()
         if name == "repr":  return repr(args[0])
         if name == "sorted": return sorted(args[0])

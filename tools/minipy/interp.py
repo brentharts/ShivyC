@@ -462,6 +462,15 @@ def to_disp(st: "St", v: "V", use_repr: "int") -> "char*":
                 j = j + 2
             return ""
         ci = classes[cid]
+        if use_repr == 0:
+            mfx = lookup_method(st, cid, "__str__")
+            if mfx >= 0:
+                argl = new_v_list()
+                argl.append(v)
+                rv = run_func(st, mfx, argl)
+                if rv.tag == 3:
+                    return rv.sv
+                return to_disp(st, rv, 0)
         return "<" + ci.cname + " object>"
     return "<callable>"
 
@@ -1531,6 +1540,13 @@ def do_builtin(st: "St", bid: "long", args: "list[V]") -> "V":
             for e in materialize(st, args[0]):
                 _set_add(st, sv, e)
         return sv
+    if bid == 29:              # frozenset (minipy: same as set, no immutability)
+        out = new_v_list()
+        sv = v_container(st, 9, 2, out)
+        if len(args) > 0:
+            for e in materialize(st, args[0]):
+                _set_add(st, sv, e)
+        return sv
     if bid == 11:              # tuple
         if len(args) > 0:
             return v_container(st, 10, 3, materialize(st, args[0]))
@@ -2454,9 +2470,16 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
             pc = pc + 1
         elif op == 23:
             ob = _lget(regs, b); oc = _lget(regs, c)
-            _lset(regs, ra, v_div(ob, oc))
-            if fc == 1:
-                _free_v(oc)
+            if ob.tag == 12:                # instance: dispatch __truediv__
+                argl = new_v_list()
+                argl.append(ob)
+                argl.append(oc)
+                _lset(regs, ra, run_func(st, lookup_method(
+                    st, st.heap[ob.iv].cursor, "__truediv__"), argl))
+            else:
+                _lset(regs, ra, v_div(ob, oc))
+                if fc == 1:
+                    _free_v(oc)
             if fb == 1:
                 _free_v(ob)
             pc = pc + 1
