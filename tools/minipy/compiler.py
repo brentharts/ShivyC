@@ -2467,7 +2467,11 @@ def _lift_closures(tree):
             for s in list(top.body):          # methods can nest functions too
                 if isinstance(s, ast.FunctionDef):
                     lift_enclosing(s)
-    tree.body = tree.body + new_top
+    # Lifted functions are placed *before* the rest of the module body: a def
+    # only stores its function value (the body runs later, at call time), and
+    # module-level code may call into functions that reach these closures, so
+    # their globals must be bound before any such call executes.
+    tree.body = new_top + tree.body
     ast.fix_missing_locations(tree)
     return tree
 
