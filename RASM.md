@@ -13,39 +13,47 @@ Done and validated:
 
 * **Encoder** (`rasm.py`): x86-64 machine-code encoding — REX / ModRM / SIB /
   displacement / immediate layout — for the instruction and operand vocabulary
-  ShivyCX emits: `mov movsx movzx movsxd lea push pop add sub or and xor cmp
+  ShivyCX emits (`mov movsx movzx movsxd lea push pop add sub or and xor cmp
   test imul idiv div mul neg not cqo cdq sal shl sar shr call jmp ret leave nop`
-  and the `Jcc` family. Operands: registers (8/16/32/64-bit, incl. r8–r15),
-  immediates (imm8 sign-extended vs imm32, accumulator short forms), and memory
-  (`[base + index*scale + disp]`, disp8/disp32, RIP-relative, absolute, and
-  symbolic). Symbolic operands emit a `Reloc` record for the ELF writer.
+  and the `Jcc` family). Operands: registers (8/16/32/64-bit, incl. r8–r15),
+  immediates (imm8 sign-extension, accumulator short forms), and memory
+  (`[base + index*scale + disp]`, constant products, disp8/disp32, RIP-relative,
+  absolute, symbolic). **100/100 differential cases byte-identical to GNU `as`.**
 * **Parser** (`rasm.py`): the Intel-syntax subset ShivyCX emits — directives,
   labels, `SIZE PTR [...]` memory operands, comments.
-* **Differential test** (`rasm_test.py`): 96/96 cases byte-identical to GNU
-  `as` (assembled in one batch, compared via objdump), covering reg/imm/mem
-  forms plus relocation cases. On a real ShivyCX-emitted `.s`, 99/99
-  instructions encode.
+* **Driver** (`rasm_obj.py`): two passes — lay out `.text`/`.data`/`.bss` from
+  the directive stream (`.section .global .comm .quad .int .byte .zero`), record
+  labels, encode instructions and data, collect relocations; then resolve
+  same-section PC-relative refs to local labels in place, keeping the rest as
+  ELF relocations.
+* **ELF64 writer** (`rasm_obj.py`): emits an ET_REL x86-64 object — header,
+  `.text`/`.data`/`.bss`, `.symtab`/`.strtab`/`.shstrtab`, `.rela.text`/
+  `.rela.data`, `.note.GNU-stack` — with STT_SECTION/FUNC/OBJECT symbols,
+  SHN_COMMON, and R_X86_64_PC32 / _32S / _64 relocations.
+* **End-to-end test** (`rasm_obj_test.py`): compile a C program with ShivyCX,
+  assemble it with **both** rasm and `as`, link both with gcc, run both, and
+  require matching results. **9/9 programs pass** (arithmetic, recursion, loops,
+  globals, bitops, conditionals, function-pointers-in-data, nested calls,
+  arrays, pointers/structs).
 
-The encoding model mirrors pycca (campagnola/pycca) and the Intel SDM, but is
-rewritten flat (no metaclasses/generators/`**kwargs`; one uniform `Operand`
-class) for RPython translation.
+The encoding model mirrors pycca and the Intel SDM, rewritten flat (no
+metaclasses/generators/`**kwargs`; one uniform `Operand` class) for RPython.
 
-## Next steps
+## Not yet done
 
-1. **Two-pass driver**: resolve local labels to offsets, keep external/`.global`
-   symbols as relocations. Emit `.text`/`.data`/`.bss` sections from the
-   directive stream (`.section .comm .quad .global`).
-2. **ELF64 writer**: emit a relocatable object (ELF header, section headers,
-   `.symtab`/`.strtab`, `.rela.text`) so the output drops in for `as -o x.o`.
-   PeachPy's `peachpy/formats/elf` is a reference for the structures.
-3. **Integrate**: swap `shivyc/main.py:assemble` to call `rasm` instead of the
-   `as` subprocess; add an end-to-end diff test (compile a C file, assemble with
-   both `as` and `rasm`, compare `.o`/linked output).
-4. **RPython cleanup**: remove tuple-unpacking of `partition`, make dict
-   iteration order-independent, add explicit type annotations; then translate
-   and (later) run under minipy for full self-hosting.
+* **Branch relaxation**: jumps always use rel32, so objects are larger than
+  `as` (which picks rel8 when possible) but functionally identical. A relaxation
+  pass (iterate to a fixpoint as short jumps shift offsets) would close the gap.
+* **Integration**: swap `shivyc/main.py:assemble` to call rasm instead of the
+  `as` subprocess, behind a flag, then flip the default once the difftest corpus
+  is broad enough.
+* **RPython cleanup + minipy**: drop `partition` tuple-unpacking, make dict
+  iteration order-independent, add type annotations; translate, then run under
+  minipy for full self-hosting.
 
 ## Files
 
-* `rasm.py` — encoder + parser + operand/relocation model.
-* `rasm_test.py` — differential test against GNU `as`.
+* `tools/rpy_lib/rasm.py` — encoder + parser + operand/relocation model.
+* `tools/rpy_lib/rasm_obj.py` — assembler driver + ELF64 object writer.
+* `tools/rpy_lib/rasm_test.py` — differential encoder test vs GNU `as`.
+* `tools/rpy_lib/rasm_obj_test.py` — end-to-end compile→assemble→link→run test.
