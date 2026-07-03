@@ -491,3 +491,5 @@ thus making the entire project self contained.
 - (B. Hartshorn, viXra 2025, 2026).
     - *Foundational Problems with Compilers and Operating Systems* https://ai.vixra.org/abs/2507.0081
     - *Rethinking Meta-Interpreters for High-Performance Execution* https://ai.vixra.org/abs/2606.0084
+    - *Closing the Compiler Loop:
+Toward a Self-Hosting, Dependency-Free Python JIT* https://zenodo.org/records/21178004
