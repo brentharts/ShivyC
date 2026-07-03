@@ -100,3 +100,27 @@ class _Path:
 
 
 path = _Path()
+
+
+# minipy runs without a real filesystem. The transpiler's cross-file scans (used
+# to resolve symbol collisions across a package) therefore see no sibling files,
+# which is correct for a single self-contained source: these return empty.
+def listdir(p):
+    return []
+
+
+def walk(top):
+    return []                                 # list of (dir, subdirs, files)
+
+
+def makedirs(p, exist_ok=False):
+    return None
+
+
+def remove(p):
+    return None
+
+
+def fspath(p):
+    return p
+
