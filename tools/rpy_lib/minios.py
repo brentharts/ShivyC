@@ -78,6 +78,14 @@ class _Path:
         h, t = self.split(p)
         return t
 
+    def abspath(self, p):
+        # minipy has no cwd; paths handed to a self-hosted run are already
+        # absolute (e.g. __file__), so return them unchanged, and only anchor a
+        # clearly-relative path at "/" as a best effort.
+        if len(p) > 0 and p[0] == "/":
+            return p
+        return "/" + p
+
     def splitext(self, p):
         sep_i = _rfind(p, "/")
         dot_i = _rfind(p, ".")
