@@ -5678,7 +5678,13 @@ class Transpiler:
         is_void/is_integral/is_pointer/... live only in `ctypes` -- so any call
         to it can dispatch through that module's vtable, correct for a non-leaf
         base and uniform across typed-pointer and bare-obj receivers. Cached."""
-        cache = self.__dict__.setdefault("_excl_vt_cache", {})
+        # Lazy per-instance cache. Using getattr/setattr (not
+        # `self.__dict__.setdefault`) keeps this working under self-hosting:
+        # minipy instances don't expose a live `__dict__` mapping.
+        cache = getattr(self, "_excl_vt_cache", None)
+        if cache is None:
+            cache = {}
+            self._excl_vt_cache = cache
         if attr in cache:
             return cache[attr]
         res = None
