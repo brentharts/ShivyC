@@ -501,6 +501,14 @@ class Compiler:
             mod.emit("LOAD_CONST", r, ci)
             mod.emit("STORE_GLOBAL", r, self.gslot(bname))
             mod.pop_to(mod.base)
+        # bind __name__ = "__main__" for the entry module so the script-entry
+        # idiom `if __name__ == "__main__":` fires (minipy links everything into
+        # one program, so there is a single module namespace = the entry).
+        ci = self.consts.add("str", "__main__")
+        r = mod.push()
+        mod.emit("LOAD_CONST", r, ci)
+        mod.emit("STORE_GLOBAL", r, self.gslot("__name__"))
+        mod.pop_to(mod.base)
         # materialise referenced builtin exception classes (parents first) so
         # they exist before any user `class Err(Exception)` / raise / except.
         for bname in _needed_builtin_excs(tree):
@@ -1825,6 +1833,14 @@ class Compiler:
         return base
 
     def ex_Attribute(self, f, node):
+        # `sys.argv` / `sys.path` -> pre-bound global lists the VM fills (minipy
+        # has no real `sys` module object at runtime).
+        if (isinstance(node.value, ast.Name) and node.value.id == "sys"
+                and node.attr in ("argv", "path")):
+            r = f.push()
+            slot = "__argv__" if node.attr == "argv" else "__syspath__"
+            f.emit("LOAD_GLOBAL", r, self.gslot(slot))
+            return r
         rb = self.expr(f, node.value)
         cn = self.consts.add("str", node.attr)
         f.emit("LOAD_ATTR", rb, rb, cn)
@@ -2545,6 +2561,32 @@ class VM:
         raise RuntimeError("bad const %r" % (c,))
 
     def run(self):
+        # expose the process argv to the program as `sys.argv` (compiled to a
+        # read of the __argv__ global). script_argv is set by the launcher.
+        argv = getattr(self, "script_argv", None)
+        if argv is not None and "__argv__" in self.names:
+            self.globals[self.names.index("__argv__")] = list(argv)
+        # `sys.path` is a real (empty) list programs may mutate; minipy resolves
+        # imports at compile time, so its runtime contents don't affect linking.
+        if "__syspath__" in self.names:
+            self.globals[self.names.index("__syspath__")] = []
+        # Reference VM only: bind host builtins minipy doesn't provide natively
+        # (open, hex, hash, ...) so the transpiler's I/O and helpers work. Names
+        # minipy already provides (BUILTINS) and dunders are left alone; the
+        # module body runs next and overrides any it defines itself.
+        import builtins as _bi
+        i = 0
+        while i < len(self.names):
+            nm = self.names[i]
+            if (nm not in BUILTINS and not nm.startswith("__")
+                    and self.globals[i] is None and hasattr(_bi, nm)):
+                self.globals[i] = getattr(_bi, nm)
+            i += 1
+        # give the minios shim a real filesystem via its injectable host-os hook
+        # (never assigned in minios, so this survives module load).
+        if "_host_os" in self.names:
+            import os as _realos
+            self.globals[self.names.index("_host_os")] = _realos
         self._call(self.prog["entry"], [])
 
     def _call(self, fidx, args):
@@ -2620,8 +2662,14 @@ class VM:
                 posvals = [regs[b + 1 + k] for k in range(npos)]
                 kwvals = [regs[b + 1 + npos + k] for k in range(nkw)]
                 kwnames = [regs[b + 1 + npos + nkw + k] for k in range(nkw)]
-                fullargs = self._bind_kwargs(callee, posvals, kwnames, kwvals)
-                regs[a] = self._invoke(callee, fullargs)
+                if isinstance(callee, tuple):
+                    fullargs = self._bind_kwargs(callee, posvals, kwnames, kwvals)
+                    regs[a] = self._invoke(callee, fullargs)
+                else:                           # host callable: real kwargs
+                    kw = {}
+                    for k in range(nkw):
+                        kw[kwnames[k]] = kwvals[k]
+                    regs[a] = callee(*posvals, **kw)
             elif op == 89:                      # CALL_FUNC (direct)
                 fnum = c // 256; nargs = c % 256
                 ca = [regs[b + k] for k in range(nargs)]
@@ -2682,16 +2730,24 @@ class VM:
                                    if v == obj[1]][0]
                     else:
                         regs[a] = obj.attrs[nm]
-                else:
+                elif isinstance(obj, _Inst):
                     regs[a] = obj.attrs[nm]
+                else:
+                    regs[a] = getattr(obj, nm)   # host object attribute (ref VM)
             elif op == 51:                      # STORE_ATTR
                 regs[a].attrs[self._const(c)] = regs[b]
             elif op == 52:                      # LOAD_METHOD
                 obj = regs[b]; name = self._const(c)
                 if isinstance(obj, _Inst):
                     regs[a] = ("bound", self._lookup_method(obj.cid, name), obj)
-                else:                            # builtin method on a container/str
+                elif name in METHODS:            # builtin method on a container/str
                     regs[a] = ("boundb", METHODS[name], obj)
+                else:
+                    m = getattr(obj, name, None)  # host object method (ref VM)
+                    if m is not None:
+                        regs[a] = ("hostb", m)
+                    else:
+                        self._raise_attr_error(name)
             elif op == 53:                      # CALL_METHOD (fused load+call)
                 nargs = c % 256; name = self._const(c // 256)
                 recv = regs[b]
@@ -2699,8 +2755,14 @@ class VM:
                 if isinstance(recv, _Inst):
                     regs[a] = self._call(
                         self._lookup_method(recv.cid, name), [recv] + ca)
-                else:
+                elif name in METHODS:
                     regs[a] = self._method(METHODS[name], [recv] + ca)
+                else:
+                    m = getattr(recv, name, None)  # host object method (ref VM)
+                    if m is not None:
+                        regs[a] = m(*ca)
+                    else:
+                        self._raise_attr_error(name)
             elif op == 20: regs[a] = regs[b] + regs[c]
             elif op == 21: regs[a] = regs[b] - regs[c]
             elif op == 22: regs[a] = regs[b] * regs[c]
@@ -2821,6 +2883,13 @@ class VM:
             return self._call(callee[1], [callee[2]] + args)
         if isinstance(callee, tuple) and callee[0] == "boundb":
             return self._method(callee[1], [callee[2]] + args)
+        if isinstance(callee, tuple) and callee[0] == "hostb":
+            return callee[1](*args)          # host bound method (already bound)
+        if not isinstance(callee, tuple):
+            # host builtin / function bound into a global on the reference VM
+            # (e.g. open): the transpiler logic runs on minipy bytecode; only
+            # the host syscall delegates, exactly as native minipy would via libc.
+            return callee(*args)
         raise RuntimeError("not callable: %r" % (callee,))
 
     def _chain_has(self, cid, name):
@@ -2849,6 +2918,29 @@ class VM:
             if m is not None:
                 return _pystr(self._call(m, [x]))
         return _pystr(x)
+
+    def _raise_attr_error(self, name):
+        # Set a catchable exception (matches `except Exception`) for a method
+        # call on something that has no such method -- e.g. a method on an
+        # unbound name left by an unlinked `import`. Mirrors CPython raising
+        # AttributeError, so guarded `try/except` blocks skip cleanly instead of
+        # crashing the interpreter with a host-level KeyError.
+        classes = self.prog["classes"]
+        cid = -1
+        fallback = -1
+        i = 0
+        while i < len(classes):
+            cn = classes[i].get("cname", "")
+            di = cn.rfind("$")
+            short = cn[di + 1:] if di >= 0 else cn
+            if short == "AttributeError":
+                cid = i
+            elif short == "Exception":
+                fallback = i
+            i += 1
+        use = cid if cid >= 0 else fallback
+        self._exc_val = self._invoke(("class", use), []) if use >= 0 else None
+        self._exc_flag = True
 
     def _isinstance(self, exc, classval):
         if not isinstance(exc, _Inst):
