@@ -2653,6 +2653,70 @@ class _StripOpenKwargs(ast.NodeTransformer):
         return node
 
 
+def _lower_class_attrs(tree):
+    """Lower class-level attribute assignments (`X = <value>` directly in a
+    class body) into per-instance initialisation: each becomes `self.X =
+    <value>` prepended to the class's __init__ (synthesised if the class has
+    none). minipy has no class-object storage, so a class variable is modelled
+    as an ordinary instance attribute established at construction time. This is
+    faithful for the read-only-constant use (lookup tables, method-name sets)
+    that self-hosting relies on; it does not provide `ClassName.X` access, and
+    a mutated class variable would not be shared across instances (no such use
+    exists in the transpiler). Runs after _link_modules so any `mod.X` inside a
+    value has already been rewritten to its linked global.
+    """
+    classes = [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]
+    for node in classes:
+        attr_stmts = []
+        new_body = []
+        for item in node.body:
+            name = None
+            value = None
+            if isinstance(item, ast.Assign) and item.value is not None and \
+                    len(item.targets) == 1 and isinstance(item.targets[0], ast.Name):
+                name = item.targets[0].id
+                value = item.value
+            elif isinstance(item, ast.AnnAssign) and item.value is not None and \
+                    isinstance(item.target, ast.Name):
+                name = item.target.id
+                value = item.value
+            if name is not None:
+                st = ast.Assign(
+                    targets=[ast.Attribute(
+                        value=ast.Name(id="self", ctx=ast.Load()),
+                        attr=name, ctx=ast.Store())],
+                    value=value)
+                attr_stmts.append(st)
+                continue                      # drop the class-level assignment
+            new_body.append(item)
+        if not attr_stmts:
+            continue
+        node.body = new_body
+        init = None
+        for item in node.body:
+            if isinstance(item, ast.FunctionDef) and item.name == "__init__":
+                init = item
+                break
+        if init is None:
+            init = ast.FunctionDef(
+                name="__init__",
+                args=ast.arguments(
+                    posonlyargs=[], args=[ast.arg(arg="self")], vararg=None,
+                    kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[]),
+                body=[], decorator_list=[], returns=None)
+            node.body.insert(0, init)
+        insert_at = 0                          # keep a leading docstring first
+        if init.body and isinstance(init.body[0], ast.Expr) and \
+                isinstance(init.body[0].value, ast.Constant) and \
+                isinstance(init.body[0].value.value, str):
+            insert_at = 1
+        init.body[insert_at:insert_at] = attr_stmts
+        if not init.body:
+            init.body.append(ast.Pass())
+    ast.fix_missing_locations(tree)
+    return tree
+
+
 def compile_source(src, source_name="<module>"):
     tree = ast.parse(src, filename=source_name)
     # expose __file__ so programs that introspect their own path work (pathlib)
@@ -2666,6 +2730,7 @@ def compile_source(src, source_name="<module>"):
     tree = _link_modules(tree)               # inline supported library imports
     tree = _WithDesugar().visit(tree)        # with -> manager-protocol + try/finally
     tree = _StripOpenKwargs().visit(tree)    # open(..., encoding=..) -> open(..)
+    tree = _lower_class_attrs(tree)          # class variables -> self.X in __init__
     tree = _lift_closures(tree)              # nested funcs -> top-level + captures
     tree = _lift_nested_classes(tree)        # nested class methods capture locals
     ast.fix_missing_locations(tree)
