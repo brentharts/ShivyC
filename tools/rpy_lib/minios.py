@@ -166,11 +166,15 @@ class _Path:
     def exists(self, p):
         if _host_os is not None:
             return _host_os.path.exists(p)
+        if _native_exists is not None:
+            return _native_exists(p)
         return False
 
     def isfile(self, p):
         if _host_os is not None:
             return _host_os.path.isfile(p)
+        if _native_exists is not None:
+            return _native_exists(p)     # native: a path that exists is our file
         return False
 
     def isdir(self, p):
@@ -225,6 +229,8 @@ def walk(top):
 def makedirs(p, exist_ok=False):
     if _host_os is not None:
         _host_os.makedirs(p, exist_ok=exist_ok)
+    elif _native_makedirs is not None:
+        _native_makedirs(p)
     return None
 
 
