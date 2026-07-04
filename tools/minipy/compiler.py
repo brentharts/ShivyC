@@ -2492,6 +2492,144 @@ def _lift_closures(tree):
     return tree
 
 
+class _NameToSelfAttr(ast.NodeTransformer):
+    """Rewrite free Load references to captured names -> self._cap_<name>,
+    without descending into nested scopes (their names resolve elsewhere)."""
+    def __init__(self, caps):
+        self.caps = caps
+
+    def visit_FunctionDef(self, node):
+        return node
+
+    def visit_Lambda(self, node):
+        return node
+
+    def visit_ClassDef(self, node):
+        return node
+
+    def visit_Name(self, node):
+        if isinstance(node.ctx, ast.Load) and node.id in self.caps:
+            return ast.Attribute(
+                value=ast.Name(id="self", ctx=ast.Load()),
+                attr="_cap_" + node.id, ctx=ast.Load())
+        return node
+
+
+class _ClassConsRewriter(ast.NodeTransformer):
+    """Rewrite `C(...)` -> `C(capvals..., ...)` at a nested class's construction
+    sites, prepending the captured enclosing locals."""
+    def __init__(self, cname, cap_list):
+        self.cname = cname
+        self.cap_list = cap_list
+
+    def visit_FunctionDef(self, node):
+        return node
+
+    def visit_ClassDef(self, node):
+        return node
+
+    def visit_Call(self, node):
+        self.generic_visit(node)
+        if isinstance(node.func, ast.Name) and node.func.id == self.cname:
+            node.args = [ast.Name(id=c, ctx=ast.Load())
+                         for c in self.cap_list] + node.args
+        return node
+
+
+def _classes_nested_in(body, out):
+    """ClassDefs directly nested in body (through control-flow blocks, not into
+    nested def/class scopes)."""
+    for s in body:
+        if isinstance(s, ast.ClassDef):
+            out.append(s)
+        elif isinstance(s, (ast.FunctionDef, ast.ClassDef)):
+            pass
+        else:
+            for sub in _child_stmt_lists(s):
+                _classes_nested_in(sub, out)
+
+
+def _lift_nested_classes(tree):
+    """Thread an enclosing function's locals into a class defined inside it.
+
+    minipy compiles a class method as a plain function, so a method's reference
+    to an enclosing local resolves as a (missing) global and reads None. Here we
+    capture each such local as an instance attribute self._cap_<name>, set in a
+    synthesized or extended __init__, rewrite the method bodies to read it, and
+    rewrite the construction site `C(...)` to pass the current values. Captures
+    are read or mutated-in-place (dict/list/set), never rebound -- matching the
+    contract of _lift_closures. Runs after _lift_closures, when every function
+    that may contain such a class is already at module top level."""
+    module_globals = _module_bound_names(tree.body) | set(BUILTINS.keys())
+
+    def handle(enc):
+        enc_locals = set(_fn_paramnames(enc)) | set(_collect_locals(enc))
+        classes = []
+        _classes_nested_in(enc.body, classes)
+        for cls_node in classes:
+            _thread(cls_node, enc, enc_locals)
+
+    def _thread(cls_node, enc, enc_locals):
+        methods = [m for m in cls_node.body if isinstance(m, ast.FunctionDef)]
+        allcaps = set()
+        per = {}
+        for m in methods:
+            mbound = set(a.arg for a in m.args.args) | set(_collect_locals(m))
+            free = _loaded_names(m) - mbound
+            c = (free & enc_locals) - module_globals
+            c.discard("self")
+            per[m.name] = c
+            allcaps |= c
+        if not allcaps:
+            return
+        cap_list = sorted(allcaps)
+        # rewrite method bodies (except __init__) to read captures off self
+        for m in methods:
+            if m.name == "__init__":
+                continue
+            rw = _NameToSelfAttr(per[m.name])
+            m.body = [rw.visit(st) for st in m.body]
+        # build the capture-storing statements + params
+        store = []
+        for c in cap_list:
+            store.append(ast.Assign(
+                targets=[ast.Attribute(
+                    value=ast.Name(id="self", ctx=ast.Load()),
+                    attr="_cap_" + c, ctx=ast.Store())],
+                value=ast.Name(id="_arg_" + c, ctx=ast.Load())))
+        cap_args = [ast.arg(arg="_arg_" + c, annotation=None) for c in cap_list]
+        init = None
+        for m in methods:
+            if m.name == "__init__":
+                init = m
+        if init is None:
+            init = ast.FunctionDef(
+                name="__init__",
+                args=ast.arguments(
+                    posonlyargs=[],
+                    args=[ast.arg(arg="self", annotation=None)] + cap_args,
+                    vararg=None, kwonlyargs=[], kw_defaults=[],
+                    kwarg=None, defaults=[]),
+                body=store, decorator_list=[], returns=None)
+            cls_node.body.insert(0, init)
+        else:
+            init.args.args = init.args.args[:1] + cap_args + init.args.args[1:]
+            init.body = store + init.body
+        # pass the captured values at every construction site inside enc
+        cons = _ClassConsRewriter(cls_node.name, cap_list)
+        enc.body = [cons.visit(st) for st in enc.body]
+
+    for top in list(tree.body):
+        if isinstance(top, ast.FunctionDef):
+            handle(top)
+        elif isinstance(top, ast.ClassDef):
+            for s in list(top.body):
+                if isinstance(s, ast.FunctionDef):
+                    handle(s)
+    ast.fix_missing_locations(tree)
+    return tree
+
+
 def compile_source(src, source_name="<module>"):
     tree = ast.parse(src, filename=source_name)
     # expose __file__ so programs that introspect their own path work (pathlib)
@@ -2505,6 +2643,7 @@ def compile_source(src, source_name="<module>"):
     tree = _link_modules(tree)               # inline supported library imports
     tree = _WithDesugar().visit(tree)        # with -> manager-protocol + try/finally
     tree = _lift_closures(tree)              # nested funcs -> top-level + captures
+    tree = _lift_nested_classes(tree)        # nested class methods capture locals
     ast.fix_missing_locations(tree)
     c = Compiler()
     c._loops = []
@@ -2588,6 +2727,17 @@ class VM:
             import os as _realos
             self.globals[self.names.index("_host_os")] = _realos
         self._call(self.prog["entry"], [])
+        if self._exc_flag:
+            # surface an unhandled exception rather than returning silently
+            v = self._exc_val
+            desc = repr(v)
+            if isinstance(v, _Inst):
+                cn = self.prog["classes"][v.cid].get("cname", "?")
+                di = cn.rfind("$")
+                short = cn[di + 1:] if di >= 0 else cn
+                a = v.attrs.get("args", ())
+                desc = "%s%s" % (short, tuple(a) if a else "")
+            raise RuntimeError("minipy: unhandled exception: %s" % desc)
 
     def _call(self, fidx, args):
         fn = self.funcs[fidx]
