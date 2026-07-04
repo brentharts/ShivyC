@@ -856,7 +856,10 @@ def v_hash(key: "V") -> "long":
         i = 0
         n = len(s)
         while i < n:
-            h = h * 33 + ord(s[i])
+            # Mask to 57 bits each step so h*33 stays within signed long (no UB
+            # signed overflow -- which gcc -O2 miscompiles). Keeps h non-negative
+            # too, so the bucket index (h % cap) is well-defined.
+            h = (h * 33 + ord(s[i])) & 144115188075855871
             i = i + 1
         return h
     if t == 2:                         # float (consistent with int when integral)
@@ -1908,10 +1911,30 @@ def do_method(st: "St", mid: "long", args: "list[V]") -> "V":
     if mid == 106:             # set.add
         _set_add(st, recv, args[1])
         return v_none()
-    if mid == 110:             # startswith
-        return v_bool(1 if recv.sv.startswith(args[1].sv) else 0)
-    if mid == 111:             # endswith
-        return v_bool(1 if recv.sv.endswith(args[1].sv) else 0)
+    if mid == 110:             # startswith (str, or tuple/list of prefixes)
+        if args[1].tag == 10 or args[1].tag == 7:
+            pref = items_of(st, args[1])
+            pk = 0
+            while pk < len(pref):
+                if pref[pk].tag == 3 and recv.sv.startswith(pref[pk].sv):
+                    return v_bool(1)
+                pk = pk + 1
+            return v_bool(0)
+        if args[1].tag == 3:
+            return v_bool(1 if recv.sv.startswith(args[1].sv) else 0)
+        return v_bool(0)
+    if mid == 111:             # endswith (str, or tuple/list of suffixes)
+        if args[1].tag == 10 or args[1].tag == 7:
+            suf = items_of(st, args[1])
+            sk = 0
+            while sk < len(suf):
+                if suf[sk].tag == 3 and recv.sv.endswith(suf[sk].sv):
+                    return v_bool(1)
+                sk = sk + 1
+            return v_bool(0)
+        if args[1].tag == 3:
+            return v_bool(1 if recv.sv.endswith(args[1].sv) else 0)
+        return v_bool(0)
     if mid == 107:             # str.split([sep])
         s = recv.sv
         out = new_v_list()
@@ -2674,6 +2697,13 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
             _lset(regs, a, v_bool(v_eq_bool(_lget(regs, b), _lget(regs, c)))); pc = pc + 1
         elif op == 35:
             _lset(regs, a, v_bool(1 if v_eq_bool(_lget(regs, b), _lget(regs, c)) == 0 else 0)); pc = pc + 1
+        elif op == 59:                     # IS: tag-strict identity (1 is True -> 0)
+            ob = _lget(regs, b); oc = _lget(regs, c)
+            if ob.tag == oc.tag and v_eq_bool(ob, oc) == 1:
+                _lset(regs, a, v_bool(1))
+            else:
+                _lset(regs, a, v_bool(0))
+            pc = pc + 1
         elif op == 40:
             _lset(regs, a, v_neg(_lget(regs, b))); pc = pc + 1
         elif op == 41:

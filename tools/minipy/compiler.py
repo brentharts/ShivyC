@@ -86,6 +86,7 @@ OPS = {
     "BITOR":       27, "BITAND": 28, "BITXOR": 29,  # int bitwise / set ops
     # --- generic compare (30-39): reg[a] = reg[b] CMP reg[c] ---
     "LT":          30, "LE": 31, "GT": 32, "GE": 33, "EQ": 34, "NE": 35,
+    "IS":          59,                   # reg[a] = (reg[b] is reg[c]) tag-strict
     "SHL":         36, "SHR": 37,        # reg[a] = reg[b] << / >> reg[c]
     "SLICE":       38,                   # reg[a] = reg[a][lo:hi:step], (lo,hi,
                                          # step) = reg[b],reg[b+1],reg[b+2]
@@ -960,8 +961,7 @@ class Compiler:
             return jfs
         if isinstance(test, ast.Compare) and len(test.ops) == 1:
             opn = {ast.Lt: "JF_LT", ast.LtE: "JF_LE", ast.Gt: "JF_GT",
-                   ast.GtE: "JF_GE", ast.Eq: "JF_EQ", ast.NotEq: "JF_NE",
-                   ast.Is: "JF_EQ", ast.IsNot: "JF_NE"}.get(type(test.ops[0]))
+                   ast.GtE: "JF_GE", ast.Eq: "JF_EQ", ast.NotEq: "JF_NE"}.get(type(test.ops[0]))
             if opn is not None:
                 ra = self.expr(f, test.left)
                 rc = self.expr(f, test.comparators[0])
@@ -977,7 +977,7 @@ class Compiler:
     def _is_simple_cmp(test):
         return (isinstance(test, ast.Compare) and len(test.ops) == 1
                 and type(test.ops[0]) in (ast.Lt, ast.LtE, ast.Gt, ast.GtE,
-                                          ast.Eq, ast.NotEq, ast.Is, ast.IsNot))
+                                          ast.Eq, ast.NotEq))
 
     def _is_impl_name(self, node):
         # Matches the attribute chain `sys.implementation.name`.
@@ -1046,8 +1046,7 @@ class Compiler:
         # Mirror of _emit_branch_false; used for the rotated-loop back-edge.
         if isinstance(test, ast.Compare) and len(test.ops) == 1:
             opn = {ast.Lt: "JT_LT", ast.LtE: "JT_LE", ast.Gt: "JT_GT",
-                   ast.GtE: "JT_GE", ast.Eq: "JT_EQ", ast.NotEq: "JT_NE",
-                   ast.Is: "JT_EQ", ast.IsNot: "JT_NE"}.get(type(test.ops[0]))
+                   ast.GtE: "JT_GE", ast.Eq: "JT_EQ", ast.NotEq: "JT_NE"}.get(type(test.ops[0]))
             if opn is not None:
                 ra = self.expr(f, test.left)
                 rc = self.expr(f, test.comparators[0])
@@ -1582,11 +1581,22 @@ class Compiler:
                 f.emit("NOT", rx, rx)
             f.numreg.discard(rx)
             return rx
+        # identity: `x is y` / `x is not y` -- tag-strict, distinct from ==,
+        # so `1 is True` is False (unlike `1 == True`). py2c relies on this via
+        # `v is True`/`v is False` to tell a bool constant from the int 1/0.
+        if isinstance(op, (ast.Is, ast.IsNot)):
+            rb = self.expr(f, node.left)
+            rc = self.expr(f, node.comparators[0])
+            f.emit("IS", rb, rb, rc)
+            f.pop_to(rb + 1)
+            if isinstance(op, ast.IsNot):
+                f.emit("NOT", rb, rb)
+            f.numreg.discard(rb)
+            return rb
         rb = self.expr(f, node.left)
         rc = self.expr(f, node.comparators[0])
         name = {ast.Lt: "LT", ast.LtE: "LE", ast.Gt: "GT", ast.GtE: "GE",
-                ast.Eq: "EQ", ast.NotEq: "NE",
-                ast.Is: "EQ", ast.IsNot: "NE"}.get(type(op))
+                ast.Eq: "EQ", ast.NotEq: "NE"}.get(type(op))
         if name is None:
             raise CompileError("v0 compare: unsupported op %s" % type(op).__name__)
         numeric = rb in f.numreg and rc in f.numreg
@@ -2958,6 +2968,14 @@ class VM:
             elif op == 33: regs[a] = regs[b] >= regs[c]
             elif op == 34: regs[a] = regs[b] == regs[c]
             elif op == 35: regs[a] = regs[b] != regs[c]
+            elif op == 59:                                # IS: tag-strict identity
+                _isx = regs[b]; _isy = regs[c]
+                if type(_isx) is not type(_isy):
+                    regs[a] = False                       # e.g. 1 is True -> False
+                elif isinstance(_isx, (int, float, str, bool)) or _isx is None:
+                    regs[a] = (_isx == _isy)              # value identity for immutables
+                else:
+                    regs[a] = (_isx is _isy)              # object identity otherwise
             elif op == 40: regs[a] = -regs[b]
             elif op == 41: regs[a] = not regs[b]
             elif op == 60: regs[a] = regs[b] + regs[c]   # ADD_NN
