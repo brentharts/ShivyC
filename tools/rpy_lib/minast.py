@@ -632,15 +632,18 @@ def iter_child_nodes(node):
 
 
 def walk(node):
-    out = []
+    # BFS, matching CPython's ast.walk (deque + popleft): a node then its
+    # children in source order. A list + read index avoids the O(n^2) of
+    # pop(0); the earlier todo.pop() was a LIFO stack, which reversed sibling
+    # order and made field/discovery passes diverge from CPython.
     todo = [node]
-    while todo:
-        cur = todo.pop()
-        out.append(cur)
-        kids = iter_child_nodes(cur)
-        for k in kids:
+    i = 0
+    while i < len(todo):
+        cur = todo[i]
+        i = i + 1
+        for k in iter_child_nodes(cur):
             todo.append(k)
-    return out
+    return todo
 
 
 def copy_location(new_node, old_node):
