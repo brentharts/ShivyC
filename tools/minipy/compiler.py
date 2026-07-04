@@ -2630,6 +2630,19 @@ def _lift_nested_classes(tree):
     return tree
 
 
+class _StripOpenKwargs(ast.NodeTransformer):
+    """Drop encoding=/errors=/newline= (and any) keyword args from open() calls.
+    minipy files are byte/UTF-8 oriented, so these are no-ops; removing them
+    keeps open a clean positional call (path[, mode]) on both VMs -- the native
+    interp binds open as a builtin whose CALL path takes positional args only."""
+    def visit_Call(self, node):
+        self.generic_visit(node)
+        if isinstance(node.func, ast.Name) and node.func.id == "open" \
+                and node.keywords:
+            node.keywords = []
+        return node
+
+
 def compile_source(src, source_name="<module>"):
     tree = ast.parse(src, filename=source_name)
     # expose __file__ so programs that introspect their own path work (pathlib)
@@ -2642,11 +2655,13 @@ def compile_source(src, source_name="<module>"):
     tree.body.insert(0, fileassign)
     tree = _link_modules(tree)               # inline supported library imports
     tree = _WithDesugar().visit(tree)        # with -> manager-protocol + try/finally
+    tree = _StripOpenKwargs().visit(tree)    # open(..., encoding=..) -> open(..)
     tree = _lift_closures(tree)              # nested funcs -> top-level + captures
     tree = _lift_nested_classes(tree)        # nested class methods capture locals
     ast.fix_missing_locations(tree)
     c = Compiler()
     c._loops = []
+    c._finallys = []         # module-level try/finally + with needs this too
     # give every top-level def its locals before lowering its body
     for node in tree.body:
         if isinstance(node, ast.FunctionDef):

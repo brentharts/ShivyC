@@ -1453,6 +1453,74 @@ def const_to_v(prog: "Program", idx: "int") -> "V":
 
 
 # ---- builtins (ids 0-99) and methods (ids 100+) ----
+# ---- file objects (tag 16 / heap kind 8) ----
+# minipy has no persistent FILE* value, and py2c loses the C FILE* type when a
+# file is boxed into a generic container. So a file is modelled as a buffered
+# object: reads slurp the whole file at open, writes accumulate string chunks in
+# the heap cell and are flushed once on close. The actual C file I/O happens only
+# inside the two transient helpers below, which py2c compiles to fopen/fread/
+# fwrite/fclose. cursor: 0 = read, 1 = open-for-write, 2 = write flushed/closed.
+
+def _read_file_native(path: "char*") -> "char*":
+    return open(path).read()
+
+
+def _write_file_native(path: "char*", content: "char*") -> "int":
+    f = open(path, "w")
+    f.write(content)
+    f.close()
+    return 0
+
+
+def file_open(st: "St", args: "list[V]") -> "V":
+    path = args[0].sv
+    mode = "r"
+    if len(args) > 1:
+        mode = args[1].sv
+    is_write = 0
+    i = 0
+    while i < len(mode):
+        ch = mode[i]
+        if ch == "w" or ch == "a":
+            is_write = 1
+        i = i + 1
+    items = new_v_list()
+    items.append(v_str(path))
+    if is_write == 0:
+        items.append(v_str(_read_file_native(path)))
+    r = v_container(st, 16, 8, items)
+    st.heap[r.iv].cursor = is_write
+    return r
+
+
+def file_method(st: "St", nm: "char*", args: "list[V]") -> "V":
+    self_v = args[0]
+    c = st.heap[self_v.iv]
+    if nm == "read":
+        if len(c.items) > 1:
+            return c.items[1]
+        return v_str("")
+    if nm == "write":
+        if len(args) > 1:
+            c.items.append(args[1])
+        return v_none()
+    if nm == "close":
+        if c.cursor == 1:
+            joined = ""
+            k = 1
+            while k < len(c.items):
+                joined = joined + c.items[k].sv
+                k = k + 1
+            _write_file_native(c.items[0].sv, joined)
+            c.cursor = 2
+        return v_none()
+    if nm == "__enter__":
+        return self_v
+    if nm == "__exit__":
+        return file_method(st, "close", args)
+    return v_none()
+
+
 def do_builtin(st: "St", bid: "long", args: "list[V]") -> "V":
     if bid >= 100:
         return do_method(st, bid, args)
@@ -1701,6 +1769,8 @@ def do_builtin(st: "St", bid: "long", args: "list[V]") -> "V":
             if obj.tag == 12:
                 inst_set(st, obj, args[1].sv, args[2])
         return v_none()
+    if bid == 30:              # open -> buffered file object (tag 16)
+        return file_open(st, args)
     return v_none()
 
 
@@ -2454,6 +2524,8 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
             if recv.tag == 12:             # instance -> user method, no binding
                 fidx = mcache_lookup(st, recv.jitcode, c // 256, nm)
                 _lset(regs, a, run_func(st, fidx, callargs))
+            elif recv.tag == 16:           # file object -> buffered file method
+                _lset(regs, a, file_method(st, nm, callargs))
             else:                          # container/str -> builtin method
                 _lset(regs, a, do_builtin(st, method_id(nm), callargs))
             st.regpool.append(callargs)
@@ -2624,7 +2696,7 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
     return v_none()
 
 
-def interp_run(prog: "Program") -> "int":
+def interp_run(prog: "Program", sargs: "list[str]") -> "int":
     global _const_vs, _const_vs_ready
     setup_cache()
     _const_vs = new_v_list()               # materialize each constant once
@@ -2650,6 +2722,25 @@ def interp_run(prog: "Program") -> "int":
     while k < prog.nglobals:
         glob.append(v_none())
         k = k + 1
+    # expose sys.argv / sys.path to the interpreted program, mirroring the
+    # reference VM. The interp is run as `interp <bytecode> <prog args...>`, so
+    # the program's argv is a placeholder argv[0] followed by sys.argv[2:].
+    gi = 0
+    while gi < len(prog.names) and gi < len(glob):
+        nm = prog.names[gi]
+        if _strcmp(nm, "__argv__") == 0:
+            av = new_v_list()
+            av.append(v_str("minipy"))
+            ai = 0
+            while ai < len(sargs):
+                av.append(v_str(sargs[ai]))
+                ai = ai + 1
+            glob[gi] = v_container(st, 7, 0, av)
+        elif _strcmp(nm, "__syspath__") == 0:
+            glob[gi] = v_container(st, 7, 0, new_v_list())
+        elif _strcmp(nm, "open") == 0:
+            glob[gi] = v_builtin(30)            # do_builtin(30) -> file_open
+        gi = gi + 1
     run_func(st, prog.entry, new_v_list())
     return 0
 
@@ -2661,4 +2752,9 @@ def main() -> "int":
     src = open(sys.argv[1]).read()
     hook = rpy.json.generate_decoder(Program)
     prog = json.loads(src, object_hook=hook)
-    return interp_run(prog)
+    sargs = []
+    ai = 2
+    while ai < len(sys.argv):
+        sargs.append(sys.argv[ai])
+        ai = ai + 1
+    return interp_run(prog, sargs)
