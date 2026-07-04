@@ -14167,14 +14167,17 @@ def main(argv):
         return False
 
     _rwayland_notes = []
-    import rwayland_integration as _rwayland
-    files = _rwayland.bundle(files)
-    _rwayland_notes = _rwayland.emit_runtime(out_dir, files)
-    # PyQt-compatible layer: bundle rpy_lib/rpyqt.py and emit the same runtime
-    # (rpyqt binds it directly without importing the rwayland rpython module).
-    import rpyqt_integration as _rpyqt
-    files = _rpyqt.bundle(files)
-    _rwayland_notes += _rpyqt.emit_runtime(out_dir, files)
+    try:
+        import rwayland_integration as _rwayland
+        files = _rwayland.bundle(files)
+        _rwayland_notes = _rwayland.emit_runtime(out_dir, files)
+        # PyQt-compatible layer: bundle rpy_lib/rpyqt.py and emit the same runtime
+        # (rpyqt binds it directly without importing the rwayland rpython module).
+        import rpyqt_integration as _rpyqt
+        files = _rpyqt.bundle(files)
+        _rwayland_notes += _rpyqt.emit_runtime(out_dir, files)
+    except Exception:
+        pass                                  # optional integrations; absent on minipy
     # Profile-guided auto-typing. Single .py inputs go through transpile_file's
     # per-file hook (so the ShivyCX front end gets them too); multi-file programs
     # are profiled once here as a set (one run, module-qualified types) so cross
