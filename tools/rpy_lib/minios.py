@@ -98,26 +98,139 @@ class _Path:
                 return (p[0:dot_i], p[dot_i:len(p)])
         return (p, "")
 
+    def normpath(self, p):
+        # pure-string path normalization: collapse '', '.', and '..' segments.
+        if p == "":
+            return "."
+        rooted = p[0] == "/"
+        out = []
+        for seg in p.split("/"):
+            if seg == "" or seg == ".":
+                continue
+            if seg == "..":
+                if len(out) > 0 and out[len(out) - 1] != "..":
+                    out.pop()
+                elif not rooted:
+                    out.append(seg)
+            else:
+                out.append(seg)
+        res = "/".join(out)
+        if rooted:
+            res = "/" + res
+        if res == "":
+            return "/" if rooted else "."
+        return res
+
+    def relpath(self, p, start=None):
+        if start is None:
+            start = "."
+        pa = self.normpath(p).split("/")
+        sa = self.normpath(start).split("/")
+        i = 0
+        while i < len(pa) and i < len(sa) and pa[i] == sa[i]:
+            i = i + 1
+        ups = []
+        k = i
+        while k < len(sa):
+            ups.append("..")
+            k = k + 1
+        rest = pa[i:len(pa)]
+        parts = ups + rest
+        if len(parts) == 0:
+            return "."
+        return "/".join(parts)
+
+    def commonpath(self, paths):
+        if len(paths) == 0:
+            return ""
+        split = []
+        for p in paths:
+            split.append(self.normpath(p).split("/"))
+        first = split[0]
+        i = 0
+        common = []
+        while i < len(first):
+            seg = first[i]
+            same = True
+            for parts in split:
+                if i >= len(parts) or parts[i] != seg:
+                    same = False
+            if not same:
+                break
+            common.append(seg)
+            i = i + 1
+        return "/".join(common)
+
+    # No filesystem view on native minipy: predicates report absent. On the
+    # reference VM the injected host os answers them accurately.
+    def exists(self, p):
+        if _host_os is not None:
+            return _host_os.path.exists(p)
+        return False
+
+    def isfile(self, p):
+        if _host_os is not None:
+            return _host_os.path.isfile(p)
+        return False
+
+    def isdir(self, p):
+        if _host_os is not None:
+            return _host_os.path.isdir(p)
+        return False
+
 
 path = _Path()
+
+
+# minipy runs with no real environment. The transpiler only reads *optional*
+# feature-flag env vars (PY2C_*, RPY_PROFILE_*), so an environment that reports
+# every variable as unset makes it take the normal (feature-off) path -- exactly
+# what a clean, reproducible self-transpile wants.
+class _Environ:
+    def get(self, key, default=None):
+        return default
+
+    def __contains__(self, key):
+        return False
+
+
+environ = _Environ()
+
+
+def getenv(key, default=None):
+    return default
 
 
 # minipy runs without a real filesystem. The transpiler's cross-file scans (used
 # to resolve symbol collisions across a package) therefore see no sibling files,
 # which is correct for a single self-contained source: these return empty.
+#
+# On the reference VM (CPython-hosted), the interpreter injects the real `os`
+# module into the module-global `_host_os` (which is never assigned here, so the
+# injection survives module load). Native minipy leaves it unset (None), keeping
+# the no-filesystem behaviour. This lets a self-hosted transpile actually read
+# inputs and write its C outputs when run on the reference VM.
 def listdir(p):
+    if _host_os is not None:
+        return _host_os.listdir(p)
     return []
 
 
 def walk(top):
+    if _host_os is not None:
+        return list(_host_os.walk(top))
     return []                                 # list of (dir, subdirs, files)
 
 
 def makedirs(p, exist_ok=False):
+    if _host_os is not None:
+        _host_os.makedirs(p, exist_ok=exist_ok)
     return None
 
 
 def remove(p):
+    if _host_os is not None:
+        _host_os.remove(p)
     return None
 
 
