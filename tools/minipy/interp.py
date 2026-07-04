@@ -14,6 +14,7 @@ Opcode numbers and the builtin/method tables mirror minipy/compiler.py.
 import sys
 import json
 import rpy
+import os
 
 
 # ====================== JSON-decoded POD structs ======================
@@ -1241,6 +1242,43 @@ def instantiate(st: "St", classid: "int", args: "list[V]") -> "V":
     return inst
 
 
+def raise_attr_error(st: "St") -> "int":
+    # Attribute/method access on a value that has none -- e.g. a method call on
+    # an unbound name left by an unlinked `import X as m` (m is None). Set a
+    # catchable exception (matches `except Exception`), mirroring CPython's
+    # AttributeError, so guarded try/except blocks skip cleanly instead of the
+    # access silently yielding None. Mirrors the reference VM _raise_attr_error.
+    classes = st.prog.classes
+    cid = -1
+    fallback = -1
+    i = 0
+    while i < len(classes):
+        cn = classes[i].cname
+        di = len(cn) - 1
+        cut = -1
+        while di >= 0:
+            if cn[di] == "$":                  # strip link prefix ($mod$Name)
+                cut = di
+                di = -1
+            else:
+                di = di - 1
+        short = cn
+        if cut >= 0:
+            short = cn[cut + 1:len(cn)]
+        if _strcmp(short, "AttributeError") == 0:
+            cid = i
+        elif _strcmp(short, "Exception") == 0:
+            fallback = i
+        i = i + 1
+    use = cid
+    if use < 0:
+        use = fallback
+    if use >= 0:
+        st.exc_val = instantiate(st, use, new_v_list())
+    st.exc_flag = 1
+    return 0
+
+
 def method_id(name: "char*") -> "long":
     if name == "append":
         return 100
@@ -1771,6 +1809,14 @@ def do_builtin(st: "St", bid: "long", args: "list[V]") -> "V":
         return v_none()
     if bid == 30:              # open -> buffered file object (tag 16)
         return file_open(st, args)
+    if bid == 31:             # native os.path.exists (compiles to access())
+        if len(args) > 0 and args[0].tag == 3 and os.path.exists(args[0].sv):
+            return v_bool(1)
+        return v_bool(0)
+    if bid == 32:             # native os.makedirs (compiles to mkdir loop)
+        if len(args) > 0 and args[0].tag == 3:
+            os.makedirs(args[0].sv)
+        return v_none()
     return v_none()
 
 
@@ -2138,7 +2184,10 @@ def do_call(st: "St", callee: "V", args: "list[V]") -> "V":
         callargs.append(cont.items[0])
         for a in args:
             callargs.append(a)
-        r = do_builtin(st, cont.cursor, callargs)
+        if cont.items[0].tag == 16:        # bound file method: name in items[1]
+            r = file_method(st, cont.items[1].sv, callargs)
+        else:
+            r = do_builtin(st, cont.cursor, callargs)
         st.regpool.append(callargs)
         return r
     return v_none()
@@ -2487,6 +2536,9 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
                 if cut >= 0:
                     cn = cn[cut + 1:len(cn)]
                 _lset(regs, a, v_str(cn)); pc = pc + 1
+            elif ob.tag == 0:                  # attribute on None -> AttributeError
+                raise_attr_error(st)
+                _lset(regs, a, v_none()); pc = pc + 1
             else:
                 _lset(regs, a, inst_get(st, ob, nm)); pc = pc + 1
         elif op == 51:                     # STORE_ATTR
@@ -2500,6 +2552,12 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
             if obj.tag == 12:              # instance -> bound user method
                 fidx = lookup_method(st, st.heap[obj.iv].cursor, nm)
                 _lset(regs, a, V(14, obj.iv * _METH_SHIFT + fidx))   # packed, no alloc
+            elif obj.tag == 0:             # method on None -> AttributeError
+                raise_attr_error(st)
+                _lset(regs, a, v_none())
+            elif obj.tag == 16:            # file object -> bound file method
+                bargs = new_v_list(); bargs.append(obj); bargs.append(v_str(nm))
+                _lset(regs, a, v_container(st, 15, 7, bargs))   # name kept in items[1]
             else:                          # container/str -> bound builtin
                 bargs = new_v_list(); bargs.append(obj)
                 _lset(regs, a, v_container(st, 15, 7, bargs))
@@ -2526,6 +2584,9 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
                 _lset(regs, a, run_func(st, fidx, callargs))
             elif recv.tag == 16:           # file object -> buffered file method
                 _lset(regs, a, file_method(st, nm, callargs))
+            elif recv.tag == 0:            # method on None -> AttributeError
+                raise_attr_error(st)
+                _lset(regs, a, v_none())
             else:                          # container/str -> builtin method
                 _lset(regs, a, do_builtin(st, method_id(nm), callargs))
             st.regpool.append(callargs)
@@ -2740,8 +2801,30 @@ def interp_run(prog: "Program", sargs: "list[str]") -> "int":
             glob[gi] = v_container(st, 7, 0, new_v_list())
         elif _strcmp(nm, "open") == 0:
             glob[gi] = v_builtin(30)            # do_builtin(30) -> file_open
+        elif _strcmp(nm, "_native_exists") == 0:
+            glob[gi] = v_builtin(31)            # minios exists/isfile fallback
+        elif _strcmp(nm, "_native_makedirs") == 0:
+            glob[gi] = v_builtin(32)            # minios makedirs fallback
         gi = gi + 1
     run_func(st, prog.entry, new_v_list())
+    if st.exc_flag != 0:                        # top-level unhandled exception
+        ev = st.exc_val
+        desc = "exception"
+        if ev.tag == 12:
+            cn = st.prog.classes[st.heap[ev.iv].cursor].cname
+            di = len(cn) - 1
+            cut = -1
+            while di >= 0:
+                if cn[di] == "$":
+                    cut = di
+                    di = -1
+                else:
+                    di = di - 1
+            if cut >= 0:
+                cn = cn[cut + 1:len(cn)]
+            desc = cn
+        print("minipy: unhandled exception: " + desc)
+        return 1
     return 0
 
 
