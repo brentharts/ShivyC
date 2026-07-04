@@ -6242,7 +6242,14 @@ class Transpiler:
             pct = [arg_ctype(m, a) for a in m.args.args[1:]]
             cargs = self.coerce_args(pct, arg_nodes, self.defaults_for(m, True))
             ret = self._c_ret(m)
-            self.used_xmethods[(ci.name, mname)] = ret
+            # Ambiguous class names (e.g. minire.Pattern and test_minire.Pattern
+            # both `Pattern`) must be externed per module-qualified csym; keying
+            # by bare name collides and would leave one call site undeclared
+            # (gcc then assumes int -> obj/int type errors).
+            if ci.name in self.ambiguous and ci.name not in self.classes:
+                self.used_xmethods_csym[(ci.csym, mname)] = ret
+            else:
+                self.used_xmethods[(ci.name, mname)] = ret
             self._ref_xclass(ci, body=True, typeinfo=True)
             call = "%s_%s((Obj*)AS_OBJ(_d)%s)" % (
                 ci.csym, mname, (", " + ", ".join(cargs)) if cargs else "")
@@ -7650,6 +7657,13 @@ class Transpiler:
         if ct == "char*":
             return "AS_STR(%s)" % expr
         if ct.endswith("*") and ct != OBJ:
+            cls = ct[:-1]
+            lci = self.classes.get(cls)
+            if lci is not None and getattr(lci, "csym", cls) != cls:
+                ct = lci.csym + "*"              # local class: module csym
+            elif cls in self.xclasses and cls not in self.classes:
+                self.xstructs_needed.add(cls)   # cast needs its forward struct
+                ct = self.xcsym(cls) + "*"       # qualify csym (matches decl)
             return "(%s)AS_OBJ(%s)" % (ct, expr)
         return expr
 
@@ -12403,7 +12417,8 @@ class Transpiler:
                 if cls in self.xclasses:
                     self.xstructs_needed.add(cls)
                 ci = self.classes.get(cls) or \
-                    (self.xclasses[cls][0] if cls in self.xclasses else None)
+                    (self.xclasses[cls][0] if cls in self.xclasses else None) or \
+                    self._ci_by_csym(cls)   # bt may be a module-qualified csym
                 if ci:
                     return ci.field_ctype(tgt.attr)
             if self.is_obj_word(tgt.value) or bt == OBJ:
@@ -12467,6 +12482,9 @@ class Transpiler:
                         self._load_xclass_anywhere(_tc)
                         if _tc in self.xclasses:
                             self.xstructs_needed.add(_tc)
+                            # qualify to the module csym so the cast names the
+                            # same struct the forward typedef/declaration use.
+                            target = self.xcsym(_tc) + "*"
                 return "(%s)AS_OBJ(%s)" % (target, rendered)
             if vt and vt.endswith("*") and vt != OBJ:
                 return "(%s)(%s)" % (target, rendered)   # base/derived cast
