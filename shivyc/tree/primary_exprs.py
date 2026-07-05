@@ -120,7 +120,7 @@ class String(_LExprNode):
     """
 
     def __init__(self, chars, wide=False):
-        """Initialize Node.
+        """Initialize CNode.
 
         wide - True for an L"..." literal, whose elements are wchar_t (int).
         """
@@ -172,7 +172,7 @@ class Identifier(_LExprNode):
         return super().make_il_raw(il_code, symbol_table, c)
 
 
-class ParenExpr(general_nodes.Node):
+class ParenExpr(general_nodes.CNode):
     """Expression in parentheses.
 
     This is implemented a bit hackily. Rather than being an LExprNode or

@@ -6,7 +6,7 @@ package level.
 """
 
 # Base classes
-from shivyc.tree.base_nodes import Node
+from shivyc.tree.base_nodes import CNode
 
 # Control flow statements
 from shivyc.tree.control_flow_nodes import (
@@ -71,7 +71,7 @@ from shivyc.tree.call_exprs import (
 # Expose all public classes in __all__
 __all__ = [
     # Base classes
-    'Node',
+    'CNode',
 
     # Control flow statements
     'Return', 'Break', 'Continue',

@@ -1,11 +1,11 @@
 """Base classes for expression nodes in the AST."""
 
 from shivyc.ctypes import PointerCType
-from shivyc.tree.base_nodes import Node
+from shivyc.tree.base_nodes import CNode
 from shivyc.tree.utils import set_type
 
 
-class _ExprNode(Node):
+class _ExprNode(CNode):
     """Base class for representing expression nodes in the AST.
 
     There are two types of expression nodes, RExprNode and LExprNode.
@@ -52,7 +52,7 @@ class _RExprNode(_ExprNode):
     An RExprNode-derived node implements only the _make_il function.
     """
     def __init__(self):  # noqa D102
-        Node.__init__(self)
+        CNode.__init__(self)
 
     def make_il(self, il_code, symbol_table, c):  # noqa D102
         raise NotImplementedError

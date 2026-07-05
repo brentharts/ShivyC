@@ -1,7 +1,7 @@
 """Base classes for AST nodes."""
 
 
-class Node:
+class CNode:
     """Base class for representing a single node in the AST.
 
     All AST nodes inherit from this class.

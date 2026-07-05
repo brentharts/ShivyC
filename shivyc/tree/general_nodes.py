@@ -11,11 +11,11 @@ from shivyc.ctypes import (PointerCType, ArrayCType, FunctionCType,
                            StructCType, UnionCType)
 from shivyc.errors import CompilerError, error_collector
 from shivyc.il_gen import ILValue
-from shivyc.tree.base_nodes import Node
+from shivyc.tree.base_nodes import CNode
 from shivyc.tree.utils import DirectLValue, report_err
 
 
-class Root(Node):
+class Root(CNode):
     """Root node of the program."""
 
     def __init__(self, nodes):
@@ -31,8 +31,8 @@ class Root(Node):
                 node.make_il(il_code, symbol_table, c)
 
 
-class Compound(Node):
-    """Node for a compound statement."""
+class Compound(CNode):
+    """CNode for a compound statement."""
 
     def __init__(self, items):
         """Initialize node."""
@@ -58,8 +58,8 @@ class Compound(Node):
             symbol_table.end_scope()
 
 
-class EmptyStatement(Node):
-    """Node for a statement which is just a semicolon."""
+class EmptyStatement(CNode):
+    """CNode for a statement which is just a semicolon."""
 
     def __init__(self):
         """Initialize node."""
@@ -70,8 +70,8 @@ class EmptyStatement(Node):
         pass
 
 
-class ExprStatement(Node):
-    """Node for a statement which contains one expression."""
+class ExprStatement(CNode):
+    """CNode for a statement which contains one expression."""
 
     def __init__(self, expr):
         """Initialize node."""
@@ -84,13 +84,13 @@ class ExprStatement(Node):
 
     def stmt_expr_value(self, il_code, symbol_table, c):
         """Value of a statement expression ending in this statement: the
-        contained expression's value (see Node.stmt_expr_value). `self.expr` is
+        contained expression's value (see CNode.stmt_expr_value). `self.expr` is
         a direct field read here because `self` is statically typed."""
         return self.expr.make_il(il_code, symbol_table, c)
 
 
-class InlineAsm(Node):
-    """Node for a (narrow subset of) GCC inline assembly statement.
+class InlineAsm(CNode):
+    """CNode for a (narrow subset of) GCC inline assembly statement.
 
     template - the assembly template string
     outputs / inputs - lists of (constraint_str, expression node)
@@ -971,11 +971,11 @@ class DeclInfo:
         return storage
 
 
-class Declaration(Node):
+class Declaration(CNode):
     """Line of a general variable declaration(s).
 
     node (decl_nodes.Root) - a declaration tree for this line
-    body (Compound(Node)) - if this is a function definition, the body of
+    body (Compound(CNode)) - if this is a function definition, the body of
     the function
     """
 
@@ -1055,7 +1055,7 @@ class Declaration(Node):
 
         Return a `ctype, identifier token` tuple.
 
-        decl - Node of decl_nodes to parse. See decl_nodes.py for explanation
+        decl - CNode of decl_nodes to parse. See decl_nodes.py for explanation
         about decl_nodes.
         prev_ctype - The ctype formed from all parts of the tree above the
         current one.

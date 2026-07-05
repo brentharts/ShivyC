@@ -4,12 +4,12 @@ import shivyc.il_cmds.control as control_cmds
 from shivyc.errors import CompilerError
 from shivyc.tokens import Token
 from shivyc.il_gen import ILValue
-from shivyc.tree.base_nodes import Node
+from shivyc.tree.base_nodes import CNode
 from shivyc.tree.utils import report_err, set_type, check_cast
 
 
-class Return(Node):
-    """Node for a return statement."""
+class Return(CNode):
+    """CNode for a return statement."""
 
     def __init__(self, return_value):
         """Initialize node."""
@@ -44,8 +44,8 @@ class Return(Node):
             il_code.add(control_cmds.Return())
 
 
-class _BreakContinue(Node):
-    """Node for a break or continue statement."""
+class _BreakContinue(CNode):
+    """CNode for a break or continue statement."""
 
     # "break" if this is a break statement, or "continue" if this is a
     # continue statement
@@ -76,7 +76,7 @@ class _BreakContinue(Node):
 
 
 class Break(_BreakContinue):
-    """Node for a break statement."""
+    """CNode for a break statement."""
 
     descrip = "break"
 
@@ -85,7 +85,7 @@ class Break(_BreakContinue):
 
 
 class Continue(_BreakContinue):
-    """Node for a continue statement."""
+    """CNode for a continue statement."""
 
     descrip = "continue"
 
@@ -93,8 +93,8 @@ class Continue(_BreakContinue):
         return c.continue_label
 
 
-class IfStatement(Node):
-    """Node for an if-statement.
+class IfStatement(CNode):
+    """CNode for an if-statement.
 
     cond - Conditional expression of the if-statement.
     stat - Body of the if-statement.
@@ -132,8 +132,8 @@ class IfStatement(Node):
             il_code.add(control_cmds.Label(endif_label))
 
 
-class WhileStatement(Node):
-    """Node for a while statement.
+class WhileStatement(CNode):
+    """CNode for a while statement.
 
     cond - Conditional expression of the while-statement.
     stat - Body of the while-statement.
@@ -165,8 +165,8 @@ class WhileStatement(Node):
         il_code.add(control_cmds.Label(end))
 
 
-class ForStatement(Node):
-    """Node for a for statement.
+class ForStatement(CNode):
+    """CNode for a for statement.
 
     first - First clause of the for-statement, or None if not provided.
     second - Second clause of the for-statement, or None if not provided.
@@ -214,8 +214,8 @@ class ForStatement(Node):
         symbol_table.end_scope()
 
 
-class DoWhileStatement(Node):
-    """Node for a do-while statement.
+class DoWhileStatement(CNode):
+    """CNode for a do-while statement.
 
     cond - Conditional expression checked after each iteration.
     stat - Body of the loop, executed at least once.
@@ -257,8 +257,8 @@ class _SwitchCollector:
         self.default = None  # label or None
 
 
-class SwitchStatement(Node):
-    """Node for a switch statement.
+class SwitchStatement(CNode):
+    """CNode for a switch statement.
 
     cond - the controlling expression.
     stat - the switch body.
@@ -313,8 +313,8 @@ class SwitchStatement(Node):
         il_code.add(control_cmds.Label(end))
 
 
-class CaseStatement(Node):
-    """Node for a `case CONST:` labeled statement."""
+class CaseStatement(CNode):
+    """CNode for a `case CONST:` labeled statement."""
 
     def __init__(self, expr, stat):
         """Initialize node."""
@@ -337,8 +337,8 @@ class CaseStatement(Node):
         self.stat.make_il(il_code, symbol_table, c)
 
 
-class DefaultStatement(Node):
-    """Node for a `default:` labeled statement."""
+class DefaultStatement(CNode):
+    """CNode for a `default:` labeled statement."""
 
     def __init__(self, stat):
         """Initialize node."""
@@ -356,8 +356,8 @@ class DefaultStatement(Node):
         self.stat.make_il(il_code, symbol_table, c)
 
 
-class LabelStatement(Node):
-    """Node for a labeled statement: `name: STMT`."""
+class LabelStatement(CNode):
+    """CNode for a labeled statement: `name: STMT`."""
 
     def __init__(self, name: "Token", stat):
         """Initialize node. `name` is the label identifier token."""
@@ -377,8 +377,8 @@ class LabelStatement(Node):
         self.stat.make_il(il_code, symbol_table, c)
 
 
-class GotoStatement(Node):
-    """Node for a `goto name;` statement."""
+class GotoStatement(CNode):
+    """CNode for a `goto name;` statement."""
 
     def __init__(self, name: "Token"):
         """Initialize node. `name` is the target label identifier token."""
