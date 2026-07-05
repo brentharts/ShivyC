@@ -3911,9 +3911,12 @@ def pod_csyms(tree, order, pod_enabled, extra_subclassed=None):
 def class_csym(name, modname, ambiguous):
     """C base symbol for class `name` defined in `modname`: bare when unique
     across the package, else module-qualified so collisions get distinct
-    symbols."""
+    symbols. The qualifier uses the module's LAST path component (as func_csym
+    does), so a defining module and its importers agree on the symbol whether
+    the module is named bare (`asm_cmds`, a top-level self-transpile) or
+    package-qualified (`shivyc.asm_cmds`, how siblings import it)."""
     if name in ambiguous and modname:
-        return "%s__%s" % (c_mod_slug(modname), name)
+        return "%s__%s" % (c_mod_slug(modname.split(".")[-1]), name)
     return name
 
 
@@ -4352,6 +4355,9 @@ class Transpiler:
         self.modules = set()
         self._regex_ids = {}        # pattern string -> matcher id (per module)
         self._regex_parsed = {}     # id -> parsed pattern struct
+        self._regex_vars = set()    # names bound to re.compile(const) (a matcher id)
+        self._regex_match_vars = set()  # names bound to a .search()/.match() result
+        self._regex_list_vars = set()   # names bound to a list of re.compile(const)
         self._ossys_used = False    # os.path/sys shim referenced
         self._struct_used = False    # struct.pack/unpack shim referenced
         self._json_used = False     # typed-json lexer prelude referenced
@@ -4654,6 +4660,48 @@ class Transpiler:
                     and _n.args and isinstance(_n.args[0], ast.Constant) \
                     and isinstance(_n.args[0].value, str):
                 self._re_intern(_n.args[0].value)
+        # Track names bound to a compiled pattern (`X = re.compile(const)`) and
+        # to a match result (`m = X.search(...)` / `m = re.search(const, ...)`).
+        # Their `.search`/`.match`/`.group` calls must lower to the generated
+        # matcher even though newer regex modules (minire/test_minire) also
+        # define classes with those method names -- otherwise the compiler's own
+        # regex use links against a regex module that isn't in the bootstrap.
+        def _is_re_compile(v):
+            return isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute) \
+                and isinstance(v.func.value, ast.Name) \
+                and v.func.value.id == "re" and v.func.attr == "compile"
+        for _n in ast.walk(tree):
+            if isinstance(_n, ast.Assign) and len(_n.targets) == 1 and \
+                    isinstance(_n.targets[0], ast.Name) and _is_re_compile(_n.value):
+                self._regex_vars.add(_n.targets[0].id)
+        for _n in ast.walk(tree):
+            if isinstance(_n, ast.Assign) and len(_n.targets) == 1 and \
+                    isinstance(_n.targets[0], ast.Name) and \
+                    isinstance(_n.value, ast.Call) and \
+                    isinstance(_n.value.func, ast.Attribute) and \
+                    _n.value.func.attr in ("search", "match") and \
+                    isinstance(_n.value.func.value, ast.Name) and \
+                    (_n.value.func.value.id in self._regex_vars or
+                     _n.value.func.value.id == "re"):
+                self._regex_match_vars.add(_n.targets[0].id)
+        # a list literal of compiled patterns (`_HOT_RE = [re.compile(...), ...]`)
+        # and the loop/comprehension variable that iterates it -- so
+        # `p.search(...)` for `p in _HOT_RE` also lowers to the matcher.
+        for _n in ast.walk(tree):
+            if isinstance(_n, ast.Assign) and len(_n.targets) == 1 and \
+                    isinstance(_n.targets[0], ast.Name) and \
+                    isinstance(_n.value, ast.List) and _n.value.elts and \
+                    all(_is_re_compile(e) for e in _n.value.elts):
+                self._regex_list_vars.add(_n.targets[0].id)
+        for _n in ast.walk(tree):
+            _it = _tgt = None
+            if isinstance(_n, ast.comprehension):
+                _it, _tgt = _n.iter, _n.target
+            elif isinstance(_n, ast.For):
+                _it, _tgt = _n.iter, _n.target
+            if isinstance(_it, ast.Name) and _it.id in self._regex_list_vars \
+                    and isinstance(_tgt, ast.Name):
+                self._regex_vars.add(_tgt.id)
         self._scan_ctypes(tree)
         # cross-module class registry: clsname -> (ClassInfo, modname)
         self.xclasses = {}
@@ -6748,6 +6796,17 @@ class Transpiler:
 
     # ---- struct emission -------------------------------------------------
 
+    def _project_subclassed_cached(self):
+        """Cached _project_subclassed(): a global 'is this class a base anywhere'
+        test. Local _class_is_leaf only sees this module's own and imported
+        classes, so a root like Node (subclassed only in sibling modules) looks
+        leaf here; this guards against devirtualizing such a class."""
+        c = self.__dict__.get("_proj_subclassed_cache")
+        if c is None:
+            c = self._project_subclassed()
+            self.__dict__["_proj_subclassed_cache"] = c
+        return c
+
     def _project_subclassed(self):
         """Set of bare class names that are used as a base anywhere in the
         project (so they must not be POD; see _compute_pod_set)."""
@@ -7299,6 +7358,57 @@ class Transpiler:
         self.emit("}")
         self.emit()
 
+    def _vtable_slot_fn(self, m, owner):
+        """Function pointer for a TypeInfo's `m` slot. Normally owner.csym_<m>,
+        but when that impl declares MORE positional params than the (canonical,
+        narrower) slot -- an override with extra defaulted args, e.g.
+        Compound.make_il's `no_scope=False` -- the raw 4-arg function can't sit
+        in a 3-arg slot (virtual calls would leave the extra arg uninitialized
+        and read stack garbage). Emit a thunk matching the slot that forwards to
+        the impl, supplying the missing args' defaults, and use it instead.
+        Direct calls that pass the extra arg still call the impl directly."""
+        base = "%s_%s" % (owner.csym, method_cname(m))
+        impl = owner.methods.get(m)
+        if impl is None or owner.name not in self.classes:
+            return base                     # imported impl: keep the extern name
+        _, slot_pct, _ = self.method_proto(m)
+        pos = impl.args.args[1:]
+        if len(pos) <= len(slot_pct):
+            return base
+        # Only forward through a thunk when the impl's leading params match the
+        # slot's types (a genuine extra-optional-arg override). If they differ
+        # -- `m` is ambiguous across UNRELATED classes and the canonical slot
+        # belongs to a sibling with different param types (e.g. DeclInfo.
+        # get_storage's `int defined` vs Declaration's) -- a thunk would pass
+        # mismatched types; leave the raw impl in the slot (it is only ever
+        # reached by direct dispatch anyway).
+        impl_narrowed = self._method_proto_params(impl)
+        if impl_narrowed[:len(slot_pct)] != list(slot_pct):
+            return base
+        ad = "%s__vtad" % base
+        emitted = self.__dict__.setdefault("_emitted_vtads", set())
+        if ad not in emitted:
+            emitted.add(ad)
+            ret = self._c_ret(impl)
+            names = self._canon_vtable_param_names(impl, len(slot_pct))
+            params = ["Obj* self"]
+            for i in range(len(slot_pct)):
+                params.append("%s %s" % (self.ctype_csym(slot_pct[i]),
+                                         cname(names[i])))
+            callargs = ["self"] + [cname(n) for n in names]
+            defs = self.defaults_for(impl, True)
+            for i in range(len(slot_pct), len(pos)):
+                dnode = defs[i] if i < len(defs) else None
+                pct = self.arg_ctype_q(impl, pos[i])
+                if isinstance(dnode, ast.Constant):
+                    callargs.append(self.coerce_to(pct, dnode, self.expr(dnode)))
+                else:
+                    callargs.append("OBJ_NONE")
+            self.emit("%s %s(%s) {" % (ret, ad, ", ".join(params)))
+            self.emit("    return %s(%s);" % (base, ", ".join(callargs)))
+            self.emit("}")
+        return ad
+
     def emit_vtable(self, ci):
         if ci.csym in self._pod_set:
             return                          # POD class: no TypeInfo / vtable
@@ -7314,7 +7424,7 @@ class Transpiler:
             owner = ci.find_method_owner(m)
             if owner and owner.name not in self.classes:  # imported impl
                 self.xvtable_impls.add((owner.name, m))
-            slots.append(".%s = %s" % (vslot_name(m), ("%s_%s" % (owner.csym, method_cname(m)))
+            slots.append(".%s = %s" % (vslot_name(m), self._vtable_slot_fn(m, owner)
                                        if owner else "NULL"))
         str_owner = ci.find_method_owner("__str__")
         if str_owner and "__str__" not in str_owner.static_methods:
@@ -11520,6 +11630,30 @@ class Transpiler:
                 (", " + ", ".join(argstrs)) if argstrs else "")
 
         if isinstance(func, ast.Attribute):
+            # A receiver known to hold a compiled pattern (`_RE = re.compile(...)`)
+            # or a match result must lower `.search`/`.match`/`.group` to the
+            # generated translation-time matcher, taking priority over any regex
+            # module (minire/test_minire) whose Pattern/Match classes share those
+            # method names -- those modules aren't part of the bootstrap link.
+            if self._regex_ids and isinstance(func.value, ast.Name) and (
+                    func.value.id in self._regex_vars or
+                    func.value.id in self._regex_match_vars):
+                if func.attr in ("search", "match") and len(node.args) == 1:
+                    anc = "1" if func.attr == "match" else "0"
+                    txt = self.coerce_to("char*", node.args[0],
+                                         self.expr(node.args[0]))
+                    return "_re_search(AS_INT(%s), %s, %s)" % (
+                        self.wrap_obj(func.value), txt, anc)
+                if func.attr == "group":
+                    if not node.args:
+                        gi = "0"
+                    elif isinstance(node.args[0], ast.Constant) and \
+                            isinstance(node.args[0].value, int):
+                        gi = str(node.args[0].value)
+                    else:
+                        gi = self.coerce_to("int", node.args[0],
+                                            self.expr(node.args[0]))
+                    return "index_obj(%s, %s)" % (self.wrap_obj(func.value), gi)
             # float.fromhex("0x1.8p3") -- C's strtod parses hex float literals.
             if func.attr == "fromhex" and isinstance(func.value, ast.Name) \
                     and func.value.id == "float" and node.args:
@@ -11982,9 +12116,17 @@ class Transpiler:
                     return self._emit_call_obj(fld, wargs)
             # translation-time regex methods on a compiled-pattern obj (an
             # OBJ_INT id) or a match obj (a list). Active only when at least one
-            # static pattern compiled, and never shadows a real ShivyCX method.
-            if self._regex_ids and func.attr not in self.method_owners \
-                    and func.attr not in self.xmethod_owners:
+            # static pattern compiled. A receiver KNOWN to hold a compiled
+            # pattern or a match result takes this path unconditionally (so the
+            # compiler's own `_RE.search(...).group(...)` never binds to a regex
+            # module's Pattern/Match methods); any other receiver keeps the
+            # conservative guard so a real ShivyCX `.search`/`.group` isn't shadowed.
+            _re_recv = isinstance(func.value, ast.Name) and (
+                func.value.id in self._regex_vars or
+                func.value.id in self._regex_match_vars)
+            if self._regex_ids and (_re_recv or (
+                    func.attr not in self.method_owners
+                    and func.attr not in self.xmethod_owners)):
                 if func.attr in ("search", "match") and len(node.args) == 1:
                     anc = "1" if func.attr == "match" else "0"
                     txt = self.coerce_to("char*", node.args[0],
@@ -12229,20 +12371,39 @@ class Transpiler:
     def vcall(self, recv_node, meth, arg_nodes):
         # POD class instance -> static dispatch (direct call, no vtable).
         rct = self.value_ctype(recv_node)
+        concrete_ci = None
         if isinstance(rct, str) and rct.endswith("*"):
             cls = rct[:-1]
-            ci = self.classes.get(cls) or next(
+            concrete_ci = self.classes.get(cls) or next(
                 (c for c in self.classes.values() if c.csym == cls), None)
-            if ci is not None and ci.csym in self._pod_set and \
-                    meth in ci.methods:
-                fn = ci.methods[meth]
+            if concrete_ci is not None and concrete_ci.csym in self._pod_set \
+                    and meth in concrete_ci.methods:
+                fn = concrete_ci.methods[meth]
                 pct = [self.arg_ctype_q(fn, a) for a in fn.args.args[1:]]
                 defs = self.defaults_for(fn, True)
                 cargs = self.coerce_args(pct, arg_nodes, defs)
                 recv = self.expr(recv_node)
-                return "%s_%s(%s)" % (ci.csym, method_cname(meth),
+                return "%s_%s(%s)" % (concrete_ci.csym, method_cname(meth),
                                       ", ".join([recv] + cargs))
         _, pct, fndef = self.method_proto(meth)
+        # `meth` ambiguous across UNRELATED classes with different arities (e.g.
+        # DeclInfo.get_storage/3 vs Declaration.get_storage/2): the global proto
+        # picked above can be the wrong overload, and there is no shared vtable
+        # slot to index. When the receiver's own concrete (leaf) class defines
+        # `meth` with a different parameter count, dispatch straight to it --
+        # otherwise the call degrades to a runtime by-name lookup the receiver's
+        # type doesn't answer, and crashes.
+        if concrete_ci is not None and meth in concrete_ci.methods and \
+                self._class_is_leaf(concrete_ci.name) and \
+                concrete_ci.name not in self._project_subclassed_cached():
+            own = concrete_ci.methods[meth]
+            if len(own.args.args) - 1 != len(pct):
+                ownpct = [self.arg_ctype_q(own, a) for a in own.args.args[1:]]
+                defs = self.defaults_for(own, True)
+                cargs = self.coerce_args(ownpct, arg_nodes, defs)
+                recv = self.expr(recv_node)
+                return "%s_%s(%s)" % (concrete_ci.csym, method_cname(meth),
+                                      ", ".join([recv] + cargs))
         if self.stdlib_root:
             return self._mp_method_call_args(recv_node, meth, arg_nodes, fndef)
         if self._method_has_varargs(fndef) or len(arg_nodes) > len(pct):

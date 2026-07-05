@@ -675,6 +675,16 @@ def cmd_compiler(build_root, args):
     entry = ['#include "shivyc_rt.h"', ""]
     entry += ["void %s(void);" % s for s in inits]
     entry.append("obj shivyc_pymain(int argc, char** argv);")
+    # Link stub for the optional internal ELF assembler. main.py reaches
+    # rasm_obj.assemble_to_elf only under SHIVYC_RASM -- a runtime-only path that
+    # dynamically imports tools/rpy_lib/rasm_obj via sys.path. That module isn't
+    # part of the native compiler, so the path cannot run in the bootstrapped
+    # binary; define the symbol so the (never-taken) reference resolves.
+    entry.append("obj assemble_to_elf(char* _s);")
+    entry.append(
+        "obj assemble_to_elf(char* _s) { (void)_s; "
+        "fputs(\"SHIVYC_RASM is unavailable in the bootstrap compiler\\n\", "
+        "stderr); abort(); }")
     entry.append("int main(int argc, char** argv) {")
     entry += ["    %s();" % s for s in inits]
     entry.append("    obj rc = shivyc_pymain(argc, argv);")
