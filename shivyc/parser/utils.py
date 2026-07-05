@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 
 from shivyc.errors import CompilerError, Range
-from shivyc.tree.base_nodes import Node
+from shivyc.tree.base_nodes import CNode
 
 
 # This is a little bit messy, but worth the repetition it saves. In the
@@ -267,7 +267,7 @@ def add_range(parse_func):
         # store rather than a dynamic setattr (which it cannot self-host).
         # Under CPython `from __future__ import annotations` makes the
         # annotation an inert string, so this is exactly `node.r = ...`.
-        ranged: "Node" = node
+        ranged: "CNode" = node
         ranged.r = token_range(start_index, end_index)
 
         return node, end_index
