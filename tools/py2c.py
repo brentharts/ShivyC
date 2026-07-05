@@ -6142,6 +6142,47 @@ class Transpiler:
         reg = self.load_xmod(mod)
         return mod if reg and attr in reg["vt"] else None
 
+    def resolve_project_xvirtual(self, attr):
+        """Canonical vtable module for a polymorphic method `attr` whose
+        hierarchy is NOT dispatchable via the imported paths (its owners span
+        modules, or its hierarchy root isn't imported here) -- e.g.
+        general_nodes calls `expr.lvalue()` / `._lvalue()` on expr nodes it
+        neither constructs nor imports. Runs only after resolve_xmethod_owner
+        and resolve_xvirtual have both declined, so it is safe to consult the
+        project-wide scan: resolve the hierarchy root, and dispatch a received
+        instance through the root module's canonical vtable exactly as an
+        importing module would. Returns that module, or None."""
+        if attr in self.method_owners or attr in VTABLE_METHODS:
+            return None
+        if attr in self.hierarchy_method:
+            return None                 # the imported-hierarchy path handles it
+        defs = project_method_owners(self.base_dir).get(attr, set())
+        if len(defs) < 2:               # single definer -> not polymorphic
+            return None
+        classes, _byname = project_class_hierarchy(self.base_dir)
+        # Resolve the canonical vtable via module_external_canon -- the same
+        # routine that decides each module's emitted vtable layout -- so the
+        # dispatch pins to the exact root the defining modules were compiled
+        # against. For each defining module, prefer its FULL class set (which
+        # yields the complete hierarchy canon), but a module that hosts several
+        # unrelated hierarchies makes that ambiguous (returns None): fall back to
+        # just this method's definer classes there. Modules that still can't pin
+        # the slot are skipped; every module that CAN must agree on one root.
+        canon_mods = set()
+        for dm in set(m for m, _c in defs):
+            allcls = set(c for (m, c) in classes if m == dm)
+            ext = module_external_canon(self.base_dir, dm, allcls)
+            if ext is None or attr not in ext[0]:
+                dcls = set(c for (m, c) in defs if m == dm)
+                ext = module_external_canon(self.base_dir, dm, dcls)
+            if ext is None or attr not in ext[0]:
+                continue                # can't pin here; another module may
+            canon_mods.add(ext[1][0])   # ext[1] is the (module, class) root key
+        if len(canon_mods) != 1:
+            return None
+        mod = next(iter(canon_mods))
+        return mod if self.load_xmod(mod) else None
+
     def ximported_method_sig(self, mod, mname):
         """(ret_ctype, [param_ctypes]) for method `mname` in imported `mod`,
         replicating that module's emitted slot signature."""
@@ -10324,6 +10365,15 @@ class Transpiler:
                 node.id not in self.scope:
             return "mp_call_import(%s, %s, 0)" % (
                 c_string(self.import_alias[node.id]), c_string(""))
+        if (node.id in self.modules or node.id in self.import_alias) and \
+                node.id not in self.scope:
+            # A module referenced as a first-class value (e.g. passed as an
+            # argument: `self._rv_binop(cmd, math_cmds, size)`). A module has no
+            # runtime representation in the generated C -- every `mod.Attr` use
+            # is resolved statically at its own site -- so any parameter that
+            # receives it is dead. Emit a placeholder instead of the undeclared
+            # module identifier.
+            return "OBJ_NONE"
         if node.id == "self" and node.id not in self.scope:
             return "self"
         if node.id in self.mod_global_names and node.id not in self.scope:
@@ -11819,6 +11869,15 @@ class Transpiler:
                         cls, func.attr,
                         self._class_ptr_expr(func.value, cls),
                         (", " + ", ".join(cargs)) if cargs else "")
+            # imported class pointer that is NOT a leaf (e.g. `node.expr`
+            # narrowed by isinstance to CompoundLiteral, which has subclasses):
+            # a runtime override is possible, so dispatch through the hierarchy's
+            # canonical vtable rather than devirtualizing or, worse, falling
+            # through to a bare undeclared call.
+            if bt and bt.endswith("*") and bt != OBJ and bt[:-1] in self.xclasses:
+                pxmod = self.resolve_project_xvirtual(func.attr)
+                if pxmod:
+                    return self.xvcall(pxmod, func.value, func.attr, node.args)
             if isinstance(func.value, ast.Name) and \
                     func.value.id in self.classes:
                 return "%s_%s(%s)" % (func.value.id, func.attr,
@@ -11849,6 +11908,12 @@ class Transpiler:
                 xmod = self.resolve_xvirtual(func.attr)
                 if xmod:
                     return self.xvcall(xmod, func.value, func.attr, node.args)
+                # a polymorphic method whose hierarchy this module never imports
+                # (e.g. general_nodes calling expr.lvalue()); dispatch through
+                # the hierarchy root's canonical vtable, resolved project-wide.
+                pxmod = self.resolve_project_xvirtual(func.attr)
+                if pxmod:
+                    return self.xvcall(pxmod, func.value, func.attr, node.args)
                 # ambiguous name across unrelated non-polymorphic classes
                 # (e.g. ILCode.add vs ErrorCollector.add): a single vtable cast
                 # would read the wrong per-module slot offset, so dispatch on
