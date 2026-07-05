@@ -2134,6 +2134,30 @@ _XMOD_CACHE = {}        # dotted module name -> imported-symbol registry
 # between them (instead of dynamic mp_call_import).
 _LOCAL_MODULE_DIRS = []
 
+# Module names (both the shivyc-package dotted form and the bare basename) of the
+# sources in the CURRENT compilation unit -- i.e. the files handed to py2c in one
+# invocation, which are the modules whose object files will actually be linked
+# together. Used to decide whether an ambiguous-method definer can be emitted as
+# a runtime type branch: referencing the TypeInfo of a class from a module that
+# is NOT in this unit (e.g. rasm_obj, imported only by the stubbed SHIVYC_RASM
+# path) would be an undefined-symbol link error, so such definers are skipped.
+_COMPILED_MODULES = set()
+
+
+def set_compiled_modules(paths):
+    """Record the module names of the compilation unit's input files."""
+    global _COMPILED_MODULES
+    mods = set()
+    for p in paths:
+        ap = os.path.abspath(p)
+        if not ap.endswith(".py"):
+            continue
+        parts = ap[:-3].split(os.sep)
+        mods.add(parts[-1])                      # bare basename form
+        if "shivyc" in parts:                    # dotted package form
+            mods.add(".".join(parts[parts.index("shivyc"):]))
+    _COMPILED_MODULES = mods
+
 
 def set_local_module_dirs(paths):
     """Register the directories of the input sources for local-module lookup."""
@@ -6217,6 +6241,7 @@ class Transpiler:
         # just this method's definer classes there. Modules that still can't pin
         # the slot are skipped; every module that CAN must agree on one root.
         canon_mods = set()
+        skipped = False
         for dm in set(m for m, _c in defs):
             allcls = set(c for (m, c) in classes if m == dm)
             ext = module_external_canon(self.base_dir, dm, allcls)
@@ -6224,9 +6249,17 @@ class Transpiler:
                 dcls = set(c for (m, c) in defs if m == dm)
                 ext = module_external_canon(self.base_dir, dm, dcls)
             if ext is None or attr not in ext[0]:
+                skipped = True          # this definer can't pin the slot
                 continue                # can't pin here; another module may
             canon_mods.add(ext[1][0])   # ext[1] is the (module, class) root key
-        if len(canon_mods) != 1:
+        # If any defining module couldn't pin a canonical slot, `attr` is NOT a
+        # single coherent cross-module vtable method -- it is merely an ambiguous
+        # name shared by unrelated classes (e.g. ILCode.add, which has no
+        # subclasses, vs ErrorCollector.add). Committing to the one module that
+        # happened to pin would cast every receiver through that module's slot
+        # layout and read the wrong offset for the others. Decline so the caller
+        # falls through to runtime type dispatch.
+        if skipped or len(canon_mods) != 1:
             return None
         mod = next(iter(canon_mods))
         return mod if self.load_xmod(mod) else None
@@ -6312,13 +6345,34 @@ class Transpiler:
                    if info.get("base")}
         definers = []
         for (modname, classname) in sorted(defs):
+            if _COMPILED_MODULES and modname not in _COMPILED_MODULES:
+                # Definer lives outside this compilation unit (e.g. rasm_obj,
+                # dragged in only by main's stubbed `import rasm_obj`). Its
+                # instances cannot occur as receivers here, and referencing its
+                # TypeInfo would be an undefined-symbol link error -- omit its
+                # branch rather than declining the whole (otherwise correct and
+                # deterministic) type switch.
+                continue
             info = classes_h.get((modname, classname))
-            if info is None or info.get("base") is not None:
-                return None                      # unknown or non-root: bail
+            base = info.get("base") if info else None
+            if info is None:
+                return None                      # unknown: bail
+            if base is not None and base != "object":
+                return None                      # real subclass: exact-type
+                                                 # match would miss it -> bail
             if classname in has_sub:
                 return None                      # polymorphic: bail
             kind, ci = self.xref(classname, modname)
-            if kind != "class" or ci is None or mname not in ci.methods:
+            if kind != "class" or ci is None:
+                # Not locally imported (e.g. general_nodes never imports the
+                # ErrorCollector class nor asm_gen at all): resolve the definer
+                # project-wide so its TypeInfo + method can still be externed
+                # into the runtime chain. Every in-unit definer must become a
+                # branch -- a receiver whose type is the omitted one would
+                # otherwise fall through and hit the wrong slot.
+                reg = self.load_xmod(modname)
+                ci = reg["classes"].get(classname) if reg else None
+            if ci is None or mname not in ci.methods:
                 return None
             if mname in getattr(ci, "static_methods", ()):
                 return None                      # static: receiver type irrelevant
@@ -12397,7 +12451,13 @@ class Transpiler:
                 self._class_is_leaf(concrete_ci.name) and \
                 concrete_ci.name not in self._project_subclassed_cached():
             own = concrete_ci.methods[meth]
-            if len(own.args.args) - 1 != len(pct):
+            # Only when the receiver's own method is WIDER than the canonical
+            # slot: that means `meth` is ambiguous across unrelated classes and
+            # the global proto belongs to a sibling with fewer params, so no
+            # shared slot fits this receiver -> call it directly. A NARROWER own
+            # method is an ordinary override whose impl is padded to the slot
+            # width; it must go through the (default-filling) vtable instead.
+            if len(own.args.args) - 1 > len(pct):
                 ownpct = [self.arg_ctype_q(own, a) for a in own.args.args[1:]]
                 defs = self.defaults_for(own, True)
                 cargs = self.coerce_args(ownpct, arg_nodes, defs)
@@ -14474,6 +14534,7 @@ def main(argv):
         else:
             print("  pgo: skipped (need .py input(s))")
     set_local_module_dirs(files)
+    set_compiled_modules(files)
     _, _, stdlib_root = _stdlib_context(files[0] if len(files) == 1 else "", None)
     uses_eval = any(_uses_eval_builtin(p) for p in files)
     # eval() no longer forces the MicroPython core: a standalone program gets the
