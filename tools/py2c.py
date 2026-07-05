@@ -8234,7 +8234,7 @@ class Transpiler:
             fn = node.func.id
             if fn in ("int", "len", "ord", "abs", "hash"):
                 return "int"
-            if fn in ("str", "chr", "repr", "input"):
+            if fn in ("str", "chr", "repr", "input", "bytes"):
                 return "str"
             if fn == "float":
                 return "float"
@@ -9155,7 +9155,7 @@ class Transpiler:
                     return "bool"
                 if f.id in ("chr", "repr"):
                     return "char*"
-                if f.id == "str":
+                if f.id in ("str", "bytes"):
                     if self.stdlib_root and len(node.args) != 1:
                         return OBJ
                     return "char*"
@@ -10809,6 +10809,19 @@ class Transpiler:
                     for i in range(2, len(node.args)):
                         e = "_ospath_join(%s, %s)" % (e, self._coerce_str_arg(node, i))
                     return e
+            # os.environ.get(key[, default]) -> getenv, boxed as an obj
+            # (there is no live environ dict in the C runtime). Both self-host
+            # call sites pass a string key; a missing var yields the default
+            # (OBJ_NONE when omitted), matching dict.get semantics.
+            if isinstance(recv, ast.Attribute) and \
+                    isinstance(recv.value, ast.Name) and \
+                    recv.value.id == "os" and recv.attr == "environ" and \
+                    f.attr == "get" and node.args:
+                key = self._coerce_str_arg(node, 0)
+                dflt = (self.wrap_obj(node.args[1]) if len(node.args) > 1
+                        else "OBJ_NONE")
+                return ("({ char* _ge = getenv(%s); "
+                        "_ge ? OBJ_STR(_ge) : %s; })" % (key, dflt))
             # a few os.* filesystem ops
             if isinstance(recv, ast.Name) and recv.id == "os" and node.args:
                 if f.attr == "makedirs":
@@ -11046,7 +11059,7 @@ class Transpiler:
                     ("int", "bool") else "AS_INT(%s)" % self.wrap_obj(size)
                 return "float_to_bits(%s, %s)" % (
                     self.wrap_obj(node.args[0]), sz)
-            if fn == "str":
+            if fn in ("str", "bytes"):
                 if len(node.args) == 1:
                     return "pystr(%s)" % self.wrap_obj(node.args[0])
                 if self.stdlib_root and node.args:
@@ -13720,7 +13733,7 @@ class Transpiler:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id in self.classes:
                 return node.func.id + "*"
-            if node.func.id == "str":
+            if node.func.id in ("str", "bytes"):
                 return "char*"
             if node.func.id == "getattr" and not (
                     len(node.args) >= 2 and isinstance(node.args[1], ast.Constant)
