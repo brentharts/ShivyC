@@ -3143,14 +3143,31 @@ def discover_fields_from_ctor_locals(tree, classes):
 
     def scan_scope(body, seed=None):
         locals_types = dict(seed) if seed else {}
-        mod = ast.Module(body=list(body), type_ignores=[])
-        for sub in ast.walk(mod):
+        # Collect the nodes of *this* lexical scope, treating a nested
+        # def/lambda as an opaque boundary: its body begins a new scope and is
+        # scanned separately (below). Flattening scopes together -- as a plain
+        # ast.walk does -- lets a `var = Cls()` binding in one function be
+        # attributed to a same-named local in a sibling function, inventing
+        # bogus fields on unrelated classes.
+        scope_nodes = []
+        nested = []
+        stack = list(body)
+        while stack:
+            node = stack.pop()
+            scope_nodes.append(node)
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                      ast.Lambda)):
+                    nested.append(child)
+                else:
+                    stack.append(child)
+        for sub in scope_nodes:
             if isinstance(sub, ast.Assign) and len(sub.targets) == 1 and \
                     isinstance(sub.targets[0], ast.Name):
                 cls = _ctor_class_name(sub.value, classes)
                 if cls:
                     locals_types[sub.targets[0].id] = cls
-        for sub in ast.walk(mod):
+        for sub in scope_nodes:
             if isinstance(sub, ast.Assign):
                 for tgt in sub.targets:
                     if isinstance(tgt, ast.Attribute) and \
@@ -3168,6 +3185,25 @@ def discover_fields_from_ctor_locals(tree, classes):
                     and isinstance(sub.args[1].value, str):
                 note(locals_types[sub.args[0].id], sub.args[1].value,
                      rhs_ctype(sub.args[2], locals_types))
+        # Recurse into nested scopes. A nested function closes over the
+        # enclosing scope's ctor-typed locals (and module globals), except for
+        # any name one of its own parameters rebinds; annotated parameters then
+        # contribute their own class. This keeps closures/globals working while
+        # never leaking a binding sideways into a sibling scope.
+        for fn in nested:
+            if isinstance(fn, ast.Lambda):
+                continue          # lambda bodies contain no assignments to scan
+            child = dict(locals_types)
+            _a = fn.args
+            for _arg in (list(_a.posonlyargs) + list(_a.args) +
+                         list(_a.kwonlyargs)):
+                child.pop(_arg.arg, None)
+            if _a.vararg:
+                child.pop(_a.vararg.arg, None)
+            if _a.kwarg:
+                child.pop(_a.kwarg.arg, None)
+            child.update(params_seed(fn))
+            scan_scope(fn.body, child)
 
     def params_seed(fn):
         seed = {}
