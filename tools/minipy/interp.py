@@ -339,6 +339,8 @@ def _str_to_float(s: "char*") -> "double":
         return _inf_val()
     if s == "-inf":
         return -_inf_val()
+    if s == "nan" or s == "-nan":
+        return _inf_val() - _inf_val()          # IEEE nan
     i = 0
     sign: "double" = 1.0
     if s[0] == "-":
@@ -358,7 +360,31 @@ def _str_to_float(s: "char*") -> "double":
             frac = frac * 10.0 + float(ord(s[i]) - 48)
             scale = scale * 10.0
             i = i + 1
-    return sign * (intpart + frac / scale)
+    result: "double" = sign * (intpart + frac / scale)
+    # exponent suffix (e.g. repr(1e-10) == '1e-10'): scale by 10**exp so the
+    # float `repr()` values written into .mpyc constants round-trip exactly.
+    if i < n and (s[i] == "e" or s[i] == "E"):
+        i = i + 1
+        esign = 1
+        if i < n and s[i] == "-":
+            esign = -1
+            i = i + 1
+        elif i < n and s[i] == "+":
+            i = i + 1
+        exp = 0
+        while i < n and ord(s[i]) >= 48 and ord(s[i]) <= 57:
+            exp = exp * 10 + (ord(s[i]) - 48)
+            i = i + 1
+        p: "double" = 1.0
+        k = 0
+        while k < exp:
+            p = p * 10.0
+            k = k + 1
+        if esign < 0:
+            result = result / p
+        else:
+            result = result * p
+    return result
 
 
 def _fmt_float(d: "double") -> "char*":
@@ -2858,13 +2884,181 @@ def interp_run(prog: "Program", sargs: "list[str]") -> "int":
     return 0
 
 
+class _MpycReader:
+    """Cursor over the raw bytes of a `.mpyc` file (see tools/minipy/mpyc.py).
+
+    The interpreter reads the file into a byte-addressable buffer and walks it
+    with this reader, filling the Program POD structs directly -- no JSON
+    tokenising and no per-record dict/object_hook rebuild. The stream is
+    NUL-free by construction so the buffer's strlen length is exact and slicing
+    is safe.
+    """
+
+    buf: "char*"
+    pos: "long"
+
+    def __init__(self, buf: "char*"):
+        self.buf = buf
+        self.pos = 0
+
+    def uvarint(self) -> "long":
+        shift = 0
+        result = 0
+        while True:
+            b = ord(self.buf[self.pos])
+            self.pos = self.pos + 1
+            result = result | ((b & 0x7F) << shift)
+            if (b & 0x80) == 0:
+                return result - 1               # undo the +1 NUL-avoidance bias
+            shift = shift + 7
+
+    def svarint(self) -> "long":
+        u = self.uvarint()
+        if (u & 1) != 0:
+            return -((u >> 1) + 1)              # zig-zag decode
+        return u >> 1
+
+    def string(self) -> "char*":
+        n = self.uvarint()
+        start = self.pos
+        s = self.buf[start:start + n]
+        self.pos = start + n
+        if sys.implementation.name == "cpython":
+            # On CPython the file was latin-1 decoded so ord() sees bytes; the
+            # slice therefore holds raw UTF-8 bytes as latin-1 chars -- recover
+            # the real text. This whole branch folds away in the compiled
+            # interpreter, where `s` is already the correct byte-addressed char*.
+            s = s.encode("latin-1").decode("utf-8")
+        return s
+
+    def double(self) -> "double":
+        return _str_to_float(self.string())
+
+
+def load_mpyc(path: "char*") -> "Program":
+    """Load a `.mpyc` binary bytecode file into a Program, bypassing JSON."""
+    f = open(path, "rb")
+    buf = f.read()
+    f.close()
+    if sys.implementation.name == "cpython":
+        buf = buf.decode("latin-1")
+    rdr = _MpycReader(buf)
+    if len(buf) < 4 or buf[0:4] != "MPYC":
+        print("interp: not a valid .mpyc file (bad magic)")
+        return Program(-1, "", [], [], 0, [], [], 0)   # sentinel: main() aborts
+    rdr.pos = 4                                    # skip the "MPYC" magic
+    version = rdr.uvarint()
+    source = rdr.string()
+
+    consts = []
+    nconsts = rdr.uvarint()
+    ci = 0
+    while ci < nconsts:
+        ct = rdr.string()
+        c_i: "long" = 0
+        c_d: "double" = 0.0
+        c_s: "char*" = ""
+        if ct == "float":
+            c_d = rdr.double()
+        elif ct == "str":
+            c_s = rdr.string()
+        elif ct == "none":
+            c_i = 0
+        else:
+            c_i = rdr.svarint()
+        consts.append(Const(ct, c_i, c_d, c_s))
+        ci = ci + 1
+
+    names = []
+    nnames = rdr.uvarint()
+    ni = 0
+    while ni < nnames:
+        names.append(rdr.string())
+        ni = ni + 1
+
+    nglobals = rdr.uvarint()
+
+    funcs = []
+    nfuncs = rdr.uvarint()
+    fi = 0
+    while fi < nfuncs:
+        fname = rdr.string()
+        nparams = rdr.uvarint()
+        nregs = rdr.uvarint()
+        nlocals = rdr.uvarint()
+        code = []
+        ncode = rdr.uvarint()
+        ii = 0
+        while ii < ncode:
+            packed = rdr.uvarint()
+            op = packed >> 2
+            fb = (packed >> 1) & 1
+            fc = packed & 1
+            ra = rdr.uvarint()
+            b = rdr.svarint()
+            c = rdr.svarint()
+            code.append(Instr(op, fb, fc, ra, b, c))
+            ii = ii + 1
+        defaults = []
+        ndefaults = rdr.uvarint()
+        di = 0
+        while di < ndefaults:
+            defaults.append(rdr.svarint())
+            di = di + 1
+        vararg = rdr.svarint()
+        params = []
+        nparamnames = rdr.uvarint()
+        pi = 0
+        while pi < nparamnames:
+            params.append(rdr.string())
+            pi = pi + 1
+        funcs.append(Func(fname, nparams, nregs, nlocals, code,
+                          defaults, vararg, params))
+        fi = fi + 1
+
+    classes = []
+    nclasses = rdr.uvarint()
+    cli = 0
+    while cli < nclasses:
+        cname = rdr.string()
+        base = rdr.svarint()
+        methods = []
+        nmethods = rdr.uvarint()
+        mi = 0
+        while mi < nmethods:
+            mname = rdr.string()
+            mfunc = rdr.svarint()
+            methods.append(MethEnt(mname, mfunc))
+            mi = mi + 1
+        classes.append(ClassInfo(cname, base, methods))
+        cli = cli + 1
+
+    entry = rdr.uvarint()
+    return Program(version, source, consts, names, nglobals,
+                   funcs, classes, entry)
+
+
+def _ends_with(s: "char*", suffix: "char*") -> "int":
+    ls = len(s)
+    lsuf = len(suffix)
+    if lsuf > ls:
+        return 0
+    return 1 if s[ls - lsuf:ls] == suffix else 0
+
+
 def main() -> "int":
     if len(sys.argv) < 2:
-        print("usage: interp <bytecode.json>")
+        print("usage: interp <bytecode.json|.mpyc>")
         return 1
-    src = open(sys.argv[1]).read()
-    hook = rpy.json.generate_decoder(Program)
-    prog = json.loads(src, object_hook=hook)
+    path = sys.argv[1]
+    if _ends_with(path, ".mpyc") != 0:
+        prog = load_mpyc(path)
+        if prog.version < 0:
+            return 1                    # load_mpyc rejected the file
+    else:
+        src = open(path).read()
+        hook = rpy.json.generate_decoder(Program)
+        prog = json.loads(src, object_hook=hook)
     sargs = []
     ai = 2
     while ai < len(sys.argv):
