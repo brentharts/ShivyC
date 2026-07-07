@@ -229,18 +229,26 @@ MB := $(RPY)/minibrowser
 minibrowser:
 	@mkdir -p $(GUIBIN)/minibrowser
 	@cp -f $(RPY)/rpy_lib/xdg-shell.xml $(GUIBIN)/minibrowser/ 2>/dev/null || true
+	@# The page-scripting engine embeds the minipy interpreter: generate a copy
+	@# with its main() stripped (json2qt provides the C entry point) and
+	@# co-compile it into the browser.
+	python3 $(MB)/gen_embed.py $(GUIBIN)/minibrowser >/dev/null
 	python3 tools/py2c.py $(MB)/json2qt.py $(MB)/dom.py $(MB)/minijson.py \
-	    --out $(GUIBIN)/minibrowser
+	    $(GUIBIN)/minibrowser/interp_embed.py --out $(GUIBIN)/minibrowser
 	cc $(WL_CFLAGS) -I$(GUIBIN)/minibrowser $(GUIBIN)/minibrowser/*.c \
-	    -o $(GUIBIN)/minibrowser_app $(WL_LIBS)
-	@# Stage the runnable site next to the binary: the browser shells out to
-	@# `python3 www2json.py <page>.html` at runtime, so www2json.py + the *.html
-	@# site must sit in the working directory it is launched from.
-	@cp -f $(MB)/www2json.py $(MB)/home.html $(MB)/about.html $(MB)/example.html \
+	    -o $(GUIBIN)/minibrowser_app $(WL_LIBS) -lm
+	@# Stage the runnable site + toolchain next to the binary: at runtime the
+	@# browser shells out to `python3 www2json.py` (fetch) and, for scripted
+	@# pages, `python3 pycompile.py` (compile <script type="python"> to .mpyc,
+	@# which needs the minipy package + minidom.py).
+	@cp -f $(MB)/www2json.py $(MB)/pycompile.py $(MB)/minidom.py \
+	    $(MB)/home.html $(MB)/about.html $(MB)/example.html $(MB)/pyscript.html \
 	    $(GUIBIN)/
+	@rm -rf $(GUIBIN)/minipy && cp -r tools/minipy $(GUIBIN)/minipy
 	@python3 $(MB)/www2json.py $(MB)/home.html --out $(GUIBIN) >/dev/null
 	@echo "built $(GUIBIN)/minibrowser_app  (run from $(GUIBIN) under a Wayland compositor)"
 	@echo "  cd $(GUIBIN) && ./minibrowser_app"
+	@echo "  cd $(GUIBIN) && ./minibrowser_app --script-selftest   # run a page's python"
 
 rpython:
 	@mkdir -p $(RPYBIN)
