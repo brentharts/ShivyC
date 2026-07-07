@@ -73,23 +73,30 @@ a shared handler (a visible status line), proving the signal path end to end.
 
 To render the above, `tools/rpy_lib/rpyqt.py` gained: **lowercase + basic
 punctuation** in the 5×7 font (web text is mostly lowercase); **`QLineEdit`** (a
-bordered text field with placeholder + a `returnPressed` signal); **`QHeading`**
-(scaled headings); **`QLink`** (link-coloured, underlined, clickable anchor);
-and **`QHLine`** (an `<hr>` rule). All stay within rpyqt's single `_QtObject`
-hierarchy so vtables remain consistent under py2c.
+bordered text field with placeholder, keyboard focus, a caret, and a
+`returnPressed` signal); **`QHeading`** (scaled headings); **`QLink`** (link-
+coloured, underlined, clickable anchor); and **`QHLine`** (an `<hr>` rule). All
+stay within rpyqt's single `_QtObject` hierarchy so vtables remain consistent
+under py2c.
+
+### Keyboard input
+
+Text fields really type. The generated Wayland runtime now binds `wl_seat`'s
+keyboard, maps evdev keycodes to ASCII for a US layout (dependency-free — shift
+is tracked from the physical shift keys, no xkbcommon), and calls a sixth
+`rw_key(codepoint, pressed)` hook. Clicking a `QLineEdit` focuses it (blue
+border + caret); printable keys append, backspace deletes, and Enter emits
+`returnPressed`. `render_test.py` drives this whole path (pointer-focus → keys →
+text) off-target as a regression check.
 
 ## Roadmap (deliberately not yet done)
 
 * **Runtime JSON in rpython.** Today the page reaches the renderer as generated
   `page_data.py` (co-compiled). A small rpython JSON reader would let the binary
   load `page.json` at runtime instead of at build time.
-* **Keyboard in rwayland.** The generated Wayland runtime currently delivers
-  only pointer events, so `QLineEdit` shows text and treats a click as submit
-  but cannot yet *type*. Real editing needs a `wl_keyboard` path in the runtime
-  plus a `rw_key` hook and an `on_key` on `rwayland.Window` — this is the main
-  **rwayland** extension the browser is waiting on.
 * **Live navigation.** Wire `QLink.clicked` / form submit to re-run `www2json`
-  on the target and rebuild the tree (back/forward stacks).
+  on the target and rebuild the tree (back/forward stacks). The input plumbing
+  is now in place: fields type and Enter submits.
 * **Scripting via minipy.** Page scripts are captured but not run. The plan is
   to translate JS → Python with OpenSourceJesus's [Js2Py fork](https://github.com/OpenSourceJesus/Js2Py)
   and execute it through **embedded minipy** (see `MINIPY.md`) as the page's

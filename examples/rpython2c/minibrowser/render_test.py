@@ -55,6 +55,17 @@ def _find_button(rpyqt, layout):
     return None
 
 
+def _find_lineedit(rpyqt, layout):
+    for it in layout.items:
+        if isinstance(it, rpyqt.QLineEdit):
+            return it
+        if isinstance(it, rpyqt.QBoxLayout):
+            got = _find_lineedit(rpyqt, it)
+            if got is not None:
+                return got
+    return None
+
+
 def main(argv):
     here = os.path.dirname(os.path.abspath(__file__))
     rpy_lib = os.path.abspath(
@@ -74,6 +85,11 @@ def main(argv):
     json2qt._status = status
     box.addWidget(status)
 
+    # A real top-level window so pointer/key routing matches the C runtime.
+    win = rpyqt.QWidget()
+    win.setLayout(box)
+    rpyqt.set_active(win)
+
     W, H = rpyqt.WIN_W, 1000
     box.place(rpyqt.PAD, rpyqt.PAD, W - 2 * rpyqt.PAD, H)
     fb = [rpyqt.COL_BG] * (W * H)
@@ -89,6 +105,22 @@ def main(argv):
     btn.on_press(btn.x + 2, btn.y + 2)
     assert status.text == "CLICKED", "button signal did not reach the handler"
     print("button click -> status = %r  OK" % status.text)
+
+    # Keyboard: click the field to focus it, type through the rw_key path, then
+    # backspace and submit -- exactly the routing the generated runtime drives.
+    field = _find_lineedit(rpyqt, box)
+    assert field is not None, "expected a text input in the sample page"
+    win.on_pointer_button(field.x + 4, field.y + 4, 1)
+    assert rpyqt._focused is field and field.focused == 1, "field did not focus"
+    for ch in "cat food":
+        rpyqt.rw_key(ord(ch), 1)
+    assert field.text == "cat food", "typed text wrong: %r" % field.text
+    rpyqt.rw_key(8, 1)
+    assert field.text == "cat foo", "backspace wrong: %r" % field.text
+    status.text = "READY"
+    rpyqt.rw_key(13, 1)      # enter -> returnPressed -> on_activate
+    assert status.text == "CLICKED", "enter did not submit: %r" % status.text
+    print("keyboard: focus + type + backspace + enter/submit  OK")
 
     if len(argv) > 1:
         from PIL import Image
