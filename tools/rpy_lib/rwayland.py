@@ -17,6 +17,9 @@ in `on_paint`, react to clicks in `on_pointer_button`, and call `.run()`:
             self.pressed = pressed
             return rwayland.ACTION_REDRAW
 
+        def on_key(self, codepoint: int, pressed: int) -> int:
+            return rwayland.ACTION_NONE
+
     def main() -> int:
         return App().run()
 
@@ -26,7 +29,7 @@ The Wayland protocol boilerplate -- listener vtables, shm buffers, the registry,
 the dispatch loop -- is *generated* by py2c, not written by hand. When a program
 imports this module, py2c writes an app-agnostic C runtime (`rwayland_rt.{h,c}`,
 plus the scanned `xdg-shell` files) to the output directory and links
-`-lwayland-client`. That runtime drives Wayland and calls back into the five
+`-lwayland-client`. That runtime drives Wayland and calls back into the six
 `rw_*` trampolines below, which forward to the currently-running `Window`.
 
 So the user side is entirely rpython; the only C is machine-generated and the
@@ -72,6 +75,11 @@ class Window:
         """Override: handle a left-button press/release; return an ACTION_*."""
         return ACTION_NONE
 
+    def on_key(self, codepoint: int, pressed: int) -> int:
+        """Override: handle a key event. `codepoint` is ASCII (8=backspace,
+        13=enter, >=32 printable); `pressed` is 1 on press, 0 on release."""
+        return ACTION_NONE
+
     def run(self) -> int:
         """Hand control to the generated Wayland runtime (blocks until close)."""
         set_active(self)
@@ -103,9 +111,9 @@ def fill_rect(fb: "u32*", fb_w: int, fb_h: int,
 
 # --- the rw_* trampolines the generated runtime calls --------------------
 # A single active window is held in a module global. The generated C runtime
-# calls these five externs; each forwards to the active Window. Their C symbols
-# are exactly rw_width/rw_height/rw_title/rw_paint/rw_pointer (unique names ->
-# unmangled), matching the contract in rwayland_rt.h.
+# calls these six externs; each forwards to the active Window. Their C symbols
+# are exactly rw_width/rw_height/rw_title/rw_paint/rw_pointer/rw_key (unique
+# names -> unmangled), matching the contract in rwayland_rt.h.
 _active: "Window*" = None
 
 
@@ -132,3 +140,7 @@ def rw_paint(fb: "u32*") -> None:
 
 def rw_pointer(x: int, y: int, pressed: int) -> int:
     return _active.on_pointer_button(x, y, pressed)
+
+
+def rw_key(codepoint: int, pressed: int) -> int:
+    return _active.on_key(codepoint, pressed)

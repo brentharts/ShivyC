@@ -32,7 +32,7 @@ is to show the adaptation path PyQt -> rpyqt -> Wayland, not API completeness.
 import rpy_ctypes as ctypes
 
 # rpyqt is self-contained over the generated Wayland runtime: it binds rwl_run()
-# (resolved from rwayland_rt.o at link time) and defines the five rw_* hooks the
+# (resolved from rwayland_rt.o at link time) and defines the six rw_* hooks the
 # runtime calls. It deliberately does NOT subclass rwayland.Window, so every
 # class here is locally rooted and shares one consistent vtable layout -- mixing
 # a cross-module-rooted class with local hierarchies in a single module yields
@@ -263,6 +263,16 @@ class _QtObject:
     def on_press(self, px: int, py: int) -> int:
         return ACTION_NONE
 
+    def on_key(self, codepoint: int, pressed: int) -> int:
+        # Overridden by editable widgets (QLineEdit). Declared on the base so a
+        # key routed through an obj-typed focus reference dispatches virtually.
+        return ACTION_NONE
+
+    def set_focused(self, v: int) -> None:
+        # Overridden by focusable widgets; a no-op elsewhere so focus bookkeeping
+        # can call it uniformly through an obj reference.
+        return
+
 
 # ---- signal --------------------------------------------------------------
 class Signal(_QtObject):
@@ -384,15 +394,16 @@ class QLink(Widget):
 
 class QLineEdit(Widget):
     """A single-line text field. It renders its current text (or a greyed
-    placeholder when empty) inside a bordered white box. The rwayland runtime
-    delivers only pointer events today -- there is no keyboard channel yet -- so
-    a press is treated as `returnPressed` (submit), which is enough to drive a
-    search box + button. Real typing is a runtime extension (see README)."""
+    placeholder when empty) inside a bordered box, with a caret and a
+    highlighted border while focused. Clicking the field gives it keyboard
+    focus; keys are routed here by the top-level window via on_key(). A press
+    also focuses, and Enter emits `returnPressed` (submit)."""
 
     def __init__(self, text: "char*"):
         super().__init__()
         self.text = text
         self.placeholder = ""
+        self.focused = 0
         self.returnPressed = Signal()
 
     def setPlaceholderText(self, text: "char*") -> None:
@@ -401,19 +412,46 @@ class QLineEdit(Widget):
     def text_value(self) -> "char*":
         return self.text
 
+    def set_focused(self, v: int) -> None:
+        self.focused = v
+
     def paint(self, fb: "u32*", fbw: int, fbh: int) -> None:
         fill_rect(fb, fbw, fbh, self.x, self.y, self.w, self.h, COL_FIELD)
-        _draw_border(fb, self.x, self.y, self.w, self.h, COL_BORDER)
-        if len(self.text) > 0:
+        if self.focused:
+            _draw_border(fb, self.x, self.y, self.w, self.h, COL_LINK)
+        else:
+            _draw_border(fb, self.x, self.y, self.w, self.h, COL_BORDER)
+        n = len(self.text)
+        if n > 0:
             draw_text(fb, fbw, fbh, self.x + 8, self.y + 14, self.text, 3,
                       COL_TEXT)
         else:
             draw_text(fb, fbw, fbh, self.x + 8, self.y + 14, self.placeholder,
                       3, COL_HINT)
+        if self.focused:
+            # caret just past the end of the text (6*scale px per glyph)
+            cx = self.x + 8 + n * 18
+            fill_rect(fb, fbw, fbh, cx, self.y + 12, 2, 24, COL_TEXT)
 
     def on_press(self, px: int, py: int) -> int:
-        self.returnPressed.emit()
+        set_focus(self)
         return ACTION_REDRAW
+
+    def on_key(self, codepoint: int, pressed: int) -> int:
+        if not pressed:
+            return ACTION_NONE
+        if codepoint == 8:                      # backspace
+            n = len(self.text)
+            if n > 0:
+                self.text = self.text[0:n - 1]
+            return ACTION_REDRAW
+        if codepoint == 13:                     # enter -> submit
+            self.returnPressed.emit()
+            return ACTION_REDRAW
+        if codepoint >= 32:                     # printable -> append
+            self.text = self.text + chr(codepoint)
+            return ACTION_REDRAW
+        return ACTION_NONE
 
 
 class QHLine(Widget):
@@ -625,6 +663,12 @@ class QWidget(_QtObject):
             return b.on_press(x, y)
         return ACTION_NONE
 
+    def on_key(self, codepoint: int, pressed: int) -> int:
+        f = _focused
+        if f is not None:
+            return f.on_key(codepoint, pressed)
+        return ACTION_NONE
+
     def run(self) -> int:
         set_active(self)
         return _wl.rwl_run()
@@ -643,11 +687,24 @@ class QApplication(_QtObject):
 
 # ---- runtime trampolines (called from the generated rwayland_rt.c) -------
 _active: "QWidget*" = None
+# The widget currently holding keyboard focus (a QLineEdit), or None. Clicking a
+# field focuses it; the window routes keys here. Kept as a module global (like
+# _active) so focus is process-wide and reachable from the rw_key trampoline.
+_focused = None
 
 
 def set_active(w: "QWidget*") -> None:
     global _active
     _active = w
+
+
+def set_focus(w: "obj") -> None:
+    global _focused
+    prev = _focused
+    if prev is not None:
+        prev.set_focused(0)
+    _focused = w
+    w.set_focused(1)
 
 
 def rw_width() -> int:
@@ -668,3 +725,7 @@ def rw_paint(fb: "u32*") -> None:
 
 def rw_pointer(x: int, y: int, pressed: int) -> int:
     return _active.on_pointer_button(x, y, pressed)
+
+
+def rw_key(codepoint: int, pressed: int) -> int:
+    return _active.on_key(codepoint, pressed)
