@@ -242,8 +242,9 @@ minibrowser:
 	@# pages, `python3 pycompile.py` (compile <script type="python"> to .mpyc,
 	@# which needs the minipy package + minidom.py).
 	@cp -f $(MB)/www2json.py $(MB)/pycompile.py $(MB)/minidom.py \
+	    $(MB)/jitc.py \
 	    $(MB)/home.html $(MB)/about.html $(MB)/example.html \
-	    $(MB)/pyscript.html $(MB)/pyscript2.html \
+	    $(MB)/pyscript.html $(MB)/pyscript2.html $(MB)/pyjit.html \
 	    $(GUIBIN)/
 	@rm -rf $(GUIBIN)/minipy && cp -r tools/minipy $(GUIBIN)/minipy
 	@python3 $(MB)/www2json.py $(MB)/home.html --out $(GUIBIN) >/dev/null
