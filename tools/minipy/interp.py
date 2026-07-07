@@ -17,6 +17,32 @@ import rpy
 import os
 
 
+# ------------------------------------------------------------------ FFI ----
+# Runtime FFI for the embedded interpreter's ctypes: a page's python can load a
+# JIT-compiled <script type="rpython"> .so and call into it. These lower to the
+# mb_ffi.c shim (linked into the binary; dlopen is in libc, no -ldl) via py2c's
+# ctypes static bridge -- mb_dlopen/mb_dlsym resolve the .so + symbol at run
+# time, mb_callNi call the resolved pointer as int(int,...). Guarded so the
+# module still imports cleanly under CPython (where it is only read, never runs
+# these); py2c keeps this branch (its impl name is not "cpython").
+if sys.implementation.name != "cpython":
+    import rpy_ctypes as _ctypes
+    _ffi = _ctypes.CDLL("mb_ffi")
+    _ffi.mb_dlopen.restype = _ctypes.c_long
+    _ffi.mb_dlopen.argtypes = [_ctypes.c_char_p]
+    _ffi.mb_dlsym.restype = _ctypes.c_long
+    _ffi.mb_dlsym.argtypes = [_ctypes.c_long, _ctypes.c_char_p]
+    _ffi.mb_call0i.restype = _ctypes.c_int
+    _ffi.mb_call0i.argtypes = [_ctypes.c_long]
+    _ffi.mb_call1i.restype = _ctypes.c_int
+    _ffi.mb_call1i.argtypes = [_ctypes.c_long, _ctypes.c_int]
+    _ffi.mb_call2i.restype = _ctypes.c_int
+    _ffi.mb_call2i.argtypes = [_ctypes.c_long, _ctypes.c_int, _ctypes.c_int]
+    _ffi.mb_call3i.restype = _ctypes.c_int
+    _ffi.mb_call3i.argtypes = [_ctypes.c_long, _ctypes.c_int, _ctypes.c_int,
+                               _ctypes.c_int]
+
+
 # ====================== JSON-decoded POD structs ======================
 class Const:
     def __init__(self, t: "char*", i: "long", d: "double", s: "char*"):
@@ -1846,6 +1872,33 @@ def do_builtin(st: "St", bid: "long", args: "list[V]") -> "V":
         if len(args) > 0 and args[0].tag == 3:
             os.makedirs(args[0].sv)
         return v_none()
+    if bid == 33:             # _native_dlopen(path) -> handle (0 on failure)
+        if len(args) > 0 and args[0].tag == 3:
+            return v_int(_ffi.mb_dlopen(args[0].sv))
+        return v_int(0)
+    if bid == 34:             # _native_dlsym(handle, name) -> fn pointer
+        if len(args) > 1 and args[0].tag == 1 and args[1].tag == 3:
+            return v_int(_ffi.mb_dlsym(args[0].iv, args[1].sv))
+        return v_int(0)
+    if bid == 35:             # _native_call0i(fn) -> int
+        if len(args) > 0 and args[0].tag == 1:
+            return v_int(_ffi.mb_call0i(args[0].iv))
+        return v_int(0)
+    if bid == 36:             # _native_call1i(fn, a) -> int
+        if len(args) > 1 and args[0].tag == 1 and args[1].tag == 1:
+            return v_int(_ffi.mb_call1i(args[0].iv, args[1].iv))
+        return v_int(0)
+    if bid == 37:             # _native_call2i(fn, a, b) -> int
+        if len(args) > 2 and args[0].tag == 1 and args[1].tag == 1 \
+                and args[2].tag == 1:
+            return v_int(_ffi.mb_call2i(args[0].iv, args[1].iv, args[2].iv))
+        return v_int(0)
+    if bid == 38:             # _native_call3i(fn, a, b, c) -> int
+        if len(args) > 3 and args[0].tag == 1 and args[1].tag == 1 \
+                and args[2].tag == 1 and args[3].tag == 1:
+            return v_int(_ffi.mb_call3i(args[0].iv, args[1].iv, args[2].iv,
+                                        args[3].iv))
+        return v_int(0)
     return v_none()
 
 
@@ -2862,6 +2915,18 @@ def build_state(prog: "Program", sargs: "list[str]") -> "St":
             glob[gi] = v_builtin(31)            # minios exists/isfile fallback
         elif _strcmp(nm, "_native_makedirs") == 0:
             glob[gi] = v_builtin(32)            # minios makedirs fallback
+        elif _strcmp(nm, "_native_dlopen") == 0:
+            glob[gi] = v_builtin(33)            # FFI: dlopen a JIT'd .so
+        elif _strcmp(nm, "_native_dlsym") == 0:
+            glob[gi] = v_builtin(34)            # FFI: resolve a symbol
+        elif _strcmp(nm, "_native_call0i") == 0:
+            glob[gi] = v_builtin(35)            # FFI: call int f(void)
+        elif _strcmp(nm, "_native_call1i") == 0:
+            glob[gi] = v_builtin(36)            # FFI: call int f(int)
+        elif _strcmp(nm, "_native_call2i") == 0:
+            glob[gi] = v_builtin(37)            # FFI: call int f(int,int)
+        elif _strcmp(nm, "_native_call3i") == 0:
+            glob[gi] = v_builtin(38)            # FFI: call int f(int,int,int)
         gi = gi + 1
     return st
 
