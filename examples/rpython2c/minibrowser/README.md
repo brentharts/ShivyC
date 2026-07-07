@@ -6,53 +6,57 @@ of OpenSourceJesus's Tetra [`json2qt.py`](https://github.com/OpenSourceJesus/Tet
 which does the same job under CPython/PyQt5.
 
 The design splits cleanly into a *dynamic* CPython half and a *static* rpython
-half:
+half, joined at runtime by a `page.json` bundle:
 
 ```
-  HTML + JS ──▶ www2json.py ──▶ page.json      (canonical bundle)
-                (CPython)   └─▶ page_data.py   (the "py" form of the page)
-                                     │
-        dom.py  +  json2qt.py  +  page_data.py     ── one py2c translation unit ──▶  native
-       (Node tree)  (renderer)   (generated)                                        Wayland app
-                        │
-                     rpyqt  (widgets, software-rendered on rwayland)
+  HTML + JS ──▶ www2json.py ──▶ page.json      (canonical bundle, on disk)
+                (CPython)                              │
+                                                       │  read at runtime
+        dom.py + json2qt.py + minijson.py   ── one py2c unit ──▶  native Wayland app
+       (Node tree) (renderer) (json reader)                            │
+                        │                                        loads page.json,
+                     rpyqt  (widgets, software-rendered)         renders, navigates
 ```
 
 * **`www2json.py`** runs under ordinary **CPython** (full stdlib allowed). It
-  parses HTML, captures page scripts, and writes two things: `page.json` (the
-  bundle, same `{source,title,dom,scripts}` shape as Tetra) and `page_data.py`
-  — the *rpython* form of the page, a `build_page()` that constructs the DOM
-  with concrete `Node(...)` locals. This is the "json/py" the renderer eats.
+  parses HTML, captures page scripts, and writes `page.json` (the bundle, same
+  `{source,title,dom,scripts}` shape as Tetra). It can also emit `page_data.py`
+  (a co-compilable `build_page()`), but the renderer no longer needs that: it
+  reads the JSON at runtime.
 * **`dom.py`** is the rpython `Node` model: one class, one hierarchy, element
   kind as a `char*` field, the handful of consumed attributes promoted to typed
   `char*` fields (no dict), children in a `list[obj]`.
+* **`minijson.py`** is a tiny **runtime** JSON reader: it parses a `page.json`
+  bundle from disk into the `Node` tree, so the same binary can display any page
+  `www2json.py` produces (and is what live navigation stands on).
 * **`json2qt.py`** is the port of Tetra's `generate_interface`: it walks the
-  `Node` tree and builds an `rpyqt` widget tree, dispatching on `Node.tag()`.
+  `Node` tree and builds an `rpyqt` widget tree, dispatching on `Node.tag()`,
+  and adds the navigation toolbar + link/URL-bar handling.
 * **`rpyqt`** (in `tools/rpy_lib/rpyqt.py`) is the widget layer, software-
   rendered into the `rwayland` framebuffer.
 
 ## Build & run
 
 ```sh
-make minibrowser          # regenerates page_data.py, transpiles, links wl
-./build/gui/minibrowser_app   # run under a Wayland compositor
+make minibrowser                 # transpiles json2qt+dom+minijson, links wl,
+                                 # and stages the site next to the binary
+cd build/gui && ./minibrowser_app   # run under a Wayland compositor
 ```
 
-`make minibrowser` first runs `www2json.py example.html` to (re)generate
-`page.json` + `page_data.py`, then co-compiles `json2qt.py dom.py page_data.py`
-(rpyqt is bundled automatically and the Wayland glue is generated). Point it at
-another page by editing the `www2json.py` line, or run it by hand:
-
-```sh
-python3 www2json.py some_page.html --out .
-python3 www2json.py --url https://example.com --out .
-```
+The binary loads a page by shelling out to `python3 www2json.py <name>.html` at
+runtime and parsing the resulting `page.json`, so it must run from a directory
+containing `www2json.py` and the `*.html` site — `make minibrowser` stages
+`www2json.py`, `home.html`, and `about.html` next to the binary for you. Point
+it at other local pages by dropping their `.html` in that directory (a live
+`--url` fetch uses the same `www2json` path where the network is available).
 
 ## Off-target check (no compositor needed)
 
 Because the rpython dialect is a Python subset, the renderer also runs under
-CPython. `render_test.py` builds the page, paints into a framebuffer, asserts it
-draws and that a button click reaches its handler, and can dump a screenshot:
+CPython. `render_test.py` drives the whole navigation loop off-target — loads
+`home`, asserts it draws, clicks the in-page About link and asserts the About
+page loads, types a name + Enter in the URL bar, and checks Back — and can dump
+a screenshot:
 
 ```sh
 python3 render_test.py            # asserts
@@ -89,15 +93,33 @@ border + caret); printable keys append, backspace deletes, and Enter emits
 `returnPressed`. `render_test.py` drives this whole path (pointer-focus → keys →
 text) off-target as a regression check.
 
+### Runtime JSON + live navigation
+
+The page is no longer baked in at build time. `minijson.py` parses a `page.json`
+bundle from disk at runtime into the `Node` tree — a small schema-specific
+recursive-descent parser (objects/arrays/strings, `\uXXXX` folded to `?`), where
+each parse method returns one concrete rpython type so it lowers to direct C.
+
+On top of that, `json2qt.py` adds a real browser loop. A toolbar (Back / URL
+field / GO) sits above the page. Clicking an in-page link, or typing a page name
++ Enter in the URL bar, calls `navigate()`, which re-runs `www2json.py` on the
+target (via `os.system`) to (re)produce `page.json`, parses it, and rebuilds the
+window's layout in place; a back-stack drives the Back button. Getting this to
+lower cleanly drove a few rpython-dialect findings: navigation state lives on an
+object-model class behind a module global (a module-global *list* miscompiles);
+`QWidget.setLayout` takes a concrete `QBoxLayout` (not `obj`) so it can be called
+on a window held in a global without the boxed-arg mis-lowering; and strings
+read off an `obj`-typed `Node` are bound to explicitly annotated `char*` locals
+before use. A method name shared across the `dom.Node` and `rpyqt` hierarchies
+(`get_href`) made obj-dispatch pick the wrong vtable, so rpyqt's is `href_value`.
+
 ## Roadmap (deliberately not yet done)
 
-* **Runtime JSON in rpython.** Today the page reaches the renderer as generated
-  `page_data.py` (co-compiled). A small rpython JSON reader would let the binary
-  load `page.json` at runtime instead of at build time.
-* **Live navigation.** Wire `QLink.clicked` / form submit to re-run `www2json`
-  on the target and rebuild the tree (back/forward stacks). The input plumbing
-  is now in place: fields type and Enter submits.
 * **Scripting via minipy.** Page scripts are captured but not run. The plan is
   to translate JS → Python with OpenSourceJesus's [Js2Py fork](https://github.com/OpenSourceJesus/Js2Py)
   and execute it through **embedded minipy** (see `MINIPY.md`) as the page's
   scripting engine — Python instead of JavaScript, on the same DOM.
+* **Real network fetch.** `www2json --url` exists; wiring it into `navigate()`
+  (rather than local `*.html`) is a small step where the network is available.
+* **Images beyond a placeholder**, and a fuller keymap (other layouts, via
+  xkbcommon) than the built-in US map.
