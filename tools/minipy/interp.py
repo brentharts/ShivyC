@@ -3036,6 +3036,33 @@ def mpy_call_i(name: "char*", arg: "int") -> "int":
     return -1
 
 
+def mpy_call_is(name: "char*", i: "int", s: "char*") -> "int":
+    # Call a booted top-level function by name with one int and one string
+    # argument. Used for two-way binding: mpy_call_is("__set_value", handle,
+    # typed_text) pushes an edited input's text back into the DOM.
+    prog: "Program" = _embed_prog
+    st: "St" = _embed_st
+    if _embed_ready == 0:
+        return -1
+    gi = 0
+    while gi < len(prog.names) and gi < len(st.glob):
+        if _strcmp(prog.names[gi], name) == 0:
+            fv = st.glob[gi]
+            if fv.tag != 5:
+                return -1
+            cargs = new_v_list()
+            cargs.append(v_int(i))
+            cargs.append(v_str(s))
+            r = do_call(st, fv, cargs)
+            if st.exc_flag != 0:
+                return -1
+            if r.tag == 1:
+                return r.iv
+            return 0
+        gi = gi + 1
+    return -1
+
+
 def interp_run(prog: "Program", sargs: "list[str]") -> "int":
     st = build_state(prog, sargs)
     run_func(st, prog.entry, new_v_list())
