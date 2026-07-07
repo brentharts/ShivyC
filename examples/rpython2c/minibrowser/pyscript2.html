@@ -1,0 +1,21 @@
+<html>
+<head>
+<script type="python">
+def bar():
+    b = document.getElementById('INPUT')
+    b.value = 'world'
+def foo():
+    console.log('hello minipy console')
+    iput = document.createElement('input')
+    iput.value = 'hello'
+    iput.setAttribute('id','INPUT')
+    document.body.appendChild(iput)
+    btn = document.createElement('button')
+    btn.onclick = bar
+    document.body.appendChild(btn)
+</script>
+</head>
+<body>
+<button onclick="foo()">clickme</button>
+</body>
+</html>

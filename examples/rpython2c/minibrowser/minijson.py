@@ -253,3 +253,43 @@ def load_page(path: "char*") -> "obj":
     s = read_file(path)
     p = Parser(s)
     return p.parse_bundle()
+
+
+def parse_dom_str(s: "char*") -> "obj":
+    """Parse a bare DOM node JSON string (a {type,attributes,text,children}
+    object, as the live minidom serializes document.body) into a Node tree."""
+    p = Parser(s)
+    return p.parse_node()
+
+
+def _find(s: "char*", sub: "char*", start: "int") -> "int":
+    n = len(s)
+    m = len(sub)
+    i = start
+    while i <= n - m:
+        j = 0
+        while j < m and ord(s[i + j]) == ord(sub[j]):
+            j = j + 1
+        if j == m:
+            return i
+        i = i + 1
+    return -1
+
+
+def has_python(path: "char*") -> "int":
+    """True if the page.json bundle at `path` carries a non-empty "python" field
+    (i.e. the page has a <script type="python">). A pure text scan so it is safe
+    to call off-target (CPython), gating whether the browser boots minipy."""
+    s = read_file(path)
+    n = len(s)
+    idx = _find(s, "\"python\"", 0)
+    if idx < 0:
+        return 0
+    i = idx + 8
+    while i < n and (ord(s[i]) == 32 or ord(s[i]) == 58 or ord(s[i]) == 9):
+        i = i + 1
+    if i < n and ord(s[i]) == 34:          # opening quote of the value
+        if i + 1 < n and ord(s[i + 1]) == 34:
+            return 0                        # "" -> empty
+        return 1
+    return 0

@@ -28,8 +28,8 @@ import sys
 from rpyqt import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QBoxLayout,
                    QLabel, QPushButton, QHeading, QLink, QLineEdit, QHLine,
                    last_link_href, last_action)
-from minijson import load_page
-from interp_embed import mpy_boot, mpy_call
+from minijson import load_page, parse_dom_str, has_python
+from interp_embed import mpy_boot, mpy_call, mpy_call_s, mpy_call_i
 
 # ----- navigation state ---------------------------------------------------
 # The window is held in a *typed* global so setLayout (which takes a concrete
@@ -39,6 +39,7 @@ from interp_embed import mpy_boot, mpy_call
 _win: "QWidget*" = None
 _url = None
 _status = None
+_scripted = 0            # 1 while the current page is driven by minipy
 
 
 class NavBase:
@@ -95,41 +96,48 @@ def fetch(name: "char*") -> None:
 
 
 # ----- page scripting (minipy) -------------------------------------------
-# A page's <script type="python"> runs on the embedded minipy interpreter, not
-# the renderer. The script is compiled to page.mpyc by the CPython helper
-# (pycompile.py) and booted lazily on the first onclick, so scriptless pages
-# never pay for the interpreter. `_booted` records which page is currently
-# booted so we recompile only when the page changes.
-_booted = ""
+# A scripted page (one with a <script type="python">) is driven by the embedded
+# minipy interpreter, which owns the live DOM. On navigation the page's python +
+# a body tree built from the HTML are compiled to page.mpyc and booted; the
+# browser then renders from what minipy reports, re-reading it after every event
+# so script mutations (createElement / value= / appendChild) show on screen.
+#
+#   render:  mpy_call_s("__serialize") -> DOM JSON -> parse_dom_str -> widgets
+#   click:   mpy_call_i("__fire", handle) runs the element's onclick, then render
+#   console/alert surfaces: mpy_call_s("__console") / ("__alert")
 
 
 def boot_page() -> None:
-    global _booted
-    src: "char*" = _hist.get_source()
-    if _booted == src:
-        return
     os.system("python3 pycompile.py page.json minidom.py page.mpyc")
     mpy_boot("page.mpyc")
-    _booted = src
 
 
-def handler_name(action: "char*") -> "char*":
-    # Turn an inline handler like "foo()" into the function name "foo".
-    a = action
-    n = len(a)
+def _atoi(s: "char*") -> "int":
+    n = len(s)
     i = 0
+    v = 0
     while i < n:
-        if a[i] == "(":
-            return a[0:i]
+        c = ord(s[i])
+        if c >= 48 and c <= 57:
+            v = v * 10 + (c - 48)
         i = i + 1
-    return a
+    return v
+
+
+def render_from_dom() -> None:
+    # Rebuild the page from minipy's current DOM (after boot or an event).
+    s: "char*" = mpy_call_s("__serialize")
+    root = parse_dom_str(s)
+    apply_ui(root)
 
 
 def on_script() -> None:
-    boot_page()
+    # A script-backed element was clicked: its recorded action is the element's
+    # integer handle. Fire its onclick in minipy, then re-render the DOM.
     act: "char*" = last_action()
-    name: "char*" = handler_name(act)
-    mpy_call(name)
+    h: "int" = _atoi(act)
+    mpy_call_i("__fire", h)
+    render_from_dom()
 
 
 # ----- tag dispatch (the port of Tetra's generate_interface) --------------
@@ -315,6 +323,22 @@ def render_node(node: "obj", box: "QBoxLayout") -> None:
 
 
 # ----- UI assembly + navigation ------------------------------------------
+def render_console(text: "char*", box: "QBoxLayout") -> None:
+    # One label per console.log line (text is the lines joined by '\n').
+    n = len(text)
+    start = 0
+    i = 0
+    while i < n:
+        if ord(text[i]) == 10:
+            line: "char*" = text[start:i]
+            box.addWidget(QLabel("console: " + line))
+            start = i + 1
+        i = i + 1
+    last: "char*" = text[start:n]
+    if len(last) > 0:
+        box.addWidget(QLabel("console: " + last))
+
+
 def build_ui(root: "obj") -> "QVBoxLayout":
     global _url, _status
     box = QVBoxLayout()
@@ -336,6 +360,16 @@ def build_ui(root: "obj") -> "QVBoxLayout":
 
     render_node(root, box)
 
+    # Scripted pages surface their console.log / window.alert output on screen.
+    if _scripted != 0:
+        box.addWidget(QHLine())
+        ctext: "char*" = mpy_call_s("__console")
+        if len(ctext) > 0:
+            render_console(ctext, box)
+        atext: "char*" = mpy_call_s("__alert")
+        if len(atext) > 0:
+            box.addWidget(QLabel("[alert] " + atext))
+
     label: "char*" = "LOADED " + src
     status = QLabel(label)
     _status = status
@@ -350,12 +384,20 @@ def apply_ui(root: "obj") -> None:
 
 
 def navigate(name: "char*", push: int) -> None:
+    global _scripted
     if push:
         _hist.push(_hist.get_source())
     _hist.set_source(name)
     fetch(name)
-    root = load_page("page.json")
-    apply_ui(root)
+    if has_python("page.json") != 0:
+        # Scripted page: minipy owns the live DOM; render from what it reports.
+        _scripted = 1
+        boot_page()
+        render_from_dom()
+    else:
+        _scripted = 0
+        root = load_page("page.json")
+        apply_ui(root)
 
 
 # ----- no-arg handlers wired to signals ----------------------------------
@@ -376,17 +418,41 @@ def on_back() -> None:
 
 
 def script_selftest() -> int:
-    # Headless proof of the full script path: load a scripted page, compile its
-    # python to bytecode, boot it on the embedded interpreter, and fire the
-    # button's onclick handler -- printing whatever the page script logs. Used
-    # by the Makefile/tests where no Wayland compositor (and no click) exists.
-    global _hist
+    # Headless proof of live DOM mutation: load the scripted page, boot it, then
+    # drive events by element handle (as clicks would) and read the DOM back,
+    # checking that createElement/appendChild and value= actually take effect.
+    global _hist, _scripted
     _hist = History()
-    _hist.set_source("pyscript")
-    fetch("pyscript")            # www2json pyscript.html -> page.json
-    boot_page()                  # pycompile -> page.mpyc -> mpy_boot
-    r = mpy_call("foo")          # fire the handler, as a click would
-    print("selftest mpy_call rc=" + str(r))
+    _hist.set_source("pyscript2")
+    fetch("pyscript2")
+    _scripted = 1
+    boot_page()
+
+    s0: "char*" = mpy_call_s("__serialize")
+    root0 = parse_dom_str(s0)
+    print("initial dom: " + s0)
+    btn = root0.child(0)
+    oc0: "char*" = btn.get_onclick()
+    h0: "int" = _atoi(oc0)                     # the clickme button's handle
+    mpy_call_i("__fire", h0)                   # click it -> foo()
+
+    s1: "char*" = mpy_call_s("__serialize")
+    root1 = parse_dom_str(s1)
+    inp: "obj" = root1.child(1)
+    vfoo: "char*" = inp.get_value()
+    print("input value after foo: " + vfoo)
+    newbtn = root1.child(2)
+    oc1: "char*" = newbtn.get_onclick()
+    h1: "int" = _atoi(oc1)                      # the created button's handle
+    mpy_call_i("__fire", h1)                    # click it -> bar()
+
+    s2: "char*" = mpy_call_s("__serialize")
+    root2 = parse_dom_str(s2)
+    inp2: "obj" = root2.child(1)
+    vbar: "char*" = inp2.get_value()
+    print("input value after bar: " + vbar)
+    ctext: "char*" = mpy_call_s("__console")
+    print("console: " + ctext)
     return 0
 
 

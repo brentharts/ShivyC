@@ -49,26 +49,61 @@ def _lit(s):
     return "".join(out)
 
 
-def _walk(node, out):
+
+
+def _handler_name(onclick):
+    """Map an inline handler like "foo()" to the function name "foo", or "" if
+    it is not a simple name()-call we can bind to a script function."""
+    s = onclick.strip()
+    if not s.endswith(")"):
+        return ""
+    head = s[:s.find("(")].strip()
+    if head and (head[0].isalpha() or head[0] == "_") and \
+            all(c.isalnum() or c == "_" for c in head):
+        return head
+    return ""
+
+
+def _emit_node(node, parent_var, counter, lines):
+    tag = node.get("type", "")
+    if tag.startswith("#"):            # #text and friends: fold as text, no node
+        return
+    counter[0] += 1
+    var = "__e%d" % counter[0]
+    lines.append("%s = document.createElement(%s)" % (var, _lit(tag)))
+    text = node.get("text", "")
+    if text:
+        lines.append("%s.textContent = %s" % (var, _lit(text)))
     attrs = node.get("attributes", {})
-    eid = attrs.get("id", "")
-    if eid:
-        out.append((eid, node.get("type", ""), node.get("text", "")))
+    if attrs.get("id", ""):
+        lines.append("%s.setAttribute(\"id\", %s)" % (var, _lit(attrs["id"])))
+    if attrs.get("value", ""):
+        lines.append("%s.value = %s" % (var, _lit(attrs["value"])))
+    name = _handler_name(attrs.get("onclick", ""))
+    if name:
+        lines.append("%s.onclick = %s" % (var, name))
+    lines.append("%s.appendChild(%s)" % (parent_var, var))
     for ch in node.get("children", []):
-        _walk(ch, out)
-    return out
+        _emit_node(ch, var, counter, lines)
 
 
 def assemble(bundle, minidom_path):
+    """One minipy program: minidom prelude + page script + a live body tree.
+
+    The body is built with createElement/appendChild so it is the same mutable
+    structure the script edits (not a separate read-only registration), and it
+    comes *after* the script so onclick="foo()" can bind to the function foo.
+    """
     prelude = open(minidom_path).read()
-    lines = ["", "# ---- DOM populated from the parsed page ----"]
-    for (eid, tag, text) in _walk(bundle.get("dom", {}), []):
-        lines.append("document._register(Element(%s, %s, %s))"
-                     % (_lit(eid), _lit(tag), _lit(text)))
-    parts = [prelude, "\n".join(lines)]
+    parts = [prelude]
     py = bundle.get("python", "")
     if py.strip():
         parts += ["", "# ---- page <script type=\"python\"> ----", py]
+    lines = ["", "# ---- live body built from the parsed page ----"]
+    counter = [0]
+    for ch in bundle.get("dom", {}).get("children", []):
+        _emit_node(ch, "document.body", counter, lines)
+    parts.append("\n".join(lines))
     return "\n".join(parts)
 
 

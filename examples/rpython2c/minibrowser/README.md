@@ -145,26 +145,60 @@ make minibrowser
 cd build/gui && ./minibrowser_app --script-selftest
 ```
 
-which loads `pyscript.html`, compiles + boots its script, and fires the button's
-`onclick="foo()"`, printing what the script logs:
+which loads `pyscript2.html`, boots it, then drives events by element handle
+(as clicks would) and reads the DOM back after each one:
 
 ```
+initial dom: {"type":"body",...,"children":[{"type":"button",...,"text":"clickme"}]}
 hello minipy console
-[object HTMLDocument] with 1 indexed elements
-<button id="A">clickme</button>
-[alert] hello minipy
+input value after foo: hello
+input value after bar: world
 ```
 
+### Live DOM mutation
+
+The DOM is authoritative *inside* minipy: page scripts mutate ordinary
+interpreted-Python objects (`minidom.py` — `document`, `Element`, `console`,
+`window`), and the browser renders from what they report. After boot and after
+every event the browser calls `__serialize()` to get `document.body` as JSON
+(the same shape `minijson` already parses), rebuilds the widget tree, and
+surfaces `console.log` / `window.alert` output on screen. This side-steps the
+hard direction (native → interpreter) entirely: the browser only ever reads a
+string back.
+
+So the full example works live —
+
+```python
+def foo():
+    iput = document.createElement('input')   # create
+    iput.value = 'hello'                       # set value
+    iput.setAttribute('id', 'INPUT')
+    document.body.appendChild(iput)            # append -> a real widget appears
+    btn = document.createElement('button')
+    btn.onclick = bar                          # a Python callable as the handler
+    document.body.appendChild(btn)
+def bar():
+    document.getElementById('INPUT').value = 'world'   # mutate -> widget updates
+```
+
+Events reach back through **integer handles**: every element gets a unique one,
+an element with an onclick serializes `"onclick":"<handle>"`, and clicking it
+calls `mpy_call_i("__fire", handle)` — which runs that element's onclick (a
+string handler like `foo()` wired by `pycompile` to `el.onclick = foo`, or a
+script-assigned callable like `btn.onclick = bar`) and triggers a re-render.
 `pyscript_test.py` is the same proof at the source level (assemble → native
-minipy → assert). Today the DOM surface is read + `console.log` + `window.alert`
-(alerts print to stdout; a real overlay comes later); live DOM *mutation* is the
-next step, behind native host primitives.
+minipy → assert).
+
+Two minipy-subset constraints shaped `minidom.py`: a function stored in an
+attribute can't be called as `obj.cb()` (that parses as a method lookup) so
+`_fire` binds it to a local first (`cb = e.onclick; cb()`), and mutable
+counters/registries live as object fields, not module globals.
 
 ## Roadmap (deliberately not yet done)
 
-* **Live DOM mutation.** `getElementById` currently returns a read-only element
-  (tag / id / text). Making `el.textContent = ...` update the actual widget
-  needs a few native host primitives bridging minidom to the `rpyqt` tree.
+* **Two-way inputs & more DOM.** Rendered `<input>`s show their value but typing
+  doesn't yet flow back into the minidom; `removeChild`, more attributes, and a
+  real modal `alert` overlay (rather than an on-screen label) are the follow-ups.
 * **JS via Js2Py.** JavaScript is captured verbatim (bundle `scripts`); the plan
   is to translate JS → Python with OpenSourceJesus's
   [Js2Py fork](https://github.com/OpenSourceJesus/Js2Py) and feed it the same
