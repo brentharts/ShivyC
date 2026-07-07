@@ -368,6 +368,12 @@ def _ensure_native(force=False):
              "import sys;sys.path.insert(0,%r);import py2c;py2c.write_runtime(%r)"
              % (here, bdir)], capture_output=True, text=True)
         import glob
+        # The interpreter's ctypes FFI builtins lower to the mb_ffi.c shim
+        # (dlopen/dlsym/indirect call); drop it in so the glob links it.
+        import shutil
+        _mbffi = _os.path.join(here, "rpy_lib", "mb_ffi.c")
+        if _os.path.isfile(_mbffi):
+            shutil.copy(_mbffi, _os.path.join(bdir, "mb_ffi.c"))
         csrc = glob.glob(_os.path.join(bdir, "*.c"))
         cc = subprocess.run(["gcc", "-std=c99", "-O2", "-I", bdir] + csrc
                             + ["-o", binp], capture_output=True, text=True)
