@@ -144,3 +144,12 @@ def rw_pointer(x: int, y: int, pressed: int) -> int:
 
 def rw_key(codepoint: int, pressed: int) -> int:
     return _active.on_key(codepoint, pressed)
+
+
+def rw_frame(px: int, py: int) -> int:
+    # Base Window is event-driven; the frame-callback loop stays off.
+    return ACTION_NONE
+
+
+def rw_wants_frame() -> int:
+    return 0

@@ -525,6 +525,12 @@ class QCanvas(Widget):
     def pref_h(self) -> int:
         return self.ch
 
+    def canvas_x(self) -> int:
+        return self.x
+
+    def canvas_y(self) -> int:
+        return self.y
+
     def paint(self, fb: "u32*", fbw: int, fbh: int) -> None:
         n = len(self.px)
         cw = self.cw
@@ -840,6 +846,36 @@ def last_edit_text() -> "char*":
     return _edit_text
 
 
+# ---- animation frames + pointer uniform ---------------------------------
+# When an animated widget (a canvas shader) is on screen, the runtime drives a
+# Wayland frame-callback loop: each frame it calls rw_frame(px, py), which
+# records the pointer and runs the frame handler (which advances time + refills
+# the canvas), then repaints. rw_wants_frame() gates the loop so pages/apps with
+# nothing animating stay event-driven (no continuous repaint).
+_wants_frame = 0
+_frame_handler = None
+_ptr_x = 0
+_ptr_y = 0
+
+
+def set_wants_frame(v: "int") -> None:
+    global _wants_frame
+    _wants_frame = v
+
+
+def set_frame_handler(fn: "obj") -> None:
+    global _frame_handler
+    _frame_handler = fn
+
+
+def pointer_x() -> "int":
+    return _ptr_x
+
+
+def pointer_y() -> "int":
+    return _ptr_y
+
+
 def rw_width() -> int:
     return _active.width
 
@@ -862,3 +898,19 @@ def rw_pointer(x: int, y: int, pressed: int) -> int:
 
 def rw_key(codepoint: int, pressed: int) -> int:
     return _active.on_key(codepoint, pressed)
+
+
+def rw_frame(px: int, py: int) -> int:
+    global _ptr_x, _ptr_y
+    _ptr_x = px
+    _ptr_y = py
+    f = _frame_handler
+    if f is not None:
+        f()
+    if _wants_frame != 0:
+        return ACTION_REDRAW
+    return ACTION_NONE
+
+
+def rw_wants_frame() -> int:
+    return _wants_frame
