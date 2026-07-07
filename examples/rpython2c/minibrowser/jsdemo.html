@@ -1,0 +1,17 @@
+<html>
+<head>
+<title>javascript on minipy</title>
+<script>
+function greet() {
+    console.log('hello from javascript');
+    var out = document.getElementById('OUT');
+    out.value = 'set by JS';
+}
+</script>
+</head>
+<body>
+<h1>hello js</h1>
+<button onclick="greet()">click me</button>
+<input id="OUT" value="unset">
+</body>
+</html>

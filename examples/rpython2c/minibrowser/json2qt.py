@@ -551,6 +551,48 @@ def jit_selftest() -> int:
     return 0
 
 
+def js_selftest() -> int:
+    # Headless proof that JavaScript rides the same engine: load jsdemo.html
+    # (a plain <script> translated to minipy python by js2py), boot it, fire the
+    # button's onclick=greet(), and read the DOM back -- greet() should log to
+    # the console and set the OUT input's value, from JavaScript.
+    global _hist, _scripted
+    _hist = History()
+    _hist.set_source("jsdemo")
+    fetch("jsdemo")
+    _scripted = 1
+    boot_page()
+    s0: "char*" = mpy_call_s("__serialize")
+    root0 = parse_dom_str(s0)
+    n = root0.child_count()
+    i = 0
+    done = 0
+    while i < n:
+        ch = root0.child(i)
+        oc: "char*" = ch.get_onclick()
+        if len(oc) > 0 and done == 0:
+            hh: "int" = _atoi(oc)
+            mpy_call_i("__fire", hh)            # click -> greet() (from JS)
+            done = 1
+        i = i + 1
+    ctext: "char*" = mpy_call_s("__console")
+    print("console: " + ctext)
+    s1: "char*" = mpy_call_s("__serialize")
+    root1 = parse_dom_str(s1)
+    n2 = root1.child_count()
+    i2 = 0
+    found = 0
+    while i2 < n2:
+        c2 = root1.child(i2)
+        cid: "char*" = c2.get_id()
+        if cid == "OUT" and found == 0:
+            v: "char*" = c2.get_value()
+            print("OUT value: " + v)
+            found = 1
+        i2 = i2 + 1
+    return 0
+
+
 def canvas_selftest() -> int:
     # Headless proof of "native draws to the page": load canvas.html, JIT its
     # <script type="rpython"> shader, and confirm the native pixel(x,y) varies
@@ -599,6 +641,8 @@ def main() -> int:
         return jit_selftest()
     if len(sys.argv) > 1 and sys.argv[1] == "--canvas-selftest":
         return canvas_selftest()
+    if len(sys.argv) > 1 and sys.argv[1] == "--js-selftest":
+        return js_selftest()
     app = QApplication()
     win = QWidget()
     win.setWindowTitle("MINIBROWSER")

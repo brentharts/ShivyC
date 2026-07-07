@@ -299,15 +299,57 @@ python3 canvas_render.py canvas.png                    # same shader -> a viewab
 `canvas_render.py` runs the identical shader under CPython + real ctypes and
 saves the image the browser draws, so the native output is viewable off-target.
 
+## JavaScript on the same engine (js2py)
+
+Plain `<script>` JavaScript runs on the *same* minipy engine and DOM as
+`<script type="python">`. `js2py.py` parses the JS with **pyjsparser** (the
+parser the [Js2Py](https://github.com/OpenSourceJesus/Js2Py) project is built
+on) and translates the ESTree AST into minipy-subset Python against the minidom,
+so `www2json` folds it into the page's `python` field:
+
+```html
+<script>
+function greet() {
+    console.log('hello from javascript');
+    document.getElementById('OUT').value = 'set by JS';
+}
+</script>
+<button onclick="greet()">click me</button>
+<input id="OUT" value="unset">
+```
+
+becomes, transparently:
+
+```python
+def greet():
+    console.log("hello from javascript")
+    document.getElementById("OUT").value = "set by JS"
+```
+
+and the click runs it -- console line printed, input value mutated -- exactly as
+the Python path would. The translator covers a pragmatic subset (functions,
+`var`/`let`/`const`, `if`/`while`/C-style `for`, `return`, member/call/assign
+expressions, `===`->`==`, `&&`->`and`, `?:`->`if/else`); unsupported constructs
+are skipped (the JS stays in `scripts`, unrun) rather than breaking the page.
+Full ECMAScript semantics -- `+` type coercion, hoisting, closures, prototypes,
+`this` -- are out of scope; the goal is DOM-scripting parity, not a JS VM.
+
+```
+python3 js_test.py                                # translate + run on native minipy
+cd build/gui && ./minibrowser_app --js-selftest   # JS greet() runs in the browser
+```
+
+Needs `pip install pyjsparser` (optional, like Js2Py itself); without it the JS
+is simply left unrun.
+
 ## Roadmap (deliberately not yet done)
 
 * **Two-way inputs & more DOM.** Rendered `<input>`s show their value but typing
   doesn't yet flow back into the minidom; `removeChild`, more attributes, and a
   real modal `alert` overlay (rather than an on-screen label) are the follow-ups.
-* **JS via Js2Py.** JavaScript is captured verbatim (bundle `scripts`); the plan
-  is to translate JS → Python with OpenSourceJesus's
-  [Js2Py fork](https://github.com/OpenSourceJesus/Js2Py) and feed it the same
-  `python` path, so JS and Python share one DOM and one engine.
+* **Wider JS coverage.** The js2py subset handles DOM scripting; JS `+` string
+  coercion, object literals, `this`/closures, and array methods are the next
+  reach (some map cleanly onto minipy, some need runtime helpers).
 * **Real network fetch.** `www2json --url` exists; wiring it into `navigate()`
   (rather than local `*.html`) is a small step where the network is available.
 * **Images beyond a placeholder**, and a fuller keymap (other layouts, via

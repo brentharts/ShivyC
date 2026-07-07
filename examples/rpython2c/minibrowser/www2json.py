@@ -164,13 +164,30 @@ def build_bundle(source, html_text):
     for (stype, sid, code) in parser.scripts:
         if stype in ("rpython", "text/rpython") and code.strip():
             rpython[sid or ("rpy%d" % len(rpython))] = code.strip()
+    # Translate plain <script> JavaScript to minipy python (js2py, via the
+    # pyjsparser AST) so it runs on the *same* engine + DOM as a python script.
+    # Best-effort: if pyjsparser is missing or the JS uses an unsupported
+    # construct, the JS is left unrun (still captured in "scripts") rather than
+    # breaking the page.
+    js_python = ""
+    if other_code.strip():
+        try:
+            import js2py as _js2py
+            js_python = _js2py.translate(other_code)
+        except Exception as e:                       # noqa: BLE001
+            sys.stderr.write("js2py: skipping <script> (%s)\n" % e)
+            js_python = ""
+    combined_py = py_code
+    if js_python.strip():
+        combined_py = (py_code + "\n\n" + js_python).strip() \
+            if py_code.strip() else js_python.strip()
     return {
         "source": source,
         "title": title,
         "dom": body,
-        "python": py_code,          # <script type="python"> bodies (run by minipy)
+        "python": combined_py,      # <script type="python"> + translated JS
         "rpython": rpython,         # <script type="rpython" id=..> -> native .so
-        "scripts": other_code,      # other scripts (e.g. JS) captured verbatim
+        "scripts": other_code,      # original JavaScript, captured verbatim
     }
 
 
