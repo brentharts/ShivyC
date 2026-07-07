@@ -229,12 +229,18 @@ MB := $(RPY)/minibrowser
 minibrowser:
 	@mkdir -p $(GUIBIN)/minibrowser
 	@cp -f $(RPY)/rpy_lib/xdg-shell.xml $(GUIBIN)/minibrowser/ 2>/dev/null || true
-	python3 $(MB)/www2json.py $(MB)/example.html --out $(MB)
-	python3 tools/py2c.py $(MB)/json2qt.py $(MB)/dom.py $(MB)/page_data.py \
+	python3 tools/py2c.py $(MB)/json2qt.py $(MB)/dom.py $(MB)/minijson.py \
 	    --out $(GUIBIN)/minibrowser
 	cc $(WL_CFLAGS) -I$(GUIBIN)/minibrowser $(GUIBIN)/minibrowser/*.c \
 	    -o $(GUIBIN)/minibrowser_app $(WL_LIBS)
-	@echo "built $(GUIBIN)/minibrowser_app  (run it under a Wayland compositor)"
+	@# Stage the runnable site next to the binary: the browser shells out to
+	@# `python3 www2json.py <page>.html` at runtime, so www2json.py + the *.html
+	@# site must sit in the working directory it is launched from.
+	@cp -f $(MB)/www2json.py $(MB)/home.html $(MB)/about.html $(MB)/example.html \
+	    $(GUIBIN)/
+	@python3 $(MB)/www2json.py $(MB)/home.html --out $(GUIBIN) >/dev/null
+	@echo "built $(GUIBIN)/minibrowser_app  (run from $(GUIBIN) under a Wayland compositor)"
+	@echo "  cd $(GUIBIN) && ./minibrowser_app"
 
 rpython:
 	@mkdir -p $(RPYBIN)
