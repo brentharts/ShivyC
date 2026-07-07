@@ -246,6 +246,7 @@ minibrowser:
 	    $(MB)/jitc.py \
 	    $(MB)/home.html $(MB)/about.html $(MB)/example.html \
 	    $(MB)/pyscript.html $(MB)/pyscript2.html $(MB)/pyjit.html \
+	    $(MB)/canvas.html \
 	    $(GUIBIN)/
 	@rm -rf $(GUIBIN)/minipy && cp -r tools/minipy $(GUIBIN)/minipy
 	@python3 $(MB)/www2json.py $(MB)/home.html --out $(GUIBIN) >/dev/null
