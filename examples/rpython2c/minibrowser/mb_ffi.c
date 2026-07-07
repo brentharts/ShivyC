@@ -29,3 +29,6 @@ int mb_call2i(long fn, int a, int b) {
 int mb_call3i(long fn, int a, int b, int c) {
     return ((int (*)(int, int, int))fn)(a, b, c);
 }
+int mb_call5i(long fn, int a, int b, int c, int d, int e) {
+    return ((int (*)(int, int, int, int, int))fn)(a, b, c, d, e);
+}

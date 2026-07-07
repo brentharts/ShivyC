@@ -271,33 +271,45 @@ The unrewritten page source still runs under CPython with real ctypes
 
 ### Native drawing (a canvas fragment shader)
 
-Native code can also *draw* to the page. A `<canvas>` is filled by a native
-`pixel(x, y) -> argb` shader shipped as a `<script type="rpython">` block:
+Native code can also *draw* to the page, and animate. A `<canvas>` is filled by a
+native `pixel(x, y, t, mx, my) -> argb` shader shipped as a `<script
+type="rpython">` block -- with a **time** uniform `t` and a **pointer** uniform
+`(mx, my)`, like a fragment shader:
 
 ```html
 <script type="rpython" id="shader">
-def pixel(x: int, y: int) -> int:
-    r = (x * 5) % 256
-    g = (y * 5) % 256
-    b = ((x + y) * 3) % 256
+def pixel(x: int, y: int, t: int, mx: int, my: int) -> int:
+    r = (x * 5 + t * 3) & 255           # shifts with time
+    g = (y * 5 + t * 2) & 255
+    b = ((x + y) * 3 + t) & 255
+    dx = x - mx
+    dy = y - my
+    if dx * dx + dy * dy < 200:         # brighten near the pointer
+        r = 255
+        g = 255
     return (255 << 24) | (r << 16) | (g << 8) | b
 </script>
 <canvas id="cvs" width="96" height="96"></canvas>
 ```
 
-On navigation the browser JIT-compiles the block (`jitc`), then the renderer's
-`QCanvas` widget calls the native `pixel` once per pixel through the FFI shim
-(`mb_call2i`) and blits the result -- no interpreter in the per-pixel loop, and
-no wasm/JS glue. It's effectively a fragment shader, and the same int-in/int-out
-FFI that powers `calc_sum`. This is the seed of a real Canvas2D/WebGL surface.
+On navigation the browser JIT-compiles the block (`jitc`), then fills the
+`QCanvas` by calling the native `pixel` once per pixel through the FFI shim
+(`mb_call5i`) -- no interpreter in the per-pixel loop, no wasm/JS glue.
+
+**Animation** is driven by a Wayland **frame-callback loop** added to the
+runtime: while an animated widget is on screen (`rw_wants_frame()` returns 1),
+each frame calls `rw_frame(px, py)`, which advances `t`, refills the canvas with
+the current pointer, and repaints. Pages with nothing animating stay purely
+event-driven -- the loop is opt-in, so the other GUI examples are unaffected.
 
 ```
-cd build/gui && ./minibrowser_app --canvas-selftest   # native shader fills 96x96
-python3 canvas_render.py canvas.png                    # same shader -> a viewable PNG
+cd build/gui && ./minibrowser_app --canvas-selftest   # shader animates + reacts to pointer
+python3 canvas_render.py canvas.gif                    # same shader -> an animated GIF
 ```
 
-`canvas_render.py` runs the identical shader under CPython + real ctypes and
-saves the image the browser draws, so the native output is viewable off-target.
+`canvas_render.py` runs the identical shader under CPython + real ctypes over a
+range of `t` (and a moving pointer) and saves an animated GIF, so the native
+output is viewable off-target.
 
 ## JavaScript on the same engine (js2py)
 
@@ -374,6 +386,9 @@ cd build/gui && ./minibrowser_app --twoway-selftest
 
 * **More DOM.** `removeChild`, more attributes, and a real modal `alert` overlay
   (rather than an on-screen label) are the next DOM gaps.
+* **Richer canvas.** Configurable size / `data-shader` from the element, a
+  `pixel`-buffer FFI (one native call fills a whole frame instead of per-pixel),
+  and click/drag state beyond the pointer position.
 * **Wider JS coverage.** The js2py subset now handles DOM scripting, objects, and
   arrays; JS `+` string coercion, `this`/closures, and array iteration methods
   (`map`/`forEach`) are the next reach.

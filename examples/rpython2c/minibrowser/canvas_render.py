@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Render the page's native <script type="rpython"> shader to a PNG under CPython.
+"""Render the page's native <script type="rpython"> shader off-target (CPython).
 
-Same pipeline as the browser (extract -> jitc -> ctypes), but calls the JIT'd
-`pixel(x, y)` per pixel with real ctypes and saves the image -- so the native
-"drawing on the page" is viewable off-target. Proves the canvas output visually
-and that the shader is CPython/ctypes-portable.
+Same pipeline as the browser (extract -> jitc -> ctypes), calling the JIT'd
+`pixel(x, y, t, mx, my)` shader with real ctypes. Writes an animated GIF (frames
+at advancing time t) so the native "drawing on the page" -- and its animation --
+is viewable without a compositor.
 
-    python3 canvas_render.py [out.png]
+    python3 canvas_render.py [out.gif] [frames]
 """
 import ctypes
 import os
@@ -30,16 +30,27 @@ def main(argv):
 
     dll = ctypes.CDLL(so)
     dll.pixel.restype = ctypes.c_int
-    dll.pixel.argtypes = [ctypes.c_int, ctypes.c_int]
+    dll.pixel.argtypes = [ctypes.c_int] * 5
 
-    img = Image.new("RGB", (W, H))
-    for y in range(H):
-        for x in range(W):
-            v = dll.pixel(x, y) & 0xFFFFFFFF
-            img.putpixel((x, y), ((v >> 16) & 255, (v >> 8) & 255, v & 255))
-    out = argv[1] if len(argv) > 1 else os.path.join(HERE, "canvas.png")
-    img.save(out)
-    print("wrote", out)
+    out = argv[1] if len(argv) > 1 else os.path.join(HERE, "canvas.gif")
+    nframes = int(argv[2]) if len(argv) > 2 else 24
+    import math
+    frames = []
+    for t in range(nframes):
+        # move the "pointer" in a circle so both uniforms are visible
+        ang = 2 * math.pi * t / nframes
+        mx = int(W / 2 + W / 3 * math.cos(ang))
+        my = int(H / 2 + H / 3 * math.sin(ang))
+        img = Image.new("RGB", (W, H))
+        px = img.load()
+        for y in range(H):
+            for x in range(W):
+                v = dll.pixel(x, y, t * 4, mx, my) & 0xFFFFFFFF
+                px[x, y] = ((v >> 16) & 255, (v >> 8) & 255, v & 255)
+        frames.append(img.resize((W * 3, H * 3), Image.NEAREST))
+    frames[0].save(out, save_all=True, append_images=frames[1:],
+                   duration=60, loop=0)
+    print("wrote", out, "(%d frames)" % nframes)
     return 0
 
 

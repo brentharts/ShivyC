@@ -28,7 +28,8 @@ import sys
 from rpyqt import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QBoxLayout,
                    QLabel, QPushButton, QHeading, QLink, QLineEdit, QHLine,
                    QCanvas, last_link_href, last_action,
-                   last_edit_handle, last_edit_text)
+                   last_edit_handle, last_edit_text,
+                   set_wants_frame, set_frame_handler, pointer_x, pointer_y)
 from minijson import load_page, parse_dom_str, has_python, has_rpython
 from interp_embed import (mpy_boot, mpy_call, mpy_call_s, mpy_call_i,
                           mpy_call_is)
@@ -247,9 +248,18 @@ if sys.implementation.name != "cpython":
     _ffi.mb_dlsym.argtypes = [_ct.c_long, _ct.c_char_p]
     _ffi.mb_call2i.restype = _ct.c_int
     _ffi.mb_call2i.argtypes = [_ct.c_long, _ct.c_int, _ct.c_int]
+    _ffi.mb_call5i.restype = _ct.c_int
+    _ffi.mb_call5i.argtypes = [_ct.c_long, _ct.c_int, _ct.c_int, _ct.c_int,
+                               _ct.c_int, _ct.c_int]
 
 CANVAS_W = 96
 CANVAS_H = 96
+
+# Animation state: the current frame (time uniform) and the on-screen canvas +
+# its native shader pointer, so the frame loop can refill it each tick.
+_frame = 0
+_shader_fn = 0
+_canvas: "QCanvas*" = None
 
 
 def _page_id(name: "char*") -> "char*":
@@ -279,23 +289,47 @@ def _shader_so() -> "char*":
     return "/tmp/minibrowser_cache/" + _page_id(src) + "/jit.shader.so"
 
 
+def _fill_canvas(cvs: "QCanvas*", fn: "long", t: "int",
+                 mx: "int", my: "int") -> None:
+    # Call the native shader pixel(x, y, t, mx, my) for every pixel.
+    px = []
+    y = 0
+    while y < CANVAS_H:
+        x = 0
+        while x < CANVAS_W:
+            px.append(_ffi.mb_call5i(fn, x, y, t, mx, my))
+            x = x + 1
+        y = y + 1
+    cvs.set_pixels(px)
+
+
 def render_canvas(box: "QBoxLayout") -> None:
+    global _canvas, _shader_fn
     cvs = QCanvas(CANVAS_W, CANVAS_H)
     so: "char*" = _shader_so()
     h = _ffi.mb_dlopen(so)
     if h != 0:
         fn = _ffi.mb_dlsym(h, "pixel")
         if fn != 0:
-            px = []
-            y = 0
-            while y < CANVAS_H:
-                x = 0
-                while x < CANVAS_W:
-                    px.append(_ffi.mb_call2i(fn, x, y))
-                    x = x + 1
-                y = y + 1
-            cvs.set_pixels(px)
+            _shader_fn = fn
+            _canvas = cvs
+            _fill_canvas(cvs, fn, _frame, 0, 0)
+            set_wants_frame(1)                 # animate this page
+            set_frame_handler(on_frame)
     box.addWidget(cvs)
+
+
+def on_frame() -> None:
+    # Runtime frame tick: advance time and refill the canvas with the current
+    # pointer (mapped into canvas-local coords). The runtime repaints after.
+    global _frame
+    _frame = _frame + 1
+    c: "QCanvas*" = _canvas
+    fn: "long" = _shader_fn
+    if fn != 0:
+        mx: "int" = pointer_x() - c.canvas_x()
+        my: "int" = pointer_y() - c.canvas_y()
+        _fill_canvas(c, fn, _frame, mx, my)
 
 
 def render_node(node: "obj", box: "QBoxLayout") -> None:
@@ -428,7 +462,12 @@ def render_console(text: "char*", box: "QBoxLayout") -> None:
 
 
 def build_ui(root: "obj") -> "QVBoxLayout":
-    global _url, _status
+    global _url, _status, _canvas, _shader_fn
+    # A fresh render: stop any previous page's animation; render_canvas turns it
+    # back on if this page has a canvas.
+    _canvas = None
+    _shader_fn = 0
+    set_wants_frame(0)
     box = QVBoxLayout()
     src: "char*" = _hist.get_source()
 
@@ -680,20 +719,24 @@ def canvas_selftest() -> int:
     if fn == 0:
         print("canvas: dlsym pixel failed")
         return 1
-    p00 = _ffi.mb_call2i(fn, 0, 0)
-    pa = _ffi.mb_call2i(fn, 20, 0)
-    pb = _ffi.mb_call2i(fn, 0, 20)
-    if p00 != pa and p00 != pb:
-        print("canvas OK: native shader varies per pixel")
+    p_t0 = _ffi.mb_call5i(fn, 10, 10, 0, 0, 0)
+    p_t9 = _ffi.mb_call5i(fn, 10, 10, 9, 0, 0)
+    p_ptr = _ffi.mb_call5i(fn, 10, 10, 0, 10, 10)   # pointer on this pixel
+    if p_t0 != p_t9:
+        print("canvas OK: shader animates with time")
     else:
-        print("canvas FAIL: shader not varying")
-    # exercise the full render loop the browser runs to fill the QCanvas
+        print("canvas FAIL: no time animation")
+    if p_ptr != p_t0:
+        print("canvas OK: shader reacts to pointer")
+    else:
+        print("canvas FAIL: no pointer reaction")
+    # exercise the full frame fill the browser runs
     cnt = 0
     y = 0
     while y < CANVAS_H:
         x = 0
         while x < CANVAS_W:
-            _ffi.mb_call2i(fn, x, y)
+            _ffi.mb_call5i(fn, x, y, 3, 48, 32)
             cnt = cnt + 1
             x = x + 1
         y = y + 1
