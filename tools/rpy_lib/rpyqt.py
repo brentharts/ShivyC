@@ -308,6 +308,19 @@ class Widget(_QtObject):
     def setText(self, text: "char*") -> None:
         self.text = text
 
+    def text_value(self) -> "char*":
+        # Declared on the base so a widget reached through an obj reference (a
+        # focused field, an activated link) can be read back uniformly.
+        return self.text
+
+    def href_value(self) -> "char*":
+        # Navigation target of an anchor; overridden by QLink, "" elsewhere.
+        # Named href_value (not get_href) to avoid colliding with the DOM
+        # Node.get_href in the co-compiled minibrowser: a shared method name
+        # across the two class hierarchies makes obj-dispatch pick the wrong
+        # vtable.
+        return ""
+
     def value(self) -> int:
         return 0
 
@@ -369,15 +382,19 @@ class QHeading(Widget):
 
 
 class QLink(Widget):
-    """An anchor: link-coloured text that emits `clicked` when pressed. `href`
-    is carried so a future navigation step can follow it; today the click just
-    fires the signal (e.g. to load another bundle)."""
+    """An anchor: link-coloured, underlined text that emits `clicked` when
+    pressed. `href` is the navigation target; on press the link records itself
+    as the last-activated link (so a no-arg `clicked` handler can recover the
+    href via `last_link_href()`) and fires `clicked`."""
 
     def __init__(self, text: "char*", href: "char*"):
         super().__init__()
         self.text = text
         self.href = href
         self.clicked = Signal()
+
+    def href_value(self) -> "char*":
+        return self.href
 
     def paint(self, fb: "u32*", fbw: int, fbh: int) -> None:
         fill_rect(fb, fbw, fbh, self.x, self.y, self.w, self.h, COL_LABEL_BG)
@@ -388,6 +405,7 @@ class QLink(Widget):
                   COL_LINK)
 
     def on_press(self, px: int, py: int) -> int:
+        set_last_link(self)
         self.clicked.emit()
         return ACTION_REDRAW
 
@@ -647,7 +665,12 @@ class QWidget(_QtObject):
     def setWindowTitle(self, title: "char*") -> None:
         self.title = title
 
-    def setLayout(self, box: "obj") -> None:
+    def setLayout(self, box: "QBoxLayout") -> None:
+        # The argument is always a layout (a QBoxLayout subclass), so it is typed
+        # concretely rather than as obj: that passes a plain pointer instead of a
+        # 16-byte boxed value, which is what lets setLayout be called on a window
+        # held in a module global (e.g. re-layout during navigation) without the
+        # untyped-extern arg mis-lowering that a boxed obj would hit.
         self.box = box
         box.place(PAD, PAD, WIN_W - 2 * PAD, WIN_H - 2 * PAD)
 
@@ -705,6 +728,23 @@ def set_focus(w: "obj") -> None:
         prev.set_focused(0)
     _focused = w
     w.set_focused(1)
+
+
+# The most recently activated QLink. Recorded on press so a no-arg `clicked`
+# handler can recover the navigation target with last_link_href().
+_last_link = None
+
+
+def set_last_link(w: "obj") -> None:
+    global _last_link
+    _last_link = w
+
+
+def last_link_href() -> "char*":
+    w = _last_link
+    if w is not None:
+        return w.href_value()
+    return ""
 
 
 def rw_width() -> int:
