@@ -2921,6 +2921,56 @@ def mpy_call(name: "char*") -> "int":
     return 3
 
 
+def mpy_call_s(name: "char*") -> "char*":
+    # Call a booted top-level function by name (no args) and return its string
+    # result (empty string if not booted / not found / raised / non-string).
+    # Used to read back serialized DOM / console / alert text from the page.
+    prog: "Program" = _embed_prog
+    st: "St" = _embed_st
+    if _embed_ready == 0:
+        return ""
+    gi = 0
+    while gi < len(prog.names) and gi < len(st.glob):
+        if _strcmp(prog.names[gi], name) == 0:
+            fv = st.glob[gi]
+            if fv.tag != 5:
+                return ""
+            r = do_call(st, fv, new_v_list())
+            if st.exc_flag != 0:
+                return ""
+            if r.tag == 3:
+                return r.sv
+            return ""
+        gi = gi + 1
+    return ""
+
+
+def mpy_call_i(name: "char*", arg: "int") -> "int":
+    # Call a booted top-level function by name with one int argument and return
+    # its int result (-1 if not booted / not found / raised). Used to dispatch a
+    # click by element handle: mpy_call_i("__fire", handle).
+    prog: "Program" = _embed_prog
+    st: "St" = _embed_st
+    if _embed_ready == 0:
+        return -1
+    gi = 0
+    while gi < len(prog.names) and gi < len(st.glob):
+        if _strcmp(prog.names[gi], name) == 0:
+            fv = st.glob[gi]
+            if fv.tag != 5:
+                return -1
+            cargs = new_v_list()
+            cargs.append(v_int(arg))
+            r = do_call(st, fv, cargs)
+            if st.exc_flag != 0:
+                return -1
+            if r.tag == 1:
+                return r.iv
+            return 0
+        gi = gi + 1
+    return -1
+
+
 def interp_run(prog: "Program", sargs: "list[str]") -> "int":
     st = build_state(prog, sargs)
     run_func(st, prog.entry, new_v_list())
