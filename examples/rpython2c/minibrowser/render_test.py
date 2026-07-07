@@ -92,12 +92,22 @@ def _painted(rpyqt, box, H=1200):
 
 def main(argv):
     here = os.path.dirname(os.path.abspath(__file__))
-    rpy_lib = os.path.abspath(
-        os.path.join(here, "..", "..", "..", "tools", "rpy_lib"))
+    tools = os.path.abspath(os.path.join(here, "..", "..", "..", "tools"))
+    rpy_lib = os.path.join(tools, "rpy_lib")
     _install_ctypes_stub()
     sys.path.insert(0, here)
     sys.path.insert(0, rpy_lib)
+    sys.path.insert(0, tools)            # interp_embed imports `rpy`
     os.chdir(here)                       # navigate() shells out to www2json here
+
+    # json2qt imports the embedded interpreter (interp_embed); generate it into a
+    # temp dir on the path so this off-target import resolves. The nav test never
+    # runs a page script, so minipy is only imported here, never invoked.
+    import tempfile
+    import gen_embed
+    embed_dir = tempfile.mkdtemp(prefix="mb_embed_")
+    gen_embed.generate(embed_dir)
+    sys.path.insert(0, embed_dir)
 
     import rpyqt
     import json2qt

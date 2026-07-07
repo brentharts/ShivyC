@@ -113,12 +113,62 @@ read off an `obj`-typed `Node` are bound to explicitly annotated `char*` locals
 before use. A method name shared across the `dom.Node` and `rpyqt` hierarchies
 (`get_href`) made obj-dispatch pick the wrong vtable, so rpyqt's is `href_value`.
 
+## Python scripting via embedded minipy
+
+A page's `<script type="python">` runs on **minipy** — the RPython Python
+interpreter (`tools/minipy`, see `MINIPY.md`) — co-compiled *into the browser
+binary*. The split mirrors the renderer's own CPython/native halves:
+
+* **Offline (CPython).** `www2json.py` captures `<script type="python">` bodies
+  (into the bundle's `python` field, separate from other `scripts`) plus element
+  `id`s and inline `onclick` handlers. At page load the browser shells out to
+  **`pycompile.py`**, which assembles one minipy program — the **`minidom.py`**
+  prelude (`document` / `console` / `window`, written in the minipy subset) +
+  one `document._register(Element(...))` per id'd element + the page script —
+  and compiles it to `page.mpyc` bytecode.
+* **Runtime (native).** The embedded interpreter `mpy_boot`s that bytecode once
+  (defining the page's functions and the DOM globals), and a button's `onclick`
+  fires the named handler through `mpy_call` — so a click runs Python against
+  the DOM. Booting is **lazy**: scriptless pages never invoke the interpreter.
+
+`interp.py` grows only a small, additive embedding facade (`build_state`,
+`mpy_boot`, `mpy_call`) that keeps its `Program`/`St` types on the interpreter
+side of the translation-unit boundary (callers pass only `char*`/`int`); the
+3-way minipy suite is unaffected. The interpreter's `main()` is stripped for the
+co-compiled copy (`gen_embed.py` → `interp_embed.py`, a build artifact) because
+py2c turns any `main` into the C entry point and `json2qt` already provides one.
+
+Try it headless (no compositor, no click needed):
+
+```
+make minibrowser
+cd build/gui && ./minibrowser_app --script-selftest
+```
+
+which loads `pyscript.html`, compiles + boots its script, and fires the button's
+`onclick="foo()"`, printing what the script logs:
+
+```
+hello minipy console
+[object HTMLDocument] with 1 indexed elements
+<button id="A">clickme</button>
+[alert] hello minipy
+```
+
+`pyscript_test.py` is the same proof at the source level (assemble → native
+minipy → assert). Today the DOM surface is read + `console.log` + `window.alert`
+(alerts print to stdout; a real overlay comes later); live DOM *mutation* is the
+next step, behind native host primitives.
+
 ## Roadmap (deliberately not yet done)
 
-* **Scripting via minipy.** Page scripts are captured but not run. The plan is
-  to translate JS → Python with OpenSourceJesus's [Js2Py fork](https://github.com/OpenSourceJesus/Js2Py)
-  and execute it through **embedded minipy** (see `MINIPY.md`) as the page's
-  scripting engine — Python instead of JavaScript, on the same DOM.
+* **Live DOM mutation.** `getElementById` currently returns a read-only element
+  (tag / id / text). Making `el.textContent = ...` update the actual widget
+  needs a few native host primitives bridging minidom to the `rpyqt` tree.
+* **JS via Js2Py.** JavaScript is captured verbatim (bundle `scripts`); the plan
+  is to translate JS → Python with OpenSourceJesus's
+  [Js2Py fork](https://github.com/OpenSourceJesus/Js2Py) and feed it the same
+  `python` path, so JS and Python share one DOM and one engine.
 * **Real network fetch.** `www2json --url` exists; wiring it into `navigate()`
   (rather than local `*.html`) is a small step where the network is available.
 * **Images beyond a placeholder**, and a fuller keymap (other layouts, via

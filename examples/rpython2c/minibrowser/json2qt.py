@@ -24,10 +24,12 @@ from a directory holding www2json.py + the *.html site (the Makefile stages
 these next to the binary).
 """
 import os
+import sys
 from rpyqt import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QBoxLayout,
                    QLabel, QPushButton, QHeading, QLink, QLineEdit, QHLine,
-                   last_link_href)
+                   last_link_href, last_action)
 from minijson import load_page
+from interp_embed import mpy_boot, mpy_call
 
 # ----- navigation state ---------------------------------------------------
 # The window is held in a *typed* global so setLayout (which takes a concrete
@@ -90,6 +92,44 @@ def fetch(name: "char*") -> None:
     """Re-run the CPython helper to (re)produce page.json for `name`."""
     cmd = "python3 www2json.py " + name + ".html --out ."
     os.system(cmd)
+
+
+# ----- page scripting (minipy) -------------------------------------------
+# A page's <script type="python"> runs on the embedded minipy interpreter, not
+# the renderer. The script is compiled to page.mpyc by the CPython helper
+# (pycompile.py) and booted lazily on the first onclick, so scriptless pages
+# never pay for the interpreter. `_booted` records which page is currently
+# booted so we recompile only when the page changes.
+_booted = ""
+
+
+def boot_page() -> None:
+    global _booted
+    src: "char*" = _hist.get_source()
+    if _booted == src:
+        return
+    os.system("python3 pycompile.py page.json minidom.py page.mpyc")
+    mpy_boot("page.mpyc")
+    _booted = src
+
+
+def handler_name(action: "char*") -> "char*":
+    # Turn an inline handler like "foo()" into the function name "foo".
+    a = action
+    n = len(a)
+    i = 0
+    while i < n:
+        if a[i] == "(":
+            return a[0:i]
+        i = i + 1
+    return a
+
+
+def on_script() -> None:
+    boot_page()
+    act: "char*" = last_action()
+    name: "char*" = handler_name(act)
+    mpy_call(name)
 
 
 # ----- tag dispatch (the port of Tetra's generate_interface) --------------
@@ -245,8 +285,13 @@ def render_node(node: "obj", box: "QBoxLayout") -> None:
         return
 
     if t == "button":
+        oc: "char*" = node.get_onclick()
         btn = QPushButton(txt)
-        btn.clicked.connect(on_go)
+        if len(oc) > 0:
+            btn.set_action(oc)
+            btn.clicked.connect(on_script)
+        else:
+            btn.clicked.connect(on_go)
         box.addWidget(btn)
         return
 
@@ -330,8 +375,25 @@ def on_back() -> None:
         navigate(name, 0)
 
 
+def script_selftest() -> int:
+    # Headless proof of the full script path: load a scripted page, compile its
+    # python to bytecode, boot it on the embedded interpreter, and fire the
+    # button's onclick handler -- printing whatever the page script logs. Used
+    # by the Makefile/tests where no Wayland compositor (and no click) exists.
+    global _hist
+    _hist = History()
+    _hist.set_source("pyscript")
+    fetch("pyscript")            # www2json pyscript.html -> page.json
+    boot_page()                  # pycompile -> page.mpyc -> mpy_boot
+    r = mpy_call("foo")          # fire the handler, as a click would
+    print("selftest mpy_call rc=" + str(r))
+    return 0
+
+
 def main() -> int:
     global _hist, _win
+    if len(sys.argv) > 1 and sys.argv[1] == "--script-selftest":
+        return script_selftest()
     app = QApplication()
     win = QWidget()
     win.setWindowTitle("MINIBROWSER")
