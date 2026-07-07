@@ -236,6 +236,7 @@ minibrowser:
 	python3 tools/py2c.py $(MB)/json2qt.py $(MB)/dom.py $(MB)/minijson.py \
 	    $(GUIBIN)/minibrowser/interp_embed.py --out $(GUIBIN)/minibrowser
 	cc $(WL_CFLAGS) -I$(GUIBIN)/minibrowser $(GUIBIN)/minibrowser/*.c \
+	    tools/rpy_lib/mb_ffi.c \
 	    -o $(GUIBIN)/minibrowser_app $(WL_LIBS) -lm
 	@# Stage the runnable site + toolchain next to the binary: at runtime the
 	@# browser shells out to `python3 www2json.py` (fetch) and, for scripted
@@ -251,6 +252,7 @@ minibrowser:
 	@echo "built $(GUIBIN)/minibrowser_app  (run from $(GUIBIN) under a Wayland compositor)"
 	@echo "  cd $(GUIBIN) && ./minibrowser_app"
 	@echo "  cd $(GUIBIN) && ./minibrowser_app --script-selftest   # run a page's python"
+	@echo "  cd $(GUIBIN) && ./minibrowser_app --jit-selftest      # JIT rpython + native ctypes call"
 
 rpython:
 	@mkdir -p $(RPYBIN)
