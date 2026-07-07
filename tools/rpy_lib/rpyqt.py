@@ -436,7 +436,17 @@ class QLineEdit(Widget):
         self.text = text
         self.placeholder = ""
         self.focused = 0
+        self.bound_handle = 0            # minidom handle for two-way binding
         self.returnPressed = Signal()
+        self.textChanged = Signal()
+
+    def set_bound(self, h: "int") -> None:
+        self.bound_handle = h
+
+    def _notify_edit(self) -> None:
+        if self.bound_handle != 0:
+            set_last_edit(self.bound_handle, self.text)
+            self.textChanged.emit()
 
     def setPlaceholderText(self, text: "char*") -> None:
         self.placeholder = text
@@ -476,12 +486,14 @@ class QLineEdit(Widget):
             n = len(self.text)
             if n > 0:
                 self.text = self.text[0:n - 1]
+            self._notify_edit()
             return ACTION_REDRAW
         if codepoint == 13:                     # enter -> submit
             self.returnPressed.emit()
             return ACTION_REDRAW
         if codepoint >= 32:                     # printable -> append
             self.text = self.text + chr(codepoint)
+            self._notify_edit()
             return ACTION_REDRAW
         return ACTION_NONE
 
@@ -806,6 +818,26 @@ def set_last_action(a: "char*") -> None:
 
 def last_action() -> "char*":
     return _last_action
+
+
+# The handle + current text of the most recently edited bound text field. A
+# no-arg textChanged handler recovers them to push the value into the DOM.
+_edit_handle = 0
+_edit_text = ""
+
+
+def set_last_edit(h: "int", t: "char*") -> None:
+    global _edit_handle, _edit_text
+    _edit_handle = h
+    _edit_text = t
+
+
+def last_edit_handle() -> "int":
+    return _edit_handle
+
+
+def last_edit_text() -> "char*":
+    return _edit_text
 
 
 def rw_width() -> int:
