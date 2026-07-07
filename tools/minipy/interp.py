@@ -2813,7 +2813,11 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
     return v_none()
 
 
-def interp_run(prog: "Program", sargs: "list[str]") -> "int":
+def build_state(prog: "Program", sargs: "list[str]") -> "St":
+    # The per-run interpreter state: materialize constants, allocate globals and
+    # the method-cache slots, and bind the special names (__argv__/open/...).
+    # Factored out of interp_run so an embedder can build the state once, run the
+    # module, and then keep the state alive to call functions on demand.
     global _const_vs, _const_vs_ready
     setup_cache()
     _const_vs = new_v_list()               # materialize each constant once
@@ -2839,9 +2843,6 @@ def interp_run(prog: "Program", sargs: "list[str]") -> "int":
     while k < prog.nglobals:
         glob.append(v_none())
         k = k + 1
-    # expose sys.argv / sys.path to the interpreted program, mirroring the
-    # reference VM. The interp is run as `interp <bytecode> <prog args...>`, so
-    # the program's argv is a placeholder argv[0] followed by sys.argv[2:].
     gi = 0
     while gi < len(prog.names) and gi < len(glob):
         nm = prog.names[gi]
@@ -2862,6 +2863,66 @@ def interp_run(prog: "Program", sargs: "list[str]") -> "int":
         elif _strcmp(nm, "_native_makedirs") == 0:
             glob[gi] = v_builtin(32)            # minios makedirs fallback
         gi = gi + 1
+    return st
+
+
+# ---- embedding facades ---------------------------------------------------
+# An embedder (e.g. the minibrowser) co-compiles interp.py and drives it through
+# these. Program/St never cross the translation-unit boundary -- they are held
+# in typed module globals here -- so callers only ever pass char* / int.
+_embed_st: "St" = None
+_embed_prog: "Program" = None
+_embed_ready: "int" = 0
+
+
+def run_mpyc(path: "char*") -> "int":
+    # One-shot: load a .mpyc and run its module top-level to completion.
+    prog = load_mpyc(path)
+    args: "list[str]" = []
+    return interp_run(prog, args)
+
+
+def mpy_boot(path: "char*") -> "int":
+    # Load a .mpyc, build the state, and run the module top-level (which defines
+    # the page's functions + globals), keeping the state for later mpy_call().
+    global _embed_st, _embed_prog, _embed_ready
+    prog = load_mpyc(path)
+    if prog.version < 0:
+        return 2
+    args: "list[str]" = []
+    st = build_state(prog, args)
+    _embed_st = st
+    _embed_prog = prog
+    _embed_ready = 1
+    run_func(st, prog.entry, new_v_list())
+    if st.exc_flag != 0:
+        return 1
+    return 0
+
+
+def mpy_call(name: "char*") -> "int":
+    # Call a top-level function of the booted module by name, no arguments.
+    # Returns 0 ok, 1 the call raised, 2 not booted, 3 name not found/callable.
+    prog: "Program" = _embed_prog
+    st: "St" = _embed_st
+    if _embed_ready == 0:
+        return 2
+    gi = 0
+    while gi < len(prog.names) and gi < len(st.glob):
+        if _strcmp(prog.names[gi], name) == 0:
+            fv = st.glob[gi]
+            if fv.tag != 5:                    # not a function value
+                return 3
+            do_call(st, fv, new_v_list())
+            if st.exc_flag != 0:
+                return 1
+            return 0
+        gi = gi + 1
+    return 3
+
+
+def interp_run(prog: "Program", sargs: "list[str]") -> "int":
+    st = build_state(prog, sargs)
     run_func(st, prog.entry, new_v_list())
     if st.exc_flag != 0:                        # top-level unhandled exception
         ev = st.exc_val
