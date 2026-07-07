@@ -1,7 +1,7 @@
 """rpyqt -- py2c-side integration for the PyQt-compatible widget layer.
 
 The rpython library lives in `rpy_lib/rpyqt.py`. It is self-contained: it binds
-the generated Wayland runtime (`rwl_run`) and defines the five `rw_*` hooks the
+the generated Wayland runtime (`rwl_run`) and defines the six `rw_*` hooks the
 runtime calls, without importing the rwayland rpython module. So when a source
 imports `rpyqt`, py2c
 
