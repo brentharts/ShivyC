@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""Off-target render check for the minibrowser (runs under CPython).
+"""Off-target navigation + render check for the minibrowser (runs under CPython).
 
 The rpython dialect is a subset of Python, so the *same* renderer source runs
-unmodified under CPython -- letting us exercise the real build_page() ->
-render_node() -> place()/paint() path (including the bitmap font) without a
-Wayland compositor, and assert the page actually draws and that a button click
-fires its signal. This mirrors how the rwayland/rpyqt drawing helpers are meant
-to be unit-tested off-target.
+unmodified under CPython -- letting us exercise the real navigation loop end to
+end without a Wayland compositor:
+
+    navigate() -> www2json (os.system) -> page.json
+               -> minijson.load_page() -> render_node()/place()/paint()
+
+and assert that pages actually draw, that clicking an in-page link loads the
+linked page, that typing a name + Enter in the URL bar loads it, and that Back
+returns. Because navigate() shells out to `python3 www2json.py <page>.html`, the
+test runs from this directory (where www2json.py + the *.html site live).
 
     python3 render_test.py            # asserts only
     python3 render_test.py out.png    # also writes a PNG screenshot (needs PIL)
@@ -44,12 +49,22 @@ def _install_ctypes_stub():
     sys.modules["rpy_ctypes"] = stub
 
 
-def _find_button(rpyqt, layout):
+def _collect_text(rpyqt, layout, out):
     for it in layout.items:
-        if isinstance(it, rpyqt.QPushButton):
+        if isinstance(it, rpyqt.QBoxLayout):
+            _collect_text(rpyqt, it, out)
+        else:
+            href = getattr(it, "href", "")
+            out.append("LINK:" + href if href else getattr(it, "text", ""))
+    return out
+
+
+def _find_link(rpyqt, layout):
+    for it in layout.items:
+        if isinstance(it, rpyqt.QLink):
             return it
         if isinstance(it, rpyqt.QBoxLayout):
-            got = _find_button(rpyqt, it)
+            got = _find_link(rpyqt, it)
             if got is not None:
                 return got
     return None
@@ -66,6 +81,15 @@ def _find_lineedit(rpyqt, layout):
     return None
 
 
+def _painted(rpyqt, box, H=1200):
+    W = rpyqt.WIN_W
+    box.place(rpyqt.PAD, rpyqt.PAD, W - 2 * rpyqt.PAD, H)
+    fb = [rpyqt.COL_BG] * (W * H)
+    box.paint(fb, W, H)
+    bg = rpyqt.COL_BG & 0xFFFFFF
+    return sum(1 for p in fb if (p & 0xFFFFFF) != bg), fb
+
+
 def main(argv):
     here = os.path.dirname(os.path.abspath(__file__))
     rpy_lib = os.path.abspath(
@@ -73,59 +97,62 @@ def main(argv):
     _install_ctypes_stub()
     sys.path.insert(0, here)
     sys.path.insert(0, rpy_lib)
+    os.chdir(here)                       # navigate() shells out to www2json here
 
     import rpyqt
     import json2qt
-    from page_data import build_page
 
-    box = rpyqt.QVBoxLayout()
-    root = build_page()
-    json2qt.render_node(root, box)
-    status = rpyqt.QLabel("READY")
-    json2qt._status = status
-    box.addWidget(status)
-
-    # A real top-level window so pointer/key routing matches the C runtime.
+    # ---- boot like main(): load + render the home page ------------------
+    app = rpyqt.QApplication()
     win = rpyqt.QWidget()
-    win.setLayout(box)
+    json2qt._win = win
+    json2qt._hist = json2qt.History()
     rpyqt.set_active(win)
+    json2qt.navigate("home", 0)
+    assert json2qt._hist.get_source() == "home"
 
-    W, H = rpyqt.WIN_W, 1000
-    box.place(rpyqt.PAD, rpyqt.PAD, W - 2 * rpyqt.PAD, H)
-    fb = [rpyqt.COL_BG] * (W * H)
-    box.paint(fb, W, H)
+    painted, _ = _painted(rpyqt, win.box)
+    print("home: non-background pixels: %d" % painted)
+    assert painted > 500, "home render produced too few pixels"
+    home_text = _collect_text(rpyqt, win.box, [])
+    assert any("Home" in t for t in home_text), "home heading missing"
+    assert "LINK:/about" in home_text, "about link missing from home"
+    print("home rendered with toolbar + about link  OK")
 
-    bg = rpyqt.COL_BG & 0xFFFFFF
-    painted = sum(1 for p in fb if (p & 0xFFFFFF) != bg)
-    print("non-background pixels: %d" % painted)
-    assert painted > 500, "render produced too few pixels"
+    # ---- click the in-page About link -> load the about page ------------
+    link = _find_link(rpyqt, win.box)
+    assert link is not None, "no link on home page"
+    link.on_press(link.x + 2, link.y + 2)     # -> on_link -> navigate("about")
+    assert json2qt._hist.get_source() == "about", "link did not load about"
+    about_text = _collect_text(rpyqt, win.box, [])
+    assert any("About" in t for t in about_text), "about heading missing"
+    assert json2qt._hist.has_back() > 0, "back-stack empty after navigation"
+    print("about link click -> about page loaded  OK")
 
-    btn = _find_button(rpyqt, box)
-    assert btn is not None, "expected at least one button in the sample page"
-    btn.on_press(btn.x + 2, btn.y + 2)
-    assert status.text == "CLICKED", "button signal did not reach the handler"
-    print("button click -> status = %r  OK" % status.text)
-
-    # Keyboard: click the field to focus it, type through the rw_key path, then
-    # backspace and submit -- exactly the routing the generated runtime drives.
-    field = _find_lineedit(rpyqt, box)
-    assert field is not None, "expected a text input in the sample page"
-    win.on_pointer_button(field.x + 4, field.y + 4, 1)
-    assert rpyqt._focused is field and field.focused == 1, "field did not focus"
-    for ch in "cat food":
+    # ---- type a name + Enter in the URL bar -> load it ------------------
+    url = _find_lineedit(rpyqt, win.box)
+    assert url is not None, "no URL field in toolbar"
+    win.on_pointer_button(url.x + 4, url.y + 4, 1)      # focus
+    assert rpyqt._focused is url, "URL field did not focus"
+    for _ in range(len(url.text)):                      # clear the pre-filled name
+        rpyqt.rw_key(8, 1)
+    assert url.text == "", "field not cleared"
+    for ch in "home":
         rpyqt.rw_key(ord(ch), 1)
-    assert field.text == "cat food", "typed text wrong: %r" % field.text
-    rpyqt.rw_key(8, 1)
-    assert field.text == "cat foo", "backspace wrong: %r" % field.text
-    status.text = "READY"
-    rpyqt.rw_key(13, 1)      # enter -> returnPressed -> on_activate
-    assert status.text == "CLICKED", "enter did not submit: %r" % status.text
-    print("keyboard: focus + type + backspace + enter/submit  OK")
+    rpyqt.rw_key(13, 1)                                 # Enter -> on_go
+    assert json2qt._hist.get_source() == "home", "typed Enter did not load home"
+    print("typed 'home' + Enter -> home page loaded  OK")
+
+    # ---- Back -> returns to the previously viewed page ------------------
+    json2qt.on_back()
+    assert json2qt._hist.get_source() == "about", "Back did not return to about"
+    print("Back -> about  OK")
 
     if len(argv) > 1:
         from PIL import Image
-        status.text = "READY"
-        box.paint(fb, W, H)
+        json2qt.navigate("home", 1)
+        W, H = rpyqt.WIN_W, 1200
+        _, fb = _painted(rpyqt, win.box, H)
         img = Image.new("RGB", (W, H))
         px = img.load()
         for y in range(H):
@@ -133,7 +160,7 @@ def main(argv):
             for x in range(W):
                 v = fb[base + x]
                 px[x, y] = ((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF)
-        img.crop((0, 0, W, 780)).save(argv[1])
+        img.crop((0, 0, W, 820)).save(argv[1])
         print("wrote %s" % argv[1])
 
     print("render_test: PASS")
