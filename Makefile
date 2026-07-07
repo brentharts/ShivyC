@@ -219,6 +219,23 @@ controls:
 	cc $(WL_CFLAGS) -I$(GUIBIN)/controls $(GUIBIN)/controls/*.c \
 	    -o $(GUIBIN)/controls_app $(WL_LIBS)
 	@echo "built $(GUIBIN)/controls_app  (run it under a Wayland compositor)"
+
+# The rpython mini web-browser: a pure-rpython DOM renderer (json2qt.py + dom.py)
+# fed by a generated page (page_data.py). The CPython helper www2json.py turns
+# example.html into BOTH page.json (the canonical bundle) and page_data.py (its
+# "py" form), then py2c co-compiles the three rpython files with rpyqt and emits
+# the Wayland glue.  -> build/gui/minibrowser_app
+MB := $(RPY)/minibrowser
+minibrowser:
+	@mkdir -p $(GUIBIN)/minibrowser
+	@cp -f $(RPY)/rpy_lib/xdg-shell.xml $(GUIBIN)/minibrowser/ 2>/dev/null || true
+	python3 $(MB)/www2json.py $(MB)/example.html --out $(MB)
+	python3 tools/py2c.py $(MB)/json2qt.py $(MB)/dom.py $(MB)/page_data.py \
+	    --out $(GUIBIN)/minibrowser
+	cc $(WL_CFLAGS) -I$(GUIBIN)/minibrowser $(GUIBIN)/minibrowser/*.c \
+	    -o $(GUIBIN)/minibrowser_app $(WL_LIBS)
+	@echo "built $(GUIBIN)/minibrowser_app  (run it under a Wayland compositor)"
+
 rpython:
 	@mkdir -p $(RPYBIN)
 	@fail=0; \
@@ -679,7 +696,7 @@ self:
         selfhost selfhost_objcore selfhost_bench selfhost_coverage \
         selfhost_coverage_musl selfhost_link selfhost_build selfhost_compiler \
         bench_compile_speed \
-        rpython benchmarks wayland rpyqt controls \
+        rpython benchmarks wayland rpyqt controls minibrowser \
         baremetal-kernel baremetal-irq minikraft run-irq \
         install_micropython clean_micropython test_micropython \
         test_micropython_core test_micropython_objects \
