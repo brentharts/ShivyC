@@ -241,15 +241,33 @@ python3 ffi_test.py     # native: transpiled RPython dlopens the .so and calls i
 
 `jit_test.py` runs the page's *exact* source (`ctypes.CDLL(...)`, `dll.calc_sum`)
 on CPython. `ffi_test.py` proves the native run-time path the embedded
-interpreter will use: `mb_ffi.c` (linked into the browser, `-ldl`) exposes
-`mb_dlopen` / `mb_dlsym` / `mb_callNi`, which transpiled RPython reaches through
-the ctypes *static* bridge while the JIT'd `.so` is `dlopen`ed dynamically.
+interpreter uses: `mb_ffi.c` (in `tools/rpy_lib/`, linked into the browser)
+exposes `mb_dlopen` / `mb_dlsym` / `mb_callNi`, which transpiled RPython reaches
+through the ctypes *static* bridge while the JIT'd `.so` is `dlopen`ed
+dynamically (`dlopen` is in libc on this glibc, so no `-ldl`).
 
-The remaining step is wiring this into the interpreter so `dll.calc_sum(1, 2)`
-runs *inside minipy* natively: minipy has no `__getattr__`, so the CDLL handle's
-attribute-call is lowered by `pycompile` (a small AST rewrite) onto ctypes
-builtins backed by `mb_ffi.c`. The mechanism is proven above; the interpreter
-hook + its build wiring are the next change.
+**This runs natively in the browser too.** The interpreter carries ctypes FFI
+builtins (`interp.py`, guarded so it still imports under CPython); and because
+minipy has no `__getattr__` to dispatch `dll.calc_sum` on the handle at run
+time, `pycompile` lowers it at compile time onto those builtins:
+
+```
+import ctypes                          ->  (dropped)
+dll = ctypes.CDLL('/tmp/jit.foo.so')   ->  dll = _ffi_open('<page-cache>/jit.foo.so')
+dll.calc_sum(1, 2)                     ->  _ffi_call2(dll, 'calc_sum', 1, 2)
+```
+
+So on a scripted page's load `pycompile` JIT-compiles the rpython blocks (via
+`jitc`), rewrites the ctypes onto the shim, and boots it; a click then runs the
+native `calc_sum` from inside minipy. Proven headless:
+
+```
+make minibrowser
+cd build/gui && ./minibrowser_app --jit-selftest    # -> console: hello minipy console / 3
+```
+
+The unrewritten page source still runs under CPython with real ctypes
+(`jit_test.py`), so the same page is portable to a stock Python + ctypes host.
 
 ## Roadmap (deliberately not yet done)
 

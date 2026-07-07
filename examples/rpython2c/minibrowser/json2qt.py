@@ -456,10 +456,35 @@ def script_selftest() -> int:
     return 0
 
 
+def jit_selftest() -> int:
+    # Headless proof of native page code: load pyjit.html (a <script
+    # type="rpython"> block JIT-compiled to a .so + a python script that calls
+    # it via ctypes), boot it, and fire the button's foo() -- which runs the
+    # native calc_sum(1,2) through the interpreter's FFI. The page console
+    # should show the returned 3.
+    global _hist, _scripted
+    _hist = History()
+    _hist.set_source("pyjit")
+    fetch("pyjit")
+    _scripted = 1
+    boot_page()
+    s0: "char*" = mpy_call_s("__serialize")
+    root0 = parse_dom_str(s0)
+    btn = root0.child(0)
+    oc0: "char*" = btn.get_onclick()
+    h0: "int" = _atoi(oc0)
+    mpy_call_i("__fire", h0)                    # click clickme -> foo()
+    ctext: "char*" = mpy_call_s("__console")
+    print("console: " + ctext)
+    return 0
+
+
 def main() -> int:
     global _hist, _win
     if len(sys.argv) > 1 and sys.argv[1] == "--script-selftest":
         return script_selftest()
+    if len(sys.argv) > 1 and sys.argv[1] == "--jit-selftest":
+        return jit_selftest()
     app = QApplication()
     win = QWidget()
     win.setWindowTitle("MINIBROWSER")
