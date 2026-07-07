@@ -269,6 +269,36 @@ cd build/gui && ./minibrowser_app --jit-selftest    # -> console: hello minipy c
 The unrewritten page source still runs under CPython with real ctypes
 (`jit_test.py`), so the same page is portable to a stock Python + ctypes host.
 
+### Native drawing (a canvas fragment shader)
+
+Native code can also *draw* to the page. A `<canvas>` is filled by a native
+`pixel(x, y) -> argb` shader shipped as a `<script type="rpython">` block:
+
+```html
+<script type="rpython" id="shader">
+def pixel(x: int, y: int) -> int:
+    r = (x * 5) % 256
+    g = (y * 5) % 256
+    b = ((x + y) * 3) % 256
+    return (255 << 24) | (r << 16) | (g << 8) | b
+</script>
+<canvas id="cvs" width="96" height="96"></canvas>
+```
+
+On navigation the browser JIT-compiles the block (`jitc`), then the renderer's
+`QCanvas` widget calls the native `pixel` once per pixel through the FFI shim
+(`mb_call2i`) and blits the result -- no interpreter in the per-pixel loop, and
+no wasm/JS glue. It's effectively a fragment shader, and the same int-in/int-out
+FFI that powers `calc_sum`. This is the seed of a real Canvas2D/WebGL surface.
+
+```
+cd build/gui && ./minibrowser_app --canvas-selftest   # native shader fills 96x96
+python3 canvas_render.py canvas.png                    # same shader -> a viewable PNG
+```
+
+`canvas_render.py` runs the identical shader under CPython + real ctypes and
+saves the image the browser draws, so the native output is viewable off-target.
+
 ## Roadmap (deliberately not yet done)
 
 * **Two-way inputs & more DOM.** Rendered `<input>`s show their value but typing

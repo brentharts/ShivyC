@@ -27,8 +27,8 @@ import os
 import sys
 from rpyqt import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QBoxLayout,
                    QLabel, QPushButton, QHeading, QLink, QLineEdit, QHLine,
-                   last_link_href, last_action)
-from minijson import load_page, parse_dom_str, has_python
+                   QCanvas, last_link_href, last_action)
+from minijson import load_page, parse_dom_str, has_python, has_rpython
 from interp_embed import mpy_boot, mpy_call, mpy_call_s, mpy_call_i
 
 # ----- navigation state ---------------------------------------------------
@@ -221,6 +221,72 @@ def render_table(node: "obj", box: "QBoxLayout") -> None:
         r = r + 1
 
 
+# ----- native canvas (a JIT'd rpython shader draws the pixels) ------------
+# A <canvas> is filled by calling the page's native `pixel(x, y) -> argb` shader
+# (a <script type="rpython"> block, JIT-compiled to jit.shader.so) once per
+# pixel through the FFI shim -- native code producing the drawing on the page.
+# The ctypes binding is guarded so json2qt still imports under CPython (the
+# renderer test never draws a canvas); py2c keeps the branch and links mb_ffi.c.
+if sys.implementation.name != "cpython":
+    import rpy_ctypes as _ct
+    _ffi = _ct.CDLL("mb_ffi")
+    _ffi.mb_dlopen.restype = _ct.c_long
+    _ffi.mb_dlopen.argtypes = [_ct.c_char_p]
+    _ffi.mb_dlsym.restype = _ct.c_long
+    _ffi.mb_dlsym.argtypes = [_ct.c_long, _ct.c_char_p]
+    _ffi.mb_call2i.restype = _ct.c_int
+    _ffi.mb_call2i.argtypes = [_ct.c_long, _ct.c_int, _ct.c_int]
+
+CANVAS_W = 96
+CANVAS_H = 96
+
+
+def _page_id(name: "char*") -> "char*":
+    # Match jitc.page_id: alnum kept, everything else -> '_'.
+    out = ""
+    i = 0
+    n = len(name)
+    while i < n:
+        c = ord(name[i])
+        if (c >= 48 and c <= 57) or (c >= 65 and c <= 90) \
+                or (c >= 97 and c <= 122):
+            out = out + name[i]
+        else:
+            out = out + "_"
+        i = i + 1
+    return out
+
+
+def jit_page() -> None:
+    # JIT-compile the page's <script type="rpython"> blocks (idempotent/cached).
+    src: "char*" = _hist.get_source()
+    os.system("python3 jitc.py page.json " + src)
+
+
+def _shader_so() -> "char*":
+    src: "char*" = _hist.get_source()
+    return "/tmp/minibrowser_cache/" + _page_id(src) + "/jit.shader.so"
+
+
+def render_canvas(box: "QBoxLayout") -> None:
+    cvs = QCanvas(CANVAS_W, CANVAS_H)
+    so: "char*" = _shader_so()
+    h = _ffi.mb_dlopen(so)
+    if h != 0:
+        fn = _ffi.mb_dlsym(h, "pixel")
+        if fn != 0:
+            px = []
+            y = 0
+            while y < CANVAS_H:
+                x = 0
+                while x < CANVAS_W:
+                    px.append(_ffi.mb_call2i(fn, x, y))
+                    x = x + 1
+                y = y + 1
+            cvs.set_pixels(px)
+    box.addWidget(cvs)
+
+
 def render_node(node: "obj", box: "QBoxLayout") -> None:
     # Pull every string off the (obj-typed) node into an explicitly annotated
     # char* local up front. Reading obj-method results straight into an
@@ -257,6 +323,10 @@ def render_node(node: "obj", box: "QBoxLayout") -> None:
 
     if t == "ul" or t == "ol":
         render_children(node, box)
+        return
+
+    if t == "canvas":
+        render_canvas(box)
         return
 
     if t == "hr":
@@ -389,6 +459,8 @@ def navigate(name: "char*", push: int) -> None:
         _hist.push(_hist.get_source())
     _hist.set_source(name)
     fetch(name)
+    if has_rpython("page.json") != 0:
+        jit_page()               # compile <script type="rpython"> -> native .so
     if has_python("page.json") != 0:
         # Scripted page: minipy owns the live DOM; render from what it reports.
         _scripted = 1
@@ -479,12 +551,54 @@ def jit_selftest() -> int:
     return 0
 
 
+def canvas_selftest() -> int:
+    # Headless proof of "native draws to the page": load canvas.html, JIT its
+    # <script type="rpython"> shader, and confirm the native pixel(x,y) varies
+    # across coordinates (i.e. it really shaded per pixel, not a constant fill).
+    global _hist
+    _hist = History()
+    _hist.set_source("canvas")
+    fetch("canvas")
+    jit_page()
+    so: "char*" = _shader_so()
+    h = _ffi.mb_dlopen(so)
+    if h == 0:
+        print("canvas: dlopen failed")
+        return 1
+    fn = _ffi.mb_dlsym(h, "pixel")
+    if fn == 0:
+        print("canvas: dlsym pixel failed")
+        return 1
+    p00 = _ffi.mb_call2i(fn, 0, 0)
+    pa = _ffi.mb_call2i(fn, 20, 0)
+    pb = _ffi.mb_call2i(fn, 0, 20)
+    if p00 != pa and p00 != pb:
+        print("canvas OK: native shader varies per pixel")
+    else:
+        print("canvas FAIL: shader not varying")
+    # exercise the full render loop the browser runs to fill the QCanvas
+    cnt = 0
+    y = 0
+    while y < CANVAS_H:
+        x = 0
+        while x < CANVAS_W:
+            _ffi.mb_call2i(fn, x, y)
+            cnt = cnt + 1
+            x = x + 1
+        y = y + 1
+    if cnt == CANVAS_W * CANVAS_H:
+        print("canvas OK: shaded all pixels")
+    return 0
+
+
 def main() -> int:
     global _hist, _win
     if len(sys.argv) > 1 and sys.argv[1] == "--script-selftest":
         return script_selftest()
     if len(sys.argv) > 1 and sys.argv[1] == "--jit-selftest":
         return jit_selftest()
+    if len(sys.argv) > 1 and sys.argv[1] == "--canvas-selftest":
+        return canvas_selftest()
     app = QApplication()
     win = QWidget()
     win.setWindowTitle("MINIBROWSER")

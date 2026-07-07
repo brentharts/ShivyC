@@ -1,0 +1,17 @@
+<html>
+<head>
+<title>native canvas</title>
+<script type="rpython" id="shader">
+def pixel(x: int, y: int) -> int:
+    # a plasma-ish gradient computed natively, per pixel (ARGB)
+    r = (x * 5) % 256
+    g = (y * 5) % 256
+    b = ((x + y) * 3) % 256
+    return (255 << 24) | (r << 16) | (g << 8) | b
+</script>
+</head>
+<body>
+<h1>native canvas</h1>
+<canvas id="cvs" width="96" height="96"></canvas>
+</body>
+</html>

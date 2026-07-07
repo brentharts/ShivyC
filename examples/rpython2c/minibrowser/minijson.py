@@ -293,3 +293,23 @@ def has_python(path: "char*") -> "int":
             return 0                        # "" -> empty
         return 1
     return 0
+
+
+def has_rpython(path: "char*") -> "int":
+    """True if the bundle carries a non-empty "rpython" map (i.e. the page ships
+    <script type="rpython"> blocks to JIT-compile). Pure scan, CPython-safe."""
+    s = read_file(path)
+    n = len(s)
+    idx = _find(s, "\"rpython\"", 0)
+    if idx < 0:
+        return 0
+    i = idx + 9
+    while i < n and ord(s[i]) != 123:      # advance to '{'
+        i = i + 1
+    i = i + 1
+    while i < n and (ord(s[i]) == 32 or ord(s[i]) == 10 or ord(s[i]) == 9
+                     or ord(s[i]) == 13):
+        i = i + 1
+    if i < n and ord(s[i]) != 125:         # non-empty if next isn't '}'
+        return 1
+    return 0
