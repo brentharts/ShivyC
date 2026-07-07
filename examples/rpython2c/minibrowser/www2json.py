@@ -50,10 +50,11 @@ class DomBuilder(HTMLParser):
                      "children": []}
         self.stack = [self.root]
         self.title = ""
-        self.scripts = []          # (type, code) for every <script>
+        self.scripts = []          # (type, id, code) for every <script>
         self._in_title = False
         self._in_script = False
         self._script_type = ""
+        self._script_id = ""
 
     def handle_starttag(self, tag, attrs):
         tag = tag.lower()
@@ -63,9 +64,12 @@ class DomBuilder(HTMLParser):
         if tag == "script":
             self._in_script = True
             self._script_type = ""
+            self._script_id = ""
             for (k, v) in attrs:
                 if k == "type":
                     self._script_type = (v or "").lower()
+                elif k == "id":
+                    self._script_id = v or ""
             return
         attributes = {k: (v if v is not None else "")
                       for (k, v) in attrs if k in KEEP_ATTRS}
@@ -100,7 +104,7 @@ class DomBuilder(HTMLParser):
             self.title += data
             return
         if self._in_script:
-            self.scripts.append((self._script_type, data))
+            self.scripts.append((self._script_type, self._script_id, data))
             return
         text = re.sub(r"\s+", " ", data).strip()
         if not text:
@@ -147,16 +151,25 @@ def build_bundle(source, html_text):
     title = parser.title.strip() or source
     py_types = ("python", "text/python", "application/python")
     py_code = "\n".join(
-        code.strip() for (stype, code) in parser.scripts
+        code.strip() for (stype, sid, code) in parser.scripts
         if stype in py_types and code.strip())
     other_code = "\n".join(
-        code.strip() for (stype, code) in parser.scripts
-        if stype not in py_types and code.strip())
+        code.strip() for (stype, sid, code) in parser.scripts
+        if stype not in ("rpython", "text/rpython") + py_types and code.strip())
+    # <script type="rpython" id="NAME"> blocks: native code for the page, keyed
+    # by id. The browser JIT-compiles each (py2c -> gcc -O2 -shared) to a cached
+    # .so the page's python loads via ctypes -- a faster, CPython-compatible
+    # alternative to a wasm VM (see jitc.py).
+    rpython = {}
+    for (stype, sid, code) in parser.scripts:
+        if stype in ("rpython", "text/rpython") and code.strip():
+            rpython[sid or ("rpy%d" % len(rpython))] = code.strip()
     return {
         "source": source,
         "title": title,
         "dom": body,
         "python": py_code,          # <script type="python"> bodies (run by minipy)
+        "rpython": rpython,         # <script type="rpython" id=..> -> native .so
         "scripts": other_code,      # other scripts (e.g. JS) captured verbatim
     }
 

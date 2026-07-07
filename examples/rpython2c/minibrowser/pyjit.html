@@ -1,0 +1,19 @@
+<html>
+<head>
+<script type="rpython" id="foo">
+def calc_sum(a: int, b: int) -> int:
+    return a + b
+</script>
+<script type="python">
+import ctypes
+dll = ctypes.CDLL('/tmp/jit.foo.so')
+def foo():
+    console.log('hello minipy console')
+    v = dll.calc_sum(1, 2)
+    console.log(v)
+</script>
+</head>
+<body>
+<button onclick="foo()">clickme</button>
+</body>
+</html>

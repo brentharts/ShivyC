@@ -194,6 +194,63 @@ attribute can't be called as `obj.cb()` (that parses as a method lookup) so
 `_fire` binds it to a local first (`cb = e.onclick; cb()`), and mutable
 counters/registries live as object fields, not module globals.
 
+## Native code in the page (a JIT alternative to wasm)
+
+A page can ship **native code** in `<script type="rpython" id="NAME">` and call it
+from its python. Instead of a stack-based wasm VM with JS wrappers for every DOM
+touch, each rpython block is compiled *to a native shared object* and loaded via
+`ctypes` — faster (real registers/SIMD, `gcc -O2`) and backwards-compatible with
+CPython:
+
+```html
+<script type="rpython" id="foo">
+def calc_sum(a: int, b: int) -> int:
+    return a + b
+</script>
+<script type="python">
+import ctypes
+dll = ctypes.CDLL('/tmp/jit.foo.so')
+def foo():
+    v = dll.calc_sum(1, 2)     # native call, no VM
+    console.log(v)             # -> 3
+</script>
+```
+
+The pipeline (`www2json` → `jitc.py`):
+
+* `www2json` captures each `<script type="rpython" id=..>` into the bundle's
+  `rpython` map, keyed by id.
+* `jitc.py` compiles each block with **py2c → `gcc -O2 -shared -fPIC`** into
+  `/tmp/minibrowser_cache/<page-id>/jit.<name>.so`, cached by a sha256 of the
+  block source. rpython translation is slow, so an unchanged block is a cache
+  hit on reload (only a first visit pays the compile). Per-page dirs keep caches
+  from colliding across sites, so the source's portable `'/tmp/jit.foo.so'` is
+  redirected to that page's cache at load.
+
+Because the model is just "native `.so` + ctypes", it is also the path to APIs
+the renderer doesn't implement yet (Canvas2D, WebGL, WebGPU): expose them as
+symbols an rpython block calls. And unlike a JIT'd JS engine, memory only spikes
+while py2c + gcc run, not for the page's lifetime.
+
+Two proofs ship, run headless:
+
+```
+python3 jit_test.py     # CPython + real ctypes: extract -> JIT -> cache -> calc_sum(1,2)=3
+python3 ffi_test.py     # native: transpiled RPython dlopens the .so and calls it at run time
+```
+
+`jit_test.py` runs the page's *exact* source (`ctypes.CDLL(...)`, `dll.calc_sum`)
+on CPython. `ffi_test.py` proves the native run-time path the embedded
+interpreter will use: `mb_ffi.c` (linked into the browser, `-ldl`) exposes
+`mb_dlopen` / `mb_dlsym` / `mb_callNi`, which transpiled RPython reaches through
+the ctypes *static* bridge while the JIT'd `.so` is `dlopen`ed dynamically.
+
+The remaining step is wiring this into the interpreter so `dll.calc_sum(1, 2)`
+runs *inside minipy* natively: minipy has no `__getattr__`, so the CDLL handle's
+attribute-call is lowered by `pycompile` (a small AST rewrite) onto ctypes
+builtins backed by `mb_ffi.c`. The mechanism is proven above; the interpreter
+hook + its build wiring are the next change.
+
 ## Roadmap (deliberately not yet done)
 
 * **Two-way inputs & more DOM.** Rendered `<input>`s show their value but typing
