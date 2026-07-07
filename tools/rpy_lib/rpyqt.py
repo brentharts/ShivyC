@@ -250,6 +250,11 @@ class _QtObject:
     def paint(self, fb: "u32*", fbw: int, fbh: int) -> None:
         return
 
+    def pref_h(self) -> int:
+        # Preferred row height for the vertical layout; widgets that need a
+        # specific height (e.g. a canvas) override this.
+        return ROW_H
+
     def contains(self, px: int, py: int) -> int:
         # Hit-test against this object's own geometry. Done as a method (read on
         # the concrete self) so a parent layout never reads x/y/w/h through an
@@ -490,6 +495,37 @@ class QHLine(Widget):
         fill_rect(fb, fbw, fbh, self.x, ty, self.w, 2, COL_RULE)
 
 
+class QCanvas(Widget):
+    """A pixel surface: holds a cw*ch list of packed ARGB pixels and blits them
+    into the framebuffer. The pixels are produced by native code (a JIT-compiled
+    <script type="rpython"> shader called per pixel), so this widget is how that
+    native output reaches the page -- the browser's Canvas primitive."""
+
+    def __init__(self, cw: int, ch: int):
+        super().__init__()
+        self.cw = cw
+        self.ch = ch
+        self.px: "list[int]" = []       # cw*ch packed ARGB pixels
+
+    def set_pixels(self, px: "list[int]") -> None:
+        self.px = px
+
+    def pref_h(self) -> int:
+        return self.ch
+
+    def paint(self, fb: "u32*", fbw: int, fbh: int) -> None:
+        n = len(self.px)
+        cw = self.cw
+        j = 0
+        while j < n:
+            col: "int" = self.px[j]
+            fx: "int" = self.x + (j % cw)
+            fy: "int" = self.y + (j // cw)
+            if fx >= 0 and fx < fbw and fy >= 0 and fy < fbh:
+                fb[fy * fbw + fx] = col
+            j = j + 1
+
+
 class QCheckBox(Widget):
     """A labelled checkbox; clicking toggles it and emits stateChanged."""
 
@@ -633,8 +669,9 @@ class QVBoxLayout(QBoxLayout):
         i = 0
         n = len(self.items)
         while i < n:
-            self.items[i].place(x, cy, w, ROW_H)
-            cy = cy + ROW_H + GAP
+            rh: "int" = self.items[i].pref_h()
+            self.items[i].place(x, cy, w, rh)
+            cy = cy + rh + GAP
             i = i + 1
 
 
