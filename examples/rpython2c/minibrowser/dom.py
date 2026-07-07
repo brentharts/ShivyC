@@ -43,6 +43,7 @@ class Node:
         self.onclick = ""
         self.placeholder = ""
         self.src = ""
+        self.eid = ""            # the HTML id attribute (for getElementById)
         self.children: "list[obj]" = []
 
     # --- kind / text -----------------------------------------------------
@@ -67,6 +68,9 @@ class Node:
 
     def get_onclick(self) -> "char*":
         return self.onclick
+
+    def get_id(self) -> "char*":
+        return self.eid
 
     def get_placeholder(self) -> "char*":
         return self.placeholder

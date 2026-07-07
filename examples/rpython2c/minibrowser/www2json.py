@@ -50,9 +50,10 @@ class DomBuilder(HTMLParser):
                      "children": []}
         self.stack = [self.root]
         self.title = ""
-        self.scripts = []
+        self.scripts = []          # (type, code) for every <script>
         self._in_title = False
         self._in_script = False
+        self._script_type = ""
 
     def handle_starttag(self, tag, attrs):
         tag = tag.lower()
@@ -61,6 +62,10 @@ class DomBuilder(HTMLParser):
             return
         if tag == "script":
             self._in_script = True
+            self._script_type = ""
+            for (k, v) in attrs:
+                if k == "type":
+                    self._script_type = (v or "").lower()
             return
         attributes = {k: (v if v is not None else "")
                       for (k, v) in attrs if k in KEEP_ATTRS}
@@ -95,7 +100,7 @@ class DomBuilder(HTMLParser):
             self.title += data
             return
         if self._in_script:
-            self.scripts.append(data)
+            self.scripts.append((self._script_type, data))
             return
         text = re.sub(r"\s+", " ", data).strip()
         if not text:
@@ -140,11 +145,19 @@ def build_bundle(source, html_text):
     prune(parser.root)
     body = find_body(parser.root)
     title = parser.title.strip() or source
+    py_types = ("python", "text/python", "application/python")
+    py_code = "\n".join(
+        code.strip() for (stype, code) in parser.scripts
+        if stype in py_types and code.strip())
+    other_code = "\n".join(
+        code.strip() for (stype, code) in parser.scripts
+        if stype not in py_types and code.strip())
     return {
         "source": source,
         "title": title,
         "dom": body,
-        "scripts": "\n".join(s.strip() for s in parser.scripts if s.strip()),
+        "python": py_code,          # <script type="python"> bodies (run by minipy)
+        "scripts": other_code,      # other scripts (e.g. JS) captured verbatim
     }
 
 
@@ -158,7 +171,7 @@ def _lit(s):
 
 ATTR_FIELD = {"href": "href", "name": "name", "value": "value",
               "type": "itype", "onclick": "onclick",
-              "placeholder": "placeholder", "src": "src"}
+              "placeholder": "placeholder", "src": "src", "id": "eid"}
 
 
 def emit_page_data(bundle):
