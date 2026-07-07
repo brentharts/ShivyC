@@ -1,0 +1,32 @@
+<html>
+<head>
+<title>Mini Browser Demo</title>
+<script>
+function greet() { alert('hi from js'); }
+</script>
+</head>
+<body>
+<h1>Welcome</h1>
+<h2>A tiny page</h2>
+<p>This page is rendered by json2qt in pure rpython.</p>
+<hr>
+<a href="/about">About this project</a>
+<ul>
+<li>First item</li>
+<li>Second item</li>
+<li>Third item</li>
+</ul>
+<h3>Search</h3>
+<form action="/search" method="get">
+<input type="text" name="q" placeholder="type a query">
+<input type="submit" value="Go">
+</form>
+<h3>A table</h3>
+<table>
+<tr><th>Name</th><th>Score</th></tr>
+<tr><td>Ada</td><td>99</td></tr>
+<tr><td>Alan</td><td>95</td></tr>
+</table>
+<button onclick="greet()">Say hi</button>
+</body>
+</html>
