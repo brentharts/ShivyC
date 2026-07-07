@@ -78,6 +78,10 @@ COL_ACCENT = 0xFF00AA00      # checkbox tick / slider handle / progress fill
 COL_TRACK = 0xFFCFCFCF       # slider / progress groove
 COL_BOX = 0xFFFFFFFF         # checkbox box interior
 COL_BORDER = 0xFF808080      # widget outlines
+COL_LINK = 0xFF0645AD        # anchor / hyperlink text
+COL_FIELD = 0xFFFFFFFF       # line-edit interior
+COL_HINT = 0xFF909090        # line-edit placeholder text
+COL_RULE = 0xFFCCCCCC        # <hr> horizontal rule
 
 
 # ---- 5x7 bitmap font -----------------------------------------------------
@@ -161,6 +165,24 @@ def glyph_row(ch: int, row: int) -> int:
         r = [0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x00]
     elif ch == 46:  # .
         r = [0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C]
+    elif ch == 45:  # -
+        r = [0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00]
+    elif ch == 47:  # /
+        r = [0x01, 0x02, 0x02, 0x04, 0x08, 0x08, 0x10]
+    elif ch == 63:  # ?
+        r = [0x0E, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04]
+    elif ch == 33:  # !
+        r = [0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04]
+    elif ch == 61:  # =
+        r = [0x00, 0x00, 0x1F, 0x00, 0x1F, 0x00, 0x00]
+    elif ch == 44:  # ,
+        r = [0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x04]
+    elif ch == 40:  # (
+        r = [0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02]
+    elif ch == 41:  # )
+        r = [0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08]
+    elif ch == 35:  # #
+        r = [0x0A, 0x0A, 0x1F, 0x0A, 0x1F, 0x0A, 0x0A]
     else:           # space / unknown
         r = [0, 0, 0, 0, 0, 0, 0]
     return r[row]
@@ -168,6 +190,10 @@ def glyph_row(ch: int, row: int) -> int:
 
 def draw_char(fb: "u32*", fbw: int, fbh: int, x: int, y: int,
               ch: int, scale: int, color: int) -> None:
+    # The 5x7 font only carries uppercase glyphs; fold lowercase onto them so
+    # ordinary web text (mostly lowercase) is legible without a second table.
+    if ch >= 97 and ch <= 122:
+        ch = ch - 32
     row = 0
     while row < 7:
         bits = glyph_row(ch, row)
@@ -309,6 +335,94 @@ class QPushButton(Widget):
     def on_press(self, px: int, py: int) -> int:
         self.clicked.emit()
         return ACTION_REDRAW
+
+
+class QHeading(Widget):
+    """A heading label (h1-h6). `level` selects a font scale so h1 renders
+    largest; deeper levels fall back to the body scale. Bold is approximated by
+    the larger glyph size (the 5x7 font has no weight axis)."""
+
+    def __init__(self, text: "char*", level: int):
+        super().__init__()
+        self.text = text
+        if level <= 1:
+            self.scale = 5
+        elif level == 2:
+            self.scale = 4
+        else:
+            self.scale = 3
+
+    def paint(self, fb: "u32*", fbw: int, fbh: int) -> None:
+        fill_rect(fb, fbw, fbh, self.x, self.y, self.w, self.h, COL_LABEL_BG)
+        draw_text(fb, fbw, fbh, self.x + 4, self.y + 8, self.text, self.scale,
+                  COL_TEXT)
+
+
+class QLink(Widget):
+    """An anchor: link-coloured text that emits `clicked` when pressed. `href`
+    is carried so a future navigation step can follow it; today the click just
+    fires the signal (e.g. to load another bundle)."""
+
+    def __init__(self, text: "char*", href: "char*"):
+        super().__init__()
+        self.text = text
+        self.href = href
+        self.clicked = Signal()
+
+    def paint(self, fb: "u32*", fbw: int, fbh: int) -> None:
+        fill_rect(fb, fbw, fbh, self.x, self.y, self.w, self.h, COL_LABEL_BG)
+        draw_text(fb, fbw, fbh, self.x + 8, self.y + 14, self.text, 3, COL_LINK)
+        # underline
+        n = len(self.text)
+        fill_rect(fb, fbw, fbh, self.x + 8, self.y + 14 + 22, n * 18, 2,
+                  COL_LINK)
+
+    def on_press(self, px: int, py: int) -> int:
+        self.clicked.emit()
+        return ACTION_REDRAW
+
+
+class QLineEdit(Widget):
+    """A single-line text field. It renders its current text (or a greyed
+    placeholder when empty) inside a bordered white box. The rwayland runtime
+    delivers only pointer events today -- there is no keyboard channel yet -- so
+    a press is treated as `returnPressed` (submit), which is enough to drive a
+    search box + button. Real typing is a runtime extension (see README)."""
+
+    def __init__(self, text: "char*"):
+        super().__init__()
+        self.text = text
+        self.placeholder = ""
+        self.returnPressed = Signal()
+
+    def setPlaceholderText(self, text: "char*") -> None:
+        self.placeholder = text
+
+    def text_value(self) -> "char*":
+        return self.text
+
+    def paint(self, fb: "u32*", fbw: int, fbh: int) -> None:
+        fill_rect(fb, fbw, fbh, self.x, self.y, self.w, self.h, COL_FIELD)
+        _draw_border(fb, self.x, self.y, self.w, self.h, COL_BORDER)
+        if len(self.text) > 0:
+            draw_text(fb, fbw, fbh, self.x + 8, self.y + 14, self.text, 3,
+                      COL_TEXT)
+        else:
+            draw_text(fb, fbw, fbh, self.x + 8, self.y + 14, self.placeholder,
+                      3, COL_HINT)
+
+    def on_press(self, px: int, py: int) -> int:
+        self.returnPressed.emit()
+        return ACTION_REDRAW
+
+
+class QHLine(Widget):
+    """A horizontal rule (<hr>): a thin centred line across the row."""
+
+    def paint(self, fb: "u32*", fbw: int, fbh: int) -> None:
+        fill_rect(fb, fbw, fbh, self.x, self.y, self.w, self.h, COL_BG)
+        ty = self.y + self.h // 2 - 1
+        fill_rect(fb, fbw, fbh, self.x, ty, self.w, 2, COL_RULE)
 
 
 class QCheckBox(Widget):
