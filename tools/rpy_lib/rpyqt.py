@@ -304,9 +304,16 @@ class Widget(_QtObject):
     def __init__(self):
         super().__init__()
         self.text = ""
+        self.action = ""        # e.g. an HTML onclick handler ("foo()")
 
     def setText(self, text: "char*") -> None:
         self.text = text
+
+    def set_action(self, a: "char*") -> None:
+        self.action = a
+
+    def action_value(self) -> "char*":
+        return self.action
 
     def text_value(self) -> "char*":
         # Declared on the base so a widget reached through an obj reference (a
@@ -356,6 +363,8 @@ class QPushButton(Widget):
                   COL_BTN_TEXT)
 
     def on_press(self, px: int, py: int) -> int:
+        if len(self.action) > 0:
+            set_last_action(self.action)
         self.clicked.emit()
         return ACTION_REDRAW
 
@@ -745,6 +754,21 @@ def last_link_href() -> "char*":
     if w is not None:
         return w.href_value()
     return ""
+
+
+# The action string (e.g. an HTML onclick like "foo()") of the most recently
+# pressed widget that carried one. A no-arg `clicked` handler recovers it with
+# last_action() to decide which script function to invoke.
+_last_action = ""
+
+
+def set_last_action(a: "char*") -> None:
+    global _last_action
+    _last_action = a
+
+
+def last_action() -> "char*":
+    return _last_action
 
 
 def rw_width() -> int:
