@@ -27,9 +27,11 @@ import os
 import sys
 from rpyqt import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QBoxLayout,
                    QLabel, QPushButton, QHeading, QLink, QLineEdit, QHLine,
-                   QCanvas, last_link_href, last_action)
+                   QCanvas, last_link_href, last_action,
+                   last_edit_handle, last_edit_text)
 from minijson import load_page, parse_dom_str, has_python, has_rpython
-from interp_embed import mpy_boot, mpy_call, mpy_call_s, mpy_call_i
+from interp_embed import (mpy_boot, mpy_call, mpy_call_s, mpy_call_i,
+                          mpy_call_is)
 
 # ----- navigation state ---------------------------------------------------
 # The window is held in a *typed* global so setLayout (which takes a concrete
@@ -138,6 +140,15 @@ def on_script() -> None:
     h: "int" = _atoi(act)
     mpy_call_i("__fire", h)
     render_from_dom()
+
+
+def on_edit() -> None:
+    # A bound text field changed: push its text into the DOM element by handle
+    # (two-way binding). No re-render -- the field already shows the text and we
+    # must not rebuild the widget tree mid-typing (it would drop focus).
+    h: "int" = last_edit_handle()
+    t: "char*" = last_edit_text()
+    mpy_call_is("__set_value", h, t)
 
 
 # ----- tag dispatch (the port of Tetra's generate_interface) --------------
@@ -353,7 +364,14 @@ def render_node(node: "obj", box: "QBoxLayout") -> None:
         ph: "char*" = node.get_placeholder()
         field = QLineEdit(val)
         field.setPlaceholderText(ph)
-        field.returnPressed.connect(on_go)
+        sh: "char*" = node.get_shandle()
+        if len(sh) > 0:
+            # Scripted page: bind the field to its DOM element so typed text
+            # flows back into the minidom (two-way). Enter does not navigate.
+            field.set_bound(_atoi(sh))
+            field.textChanged.connect(on_edit)
+        else:
+            field.returnPressed.connect(on_go)
         box.addWidget(field)
         return
 
@@ -593,6 +611,57 @@ def js_selftest() -> int:
     return 0
 
 
+def twoway_selftest() -> int:
+    # Headless proof of two-way binding: load twoway.html, boot it, then type
+    # into the bound input through the REAL widget path (QLineEdit.on_key ->
+    # textChanged -> on_edit -> minidom) and fire the button, whose show() reads
+    # getElementById('INPUT').value -- it must see the typed text.
+    global _hist, _scripted
+    _hist = History()
+    _hist.set_source("twoway")
+    fetch("twoway")
+    _scripted = 1
+    boot_page()
+    s0: "char*" = mpy_call_s("__serialize")
+    root0 = parse_dom_str(s0)
+    n = root0.child_count()
+    i = 0
+    ih = 0
+    bh = 0
+    while i < n:
+        ch = root0.child(i)
+        cid: "char*" = ch.get_id()
+        if cid == "INPUT":
+            shh: "char*" = ch.get_shandle()
+            ih = _atoi(shh)
+        oc: "char*" = ch.get_onclick()
+        if len(oc) > 0:
+            bh = _atoi(oc)
+        i = i + 1
+    # type "hi" through the actual widget -> on_edit -> minidom
+    fld = QLineEdit("")
+    fld.set_bound(ih)
+    fld.textChanged.connect(on_edit)
+    fld.on_key(104, 1)                          # 'h'
+    fld.on_key(105, 1)                          # 'i'
+    mpy_call_i("__fire", bh)                    # click show() -> reads INPUT
+    print("console: " + mpy_call_s("__console"))
+    s1: "char*" = mpy_call_s("__serialize")
+    root1 = parse_dom_str(s1)
+    n2 = root1.child_count()
+    i2 = 0
+    got2 = 0
+    while i2 < n2:
+        ce2 = root1.child(i2)
+        eid2: "char*" = ce2.get_id()
+        if eid2 == "INPUT" and got2 == 0:
+            ev2: "char*" = ce2.get_value()
+            print("INPUT value: " + ev2)
+            got2 = 1
+        i2 = i2 + 1
+    return 0
+
+
 def canvas_selftest() -> int:
     # Headless proof of "native draws to the page": load canvas.html, JIT its
     # <script type="rpython"> shader, and confirm the native pixel(x,y) varies
@@ -643,6 +712,8 @@ def main() -> int:
         return canvas_selftest()
     if len(sys.argv) > 1 and sys.argv[1] == "--js-selftest":
         return js_selftest()
+    if len(sys.argv) > 1 and sys.argv[1] == "--twoway-selftest":
+        return twoway_selftest()
     app = QApplication()
     win = QWidget()
     win.setWindowTitle("MINIBROWSER")

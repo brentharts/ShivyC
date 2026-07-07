@@ -44,6 +44,14 @@ _BINOP = {
 class Translator:
     def __init__(self):
         self.lines = []
+        self.dict_vars = set()      # vars assigned an object literal -> dicts
+
+    def _note_dict(self, target, value):
+        # If `target` (a simple name) is assigned an object literal, remember it
+        # so later `target.prop` lowers to `target["prop"]` (JS objects -> dicts).
+        if value is not None and value.get("type") == "ObjectExpression" \
+                and target.get("type") == "Identifier":
+            self.dict_vars.add(target["name"])
 
     # ---- statements ------------------------------------------------------
     def emit_program(self, node):
@@ -75,6 +83,7 @@ class Translator:
             for d in node["declarations"]:
                 name = d["id"]["name"]
                 if d.get("init") is not None:
+                    self._note_dict(d["id"], d["init"])
                     self.line(indent, "%s = %s" % (name, self.expr(d["init"])))
                 else:
                     self.line(indent, "%s = None" % name)
@@ -160,10 +169,23 @@ class Translator:
             obj = self.expr(node["object"])
             if node.get("computed"):
                 return "%s[%s]" % (obj, self.expr(node["property"]))
-            return "%s.%s" % (obj, node["property"]["name"])
+            prop = node["property"]["name"]
+            # arr.length / str.length -> len(x)
+            if prop == "length":
+                return "len(%s)" % obj
+            # object-literal var: dot access becomes dict subscript
+            if node["object"].get("type") == "Identifier" \
+                    and node["object"]["name"] in self.dict_vars:
+                return "%s[%s]" % (obj, _pystr(prop))
+            return "%s.%s" % (obj, prop)
         if t == "CallExpression":
+            call = self._array_method(node)
+            if call is not None:
+                return call
             args = ", ".join(self.expr(a) for a in node.get("arguments", []))
             return "%s(%s)" % (self.expr(node["callee"]), args)
+        if t == "ObjectExpression":
+            return self._object(node)
         if t == "NewExpression":
             args = ", ".join(self.expr(a) for a in node.get("arguments", []))
             return "%s(%s)" % (self.expr(node["callee"]), args)
@@ -200,6 +222,39 @@ class Translator:
         if t == "ThisExpression":
             raise Unsupported("this")
         raise Unsupported("expression %s" % t)
+
+    def _array_method(self, node):
+        # Map the common JS array methods onto minipy list ops. Returns the
+        # translated call, or None to fall back to a plain method call.
+        callee = node["callee"]
+        if callee.get("type") != "MemberExpression" or callee.get("computed"):
+            return None
+        prop = callee["property"]["name"]
+        obj = self.expr(callee["object"])
+        args = [self.expr(a) for a in node.get("arguments", [])]
+        if prop == "push" and len(args) == 1:
+            return "%s.append(%s)" % (obj, args[0])
+        if prop == "pop" and not args:
+            return "%s.pop()" % obj
+        if prop == "shift" and not args:
+            return "%s.pop(0)" % obj
+        if prop == "unshift" and len(args) == 1:
+            return "%s.insert(0, %s)" % (obj, args[0])
+        return None
+
+    def _object(self, node):
+        parts = []
+        for p in node.get("properties", []):
+            key = p["key"]
+            if key["type"] == "Identifier":
+                k = _pystr(key["name"])
+            elif key["type"] == "Literal":
+                v = key.get("value")
+                k = _pystr(v if isinstance(v, str) else str(v))
+            else:
+                raise Unsupported("object key %s" % key["type"])
+            parts.append("%s: %s" % (k, self.expr(p["value"])))
+        return "{%s}" % ", ".join(parts)
 
     def _literal(self, node):
         v = node.get("value")

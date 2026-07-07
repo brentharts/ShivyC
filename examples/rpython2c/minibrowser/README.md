@@ -329,10 +329,13 @@ def greet():
 and the click runs it -- console line printed, input value mutated -- exactly as
 the Python path would. The translator covers a pragmatic subset (functions,
 `var`/`let`/`const`, `if`/`while`/C-style `for`, `return`, member/call/assign
-expressions, `===`->`==`, `&&`->`and`, `?:`->`if/else`); unsupported constructs
-are skipped (the JS stays in `scripts`, unrun) rather than breaking the page.
-Full ECMAScript semantics -- `+` type coercion, hoisting, closures, prototypes,
-`this` -- are out of scope; the goal is DOM-scripting parity, not a JS VM.
+expressions, `===`->`==`, `&&`->`and`, `?:`->`if/else`), plus **object literals**
+(→ dicts, so `o.a` reads `o["a"]`) and the common **array methods**
+(`push`->`append`, `pop`, `shift`, `unshift`, `.length`->`len`). Unsupported
+constructs are skipped (the JS stays in `scripts`, unrun) rather than breaking
+the page. Full ECMAScript semantics -- `+` type coercion, hoisting, closures,
+prototypes, `this` -- are out of scope; the goal is DOM-scripting parity, not a
+JS VM.
 
 ```
 python3 js_test.py                                # translate + run on native minipy
@@ -342,14 +345,38 @@ cd build/gui && ./minibrowser_app --js-selftest   # JS greet() runs in the brows
 Needs `pip install pyjsparser` (optional, like Js2Py itself); without it the JS
 is simply left unrun.
 
+## Two-way input binding
+
+Typing into an `<input>` flows back into the DOM. Each rendered field is bound to
+its minidom element by handle; on a keystroke `QLineEdit` records the edit and
+`json2qt` pushes the new text into the DOM (`mpy_call_is("__set_value", handle,
+text)`) without a re-render (so focus survives). A script then reads the typed
+value:
+
+```html
+<input id="INPUT" value="">
+<button onclick="show()">show</button>
+<script type="python">
+def show():
+    console.log('input is: ' + document.getElementById('INPUT').value)
+</script>
+```
+
+Type `hi`, click *show*, and the console prints `input is: hi` -- the value the
+user typed, read from the DOM. Verified headless (driving the real
+`on_key -> textChanged -> on_edit -> minidom` path):
+
+```
+cd build/gui && ./minibrowser_app --twoway-selftest
+```
+
 ## Roadmap (deliberately not yet done)
 
-* **Two-way inputs & more DOM.** Rendered `<input>`s show their value but typing
-  doesn't yet flow back into the minidom; `removeChild`, more attributes, and a
-  real modal `alert` overlay (rather than an on-screen label) are the follow-ups.
-* **Wider JS coverage.** The js2py subset handles DOM scripting; JS `+` string
-  coercion, object literals, `this`/closures, and array methods are the next
-  reach (some map cleanly onto minipy, some need runtime helpers).
+* **More DOM.** `removeChild`, more attributes, and a real modal `alert` overlay
+  (rather than an on-screen label) are the next DOM gaps.
+* **Wider JS coverage.** The js2py subset now handles DOM scripting, objects, and
+  arrays; JS `+` string coercion, `this`/closures, and array iteration methods
+  (`map`/`forEach`) are the next reach.
 * **Real network fetch.** `www2json --url` exists; wiring it into `navigate()`
   (rather than local `*.html`) is a small step where the network is available.
 * **Images beyond a placeholder**, and a fuller keymap (other layouts, via

@@ -53,6 +53,12 @@ def unit_translate():
                           "x.value = (1 < 2 && 3 > 2) ? 'y' : 'n';")
     assert "document.getElementById(\"q\")" in py2, py2
     assert " and " in py2 and " if " in py2, py2
+    # object literals -> dicts (dot access -> subscript); array methods
+    py3 = js2py.translate("var o = {a: 1, b: 2}; var r = o.a; o.b = 3;")
+    assert "{\"a\":" in py3 and "o[\"a\"]" in py3 and "o[\"b\"] = 3" in py3, py3
+    py4 = js2py.translate("var xs = []; xs.push(5); var n = xs.length; "
+                          "var t = xs.pop();")
+    assert "xs.append(5" in py4 and "len(xs)" in py4 and "xs.pop()" in py4, py4
     print("js2py unit translation OK")
 
 

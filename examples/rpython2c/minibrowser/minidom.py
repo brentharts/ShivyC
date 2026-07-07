@@ -123,6 +123,14 @@ class Document:
                 cb()
         return 0
 
+    def _set_value(self, h, v):
+        # Two-way binding: the browser pushes an edited input's text back into
+        # the DOM by handle, so scripts read the typed value.
+        e = self._by_handle(h)
+        if e != None:
+            e.value = v
+        return 0
+
     def _serialize(self):
         b = self.body
         if b == None:
@@ -134,21 +142,14 @@ class Document:
 
 
 def _ser_node(e):
-    s = "{\"type\":" + _jstr(e.tagName) + ",\"attributes\":{"
-    first = 1
+    s = "{\"type\":" + _jstr(e.tagName) + ",\"attributes\":{\"h\":" \
+        + _jstr(str(e._handle))
     if e.eid != "":
-        s = s + "\"id\":" + _jstr(e.eid)
-        first = 0
+        s = s + ",\"id\":" + _jstr(e.eid)
     if e.value != "":
-        if first == 0:
-            s = s + ","
-        s = s + "\"value\":" + _jstr(e.value)
-        first = 0
+        s = s + ",\"value\":" + _jstr(e.value)
     if e.onclick != None:
-        if first == 0:
-            s = s + ","
-        s = s + "\"onclick\":" + _jstr(str(e._handle))
-        first = 0
+        s = s + ",\"onclick\":" + _jstr(str(e._handle))
     s = s + "},\"text\":" + _jstr(e.textContent) + ",\"children\":["
     i = 0
     n = len(e.children)
@@ -203,6 +204,10 @@ def __serialize():
 
 def __fire(h):
     return document._fire(h)
+
+
+def __set_value(h, v):
+    return document._set_value(h, v)
 
 
 def __console():
