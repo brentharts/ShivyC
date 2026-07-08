@@ -3063,6 +3063,32 @@ def mpy_call_is(name: "char*", i: "int", s: "char*") -> "int":
     return -1
 
 
+def mpy_call_i_s(name: "char*", arg: "int") -> "char*":
+    # Call a booted top-level function by name with one int argument and return
+    # its string result (empty if not booted/found/raised/non-string). Lets
+    # native page code read DOM values back by handle (mb_dom_get_value).
+    prog: "Program" = _embed_prog
+    st: "St" = _embed_st
+    if _embed_ready == 0:
+        return ""
+    gi = 0
+    while gi < len(prog.names) and gi < len(st.glob):
+        if _strcmp(prog.names[gi], name) == 0:
+            fv = st.glob[gi]
+            if fv.tag != 5:
+                return ""
+            cargs = new_v_list()
+            cargs.append(v_int(arg))
+            r = do_call(st, fv, cargs)
+            if st.exc_flag != 0:
+                return ""
+            if r.tag == 3:
+                return r.sv
+            return ""
+        gi = gi + 1
+    return ""
+
+
 def interp_run(prog: "Program", sargs: "list[str]") -> "int":
     st = build_state(prog, sargs)
     run_func(st, prog.entry, new_v_list())
