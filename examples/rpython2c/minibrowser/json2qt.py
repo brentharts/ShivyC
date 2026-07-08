@@ -27,7 +27,7 @@ import os
 import sys
 from rpyqt import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QBoxLayout,
                    QLabel, QPushButton, QHeading, QLink, QLineEdit, QHLine,
-                   QCanvas, last_link_href, last_action,
+                   QCanvas, QImage, last_link_href, last_action,
                    last_edit_handle, last_edit_text,
                    set_wants_frame, set_frame_handler, pointer_x, pointer_y)
 from minijson import load_page, parse_dom_str, has_python, has_rpython
@@ -251,6 +251,8 @@ if sys.implementation.name != "cpython":
     _ffi.mb_render_call.restype = _ct.c_int
     _ffi.mb_render_call.argtypes = [_ct.c_long, _ct.c_long, _ct.c_int,
                                     _ct.c_int, _ct.c_int, _ct.c_int, _ct.c_int]
+    _ffi.mb_image_load.restype = _ct.c_long
+    _ffi.mb_image_load.argtypes = [_ct.c_char_p]
 
 CANVAS_W = 96
 CANVAS_H = 96
@@ -373,7 +375,20 @@ def render_node(node: "obj", box: "QBoxLayout") -> None:
         return
 
     if t == "img":
-        box.addWidget(QLabel("[img]"))
+        # The node's src has been rewritten (by www2json / the scripting
+        # shell-out) to a blit-ready cache file. Load its pixels natively and
+        # show them; fall back to a placeholder if the cache is missing.
+        csrc: "char*" = node.get_src()
+        loaded = 0
+        if len(csrc) > 0:
+            p: "long" = _ffi.mb_image_load(csrc)
+            if p != 0:
+                im = QImage()
+                im.set_image(p)
+                box.addWidget(im)
+                loaded = 1
+        if loaded == 0:
+            box.addWidget(QLabel("[img]"))
         return
 
     if t == "input":
@@ -919,6 +934,44 @@ def canvas_selftest() -> int:
     return 0
 
 
+def img_selftest() -> int:
+    # Headless proof of the image pipeline: PIL producer -> cache file ->
+    # native mb_image_load -> QImage blit (with alpha) into a framebuffer.
+    os.system("python3 mb_imgcache.py :test: /tmp/mb_selftest.img")
+    p: "long" = _ffi.mb_image_load("/tmp/mb_selftest.img")
+    if p == 0:
+        print("img FAIL: load")
+        return 1
+    view: "u32*" = p
+    w: "int" = view[0]
+    h: "int" = view[1]
+    if w == 4 and h == 2:
+        print("img OK: loaded 4x2 cache")
+    else:
+        print("img FAIL: dims")
+    # First pixel is opaque red: check channels (mask avoids signed-u32 noise).
+    r0: "int" = view[2]
+    if ((r0 >> 16) & 255) == 255 and ((r0 >> 8) & 255) == 0 and (r0 & 255) == 0:
+        print("img OK: pixel is red (0xAARRGGBB)")
+    else:
+        print("img FAIL: pixel value")
+    # Blit through the real widget into a zeroed 8x8 scratch framebuffer and
+    # check the half-alpha blue pixel composited over black: blue 128 over 0
+    # gives blue channel (255*128 + 0*127)//255 = 128.
+    fb = _ffi.mb_canvas_alloc(8 * 8)
+    fbv: "u32*" = fb
+    im = QImage()
+    im.set_image(p)
+    im.place(0, 0, w, h)
+    im.paint(fbv, 8, 8)
+    blended: "int" = fbv[1 * 8 + 3]   # image (3,1) -> fb (3,1)
+    if (blended & 255) == 128 and ((blended >> 16) & 255) == 0:
+        print("img OK: alpha blend over background")
+    else:
+        print("img FAIL: alpha blend")
+    return 0
+
+
 def main() -> int:
     global _hist, _win
     if len(sys.argv) > 1 and sys.argv[1] == "--script-selftest":
@@ -927,6 +980,8 @@ def main() -> int:
         return jit_selftest()
     if len(sys.argv) > 1 and sys.argv[1] == "--canvas-selftest":
         return canvas_selftest()
+    if len(sys.argv) > 1 and sys.argv[1] == "--img-selftest":
+        return img_selftest()
     if len(sys.argv) > 1 and sys.argv[1] == "--js-selftest":
         return js_selftest()
     if len(sys.argv) > 1 and sys.argv[1] == "--ts-selftest":

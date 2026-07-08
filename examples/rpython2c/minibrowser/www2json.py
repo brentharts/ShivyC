@@ -143,11 +143,49 @@ def find_body(root):
             "children": root.get("children", [])}
 
 
+def _resolve_img_src(base_is_url, base, src):
+    """Resolve an <img src> against the page's location so relative paths and
+    site-relative URLs both work."""
+    if (src.startswith("http://") or src.startswith("https://")
+            or src.startswith("data:")):
+        return src
+    if base_is_url:
+        from urllib.parse import urljoin
+        return urljoin(base, src)
+    return os.path.join(base, src)
+
+
+def _convert_images(node, base_is_url, base, max_w=512, max_h=512):
+    """Walk the DOM tree and rewrite each <img src> to a blit-ready cache file
+    (produced by PIL, ahead of time). The pure-rpython browser then only carries
+    the cache path -- no libpng/libjpeg, no pixel data in its bytecode. A source
+    that can't be fetched/decoded is left untouched, so the browser falls back to
+    an "[img]" placeholder rather than failing the whole page."""
+    if node.get("type") == "img":
+        attrs = node.setdefault("attributes", {})
+        src = attrs.get("src", "")
+        if src and not src.startswith("data:"):
+            try:
+                import mb_imgcache
+                resolved = _resolve_img_src(base_is_url, base, src)
+                attrs["src"] = mb_imgcache.convert_cached(resolved, max_w, max_h)
+            except Exception as e:  # noqa: BLE001 -- best-effort per image
+                sys.stderr.write("img: could not prepare %s (%s)\n" % (src, e))
+    for ch in node.get("children", []):
+        _convert_images(ch, base_is_url, base, max_w, max_h)
+
+
 def build_bundle(source, html_text):
     parser = DomBuilder()
     parser.feed(html_text)
     prune(parser.root)
     body = find_body(parser.root)
+    # Rewrite <img src> to blit-ready cache files (relative to the page).
+    _base_is_url = (source.startswith("http://")
+                    or source.startswith("https://"))
+    _base = source if _base_is_url else os.path.dirname(
+        os.path.abspath(source))
+    _convert_images(body, _base_is_url, _base)
     title = parser.title.strip() or source
     py_types = ("python", "text/python", "application/python")
     ts_types = ("typescript", "text/typescript", "application/typescript")
