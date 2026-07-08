@@ -247,7 +247,8 @@ minibrowser:
 	    $(MB)/home.html $(MB)/about.html $(MB)/example.html \
 	    $(MB)/pyscript.html $(MB)/pyscript2.html $(MB)/pyjit.html \
 	    $(MB)/canvas.html $(MB)/jsdemo.html $(MB)/twoway.html $(MB)/ts.html \
-	    $(MB)/domnative.html \
+	    $(MB)/domnative.html $(MB)/domio.html $(MB)/objptr.html \
+	    $(MB)/domx.html \
 	    $(GUIBIN)/
 	@rm -rf $(GUIBIN)/minipy && cp -r tools/minipy $(GUIBIN)/minipy
 	@python3 $(MB)/www2json.py $(MB)/home.html --out $(GUIBIN) >/dev/null
@@ -255,6 +256,35 @@ minibrowser:
 	@echo "  cd $(GUIBIN) && ./minibrowser_app"
 	@echo "  cd $(GUIBIN) && ./minibrowser_app --script-selftest   # run a page's python"
 	@echo "  cd $(GUIBIN) && ./minibrowser_app --jit-selftest      # JIT rpython + native ctypes call"
+
+# Rebuild the SAME browser with ShivyC (our own C compiler + assembler) instead
+# of gcc, to prove the toolchain can self-compile it. gcc stays the default
+# (it is faster); this target is a compatibility check. Run `make minibrowser`
+# first (it generates the .c and stages the runtime files). The system cpp only
+# preprocesses (the C standard separates preprocessing from compilation) with
+# -P to suppress line markers -- which would otherwise split ShivyC's stdarg
+# macro calls; ShivyC does all the actual compilation, optimization, and
+# linking, including -rdynamic and -lwayland-client (both added to ShivyC).
+# Optimization level via OPT=-O0..-O4 (default -O0).
+OPT ?= -O0
+minibrowser_shivyc:
+	@test -d $(GUIBIN)/minibrowser || { echo "run 'make minibrowser' first"; exit 1; }
+	@mkdir -p $(GUIBIN)/minibrowser_shivyc_pp
+	@echo "preprocessing browser TUs with cpp -E -P ..."
+	@for src in $(GUIBIN)/minibrowser/json2qt.c $(GUIBIN)/minibrowser/dom.c \
+	    $(GUIBIN)/minibrowser/minijson.c $(GUIBIN)/minibrowser/interp_embed.c \
+	    $(GUIBIN)/minibrowser/rpyqt.c $(GUIBIN)/minibrowser/rwayland_rt.c \
+	    $(GUIBIN)/minibrowser/xdg-shell-protocol.c \
+	    $(GUIBIN)/minibrowser/shivyc_rt.c tools/rpy_lib/mb_ffi.c; do \
+	  cc -E -P -I$(GUIBIN)/minibrowser $$src \
+	    > $(GUIBIN)/minibrowser_shivyc_pp/`basename $$src` 2>/dev/null; \
+	done
+	@echo "compiling + linking with ShivyC $(OPT) ..."
+	python3 -m shivyc.main --no-cache $(OPT) -rdynamic \
+	    $(GUIBIN)/minibrowser_shivyc_pp/*.c \
+	    -o $(GUIBIN)/minibrowser_app_shivyc $(WL_LIBS) -lm
+	@echo "built $(GUIBIN)/minibrowser_app_shivyc with ShivyC $(OPT)"
+	@echo "  cd $(GUIBIN) && ./minibrowser_app_shivyc --canvas-selftest"
 
 rpython:
 	@mkdir -p $(RPYBIN)
