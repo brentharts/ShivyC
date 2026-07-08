@@ -496,8 +496,18 @@ class StructCType(_UnionStructCType):
         self.members = members
         self.bitfields = bitfields or {}
 
+        # Lay members out at their natural alignment (standard C / SysV), and
+        # pad the whole struct up to its own alignment. ShivyC previously packed
+        # members with no padding, which kept structs smaller but placed an
+        # 8-byte member (e.g. a union or pointer after an int) at a misaligned
+        # offset -- straddling the SysV eightbyte boundary, so passing such a
+        # struct by value in registers cross-TU or to/from gcc-compiled code
+        # dropped half its bytes. Aligned layout matches the platform ABI.
         cur_offset = 0
         for member, ctype in members:
+            al = ctype.alignment()
+            if al > 1:
+                cur_offset = (cur_offset + al - 1) // al * al
             self.offsets[member] = cur_offset, ctype
             self._promote_anon(member, ctype, cur_offset)
             # A flexible array member (an incomplete array, always the last
@@ -506,6 +516,9 @@ class StructCType(_UnionStructCType):
                 continue
             cur_offset += ctype.size
 
+        struct_al = self.alignment()
+        if struct_al > 1:
+            cur_offset = (cur_offset + struct_al - 1) // struct_al * struct_al
         self.size = cur_offset
 
 
@@ -528,7 +541,11 @@ class UnionCType(_UnionStructCType):
                     member_elim.mark_ineligible(getattr(inner, "tag", None))
         self.members = members
         self.bitfields = bitfields or {}
-        self.size = max([ctype.size for _, ctype in members], default=0)
+        raw = max([ctype.size for _, ctype in members], default=0)
+        al = self.alignment()
+        if al > 1:
+            raw = (raw + al - 1) // al * al
+        self.size = raw
         for member, ctype in members:
             self.offsets[member] = 0, ctype
             self._promote_anon(member, ctype, 0)

@@ -274,7 +274,11 @@ def main():
         writable_text = (getattr(arguments, "metamorphic", False)
                          or getattr(arguments, "opt_level", 0) >= 4)
         if not link_objs(out, objs, writable_text,
-                         getattr(arguments, "low_mem", False)):
+                         getattr(arguments, "low_mem", False),
+                         libs=getattr(arguments, "libs", []),
+                         lib_dirs=getattr(arguments, "lib_dirs", []),
+                         export_dynamic=getattr(arguments, "export_dynamic",
+                                                False)):
             err = "linker returned non-zero status"
             print(CompilerError(err))
             return 1
@@ -1109,6 +1113,25 @@ def get_arguments(argv=None):
                             action="append", default=[],
                             help="predefine a preprocessor macro")
 
+        # Link against a library, like the C compiler's -l (e.g. -lwayland-client
+        # -lm). Passed through to ld. -lc and -lm are always linked.
+        parser.add_argument("-l", metavar="lib", dest="libs",
+                            action="append", default=[],
+                            help="link against the named library")
+
+        # Add a directory to the library search path, like -L. Passed to ld.
+        parser.add_argument("-L", metavar="dir", dest="lib_dirs",
+                            action="append", default=[],
+                            help="add a directory to the library search path")
+
+        # Export the executable's global symbols into the dynamic symbol table
+        # (like the C compiler's -rdynamic / --export-dynamic), so a library the
+        # program dlopen()s at run time can resolve back into it. minibrowser
+        # needs this: its JIT'd page-code .so files call host DOM helpers.
+        parser.add_argument("-rdynamic", "--export-dynamic",
+                            dest="export_dynamic", action="store_true",
+                            help="add all symbols to the dynamic symbol table")
+
         # Compile against the packaged musl libc (bypassing glibc). Materializes
         # musl's headers to a temp dir and prepends their include paths + defines,
         # so user code resolves #include against musl. The needed musl .c sources
@@ -1241,8 +1264,15 @@ def assemble(asm_name, obj_name):
         return True
 
 
-def link_objs(binary_name, obj_names, writable_text=False, low_mem=False):
+def link_objs(binary_name, obj_names, writable_text=False, low_mem=False,
+              libs=None, lib_dirs=None, export_dynamic=False):
     """Assemble the given object files into a binary.
+
+    `libs` / `lib_dirs` add `-l<name>` / `-L<dir>` to the ld command (like the C
+    compiler's -l/-L); -lc and -lm are always linked. `export_dynamic` adds
+    `--export-dynamic` (the -rdynamic flag) so a run-time-dlopen'd library can
+    resolve symbols back into this executable -- minibrowser's JIT'd page code
+    calls host DOM helpers this way.
 
     When `writable_text` is set (for -fmetamorphic / -O4), the linker is asked
     to emit a writable, non-page-aligned text segment via `-N` (OMAGIC), so
@@ -1283,8 +1313,16 @@ def link_objs(binary_name, obj_names, writable_text=False, low_mem=False):
         # from emitting a position-independent ET_DYN that the loader would
         # place at a random high address.
         cmd += ["-no-pie", "-Ttext-segment=0x400000"]
-    cmd += ["-dynamic-linker", linux_so, crtnum, crti, "-lc", "-lm"]
-    cmd = cmd + obj_names + [crtn, "-o", binary_name]
+    if export_dynamic:
+        cmd += ["--export-dynamic"]
+    for d in (lib_dirs or []):
+        cmd += ["-L" + d]
+    cmd += ["-dynamic-linker", linux_so, crtnum, crti]
+    cmd = cmd + obj_names
+    cmd += ["-lc", "-lm"]
+    for lib in (libs or []):
+        cmd += ["-l" + lib]
+    cmd += [crtn, "-o", binary_name]
 
     if sys.implementation.name != 'shivyc':
         try:
@@ -1352,4 +1390,19 @@ def find_library(file):
 
 
 if __name__ == "__main__":
+    # Machine-generated C (e.g. py2c's output for the minipy interpreter) nests
+    # expressions deeply, which the recursive-descent parser follows frame for
+    # frame. Raise the Python recursion limit, and run on a large-stack thread
+    # so the deeper limit can't overflow the C stack (a mere setrecursionlimit
+    # would segfault instead of erroring). Only used for the shivyc.main CLI;
+    # the transpiled/self-hosted compiler has its own native stack.
+    if sys.implementation.name != "shivyc":
+        import threading
+        sys.setrecursionlimit(200000)
+        threading.stack_size(1024 * 1024 * 1024)
+        _result = []
+        _t = threading.Thread(target=lambda: _result.append(main()))
+        _t.start()
+        _t.join()
+        sys.exit(_result[0] if _result else 1)
     sys.exit(main())
