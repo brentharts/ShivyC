@@ -640,6 +640,46 @@ def domnative_selftest() -> int:
     return 0
 
 
+def domio_selftest() -> int:
+    # Headless proof of the dom_get_* direction + string compute in native code:
+    # load domio.html (a native TypeScript echo that reads IN's value, builds a
+    # string, and writes OUT's text -- all in native code), boot it, fire run(),
+    # and read OUT back. It should show "native read: hello world".
+    global _hist, _scripted
+    _hist = History()
+    _hist.set_source("domio")
+    fetch("domio")
+    _scripted = 1
+    boot_page()
+    s0: "char*" = mpy_call_s("__serialize")
+    root0 = parse_dom_str(s0)
+    n = root0.child_count()
+    i = 0
+    done = 0
+    while i < n:
+        ch = root0.child(i)
+        oc: "char*" = ch.get_onclick()
+        if len(oc) > 0 and done == 0:
+            hh: "int" = _atoi(oc)
+            mpy_call_i("__fire", hh)            # run() -> native echo (get+set)
+            done = 1
+        i = i + 1
+    s1: "char*" = mpy_call_s("__serialize")
+    root1 = parse_dom_str(s1)
+    n2 = root1.child_count()
+    i2 = 0
+    found = 0
+    while i2 < n2:
+        c2 = root1.child(i2)
+        cid: "char*" = c2.get_id()
+        if cid == "OUT" and found == 0:
+            tx: "char*" = c2.get_text()
+            print("OUT text: " + tx)
+            found = 1
+        i2 = i2 + 1
+    return 0
+
+
 def ts_selftest() -> int:
     # Headless proof of TypeScript compiled to native: load ts.html (a <script
     # type="typescript"> block translated to typed rpython and JIT-compiled to a
@@ -815,6 +855,8 @@ def main() -> int:
         return ts_selftest()
     if len(sys.argv) > 1 and sys.argv[1] == "--domnative-selftest":
         return domnative_selftest()
+    if len(sys.argv) > 1 and sys.argv[1] == "--domio-selftest":
+        return domio_selftest()
     if len(sys.argv) > 1 and sys.argv[1] == "--twoway-selftest":
         return twoway_selftest()
     app = QApplication()

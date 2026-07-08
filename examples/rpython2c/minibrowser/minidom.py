@@ -139,6 +139,18 @@ class Document:
             e.textContent = v
         return 0
 
+    def _get_value(self, h):
+        e = self._by_handle(h)
+        if e != None:
+            return e.value
+        return ""
+
+    def _get_text(self, h):
+        e = self._by_handle(h)
+        if e != None:
+            return e.textContent
+        return ""
+
     def _serialize(self):
         b = self.body
         if b == None:
@@ -220,6 +232,14 @@ def __set_value(h, v):
 
 def __set_text(h, v):
     return document._set_text(h, v)
+
+
+def __get_value(h):
+    return document._get_value(h)
+
+
+def __get_text(h):
+    return document._get_text(h)
 
 
 def __console():

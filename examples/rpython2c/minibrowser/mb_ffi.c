@@ -50,9 +50,16 @@ int mb_render_call(long fn, long buf, int w, int h, int t, int mx, int my) {
    page's document by element handle. mpy_call_is runs a page-level minipy entry
    (__set_text / __set_value) and is a symbol in the browser binary. */
 extern int mpy_call_is(const char *name, int i, const char *s);
+extern char *mpy_call_i_s(const char *name, int i);
 int mb_dom_set_text(int handle, const char *text) {
     return mpy_call_is("__set_text", handle, text);
 }
 int mb_dom_set_value(int handle, const char *text) {
     return mpy_call_is("__set_value", handle, text);
+}
+const char *mb_dom_get_value(int handle) {
+    return mpy_call_i_s("__get_value", handle);
+}
+const char *mb_dom_get_text(int handle) {
+    return mpy_call_i_s("__get_text", handle);
 }

@@ -142,6 +142,8 @@ class Parser:
         # strip an `export` modifier
         if self.at("id", "export"):
             self.next()
+        if self.at("id", "class"):
+            return self.class_(indent, out)
         if self.at("id", "function"):
             return self.func(indent, out)
         if self.at("id", "let") or self.at("id", "const") or self.at("id", "var"):
@@ -275,21 +277,25 @@ class Parser:
         else:                               # expression body -> return expr
             self.emit(out, indent + 1, "return %s" % self.expr())
 
-    def func(self, indent, out):
-        self.eat("id", "function")
-        name = self.eat("id")[1]
+    def params(self):
         self.eat("op", "(")
-        params = []
+        ps = []
         while not self.at("op", ")"):
             pname = self.eat("id")[1]
             ptype = self.opt_type()
             if ptype and ptype != "None":
-                params.append("%s: %s" % (pname, ptype))
+                ps.append("%s: %s" % (pname, ptype))
             else:
-                params.append(pname)
+                ps.append(pname)
             if self.at("op", ","):
                 self.next()
         self.eat("op", ")")
+        return ps
+
+    def func(self, indent, out):
+        self.eat("id", "function")
+        name = self.eat("id")[1]
+        params = self.params()
         ret = self.opt_type()
         sig = ", ".join(params)
         if ret and ret != "None":
@@ -297,6 +303,54 @@ class Parser:
         else:
             self.emit(out, indent, "def %s(%s):" % (name, sig))
         self.block(indent + 1, out)
+
+    def class_(self, indent, out):
+        self.eat("id", "class")
+        name = self.eat("id")[1]
+        if self.at("id", "extends"):
+            self.next()
+            base = self.eat("id")[1]
+            self.emit(out, indent, "class %s(%s):" % (name, base))
+        else:
+            self.emit(out, indent, "class %s:" % name)
+        self.eat("op", "{")
+        members = 0
+        while not self.at("op", "}"):
+            if self.at("eof"):
+                raise Unsupported("unterminated class")
+            members += self.member(indent + 1, out)
+        self.eat("op", "}")
+        if members == 0:
+            self.emit(out, indent + 1, "pass")
+
+    def member(self, indent, out):
+        # constructor / method / field declaration
+        if self.at("id", "constructor"):
+            self.next()
+            params = self.params()
+            sig = ", ".join(["self"] + params)
+            self.emit(out, indent, "def __init__(%s):" % sig)
+            self.block(indent + 1, out)
+            return 1
+        name = self.eat("id")[1]
+        if self.at("op", "("):                  # method
+            params = self.params()
+            ret = self.opt_type()
+            sig = ", ".join(["self"] + params)
+            if ret and ret != "None":
+                self.emit(out, indent, "def %s(%s) -> %s:" % (name, sig, ret))
+            else:
+                self.emit(out, indent, "def %s(%s):" % (name, sig))
+            self.block(indent + 1, out)
+            return 1
+        # field declaration: name: type ( = expr )? ;  -- typed by the
+        # constructor's assignment, so a bare declaration is dropped; a field
+        # with an initializer is not supported here (set it in the constructor).
+        self.opt_type()
+        if self.at("op", "="):
+            raise Unsupported("class field initializer (assign in constructor)")
+        self.opt_semi()
+        return 0
 
     def if_(self, indent, out):
         self.eat("id", "if")
@@ -387,6 +441,9 @@ class Parser:
 
     def unary(self):
         k, v = self.peek()
+        if k == "id" and v == "new":            # new X(args) -> X(args)
+            self.next()
+            return self.postfix()
         if k == "op" and v in ("!", "-", "+"):
             self.next()
             operand = self.unary()
@@ -434,6 +491,8 @@ class Parser:
                 return "False"
             if v == "null" or v == "undefined":
                 return "None"
+            if v == "this":
+                return "self"
             return v
         if k == "op" and v == "(":
             self.next()

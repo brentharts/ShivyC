@@ -53,6 +53,10 @@ if sys.implementation.name != "cpython":
     _dom.mb_dom_set_text.argtypes = [_ctypes.c_int, _ctypes.c_char_p]
     _dom.mb_dom_set_value.restype = _ctypes.c_int
     _dom.mb_dom_set_value.argtypes = [_ctypes.c_int, _ctypes.c_char_p]
+    _dom.mb_dom_get_value.restype = _ctypes.c_char_p
+    _dom.mb_dom_get_value.argtypes = [_ctypes.c_int]
+    _dom.mb_dom_get_text.restype = _ctypes.c_char_p
+    _dom.mb_dom_get_text.argtypes = [_ctypes.c_int]
 
 
 def dom_set_text(h: int, t: "char*") -> int:
@@ -61,6 +65,14 @@ def dom_set_text(h: int, t: "char*") -> int:
 
 def dom_set_value(h: int, t: "char*") -> int:
     return _dom.mb_dom_set_value(h, t)
+
+
+def dom_get_value(h: int) -> "char*":
+    return _dom.mb_dom_get_value(h)
+
+
+def dom_get_text(h: int) -> "char*":
+    return _dom.mb_dom_get_text(h)
 
 
 '''
@@ -90,7 +102,7 @@ def compile_block(name, code, cache_dir):
     Returns (so_path, status) where status is cached / built / a failure tag."""
     # Native DOM writes: if the block calls dom_set_text/value, prepend the FFI
     # prelude so those names resolve to the host callbacks.
-    needs_dom = ("dom_set_text" in code) or ("dom_set_value" in code)
+    needs_dom = ("dom_set_" in code) or ("dom_get_" in code)
     final = (DOM_PRELUDE + code) if needs_dom else code
 
     so = os.path.join(cache_dir, "jit.%s.so" % name)

@@ -404,43 +404,66 @@ the page's Python calls via ctypes like any native block.
 `ts2py.py` is a dependency-free, pure-Python TypeScript front end (no Node, no
 npm, no `typescript` compiler): its own tokenizer and a precedence-climbing
 expression parser cover typed function declarations, **arrow functions**
-(`const f = (x: number): number => x + 1`), typed locals, the usual control flow,
-and the operator set (`===`->`==`, `&&`->`and`, `i++`->`i = i + 1`). Types map
-`number`->`int` and `float`/`double`->`float` (both compile to native, callable
-via ctypes as `c_int`/`c_double`), plus `boolean`->`bool`, `string`->`str`,
-`void`->`None`, `T[]`->`list[t]`. It is a subset aimed at native page functions;
-a block it can't translate is skipped rather than mistranslated. String returns
-across the FFI, interfaces/type aliases, and inline arrow callbacks are future.
+(`const f = (x: number): number => x + 1`), **classes** (fields, `constructor`,
+methods, `this`, `new`), typed locals, the usual control flow, and the operator
+set (`===`->`==`, `&&`->`and`, `i++`->`i = i + 1`). Types map `number`->`int` and
+`float`/`double`->`float` (both compile to native, callable via ctypes as
+`c_int`/`c_double`), plus `boolean`->`bool`, `string`->`str` (a native function
+can compute and **return** a string, read via `c_char_p`), `void`->`None`,
+`T[]`->`list[t]`. A TypeScript class becomes an rpython class, which py2c lowers
+to a C struct (its three-tier object model), so a class used inside a native
+function is real native data:
+
+```html
+<script type="typescript" id="mod">
+class Vec2 {
+    x: number;
+    y: number;
+    constructor(x: number, y: number) { this.x = x; this.y = y; }
+    lenSq(): number { return this.x * this.x + this.y * this.y; }
+}
+function vlen(a: number, b: number): number {
+    let v: Vec2 = new Vec2(a, b);
+    return v.lenSq();            // 25 for (3, 4), computed natively
+}
+</script>
+```
+
+It is a subset aimed at native page functions; a block it can't translate is
+skipped rather than mistranslated. Class instances stay inside native code
+(they aren't marshalled across the ctypes boundary); interfaces/type aliases and
+inline arrow callbacks are future.
 
 ### Native code can touch the DOM directly
 
-Native page code (rpython or TypeScript) can mutate the document itself, not just
-return values for the page's Python to apply. A JIT block that calls
-`dom_set_text(handle, text)` or `dom_set_value(handle, text)` reaches the live
-DOM by handle:
+Native page code (rpython or TypeScript) can read and write the document itself,
+not just return values for the page's Python to apply. A JIT block that calls
+`dom_get_value(handle)` / `dom_get_text(handle)` (returning a string) or
+`dom_set_text(handle, text)` / `dom_set_value(handle, text)` reaches the live DOM
+by handle -- so a native function can read an input, compute text, and write an
+element, entirely in native code:
 
 ```html
-<script type="typescript" id="dnmod">
-function setLabel(handle: number): number {
-    dom_set_text(handle, "set natively by TypeScript");
+<script type="typescript" id="iomod">
+function echo(inHandle: number, outHandle: number): number {
+    let v: string = dom_get_value(inHandle);          // read the DOM
+    dom_set_text(outHandle, "native read: " + v);     // compute + write it back
     return 0;
 }
-</script>
-<script type="python">
-def run():
-    dll.setLabel(document.getElementById('OUT')._handle)   # native writes OUT
 </script>
 ```
 
 It works by calling *back* into the interpreter: the browser is linked
-`-rdynamic`, so a JIT'd `.so` resolves `mb_dom_set_text` in the browser binary,
-which invokes the interpreter's `__set_text` by handle (`jitc` injects the small
-FFI prelude that binds `dom_set_text`/`dom_set_value` when a block uses them). The
-next render shows the change. This is the same directness the canvas shader has
-for pixels, now for text and input values.
+`-rdynamic`, so a JIT'd `.so` resolves `mb_dom_get_value` / `mb_dom_set_text` in
+the browser binary, which invoke the interpreter's `__get_value` / `__set_text`
+by handle (`jitc` injects the FFI prelude that binds the `dom_*` names when a
+block uses them). The next render shows the change. This is the same directness
+the canvas shader has for pixels, now for text and input values -- in both
+directions.
 
 ```
 cd build/gui && ./minibrowser_app --domnative-selftest   # native TS sets OUT's text
+cd build/gui && ./minibrowser_app --domio-selftest        # native TS reads IN, writes OUT
 ```
 
 Because these functions reach the browser's DOM, they run only in the browser
@@ -486,9 +509,10 @@ cd build/gui && ./minibrowser_app --twoway-selftest
   arrays; JS `+` string coercion, `this`/closures, and array iteration methods
   (`map`/`forEach`) are the next reach.
 * **Wider TypeScript coverage.** `ts2py` now compiles typed numeric functions
-  (`number`/`float`), arrow functions, and control flow to native code, and
-  native code can write the DOM; string returns across the FFI, interfaces/type
-  aliases, and inline arrow callbacks are the next reach.
+  (`number`/`float`), arrow functions, classes, and string returns to native
+  code, and native code reads/writes the DOM in both directions; passing class
+  instances across the ctypes boundary, interfaces/type aliases, and inline arrow
+  callbacks are the next reach.
 * **Real network fetch.** `www2json --url` exists; wiring it into `navigate()`
   (rather than local `*.html`) is a small step where the network is available.
 * **Images beyond a placeholder**, and a fuller keymap (other layouts, via

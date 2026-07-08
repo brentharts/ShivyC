@@ -1,0 +1,25 @@
+<html>
+<head>
+<script type="typescript" id="iomod">
+function echo(inHandle: number, outHandle: number): number {
+    let v: string = dom_get_value(inHandle);
+    dom_set_text(outHandle, "native read: " + v);
+    return 0;
+}
+</script>
+<script type="python">
+import ctypes
+dll = ctypes.CDLL('/tmp/jit.iomod.so')
+def run():
+    inp = document.getElementById('IN')
+    out = document.getElementById('OUT')
+    dll.echo(inp._handle, out._handle)
+</script>
+</head>
+<body>
+<h1>native dom io</h1>
+<input id="IN" value="hello world">
+<div id="OUT">unset</div>
+<button onclick="run()">go</button>
+</body>
+</html>

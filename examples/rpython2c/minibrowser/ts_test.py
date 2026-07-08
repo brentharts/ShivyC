@@ -43,6 +43,18 @@ def unit():
     py5 = ts2py.translate(
         "const inc = (n: number): number => { return n + 1; };")
     assert "def inc(n: int) -> int:" in py5 and "return (n + 1)" in py5, py5
+    # classes: constructor -> __init__, this -> self, methods, new
+    py6 = ts2py.translate(
+        "class P { x: number; constructor(x: number) { this.x = x; } "
+        "get(): number { return this.x; } } "
+        "function mk(v: number): number { let p: P = new P(v); "
+        "return p.get(); }")
+    assert "class P:" in py6 and "def __init__(self, x: int):" in py6, py6
+    assert "self.x = x" in py6 and "def get(self) -> int:" in py6, py6
+    assert "P(v)" in py6 and "p.get()" in py6, py6
+    # string return type and dom_get usage
+    py7 = ts2py.translate('function label(): string { return "hi"; }')
+    assert "def label() -> str:" in py7, py7
     print("ts2py unit translation OK")
 
 
