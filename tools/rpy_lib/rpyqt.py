@@ -508,19 +508,23 @@ class QHLine(Widget):
 
 
 class QCanvas(Widget):
-    """A pixel surface: holds a cw*ch list of packed ARGB pixels and blits them
-    into the framebuffer. The pixels are produced by native code (a JIT-compiled
-    <script type="rpython"> shader called per pixel), so this widget is how that
-    native output reaches the page -- the browser's Canvas primitive."""
+    """A pixel surface: holds a native cw*ch ARGB buffer (filled by a JIT'd
+    `render(buf, ...)` shader in one call per frame) and blits it into the
+    framebuffer. The buffer stays in native memory -- the browser fills it via
+    FFI and this widget reads it through a u32* view -- so a frame is one native
+    call, not cw*ch per-pixel FFI calls."""
 
     def __init__(self, cw: int, ch: int):
         super().__init__()
         self.cw = cw
         self.ch = ch
-        self.px: "list[int]" = []       # cw*ch packed ARGB pixels
+        self.buf: "u32*" = 0            # native ARGB buffer (null until set)
+        self.has_buf = 0
 
-    def set_pixels(self, px: "list[int]") -> None:
-        self.px = px
+    def set_buffer(self, p: "long") -> None:
+        v: "u32*" = p
+        self.buf = v
+        self.has_buf = 1
 
     def pref_h(self) -> int:
         return self.ch
@@ -532,15 +536,17 @@ class QCanvas(Widget):
         return self.y
 
     def paint(self, fb: "u32*", fbw: int, fbh: int) -> None:
-        n = len(self.px)
+        if self.has_buf == 0:
+            return
+        buf: "u32*" = self.buf
         cw = self.cw
+        n = cw * self.ch
         j = 0
         while j < n:
-            col: "int" = self.px[j]
-            fx: "int" = self.x + (j % cw)
-            fy: "int" = self.y + (j // cw)
+            fx = self.x + (j % cw)
+            fy = self.y + (j // cw)
             if fx >= 0 and fx < fbw and fy >= 0 and fy < fbh:
-                fb[fy * fbw + fx] = col
+                fb[fy * fbw + fx] = buf[j]
             j = j + 1
 
 
