@@ -160,7 +160,7 @@ The `--image` path emits a Multiboot stub that identity-maps the first GiB,
 enables PAE/long mode, installs a flat GDT, and jumps to a 64-bit kernel with a
 long-mode IDT (timer + keyboard). The preemptive thread switcher above installs
 itself into the timer vector. Boot is validated statically here (header/checksum,
-ELF64 entry, symbol resolution) since this environment has no emulator. See
+ELF64 entry, symbol resolution)
 
 ---
 
