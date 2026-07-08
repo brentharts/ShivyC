@@ -644,6 +644,19 @@ def process_c_file(file, args):
         import shivyc.dce as dce
         dce.eliminate_dead_functions(il_code, symbol_table)
 
+    # Fold statically-known calls -- AddrOf(f) followed by Call(p) -- into a
+    # direct `call f` for every function, at every optimization level. Without
+    # this each call materializes the callee's address into a register, and the
+    # indirect-call path can allocate that register on top of an argument's
+    # source (e.g. `mov rsi, rax` after `mov rax, <callee>` clobbered the value
+    # rsi was meant to receive). The fold is idempotent -- already-direct calls
+    # are skipped -- so it is safe even though the inline pass above and the
+    # stackless pass below may also apply it.
+    import shivyc.stackless as _stk_direct
+    for _fn in il_code.commands:
+        il_code.commands[_fn] = _stk_direct._apply_direct_calls(
+            il_code.commands[_fn], symbol_table)
+
     # Metamorphic returns (advanced/experimental): functions marked
     # __metamorphic__ return via a self-modified slot in a writable, executable
     # section instead of the stack. Only active when -fmetamorphic is passed.

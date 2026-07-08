@@ -161,7 +161,15 @@ def inline_calls(cmds, inlinable, il_code):
             nv = ILValue(v.ctype)
             remap[v] = nv
             if v.literal is not None:
-                il_code.register_literal_var(nv, v.literal.val)
+                # Re-register the literal under the fresh value. Float literals
+                # must go through the float-literal path so they are emitted as
+                # data and loaded from memory: an SSE instruction cannot take an
+                # immediate operand, so giving a float an integer LiteralSpot
+                # produces `movsd xmm0, <float>`, which the assembler rejects.
+                if v.ctype.is_floating():
+                    il_code.register_float_literal(nv, v.literal.val)
+                else:
+                    il_code.register_literal_var(nv, v.literal.val)
 
         # Fresh label for every label in the body, plus one end label that all
         # returns funnel through.

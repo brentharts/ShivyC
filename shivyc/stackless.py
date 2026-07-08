@@ -88,34 +88,50 @@ def _apply_direct_calls(cmds, symbol_table):
     """Fold ``AddrOf(p, f) ... Call(p, ...)`` into a direct call to ``f``.
 
     The AddrOf need not be adjacent to the Call (argument computation may sit
-    between them). Folding is sound when the function-pointer value ``p`` is
-    produced by a single AddrOf of a known function and consumed by a single
-    Call as its callee -- then ``p`` is never materialized and the AddrOf is
-    dropped.
+    between them). Folding is sound whenever the function-pointer value ``p`` is
+    produced by an AddrOf of a known function and every use of ``p`` is as a
+    Call's callee (never as an argument or any other operand): then ``p``'s
+    value is never needed as data, each such Call can `call f` directly, and the
+    AddrOf is dead. This intentionally handles a ``p`` shared by several call
+    sites (e.g. a recursive helper called from many places) -- leaving those
+    calls indirect would materialize ``f``'s address into a register that can
+    collide with an argument's source register.
     """
-    # Count how often each ILValue is referenced across the function.
-    ref_count = {}
-    for c in cmds:
-        for v in c.inputs() + c.outputs():
-            ref_count[v] = ref_count.get(v, 0) + 1
-
-    # AddrOf outputs that name a known function and are used exactly twice
-    # (defined once, used once) are fold candidates: p -> (addrof_cmd, name).
-    fold = {}
+    # AddrOf outputs that name a known function: output -> (addrof_cmd, name).
+    candidates = {}
     for c in cmds:
         if isinstance(c, value_cmds.AddrOf):
             name = _function_name(c.var, symbol_table)
-            if name is not None and ref_count.get(c.output, 0) == 2:
-                fold[c.output] = (c, name)
+            if name is not None:
+                candidates[c.output] = (c, name)
+
+    # Classify every use of each candidate value. A use as a Call's callee is
+    # foldable; any other use (a call argument, or any operand of a non-Call
+    # command) makes the value unfoldable because its address is truly needed.
+    unfoldable = set()
+    targets = {}  # candidate output -> list of Call cmds using it as callee
+    for c in cmds:
+        if isinstance(c, control_cmds.Call) and not c.direct_name:
+            for v in c.args:
+                if v in candidates:
+                    unfoldable.add(v)
+            if c.func in candidates:
+                targets.setdefault(c.func, []).append(c)
+        else:
+            for v in c.inputs():
+                if v in candidates:
+                    unfoldable.add(v)
 
     drop = set()
-    for c in cmds:
-        if (isinstance(c, control_cmds.Call)
-                and c.func in fold
-                and not c.direct_name):
-            addrof_cmd, name = fold[c.func]
-            c.direct_name = name          # asm_gen emits `call name`
-            drop.add(id(addrof_cmd))      # the AddrOf is now dead
+    for out, (addrof_cmd, name) in candidates.items():
+        if out in unfoldable:
+            continue
+        calls = targets.get(out)
+        if not calls:
+            continue
+        for call in calls:
+            call.direct_name = name       # asm_gen emits `call name`
+        drop.add(id(addrof_cmd))          # the AddrOf is now dead
 
     return [c for c in cmds if id(c) not in drop]
 
