@@ -680,6 +680,84 @@ def domio_selftest() -> int:
     return 0
 
 
+def objptr_selftest() -> int:
+    # Headless proof that the page can hold a native object: load objptr.html
+    # (a native TS makeVec returning a Vec2 pointer + vecLen taking one), boot,
+    # fire run() -- which holds the pointer in python and passes it back. The
+    # console should show 25.
+    global _hist, _scripted
+    _hist = History()
+    _hist.set_source("objptr")
+    fetch("objptr")
+    _scripted = 1
+    boot_page()
+    s0: "char*" = mpy_call_s("__serialize")
+    root0 = parse_dom_str(s0)
+    n = root0.child_count()
+    i = 0
+    done = 0
+    while i < n:
+        ch = root0.child(i)
+        oc: "char*" = ch.get_onclick()
+        if len(oc) > 0 and done == 0:
+            hh: "int" = _atoi(oc)
+            mpy_call_i("__fire", hh)
+            done = 1
+        i = i + 1
+    print("console: " + mpy_call_s("__console"))
+    return 0
+
+
+def domx_selftest() -> int:
+    # Headless proof of native dom_get_int + createElement + removeChild: load
+    # domx.html (native build() reads a count, creates that many children under
+    # LIST, and removes DEL), boot, fire run(), and inspect the DOM.
+    global _hist, _scripted
+    _hist = History()
+    _hist.set_source("domx")
+    fetch("domx")
+    _scripted = 1
+    boot_page()
+    s0: "char*" = mpy_call_s("__serialize")
+    root0 = parse_dom_str(s0)
+    n = root0.child_count()
+    i = 0
+    done = 0
+    while i < n:
+        ch = root0.child(i)
+        oc: "char*" = ch.get_onclick()
+        if len(oc) > 0 and done == 0:
+            hh: "int" = _atoi(oc)
+            mpy_call_i("__fire", hh)            # run() -> native build()
+            done = 1
+        i = i + 1
+    s1: "char*" = mpy_call_s("__serialize")
+    root1 = parse_dom_str(s1)
+    n2 = root1.child_count()
+    i2 = 0
+    listok = 0
+    hasdel = 0
+    while i2 < n2:
+        c2 = root1.child(i2)
+        cid: "char*" = c2.get_id()
+        if cid == "LIST":
+            lc: "int" = c2.child_count()
+            if lc == 3:
+                listok = 1
+        if cid == "DEL":
+            hasdel = 1
+        i2 = i2 + 1
+    if listok == 1:
+        print("LIST OK: native created 3 children")
+    else:
+        print("LIST FAIL")
+    if hasdel == 0:
+        print("DEL OK: native removed it")
+    else:
+        print("DEL FAIL")
+    return 0
+
+
 def ts_selftest() -> int:
     # Headless proof of TypeScript compiled to native: load ts.html (a <script
     # type="typescript"> block translated to typed rpython and JIT-compiled to a
@@ -857,6 +935,10 @@ def main() -> int:
         return domnative_selftest()
     if len(sys.argv) > 1 and sys.argv[1] == "--domio-selftest":
         return domio_selftest()
+    if len(sys.argv) > 1 and sys.argv[1] == "--objptr-selftest":
+        return objptr_selftest()
+    if len(sys.argv) > 1 and sys.argv[1] == "--domx-selftest":
+        return domx_selftest()
     if len(sys.argv) > 1 and sys.argv[1] == "--twoway-selftest":
         return twoway_selftest()
     app = QApplication()

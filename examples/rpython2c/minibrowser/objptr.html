@@ -1,0 +1,27 @@
+<html>
+<head>
+<script type="typescript" id="mod">
+class Vec2 {
+    x: number;
+    y: number;
+    constructor(x: number, y: number) { this.x = x; this.y = y; }
+    lenSq(): number { return this.x * this.x + this.y * this.y; }
+}
+function makeVec(x: number, y: number): Vec2 { return new Vec2(x, y); }
+function vecLen(v: Vec2): number { return v.lenSq(); }
+</script>
+<script type="python">
+import ctypes
+dll = ctypes.CDLL('/tmp/jit.mod.so')
+dll.makeVec.restype = ctypes.c_void_p
+dll.vecLen.argtypes = [ctypes.c_void_p]
+def run():
+    v = dll.makeVec(3, 4)
+    console.log(dll.vecLen(v))
+</script>
+</head>
+<body>
+<h1>native object held by python</h1>
+<button onclick="run()">go</button>
+</body>
+</html>

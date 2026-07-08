@@ -55,6 +55,14 @@ def unit():
     # string return type and dom_get usage
     py7 = ts2py.translate('function label(): string { return "hi"; }')
     assert "def label() -> str:" in py7, py7
+    # class as a return/param type (native object passed across the FFI)
+    py8 = ts2py.translate(
+        "function makeVec(x: number, y: number): Vec2 "
+        "{ return new Vec2(x, y); } "
+        "function vecLen(v: Vec2): number { return v.lenSq(); }")
+    assert "def makeVec(x: int, y: int) -> Vec2:" in py8, py8
+    assert "def vecLen(v: Vec2) -> int:" in py8, py8
+    assert "Vec2(x, y)" in py8, py8            # 'new' dropped
     print("ts2py unit translation OK")
 
 

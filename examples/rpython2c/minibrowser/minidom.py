@@ -61,6 +61,7 @@ class Element:
         self.eid = ""
         self.onclick = None
         self.children = []
+        self.parentNode = None
 
     def setAttribute(self, name, val):
         if name == "id":
@@ -78,6 +79,7 @@ class Element:
         return ""
 
     def appendChild(self, child):
+        child.parentNode = self
         self.children.append(child)
         return child
 
@@ -150,6 +152,57 @@ class Document:
         if e != None:
             return e.textContent
         return ""
+
+    def _get_int(self, h):
+        # Parse an element's value as an integer (digits only, optional '-'),
+        # so native code can read a numeric field without a string round-trip.
+        e = self._by_handle(h)
+        if e == None:
+            return 0
+        s = e.value
+        n = 0
+        i = 0
+        neg = 0
+        if len(s) > 0 and s[0] == "-":
+            neg = 1
+            i = 1
+        while i < len(s):
+            c = ord(s[i])
+            if c >= 48 and c <= 57:
+                n = n * 10 + (c - 48)
+            i = i + 1
+        if neg == 1:
+            return -n
+        return n
+
+    def _remove(self, h):
+        # removeChild by handle: detach the element from its parent.
+        e = self._by_handle(h)
+        if e == None:
+            return 0
+        p = e.parentNode
+        if p != None:
+            kids = []
+            i = 0
+            while i < len(p.children):
+                c = p.children[i]
+                if c._handle != h:
+                    kids.append(c)
+                i = i + 1
+            p.children = kids
+            e.parentNode = None
+        return 0
+
+    def _create_child(self, parent_h, tag, text):
+        # createElement + set text + append, under a parent by handle; returns
+        # the new child's handle so native code can address it further.
+        p = self._by_handle(parent_h)
+        if p == None:
+            return -1
+        e = self.createElement(tag)
+        e.textContent = text
+        p.appendChild(e)
+        return e._handle
 
     def _serialize(self):
         b = self.body
@@ -240,6 +293,18 @@ def __get_value(h):
 
 def __get_text(h):
     return document._get_text(h)
+
+
+def __get_int(h):
+    return document._get_int(h)
+
+
+def __remove(h):
+    return document._remove(h)
+
+
+def __create_child(parent_h, tag, text):
+    return document._create_child(parent_h, tag, text)
 
 
 def __console():

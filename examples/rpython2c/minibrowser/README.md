@@ -430,18 +430,52 @@ function vlen(a: number, b: number): number {
 ```
 
 It is a subset aimed at native page functions; a block it can't translate is
-skipped rather than mistranslated. Class instances stay inside native code
-(they aren't marshalled across the ctypes boundary); interfaces/type aliases and
-inline arrow callbacks are future.
+skipped rather than mistranslated. Interfaces/type aliases and inline arrow
+callbacks are future.
+
+### A page can hold a native object
+
+A native function can return a class instance, and the page's Python can hold it
+and pass it back -- the object lives in native memory the whole time. py2c
+compiles a class-typed return/parameter as a pointer (`Vec2* makeVec(int,int)`,
+`int vecLen(Vec2*)`), and the page declares the ctypes types so the handle isn't
+truncated:
+
+```html
+<script type="typescript" id="mod">
+function makeVec(x: number, y: number): Vec2 { return new Vec2(x, y); }
+function vecLen(v: Vec2): number { return v.lenSq(); }
+</script>
+<script type="python">
+import ctypes
+dll = ctypes.CDLL('/tmp/jit.mod.so')
+dll.makeVec.restype = ctypes.c_void_p       # returns a native object
+dll.vecLen.argtypes = [ctypes.c_void_p]      # takes one back
+def run():
+    v = dll.makeVec(3, 4)                     # python holds the native Vec2
+    console.log(dll.vecLen(v))                # 25, computed natively
+</script>
+```
+
+The page's FFI shim gained pointer-aware call paths (`mb_call*p` return a pointer,
+`mb_call*l` pass 64-bit args), and the `<script type="python">` compiler honours
+`restype`/`argtypes` declarations to pick them -- so the pointer survives the
+round-trip through minipy (whose int is 64-bit) intact.
 
 ### Native code can touch the DOM directly
 
 Native page code (rpython or TypeScript) can read and write the document itself,
-not just return values for the page's Python to apply. A JIT block that calls
-`dom_get_value(handle)` / `dom_get_text(handle)` (returning a string) or
-`dom_set_text(handle, text)` / `dom_set_value(handle, text)` reaches the live DOM
-by handle -- so a native function can read an input, compute text, and write an
-element, entirely in native code:
+not just return values for the page's Python to apply. A JIT block reaches the
+live DOM by handle in both directions and by several kinds:
+
+* `dom_get_value(h)` / `dom_get_text(h)` -> string; `dom_get_int(h)` -> the
+  element's value parsed as an integer.
+* `dom_set_text(h, s)` / `dom_set_value(h, s)` -> write text / value.
+* `dom_create_child(parent, tag, text)` -> create a labelled child element
+  (returns its handle); `dom_remove(h)` -> remove an element.
+
+So a native function can read an input, compute text, and write an element, or
+read a count and build/prune the tree, entirely in native code:
 
 ```html
 <script type="typescript" id="iomod">
@@ -450,20 +484,30 @@ function echo(inHandle: number, outHandle: number): number {
     dom_set_text(outHandle, "native read: " + v);     // compute + write it back
     return 0;
 }
+function build(countH: number, listH: number, delH: number): number {
+    let n: number = dom_get_int(countH);              // read a number
+    let i: number = 0;
+    for (i = 0; i < n; i++) {
+        dom_create_child(listH, "p", "native item");  // createElement
+    }
+    dom_remove(delH);                                  // removeChild
+    return n;
+}
 </script>
 ```
 
 It works by calling *back* into the interpreter: the browser is linked
-`-rdynamic`, so a JIT'd `.so` resolves `mb_dom_get_value` / `mb_dom_set_text` in
-the browser binary, which invoke the interpreter's `__get_value` / `__set_text`
-by handle (`jitc` injects the FFI prelude that binds the `dom_*` names when a
-block uses them). The next render shows the change. This is the same directness
-the canvas shader has for pixels, now for text and input values -- in both
-directions.
+`-rdynamic`, so a JIT'd `.so` resolves `mb_dom_*` in the browser binary, which
+invoke the interpreter's `__get_*` / `__set_*` / `__create_child` / `__remove` by
+handle (`jitc` injects the FFI prelude that binds the `dom_*` names when a block
+uses them). The next render shows the change. This is the same directness the
+canvas shader has for pixels, now for text, values, and tree structure.
 
 ```
-cd build/gui && ./minibrowser_app --domnative-selftest   # native TS sets OUT's text
-cd build/gui && ./minibrowser_app --domio-selftest        # native TS reads IN, writes OUT
+cd build/gui && ./minibrowser_app --domnative-selftest   # native TS sets text
+cd build/gui && ./minibrowser_app --domio-selftest        # native TS reads + writes
+cd build/gui && ./minibrowser_app --domx-selftest         # native get_int/create/remove
+cd build/gui && ./minibrowser_app --objptr-selftest       # python holds a native object
 ```
 
 Because these functions reach the browser's DOM, they run only in the browser
@@ -510,8 +554,10 @@ cd build/gui && ./minibrowser_app --twoway-selftest
   (`map`/`forEach`) are the next reach.
 * **Wider TypeScript coverage.** `ts2py` now compiles typed numeric functions
   (`number`/`float`), arrow functions, classes, and string returns to native
-  code, and native code reads/writes the DOM in both directions; passing class
-  instances across the ctypes boundary, interfaces/type aliases, and inline arrow
+  code; the page can hold a native object (class instance) across the FFI, and
+  native code reads/writes the DOM in both directions (`dom_get_int`,
+  `createElement`, `removeChild` included). Instance methods callable more
+  ergonomically from the page, interfaces/type aliases, and inline arrow
   callbacks are the next reach.
 * **Real network fetch.** `www2json --url` exists; wiring it into `navigate()`
   (rather than local `*.html`) is a small step where the network is available.

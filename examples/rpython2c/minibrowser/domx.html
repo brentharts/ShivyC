@@ -1,0 +1,31 @@
+<html>
+<head>
+<script type="typescript" id="mod">
+function build(countHandle: number, listHandle: number, delHandle: number): number {
+    let n: number = dom_get_int(countHandle);
+    let i: number = 0;
+    for (i = 0; i < n; i++) {
+        dom_create_child(listHandle, "p", "native item");
+    }
+    dom_remove(delHandle);
+    return n;
+}
+</script>
+<script type="python">
+import ctypes
+dll = ctypes.CDLL('/tmp/jit.mod.so')
+def run():
+    c = document.getElementById('COUNT')
+    l = document.getElementById('LIST')
+    d = document.getElementById('DEL')
+    dll.build(c._handle, l._handle, d._handle)
+</script>
+</head>
+<body>
+<h1>native dom edits</h1>
+<input id="COUNT" value="3">
+<div id="LIST"></div>
+<div id="DEL">remove me</div>
+<button onclick="run()">go</button>
+</body>
+</html>

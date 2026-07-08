@@ -54,6 +54,38 @@ def _ffi_call2(h, name, a, b):
 
 def _ffi_call3(h, name, a, b, c):
     return _native_call3i(_native_dlsym(h, name), a, b, c)
+
+
+def _ffi_call0l(h, name):
+    return _native_call0l(_native_dlsym(h, name))
+
+
+def _ffi_call1l(h, name, a):
+    return _native_call1l(_native_dlsym(h, name), a)
+
+
+def _ffi_call2l(h, name, a, b):
+    return _native_call2l(_native_dlsym(h, name), a, b)
+
+
+def _ffi_call3l(h, name, a, b, c):
+    return _native_call3l(_native_dlsym(h, name), a, b, c)
+
+
+def _ffi_call0p(h, name):
+    return _native_call0p(_native_dlsym(h, name))
+
+
+def _ffi_call1p(h, name, a):
+    return _native_call1p(_native_dlsym(h, name), a)
+
+
+def _ffi_call2p(h, name, a, b):
+    return _native_call2p(_native_dlsym(h, name), a, b)
+
+
+def _ffi_call3p(h, name, a, b, c):
+    return _native_call3p(_native_dlsym(h, name), a, b, c)
 '''
 
 
@@ -71,12 +103,39 @@ class _CtypesRewriter(ast.NodeTransformer):
     def __init__(self, cache_dir):
         self.cache_dir = cache_dir
         self.handles = set()
+        self.ptr_ret = set()        # native fns declared restype = c_void_p
+        self.ptr_arg = set()        # native fns with a c_void_p in argtypes
+
+    @staticmethod
+    def _is_ptr(node):
+        return isinstance(node, ast.Attribute) \
+            and node.attr in ("c_void_p", "c_long")
+
+    def _list_has_ptr(self, node):
+        return isinstance(node, ast.List) \
+            and any(self._is_ptr(e) for e in node.elts)
 
     def visit_Import(self, node):
         node.names = [n for n in node.names if n.name != "ctypes"]
         return node if node.names else None
 
     def visit_Assign(self, node):
+        # dll.fn.restype = ctypes.c_void_p / dll.fn.argtypes = [...] -- a native
+        # function that makes or takes a native object (pointer). Record which
+        # functions are pointer-typed, and drop the declaration (minipy can't
+        # assign attributes on the handle; the type info drives call routing).
+        if len(node.targets) == 1 and isinstance(node.targets[0], ast.Attribute):
+            tgt = node.targets[0]
+            if tgt.attr in ("restype", "argtypes") \
+                    and isinstance(tgt.value, ast.Attribute) \
+                    and isinstance(tgt.value.value, ast.Name) \
+                    and tgt.value.value.id in self.handles:
+                fn = tgt.value.attr
+                if tgt.attr == "restype" and self._is_ptr(node.value):
+                    self.ptr_ret.add(fn)
+                if tgt.attr == "argtypes" and self._list_has_ptr(node.value):
+                    self.ptr_arg.add(fn)
+                return None
         v = node.value
         if isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute) \
                 and v.func.attr == "CDLL" \
@@ -98,7 +157,13 @@ class _CtypesRewriter(ast.NodeTransformer):
         f = node.func
         if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) \
                 and f.value.id in self.handles:
-            helper = "_ffi_call%d" % len(node.args)
+            n = len(node.args)
+            if f.attr in self.ptr_ret:          # returns a native object ptr
+                helper = "_ffi_call%dp" % n
+            elif f.attr in self.ptr_arg:        # takes a native object ptr
+                helper = "_ffi_call%dl" % n
+            else:
+                helper = "_ffi_call%d" % n
             return ast.Call(
                 func=ast.Name(id=helper, ctx=ast.Load()),
                 args=[ast.Name(id=f.value.id, ctx=ast.Load()),
