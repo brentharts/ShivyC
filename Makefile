@@ -257,6 +257,19 @@ minibrowser:
 	@echo "  cd $(GUIBIN) && ./minibrowser_app --script-selftest   # run a page's python"
 	@echo "  cd $(GUIBIN) && ./minibrowser_app --jit-selftest      # JIT rpython + native ctypes call"
 
+# Live demo: build the browser and open it directly on a real web page whose
+# HTML references an image -- the standard "Lenna" test image on Wikipedia. On
+# fetch, www2json downloads the page, and mb_imgcache (PIL) downloads and
+# converts the <img> it references into a blit-ready cache file, which the
+# QImage widget composites into the window. Needs a Wayland compositor and
+# working internet. Override the page with `make lenna LENNA_URL=...`.
+LENNA_URL ?= https://en.wikipedia.org/wiki/Lenna
+lenna: minibrowser
+	@echo "opening minibrowser on $(LENNA_URL)"
+	@echo "(fetches the page + its image live; needs a Wayland compositor)"
+	cd $(GUIBIN) && XDG_RUNTIME_DIR=$${XDG_RUNTIME_DIR:-/run/user/$$(id -u)} \
+	    ./minibrowser_app "$(LENNA_URL)"
+
 # Rebuild the SAME browser with ShivyC (our own C compiler + assembler) instead
 # of gcc, to prove the toolchain can self-compile it. gcc stays the default
 # (it is faster); this target is a compatibility check. Run `make minibrowser`
