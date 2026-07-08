@@ -2,17 +2,25 @@
 <head>
 <title>native canvas</title>
 <script type="rpython" id="shader">
-def pixel(x: int, y: int, t: int, mx: int, my: int) -> int:
-    # animated plasma (shifts with time t) that brightens near the pointer
-    r = (x * 5 + t * 3) & 255
-    g = (y * 5 + t * 2) & 255
-    b = ((x + y) * 3 + t) & 255
-    dx = x - mx
-    dy = y - my
-    if dx * dx + dy * dy < 200:
-        r = 255
-        g = 255
-    return (255 << 24) | (r << 16) | (g << 8) | b
+def render(buf: "u32*", w: int, h: int, t: int, mx: int, my: int) -> int:
+    # fill the whole w*h ARGB buffer in one native call (a fragment shader):
+    # an animated plasma that brightens near the pointer
+    y = 0
+    while y < h:
+        x = 0
+        while x < w:
+            r = (x * 5 + t * 3) & 255
+            g = (y * 5 + t * 2) & 255
+            b = ((x + y) * 3 + t) & 255
+            dx = x - mx
+            dy = y - my
+            if dx * dx + dy * dy < 200:
+                r = 255
+                g = 255
+            buf[y * w + x] = (255 << 24) | (r << 16) | (g << 8) | b
+            x = x + 1
+        y = y + 1
+    return 0
 </script>
 </head>
 <body>

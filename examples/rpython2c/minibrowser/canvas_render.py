@@ -29,23 +29,26 @@ def main(argv):
     print("JIT'd shader:", so, results.get("shader", ("", "?"))[1])
 
     dll = ctypes.CDLL(so)
-    dll.pixel.restype = ctypes.c_int
-    dll.pixel.argtypes = [ctypes.c_int] * 5
+    dll.render.restype = ctypes.c_int
+    dll.render.argtypes = [ctypes.POINTER(ctypes.c_uint), ctypes.c_int,
+                           ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
 
     out = argv[1] if len(argv) > 1 else os.path.join(HERE, "canvas.gif")
     nframes = int(argv[2]) if len(argv) > 2 else 24
     import math
+    buf = (ctypes.c_uint * (W * H))()
     frames = []
     for t in range(nframes):
         # move the "pointer" in a circle so both uniforms are visible
         ang = 2 * math.pi * t / nframes
         mx = int(W / 2 + W / 3 * math.cos(ang))
         my = int(H / 2 + H / 3 * math.sin(ang))
+        dll.render(buf, W, H, t * 4, mx, my)      # one native call fills a frame
         img = Image.new("RGB", (W, H))
         px = img.load()
         for y in range(H):
             for x in range(W):
-                v = dll.pixel(x, y, t * 4, mx, my) & 0xFFFFFFFF
+                v = buf[y * W + x] & 0xFFFFFFFF
                 px[x, y] = ((v >> 16) & 255, (v >> 8) & 255, v & 255)
         frames.append(img.resize((W * 3, H * 3), Image.NEAREST))
     frames[0].save(out, save_all=True, append_images=frames[1:],

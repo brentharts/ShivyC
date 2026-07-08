@@ -272,29 +272,39 @@ The unrewritten page source still runs under CPython with real ctypes
 ### Native drawing (a canvas fragment shader)
 
 Native code can also *draw* to the page, and animate. A `<canvas>` is filled by a
-native `pixel(x, y, t, mx, my) -> argb` shader shipped as a `<script
+native `render(buf, w, h, t, mx, my)` shader shipped as a `<script
 type="rpython">` block -- with a **time** uniform `t` and a **pointer** uniform
-`(mx, my)`, like a fragment shader:
+`(mx, my)`. It fills a whole ARGB buffer in **one native call per frame** (not
+per-pixel FFI), writing directly into `buf`:
 
 ```html
 <script type="rpython" id="shader">
-def pixel(x: int, y: int, t: int, mx: int, my: int) -> int:
-    r = (x * 5 + t * 3) & 255           # shifts with time
-    g = (y * 5 + t * 2) & 255
-    b = ((x + y) * 3 + t) & 255
-    dx = x - mx
-    dy = y - my
-    if dx * dx + dy * dy < 200:         # brighten near the pointer
-        r = 255
-        g = 255
-    return (255 << 24) | (r << 16) | (g << 8) | b
+def render(buf: "u32*", w: int, h: int, t: int, mx: int, my: int) -> int:
+    y = 0
+    while y < h:
+        x = 0
+        while x < w:
+            r = (x * 5 + t * 3) & 255       # shifts with time
+            g = (y * 5 + t * 2) & 255
+            b = ((x + y) * 3 + t) & 255
+            dx = x - mx
+            dy = y - my
+            if dx * dx + dy * dy < 200:      # brighten near the pointer
+                r = 255
+                g = 255
+            buf[y * w + x] = (255 << 24) | (r << 16) | (g << 8) | b
+            x = x + 1
+        y = y + 1
+    return 0
 </script>
 <canvas id="cvs" width="96" height="96"></canvas>
 ```
 
-On navigation the browser JIT-compiles the block (`jitc`), then fills the
-`QCanvas` by calling the native `pixel` once per pixel through the FFI shim
-(`mb_call5i`) -- no interpreter in the per-pixel loop, no wasm/JS glue.
+The browser JIT-compiles the block (`jitc`), allocates one native ARGB buffer
+(`mb_canvas_alloc`, reused across frames), and calls `render` through the FFI
+shim (`mb_render_call`). The buffer never enters the interpreter: `QCanvas` reads
+it back through a `u32*` view and blits it -- so a frame is **two native calls**
+(fill + blit), not `w*h` per-pixel FFI calls.
 
 **Animation** is driven by a Wayland **frame-callback loop** added to the
 runtime: while an animated widget is on screen (`rw_wants_frame()` returns 1),
@@ -386,8 +396,7 @@ cd build/gui && ./minibrowser_app --twoway-selftest
 
 * **More DOM.** `removeChild`, more attributes, and a real modal `alert` overlay
   (rather than an on-screen label) are the next DOM gaps.
-* **Richer canvas.** Configurable size / `data-shader` from the element, a
-  `pixel`-buffer FFI (one native call fills a whole frame instead of per-pixel),
+* **Richer canvas.** Configurable size / `data-shader` read from the element,
   and click/drag state beyond the pointer position.
 * **Wider JS coverage.** The js2py subset now handles DOM scripting, objects, and
   arrays; JS `+` string coercion, `this`/closures, and array iteration methods

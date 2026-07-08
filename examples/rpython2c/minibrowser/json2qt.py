@@ -246,19 +246,21 @@ if sys.implementation.name != "cpython":
     _ffi.mb_dlopen.argtypes = [_ct.c_char_p]
     _ffi.mb_dlsym.restype = _ct.c_long
     _ffi.mb_dlsym.argtypes = [_ct.c_long, _ct.c_char_p]
-    _ffi.mb_call2i.restype = _ct.c_int
-    _ffi.mb_call2i.argtypes = [_ct.c_long, _ct.c_int, _ct.c_int]
-    _ffi.mb_call5i.restype = _ct.c_int
-    _ffi.mb_call5i.argtypes = [_ct.c_long, _ct.c_int, _ct.c_int, _ct.c_int,
-                               _ct.c_int, _ct.c_int]
+    _ffi.mb_canvas_alloc.restype = _ct.c_long
+    _ffi.mb_canvas_alloc.argtypes = [_ct.c_int]
+    _ffi.mb_render_call.restype = _ct.c_int
+    _ffi.mb_render_call.argtypes = [_ct.c_long, _ct.c_long, _ct.c_int,
+                                    _ct.c_int, _ct.c_int, _ct.c_int, _ct.c_int]
 
 CANVAS_W = 96
 CANVAS_H = 96
 
-# Animation state: the current frame (time uniform) and the on-screen canvas +
-# its native shader pointer, so the frame loop can refill it each tick.
+# Animation state: current frame (time uniform), the shader's native render fn,
+# the on-screen canvas, and a native ARGB buffer reused across frames. A frame
+# is a single mb_render_call that fills the whole buffer natively.
 _frame = 0
 _shader_fn = 0
+_canvas_buf = 0
 _canvas: "QCanvas*" = None
 
 
@@ -289,47 +291,36 @@ def _shader_so() -> "char*":
     return "/tmp/minibrowser_cache/" + _page_id(src) + "/jit.shader.so"
 
 
-def _fill_canvas(cvs: "QCanvas*", fn: "long", t: "int",
-                 mx: "int", my: "int") -> None:
-    # Call the native shader pixel(x, y, t, mx, my) for every pixel.
-    px = []
-    y = 0
-    while y < CANVAS_H:
-        x = 0
-        while x < CANVAS_W:
-            px.append(_ffi.mb_call5i(fn, x, y, t, mx, my))
-            x = x + 1
-        y = y + 1
-    cvs.set_pixels(px)
-
-
 def render_canvas(box: "QBoxLayout") -> None:
-    global _canvas, _shader_fn
+    global _canvas, _shader_fn, _canvas_buf
     cvs = QCanvas(CANVAS_W, CANVAS_H)
     so: "char*" = _shader_so()
     h = _ffi.mb_dlopen(so)
     if h != 0:
-        fn = _ffi.mb_dlsym(h, "pixel")
+        fn = _ffi.mb_dlsym(h, "render")
         if fn != 0:
+            if _canvas_buf == 0:
+                _canvas_buf = _ffi.mb_canvas_alloc(CANVAS_W * CANVAS_H)
             _shader_fn = fn
             _canvas = cvs
-            _fill_canvas(cvs, fn, _frame, 0, 0)
+            cvs.set_buffer(_canvas_buf)
+            _ffi.mb_render_call(fn, _canvas_buf, CANVAS_W, CANVAS_H, _frame, 0, 0)
             set_wants_frame(1)                 # animate this page
             set_frame_handler(on_frame)
     box.addWidget(cvs)
 
 
 def on_frame() -> None:
-    # Runtime frame tick: advance time and refill the canvas with the current
-    # pointer (mapped into canvas-local coords). The runtime repaints after.
+    # Runtime frame tick: advance time and refill the whole canvas in ONE native
+    # call, with the pointer mapped into canvas-local coords. Runtime repaints.
     global _frame
     _frame = _frame + 1
-    c: "QCanvas*" = _canvas
     fn: "long" = _shader_fn
     if fn != 0:
+        c: "QCanvas*" = _canvas
         mx: "int" = pointer_x() - c.canvas_x()
         my: "int" = pointer_y() - c.canvas_y()
-        _fill_canvas(c, fn, _frame, mx, my)
+        _ffi.mb_render_call(fn, _canvas_buf, CANVAS_W, CANVAS_H, _frame, mx, my)
 
 
 def render_node(node: "obj", box: "QBoxLayout") -> None:
@@ -715,33 +706,27 @@ def canvas_selftest() -> int:
     if h == 0:
         print("canvas: dlopen failed")
         return 1
-    fn = _ffi.mb_dlsym(h, "pixel")
+    fn = _ffi.mb_dlsym(h, "render")
     if fn == 0:
-        print("canvas: dlsym pixel failed")
+        print("canvas: dlsym render failed")
         return 1
-    p_t0 = _ffi.mb_call5i(fn, 10, 10, 0, 0, 0)
-    p_t9 = _ffi.mb_call5i(fn, 10, 10, 9, 0, 0)
-    p_ptr = _ffi.mb_call5i(fn, 10, 10, 0, 10, 10)   # pointer on this pixel
-    if p_t0 != p_t9:
-        print("canvas OK: shader animates with time")
+    buf = _ffi.mb_canvas_alloc(CANVAS_W * CANVAS_H)
+    view: "u32*" = buf
+    idx = 10 * CANVAS_W + 10
+    _ffi.mb_render_call(fn, buf, CANVAS_W, CANVAS_H, 0, 0, 0)
+    pa: "int" = view[idx]
+    _ffi.mb_render_call(fn, buf, CANVAS_W, CANVAS_H, 9, 0, 0)
+    pb: "int" = view[idx]
+    _ffi.mb_render_call(fn, buf, CANVAS_W, CANVAS_H, 0, 10, 10)
+    pp: "int" = view[idx]
+    if pa != pb:
+        print("canvas OK: one render() call animates with time")
     else:
         print("canvas FAIL: no time animation")
-    if p_ptr != p_t0:
+    if pp != pa:
         print("canvas OK: shader reacts to pointer")
     else:
         print("canvas FAIL: no pointer reaction")
-    # exercise the full frame fill the browser runs
-    cnt = 0
-    y = 0
-    while y < CANVAS_H:
-        x = 0
-        while x < CANVAS_W:
-            _ffi.mb_call5i(fn, x, y, 3, 48, 32)
-            cnt = cnt + 1
-            x = x + 1
-        y = y + 1
-    if cnt == CANVAS_W * CANVAS_H:
-        print("canvas OK: shaded all pixels")
     return 0
 
 
