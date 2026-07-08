@@ -396,6 +396,7 @@ class Call(ILCommand):
         xmm_regs = spots.xmm_arg_regs
         int_moves, flt_moves, stack_args = [], [], []
         struct_reg_moves = []  # (list-of-regs, struct arg) for 9..16-byte args
+        variadic_xmm_count = 0
         if self.pack:
             # Packed calling convention: arguments are bit-packed into the
             # registers named by the plan; nothing is passed on the stack and no
@@ -403,7 +404,27 @@ class Call(ILCommand):
             # overridden below to build the packed registers).
             pass
         elif self.variadic:
+            # ShivyC's own variadic callees read every argument from the stack,
+            # so push them all. But a callee using the ordinary SysV ABI (glibc
+            # printf/sprintf/snprintf/...) reads the first arguments from the
+            # integer/vector registers instead, so ALSO classify them into
+            # registers here; the callee reads whichever it expects. (Arguments
+            # past the 6 int / 8 xmm registers reach a standard callee only via
+            # the overflow area, whose layout differs from ShivyC's all-stack
+            # push -- but every glibc variadic call ShivyC makes fits in
+            # registers.) AL must give the number of vector registers used.
             stack_args = list(self.args)
+            ii = fi = 0
+            for arg in self.args:
+                if arg.ctype.is_struct_union() and arg.ctype.size > 8:
+                    ii += (arg.ctype.size + 7) // 8
+                elif arg.ctype.is_floating() and fi < len(xmm_regs):
+                    flt_moves.append((xmm_regs[fi], arg))
+                    fi += 1
+                elif not arg.ctype.is_floating() and ii < len(self.arg_regs):
+                    int_moves.append((self.arg_regs[ii], arg))
+                    ii += 1
+            variadic_xmm_count = fi
         else:
             ii = fi = 0
             for arg in self.args:
@@ -542,16 +563,29 @@ class Call(ILCommand):
             func_spot = spotmap[self.func]
             func_size = self.func.ctype.size
 
-            # Check if function pointer spot will be clobbered by moving the
-            # arguments into the correct (integer) registers.
-            if spotmap[self.func] in int_regs_used:
-                r = get_reg([], int_regs_used)
+            # Check if the function-pointer spot will be clobbered by moving the
+            # arguments into the correct (integer) registers -- and, for a
+            # variadic call, by the `mov eax, <xmm count>` written below (which
+            # zero-extends over all of RAX). In either case relocate the pointer
+            # to a safe scratch register before the moves.
+            avoid = list(int_regs_used)
+            if self.variadic:
+                avoid.append(spots.RAX)
+            if spotmap[self.func] in avoid:
+                r = get_reg([], avoid)
                 asm_code.add(asm_cmds.Mov(r, spotmap[self.func], func_size))
                 func_spot = r
 
             emit_reg_moves()
             target = func_spot
 
+        # Variadic call under the standard SysV ABI: AL holds the number of
+        # vector registers used to pass floating varargs (glibc printf/sprintf
+        # and friends read it before touching the xmm save area). ShivyC's own
+        # variadic callees ignore AL, so setting it is always safe.
+        if self.variadic:
+            asm_code.add(asm_cmds.Mov(spots.RAX,
+                                      LiteralSpot(str(variadic_xmm_count)), 4))
         # Metamorphic call: the target returns via a self-modified slot in
         # writable .text rather than the stack. We write our return address
         # into that slot, then jump (not call) into the callee. No return
