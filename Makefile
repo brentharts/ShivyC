@@ -235,7 +235,7 @@ minibrowser:
 	python3 $(MB)/gen_embed.py $(GUIBIN)/minibrowser >/dev/null
 	python3 tools/py2c.py $(MB)/json2qt.py $(MB)/dom.py $(MB)/minijson.py \
 	    $(GUIBIN)/minibrowser/interp_embed.py --out $(GUIBIN)/minibrowser
-	cc $(WL_CFLAGS) -I$(GUIBIN)/minibrowser $(GUIBIN)/minibrowser/*.c \
+	cc $(WL_CFLAGS) -rdynamic -I$(GUIBIN)/minibrowser $(GUIBIN)/minibrowser/*.c \
 	    tools/rpy_lib/mb_ffi.c \
 	    -o $(GUIBIN)/minibrowser_app $(WL_LIBS) -lm
 	@# Stage the runnable site + toolchain next to the binary: at runtime the
@@ -247,6 +247,7 @@ minibrowser:
 	    $(MB)/home.html $(MB)/about.html $(MB)/example.html \
 	    $(MB)/pyscript.html $(MB)/pyscript2.html $(MB)/pyjit.html \
 	    $(MB)/canvas.html $(MB)/jsdemo.html $(MB)/twoway.html $(MB)/ts.html \
+	    $(MB)/domnative.html \
 	    $(GUIBIN)/
 	@rm -rf $(GUIBIN)/minipy && cp -r tools/minipy $(GUIBIN)/minipy
 	@python3 $(MB)/www2json.py $(MB)/home.html --out $(GUIBIN) >/dev/null
