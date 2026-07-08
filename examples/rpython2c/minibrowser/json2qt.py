@@ -599,6 +599,36 @@ def jit_selftest() -> int:
     return 0
 
 
+def ts_selftest() -> int:
+    # Headless proof of TypeScript compiled to native: load ts.html (a <script
+    # type="typescript"> block translated to typed rpython and JIT-compiled to a
+    # .so, plus a python script that calls it via ctypes), boot it, and fire
+    # run() -- which calls the native fib(10) through the interpreter's FFI. The
+    # page console should show 55.
+    global _hist, _scripted
+    _hist = History()
+    _hist.set_source("ts")
+    fetch("ts")
+    _scripted = 1
+    boot_page()
+    s0: "char*" = mpy_call_s("__serialize")
+    root0 = parse_dom_str(s0)
+    n = root0.child_count()
+    i = 0
+    done = 0
+    while i < n:
+        ch = root0.child(i)
+        oc: "char*" = ch.get_onclick()
+        if len(oc) > 0 and done == 0:
+            hh: "int" = _atoi(oc)
+            mpy_call_i("__fire", hh)            # click -> run() -> native fib(10)
+            done = 1
+        i = i + 1
+    ctext: "char*" = mpy_call_s("__console")
+    print("console: " + ctext)
+    return 0
+
+
 def js_selftest() -> int:
     # Headless proof that JavaScript rides the same engine: load jsdemo.html
     # (a plain <script> translated to minipy python by js2py), boot it, fire the
@@ -740,6 +770,8 @@ def main() -> int:
         return canvas_selftest()
     if len(sys.argv) > 1 and sys.argv[1] == "--js-selftest":
         return js_selftest()
+    if len(sys.argv) > 1 and sys.argv[1] == "--ts-selftest":
+        return ts_selftest()
     if len(sys.argv) > 1 and sys.argv[1] == "--twoway-selftest":
         return twoway_selftest()
     app = QApplication()
