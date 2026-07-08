@@ -45,7 +45,12 @@ def _fetch_to_temp(url):
     fd, path = tempfile.mkstemp(suffix=".dl")
     os.close(fd)
     try:
-        with urllib.request.urlopen(url, timeout=15) as r, open(path, "wb") as f:
+        # Send a real User-Agent: some hosts (notably Wikimedia's image
+        # servers) reject the default urllib agent with 403.
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "minibrowser/0.1 (image fetch)"})
+        with urllib.request.urlopen(req, timeout=15) as r, \
+                open(path, "wb") as f:
             f.write(r.read())
         return path
     except Exception:

@@ -85,6 +85,8 @@ def resolve(target: "char*") -> "char*":
     t = target
     if len(t) == 0:
         return "home"
+    if _is_url(t) != 0:          # a full URL: fetch it live, don't localise
+        return t
     if ord(t[0]) == 47:          # leading '/'
         t = t[1:]
     if len(t) == 0:
@@ -92,9 +94,32 @@ def resolve(target: "char*") -> "char*":
     return t
 
 
+def _is_url(s: "char*") -> int:
+    """True if `s` looks like an http(s):// URL. Uses ord() comparisons (like
+    resolve) since the transpiled string type has no .startswith."""
+    n = len(s)
+    if n < 7:
+        return 0
+    if ord(s[0]) != 104 or ord(s[1]) != 116 \
+            or ord(s[2]) != 116 or ord(s[3]) != 112:   # "http"
+        return 0
+    if ord(s[4]) == 58 and ord(s[5]) == 47 and ord(s[6]) == 47:   # "://"
+        return 1
+    if n >= 8 and ord(s[4]) == 115 and ord(s[5]) == 58 \
+            and ord(s[6]) == 47 and ord(s[7]) == 47:              # "s://"
+        return 1
+    return 0
+
+
 def fetch(name: "char*") -> None:
-    """Re-run the CPython helper to (re)produce page.json for `name`."""
-    cmd = "python3 www2json.py " + name + ".html --out ."
+    """Re-run the CPython helper to (re)produce page.json for `name`. A name
+    that is an http(s):// URL is fetched live (www2json --url); anything else is
+    a local <name>.html page. Either way www2json also downloads and converts
+    any <img> the page references into a blit-ready cache file."""
+    if _is_url(name) != 0:
+        cmd = "python3 www2json.py --url " + name + " --out ."
+    else:
+        cmd = "python3 www2json.py " + name + ".html --out ."
     os.system(cmd)
 
 
@@ -1001,5 +1026,10 @@ def main() -> int:
     win.setWindowTitle("MINIBROWSER")
     _win = win
     _hist = History()
-    navigate("home", 0)          # load + render the initial page
+    # A non-flag first argument is a start page or URL (e.g. `make lenna` passes
+    # a Wikipedia URL); otherwise open the built-in home page.
+    start: "char*" = "home"
+    if len(sys.argv) > 1 and len(sys.argv[1]) > 0 and ord(sys.argv[1][0]) != 45:
+        start = sys.argv[1]
+    navigate(start, 0)           # load + render the initial page
     return app.exec_(win)
