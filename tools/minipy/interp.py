@@ -41,6 +41,24 @@ if sys.implementation.name != "cpython":
     _ffi.mb_call3i.restype = _ctypes.c_int
     _ffi.mb_call3i.argtypes = [_ctypes.c_long, _ctypes.c_int, _ctypes.c_int,
                                _ctypes.c_int]
+    _ffi.mb_call0l.restype = _ctypes.c_int
+    _ffi.mb_call0l.argtypes = [_ctypes.c_long]
+    _ffi.mb_call1l.restype = _ctypes.c_int
+    _ffi.mb_call1l.argtypes = [_ctypes.c_long, _ctypes.c_long]
+    _ffi.mb_call2l.restype = _ctypes.c_int
+    _ffi.mb_call2l.argtypes = [_ctypes.c_long, _ctypes.c_long, _ctypes.c_long]
+    _ffi.mb_call3l.restype = _ctypes.c_int
+    _ffi.mb_call3l.argtypes = [_ctypes.c_long, _ctypes.c_long, _ctypes.c_long,
+                               _ctypes.c_long]
+    _ffi.mb_call0p.restype = _ctypes.c_long
+    _ffi.mb_call0p.argtypes = [_ctypes.c_long]
+    _ffi.mb_call1p.restype = _ctypes.c_long
+    _ffi.mb_call1p.argtypes = [_ctypes.c_long, _ctypes.c_long]
+    _ffi.mb_call2p.restype = _ctypes.c_long
+    _ffi.mb_call2p.argtypes = [_ctypes.c_long, _ctypes.c_long, _ctypes.c_long]
+    _ffi.mb_call3p.restype = _ctypes.c_long
+    _ffi.mb_call3p.argtypes = [_ctypes.c_long, _ctypes.c_long, _ctypes.c_long,
+                               _ctypes.c_long]
 
 
 # ====================== JSON-decoded POD structs ======================
@@ -1899,6 +1917,46 @@ def do_builtin(st: "St", bid: "long", args: "list[V]") -> "V":
             return v_int(_ffi.mb_call3i(args[0].iv, args[1].iv, args[2].iv,
                                         args[3].iv))
         return v_int(0)
+    # Pointer-aware FFI: value args passed 64-bit. *l return int, *p return a
+    # pointer (long). Used when a page holds/passes a native object.
+    if bid == 39:             # _native_call0l(fn) -> int
+        if len(args) > 0 and args[0].tag == 1:
+            return v_int(_ffi.mb_call0l(args[0].iv))
+        return v_int(0)
+    if bid == 40:             # _native_call1l(fn, a) -> int
+        if len(args) > 1 and args[0].tag == 1 and args[1].tag == 1:
+            return v_int(_ffi.mb_call1l(args[0].iv, args[1].iv))
+        return v_int(0)
+    if bid == 41:             # _native_call2l(fn, a, b) -> int
+        if len(args) > 2 and args[0].tag == 1 and args[1].tag == 1 \
+                and args[2].tag == 1:
+            return v_int(_ffi.mb_call2l(args[0].iv, args[1].iv, args[2].iv))
+        return v_int(0)
+    if bid == 42:             # _native_call3l(fn, a, b, c) -> int
+        if len(args) > 3 and args[0].tag == 1 and args[1].tag == 1 \
+                and args[2].tag == 1 and args[3].tag == 1:
+            return v_int(_ffi.mb_call3l(args[0].iv, args[1].iv, args[2].iv,
+                                        args[3].iv))
+        return v_int(0)
+    if bid == 43:             # _native_call0p(fn) -> ptr
+        if len(args) > 0 and args[0].tag == 1:
+            return v_int(_ffi.mb_call0p(args[0].iv))
+        return v_int(0)
+    if bid == 44:             # _native_call1p(fn, a) -> ptr
+        if len(args) > 1 and args[0].tag == 1 and args[1].tag == 1:
+            return v_int(_ffi.mb_call1p(args[0].iv, args[1].iv))
+        return v_int(0)
+    if bid == 45:             # _native_call2p(fn, a, b) -> ptr
+        if len(args) > 2 and args[0].tag == 1 and args[1].tag == 1 \
+                and args[2].tag == 1:
+            return v_int(_ffi.mb_call2p(args[0].iv, args[1].iv, args[2].iv))
+        return v_int(0)
+    if bid == 46:             # _native_call3p(fn, a, b, c) -> ptr
+        if len(args) > 3 and args[0].tag == 1 and args[1].tag == 1 \
+                and args[2].tag == 1 and args[3].tag == 1:
+            return v_int(_ffi.mb_call3p(args[0].iv, args[1].iv, args[2].iv,
+                                        args[3].iv))
+        return v_int(0)
     return v_none()
 
 
@@ -2927,6 +2985,22 @@ def build_state(prog: "Program", sargs: "list[str]") -> "St":
             glob[gi] = v_builtin(37)            # FFI: call int f(int,int)
         elif _strcmp(nm, "_native_call3i") == 0:
             glob[gi] = v_builtin(38)            # FFI: call int f(int,int,int)
+        elif _strcmp(nm, "_native_call0l") == 0:
+            glob[gi] = v_builtin(39)            # FFI: int f(void), ptr-safe
+        elif _strcmp(nm, "_native_call1l") == 0:
+            glob[gi] = v_builtin(40)            # FFI: int f(long)
+        elif _strcmp(nm, "_native_call2l") == 0:
+            glob[gi] = v_builtin(41)            # FFI: int f(long,long)
+        elif _strcmp(nm, "_native_call3l") == 0:
+            glob[gi] = v_builtin(42)            # FFI: int f(long,long,long)
+        elif _strcmp(nm, "_native_call0p") == 0:
+            glob[gi] = v_builtin(43)            # FFI: ptr f(void)
+        elif _strcmp(nm, "_native_call1p") == 0:
+            glob[gi] = v_builtin(44)            # FFI: ptr f(long)
+        elif _strcmp(nm, "_native_call2p") == 0:
+            glob[gi] = v_builtin(45)            # FFI: ptr f(long,long)
+        elif _strcmp(nm, "_native_call3p") == 0:
+            glob[gi] = v_builtin(46)            # FFI: ptr f(long,long,long)
         gi = gi + 1
     return st
 
@@ -3087,6 +3161,34 @@ def mpy_call_i_s(name: "char*", arg: "int") -> "char*":
             return ""
         gi = gi + 1
     return ""
+
+
+def mpy_call_iss(name: "char*", i: "int", s1: "char*", s2: "char*") -> "int":
+    # Call a booted top-level function by name with one int and two string
+    # arguments, returning its int result. Lets native page code create a
+    # labelled child element (mb_dom_create_child -> __create_child).
+    prog: "Program" = _embed_prog
+    st: "St" = _embed_st
+    if _embed_ready == 0:
+        return -1
+    gi = 0
+    while gi < len(prog.names) and gi < len(st.glob):
+        if _strcmp(prog.names[gi], name) == 0:
+            fv = st.glob[gi]
+            if fv.tag != 5:
+                return -1
+            cargs = new_v_list()
+            cargs.append(v_int(i))
+            cargs.append(v_str(s1))
+            cargs.append(v_str(s2))
+            r = do_call(st, fv, cargs)
+            if st.exc_flag != 0:
+                return -1
+            if r.tag == 1:
+                return r.iv
+            return 0
+        gi = gi + 1
+    return -1
 
 
 def interp_run(prog: "Program", sargs: "list[str]") -> "int":
