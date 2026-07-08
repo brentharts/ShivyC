@@ -493,3 +493,5 @@ thus making the entire project self contained.
     - *Rethinking Meta-Interpreters for High-Performance Execution* https://ai.vixra.org/abs/2606.0084
     - *Closing the Compiler Loop:
 Toward a Self-Hosting, Dependency-Free Python JIT* https://zenodo.org/records/21178004
+    - *Beyond WebAssembly: Rethinking the Web Browser with
+Post-JavaScript, VM-Free Page Execution* https://ai.vixra.org/pdf/2607.0013v1.pdf
