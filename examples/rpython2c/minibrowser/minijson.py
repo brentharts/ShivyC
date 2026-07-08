@@ -21,13 +21,11 @@ from dom import Node
 
 
 def read_file(path: "char*") -> "char*":
-    """Read an entire text file into one string (line-by-line, concatenated)."""
+    """Read an entire text file into one string. Uses a single whole-file read:
+    concatenating line by line is O(size^2) in the arena (every intermediate
+    string stays allocated), which alone can exhaust it on a large page."""
     f = open(path, "r")
-    out = ""
-    line = f.readline()
-    while len(line) > 0:
-        out = out + line
-        line = f.readline()
+    out = f.read()
     f.close()
     return out
 
@@ -54,7 +52,23 @@ class Parser:
     def parse_string(self) -> "char*":
         # Assumes the current char is the opening quote.
         self.pos = self.pos + 1
-        out = ""
+        start = self.pos
+        # Fast path: scan to the closing quote. If no escape appears (the common
+        # case, and what a page's long text nodes are), the value is one
+        # substring -- a single allocation instead of one per character, which
+        # in the no-free arena is the difference between O(n) and O(n^2) space.
+        while self.pos < self.n:
+            c = ord(self.s[self.pos])
+            if c == 34:                 # closing quote, no escapes seen
+                out = self.s[start:self.pos]
+                self.pos = self.pos + 1
+                return out
+            if c == 92:                 # backslash: switch to the slow path
+                break
+            self.pos = self.pos + 1
+        # Slow path (the string contains escapes): keep the unescaped prefix as
+        # one slice, then append the remainder char by char honoring escapes.
+        out = self.s[start:self.pos]
         while self.pos < self.n:
             c = ord(self.s[self.pos])
             if c == 34:                 # closing quote
