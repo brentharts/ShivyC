@@ -303,6 +303,16 @@ def check_cast(il_value, ctype, range):
                 raise CompilerError(err, range)
             return
 
+    # GCC extension (relied on by py2c's FFI glue and real-world C): an integer
+    # converts to a pointer and back, implementation-defined. For example a
+    # native handle is stashed in a `long` and read back as `unsigned *`
+    # (minibrowser's canvas buffer), or a `void *` is truncated to an int.
+    elif ctype.is_pointer() and il_value.ctype.is_integral():
+        return
+
+    elif ctype.is_integral() and il_value.ctype.is_pointer():
+        return
+
     # Cast from null pointer constant to pointer okay
     elif ctype.is_pointer() and getattr(il_value.literal, "val", None) == 0:
         return
