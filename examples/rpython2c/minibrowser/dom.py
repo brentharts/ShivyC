@@ -44,6 +44,7 @@ class Node:
         self.placeholder = ""
         self.src = ""
         self.eid = ""            # the HTML id attribute (for getElementById)
+        self.shandle = ""        # the minidom element handle (for two-way sync)
         self.children: "list[obj]" = []
 
     # --- kind / text -----------------------------------------------------
@@ -71,6 +72,9 @@ class Node:
 
     def get_id(self) -> "char*":
         return self.eid
+
+    def get_shandle(self) -> "char*":
+        return self.shandle
 
     def get_placeholder(self) -> "char*":
         return self.placeholder

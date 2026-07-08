@@ -179,6 +179,8 @@ class Parser:
                                 node.onclick = aval
                             elif akey == "id":
                                 node.eid = aval
+                            elif akey == "h":
+                                node.shandle = aval
                             elif akey == "placeholder":
                                 node.placeholder = aval
                             elif akey == "src":
