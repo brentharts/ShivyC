@@ -56,7 +56,7 @@ def tokenize(src):
 
 # TS types -> rpython types
 _TYPE = {
-    "number": "int", "int": "int", "float": "float",
+    "number": "int", "int": "int", "float": "float", "double": "float",
     "string": "str", "boolean": "bool", "bool": "bool",
     "void": "None", "any": "obj",
 }
@@ -151,6 +151,11 @@ class Parser:
             val = "None"
             if self.at("op", "="):
                 self.next()
+                if self._looks_like_arrow():
+                    # const f = (a: number): number => ...  -> def f(...):
+                    self.arrow_def(name, indent, out)
+                    self.opt_semi()
+                    return
                 val = self.expr()
             self.opt_semi()
             if ann and ann != "None":
@@ -208,6 +213,67 @@ class Parser:
             self.stmt(indent, out)
             if len(out) == start:
                 self.emit(out, indent, "pass")
+
+    def _looks_like_arrow(self):
+        # At the position just after `=`, does an arrow function follow?
+        toks = self.toks
+        k, v = toks[self.p]
+        if k == "id" and toks[self.p + 1] == ("op", "=>"):
+            return True                     # x => ...
+        if not (k == "op" and v == "("):
+            return False
+        depth = 0
+        j = self.p
+        while j < len(toks):
+            kk, vv = toks[j]
+            if kk == "op" and vv == "(":
+                depth += 1
+            elif kk == "op" and vv == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        j += 1                              # past the matching ')'
+        if j < len(toks) and toks[j] == ("op", "=>"):
+            return True                     # (params) => ...
+        if j < len(toks) and toks[j] == ("op", ":"):
+            j += 1                          # (params): type => ...
+            if j < len(toks) and toks[j][0] == "id":
+                j += 1
+                while j + 1 < len(toks) and toks[j] == ("op", "[") \
+                        and toks[j + 1] == ("op", "]"):
+                    j += 2
+                if j < len(toks) and toks[j] == ("op", "=>"):
+                    return True
+        return False
+
+    def arrow_def(self, name, indent, out):
+        params = []
+        if self.at("op", "("):
+            self.next()
+            while not self.at("op", ")"):
+                pname = self.eat("id")[1]
+                ptype = self.opt_type()
+                if ptype and ptype != "None":
+                    params.append("%s: %s" % (pname, ptype))
+                else:
+                    params.append(pname)
+                if self.at("op", ","):
+                    self.next()
+            self.eat("op", ")")
+        else:
+            params.append(self.eat("id")[1])
+        ret = self.opt_type()
+        self.eat("op", "=>")
+        sig = ", ".join(params)
+        if ret and ret != "None":
+            self.emit(out, indent, "def %s(%s) -> %s:" % (name, sig, ret))
+        else:
+            self.emit(out, indent, "def %s(%s):" % (name, sig))
+        if self.at("op", "{"):
+            self.block(indent + 1, out)
+        else:                               # expression body -> return expr
+            self.emit(out, indent + 1, "return %s" % self.expr())
 
     def func(self, indent, out):
         self.eat("id", "function")

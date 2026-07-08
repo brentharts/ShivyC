@@ -41,6 +41,40 @@ def _find_py2c():
 PY2C = _find_py2c()
 CACHE_ROOT = "/tmp/minibrowser_cache"
 
+# Prepended to a JIT block that calls dom_set_text / dom_set_value, so native
+# page code can mutate the DOM directly: these resolve (via the browser's
+# -rdynamic link) to mb_dom_set_text / mb_dom_set_value in the browser binary,
+# which call back into the interpreter (__set_text / __set_value) by handle.
+DOM_PRELUDE = '''import sys
+if sys.implementation.name != "cpython":
+    import rpy_ctypes as _ctypes
+    _dom = _ctypes.CDLL("mb_ffi")
+    _dom.mb_dom_set_text.restype = _ctypes.c_int
+    _dom.mb_dom_set_text.argtypes = [_ctypes.c_int, _ctypes.c_char_p]
+    _dom.mb_dom_set_value.restype = _ctypes.c_int
+    _dom.mb_dom_set_value.argtypes = [_ctypes.c_int, _ctypes.c_char_p]
+
+
+def dom_set_text(h: int, t: "char*") -> int:
+    return _dom.mb_dom_set_text(h, t)
+
+
+def dom_set_value(h: int, t: "char*") -> int:
+    return _dom.mb_dom_set_value(h, t)
+
+
+'''
+
+
+def _find_rpy_ctypes():
+    d = HERE
+    for _ in range(6):
+        cand = os.path.join(d, "tools", "rpy_lib", "rpy_ctypes.py")
+        if os.path.isfile(cand):
+            return cand
+        d = os.path.dirname(d)
+    return None
+
 
 def page_id(name):
     """A filesystem-safe per-page cache key from a page name / URL."""
@@ -54,9 +88,14 @@ def cache_dir_for(name):
 def compile_block(name, code, cache_dir):
     """Translate + compile one rpython block to cache_dir/jit.<name>.so.
     Returns (so_path, status) where status is cached / built / a failure tag."""
+    # Native DOM writes: if the block calls dom_set_text/value, prepend the FFI
+    # prelude so those names resolve to the host callbacks.
+    needs_dom = ("dom_set_text" in code) or ("dom_set_value" in code)
+    final = (DOM_PRELUDE + code) if needs_dom else code
+
     so = os.path.join(cache_dir, "jit.%s.so" % name)
     stamp = os.path.join(cache_dir, "jit.%s.hash" % name)
-    h = hashlib.sha256(code.encode("utf-8")).hexdigest()
+    h = hashlib.sha256(final.encode("utf-8")).hexdigest()
     if os.path.isfile(so) and os.path.isfile(stamp) and \
             open(stamp).read().strip() == h:
         return so, "cached"
@@ -65,14 +104,27 @@ def compile_block(name, code, cache_dir):
     os.makedirs(bdir, exist_ok=True)
     src = os.path.join(bdir, "%s.py" % name)
     with open(src, "w") as fh:
-        fh.write(code + "\n")
+        fh.write(final + "\n")
 
-    r = subprocess.run([sys.executable, PY2C, src, "--out", bdir],
+    inputs = [src]
+    if needs_dom:
+        # py2c needs rpy_ctypes to translate the ctypes FFI prelude.
+        rc = _find_rpy_ctypes()
+        if rc:
+            dst = os.path.join(bdir, "rpy_ctypes.py")
+            with open(dst, "w") as fh:
+                fh.write(open(rc).read())
+            inputs.append(dst)
+
+    r = subprocess.run([sys.executable, PY2C] + inputs + ["--out", bdir],
                        capture_output=True, text=True)
     if r.returncode != 0:
         sys.stderr.write(r.stdout + r.stderr)
         return None, "py2c-failed"
-    csrc = glob.glob(os.path.join(bdir, "*.c"))
+    # Compile the block's C (and any FFI glue), but not rpy_ctypes' own C --
+    # the FFI calls are emitted as direct externs resolved at dlopen.
+    csrc = [c for c in glob.glob(os.path.join(bdir, "*.c"))
+            if not c.endswith("rpy_ctypes.c")]
     if not csrc:
         return None, "no-c-emitted"
     cc = subprocess.run(["cc", "-O2", "-w", "-shared", "-fPIC"] + csrc +

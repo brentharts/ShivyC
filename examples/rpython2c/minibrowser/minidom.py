@@ -131,6 +131,14 @@ class Document:
             e.value = v
         return 0
 
+    def _set_text(self, h, v):
+        # Native page code writes an element's text directly, by handle, through
+        # the host FFI (mb_dom_set_text -> __set_text). The next render shows it.
+        e = self._by_handle(h)
+        if e != None:
+            e.textContent = v
+        return 0
+
     def _serialize(self):
         b = self.body
         if b == None:
@@ -208,6 +216,10 @@ def __fire(h):
 
 def __set_value(h, v):
     return document._set_value(h, v)
+
+
+def __set_text(h, v):
+    return document._set_text(h, v)
 
 
 def __console():

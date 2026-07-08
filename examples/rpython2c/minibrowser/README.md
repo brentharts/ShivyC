@@ -403,11 +403,48 @@ the page's Python calls via ctypes like any native block.
 
 `ts2py.py` is a dependency-free, pure-Python TypeScript front end (no Node, no
 npm, no `typescript` compiler): its own tokenizer and a precedence-climbing
-expression parser cover typed function declarations, typed locals, the usual
-control flow, and the operator set (`===`->`==`, `&&`->`and`, `i++`->`i = i + 1`).
-It is a subset aimed at native page functions; a block it can't translate is
-skipped rather than mistranslated. Numeric work maps to `int` today (TS's single
-`number` type); floats and string returns are future.
+expression parser cover typed function declarations, **arrow functions**
+(`const f = (x: number): number => x + 1`), typed locals, the usual control flow,
+and the operator set (`===`->`==`, `&&`->`and`, `i++`->`i = i + 1`). Types map
+`number`->`int` and `float`/`double`->`float` (both compile to native, callable
+via ctypes as `c_int`/`c_double`), plus `boolean`->`bool`, `string`->`str`,
+`void`->`None`, `T[]`->`list[t]`. It is a subset aimed at native page functions;
+a block it can't translate is skipped rather than mistranslated. String returns
+across the FFI, interfaces/type aliases, and inline arrow callbacks are future.
+
+### Native code can touch the DOM directly
+
+Native page code (rpython or TypeScript) can mutate the document itself, not just
+return values for the page's Python to apply. A JIT block that calls
+`dom_set_text(handle, text)` or `dom_set_value(handle, text)` reaches the live
+DOM by handle:
+
+```html
+<script type="typescript" id="dnmod">
+function setLabel(handle: number): number {
+    dom_set_text(handle, "set natively by TypeScript");
+    return 0;
+}
+</script>
+<script type="python">
+def run():
+    dll.setLabel(document.getElementById('OUT')._handle)   # native writes OUT
+</script>
+```
+
+It works by calling *back* into the interpreter: the browser is linked
+`-rdynamic`, so a JIT'd `.so` resolves `mb_dom_set_text` in the browser binary,
+which invokes the interpreter's `__set_text` by handle (`jitc` injects the small
+FFI prelude that binds `dom_set_text`/`dom_set_value` when a block uses them). The
+next render shows the change. This is the same directness the canvas shader has
+for pixels, now for text and input values.
+
+```
+cd build/gui && ./minibrowser_app --domnative-selftest   # native TS sets OUT's text
+```
+
+Because these functions reach the browser's DOM, they run only in the browser
+(not under stock CPython, unlike pure-compute native blocks).
 
 ```
 python3 ts_test.py                                # translate + www2json routing
@@ -448,9 +485,10 @@ cd build/gui && ./minibrowser_app --twoway-selftest
 * **Wider JS coverage.** The js2py subset now handles DOM scripting, objects, and
   arrays; JS `+` string coercion, `this`/closures, and array iteration methods
   (`map`/`forEach`) are the next reach.
-* **Wider TypeScript coverage.** `ts2py` compiles typed numeric functions to
-  native code; `float`/`number` distinction, string returns across the FFI,
-  interfaces/type aliases, and arrow functions are the next reach.
+* **Wider TypeScript coverage.** `ts2py` now compiles typed numeric functions
+  (`number`/`float`), arrow functions, and control flow to native code, and
+  native code can write the DOM; string returns across the FFI, interfaces/type
+  aliases, and inline arrow callbacks are the next reach.
 * **Real network fetch.** `www2json --url` exists; wiring it into `navigate()`
   (rather than local `*.html`) is a small step where the network is available.
 * **Images beyond a placeholder**, and a fuller keymap (other layouts, via

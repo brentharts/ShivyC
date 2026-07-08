@@ -36,6 +36,13 @@ def unit():
         "  let r: boolean = ok && !false; }")
     assert "def g(ok: bool, name: str):" in py3, py3
     assert " and " in py3 and "not " in py3, py3
+    # float type + arrow functions (expression body and block body)
+    py4 = ts2py.translate("const scale = (x: float, k: float): float => x * k;")
+    assert "def scale(x: float, k: float) -> float:" in py4, py4
+    assert "return (x * k)" in py4, py4
+    py5 = ts2py.translate(
+        "const inc = (n: number): number => { return n + 1; };")
+    assert "def inc(n: int) -> int:" in py5 and "return (n + 1)" in py5, py5
     print("ts2py unit translation OK")
 
 

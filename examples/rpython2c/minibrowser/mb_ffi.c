@@ -44,3 +44,15 @@ int mb_render_call(long fn, long buf, int w, int h, int t, int mx, int my) {
     return ((int (*)(unsigned *, int, int, int, int, int))fn)(
         (unsigned *)buf, w, h, t, mx, my);
 }
+
+/* Native page code -> DOM. A JIT'd module (loaded with the browser linked
+   -rdynamic) calls these back into the embedded interpreter to mutate the
+   page's document by element handle. mpy_call_is runs a page-level minipy entry
+   (__set_text / __set_value) and is a symbol in the browser binary. */
+extern int mpy_call_is(const char *name, int i, const char *s);
+int mb_dom_set_text(int handle, const char *text) {
+    return mpy_call_is("__set_text", handle, text);
+}
+int mb_dom_set_value(int handle, const char *text) {
+    return mpy_call_is("__set_value", handle, text);
+}
