@@ -550,6 +550,62 @@ class QCanvas(Widget):
             j = j + 1
 
 
+class QImage(Widget):
+    """A decoded image, blitted into the window framebuffer. The pixels live in
+    a native buffer produced by mb_imgcache.py (PIL) and loaded via
+    mb_image_load; the buffer's first two u32 words are width and height, then
+    width*height 0xAARRGGBB pixels. Like QCanvas the browser owns the buffer and
+    this widget only reads it, so display costs no per-pixel FFI. The alpha byte
+    is honoured so transparent PNGs composite over whatever is already drawn."""
+
+    def __init__(self):
+        super().__init__()
+        self.buf: "u32*" = 0           # native [w][h][pixels]; null until set
+        self.iw = 0
+        self.ih = 0
+        self.has_buf = 0
+
+    def set_image(self, p: "long") -> None:
+        # p points at [u32 w][u32 h][pixels...]; read the size from the header.
+        # Copy the u32 header words through int locals so the width/height
+        # fields stay unboxed ints (a direct u32* -> field store boxes them).
+        v: "u32*" = p
+        self.buf = v
+        iw: "int" = v[0]
+        ih: "int" = v[1]
+        self.iw = iw
+        self.ih = ih
+        self.has_buf = 1
+
+    def pref_h(self) -> int:
+        return self.ih
+
+    def paint(self, fb: "u32*", fbw: int, fbh: int) -> None:
+        if self.has_buf == 0:
+            return
+        buf: "u32*" = self.buf
+        iw = self.iw
+        n = iw * self.ih
+        j = 0
+        while j < n:
+            fx = self.x + (j % iw)
+            fy = self.y + (j // iw)
+            if fx >= 0 and fx < fbw and fy >= 0 and fy < fbh:
+                src: "int" = buf[2 + j]          # skip the [w][h] header
+                a = (src >> 24) & 255
+                di = fy * fbw + fx
+                if a == 255:
+                    fb[di] = src
+                elif a != 0:
+                    dst: "int" = fb[di]
+                    ia = 255 - a
+                    rr = (((src >> 16) & 255) * a + ((dst >> 16) & 255) * ia) // 255
+                    rg = (((src >> 8) & 255) * a + ((dst >> 8) & 255) * ia) // 255
+                    rb = ((src & 255) * a + (dst & 255) * ia) // 255
+                    fb[di] = (rr << 16) | (rg << 8) | rb
+            j = j + 1
+
+
 class QCheckBox(Widget):
     """A labelled checkbox; clicking toggles it and emits stateChanged."""
 

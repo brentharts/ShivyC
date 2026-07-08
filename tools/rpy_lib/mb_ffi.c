@@ -11,6 +11,42 @@
    int(int,...) -- matching JIT'd `int f(int, ...)` blocks. Link with -ldl. */
 #include <dlfcn.h>
 #include <stdlib.h>
+#include <stdio.h>
+
+/* Load a blit-ready image cache file (written by mb_imgcache.py) into a native
+   buffer the QImage widget blits into the window framebuffer. Returned buffer
+   layout is [u32 w][u32 h][w*h u32 pixels], so one call yields both the size
+   (buf[0], buf[1]) and the pixels (buf+2). Returns 0 on any failure -- the
+   widget then falls back to an "[img]" placeholder. The pixel format matches
+   the framebuffer (little-endian 0xAARRGGBB), so no conversion happens here. */
+long mb_image_load(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    unsigned hdr[3];
+    if (fread(hdr, 4, 3, f) != 3 || hdr[0] != 0x494D4731u) {  /* 'IMG1' */
+        fclose(f);
+        return 0;
+    }
+    unsigned w = hdr[1], h = hdr[2];
+    /* Guard against absurd sizes so a corrupt header can't request a huge or
+       overflowing allocation. */
+    if (w == 0 || h == 0 || w > 20000u || h > 20000u) { fclose(f); return 0; }
+    size_t n = (size_t)w * (size_t)h;
+    unsigned *buf = (unsigned *)malloc((n + 2) * sizeof(unsigned));
+    if (!buf) { fclose(f); return 0; }
+    buf[0] = w;
+    buf[1] = h;
+    if (fread(buf + 2, sizeof(unsigned), n, f) != n) {
+        free(buf);
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    return (long)buf;
+}
+void mb_image_free(long buf) {
+    free((void *)buf);
+}
 
 long mb_dlopen(const char *path) {
     return (long)dlopen(path, RTLD_NOW | RTLD_LOCAL);
