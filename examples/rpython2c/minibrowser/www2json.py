@@ -150,12 +150,14 @@ def build_bundle(source, html_text):
     body = find_body(parser.root)
     title = parser.title.strip() or source
     py_types = ("python", "text/python", "application/python")
+    ts_types = ("typescript", "text/typescript", "application/typescript")
     py_code = "\n".join(
         code.strip() for (stype, sid, code) in parser.scripts
         if stype in py_types and code.strip())
     other_code = "\n".join(
         code.strip() for (stype, sid, code) in parser.scripts
-        if stype not in ("rpython", "text/rpython") + py_types and code.strip())
+        if stype not in ("rpython", "text/rpython") + py_types + ts_types
+        and code.strip())
     # <script type="rpython" id="NAME"> blocks: native code for the page, keyed
     # by id. The browser JIT-compiles each (py2c -> gcc -O2 -shared) to a cached
     # .so the page's python loads via ctypes -- a faster, CPython-compatible
@@ -164,6 +166,18 @@ def build_bundle(source, html_text):
     for (stype, sid, code) in parser.scripts:
         if stype in ("rpython", "text/rpython") and code.strip():
             rpython[sid or ("rpy%d" % len(rpython))] = code.strip()
+        elif stype in ts_types and code.strip():
+            # TypeScript -> typed rpython -> native .so, via the same JIT path.
+            # Everybody compiles TypeScript to JavaScript; we compile it to
+            # native machine code. Best-effort: an untranslatable block is
+            # skipped rather than breaking the page.
+            try:
+                import ts2py as _ts2py
+                rpython[sid or ("ts%d" % len(rpython))] = \
+                    _ts2py.translate(code).strip()
+            except Exception as e:                   # noqa: BLE001
+                sys.stderr.write("ts2py: skipping <script type=typescript> "
+                                 "(%s)\n" % e)
     # Translate plain <script> JavaScript to minipy python (js2py, via the
     # pyjsparser AST) so it runs on the *same* engine + DOM as a python script.
     # Best-effort: if pyjsparser is missing or the JS uses an unsupported

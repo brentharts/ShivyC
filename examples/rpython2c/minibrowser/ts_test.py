@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Check the TypeScript -> rpython translator and its www2json integration.
+
+Fast (no native build): unit-translate a few TypeScript functions and assert the
+emitted typed rpython, then confirm www2json routes a <script type="typescript">
+block into the page's rpython (native-JIT) map rather than the JavaScript path.
+The end-to-end native compile is exercised by the browser's --ts-selftest.
+
+    python3 ts_test.py
+"""
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def unit():
+    import ts2py
+    py = ts2py.translate(
+        "function add(a: number, b: number): number { return a + b; }")
+    assert "def add(a: int, b: int) -> int:" in py, py
+    assert "return (a + b)" in py, py
+    # typed local + C-style for + if/elif/else
+    py2 = ts2py.translate(
+        "function f(n: number): number {"
+        "  let s: number = 0;"
+        "  for (let i: number = 0; i < n; i++) { s = s + i; }"
+        "  if (s > 10) { return 1; } else if (s === 0) { return 2; }"
+        "  else { return 0; } }")
+    assert "def f(n: int) -> int:" in py2, py2
+    assert "while (i < n):" in py2 and "i = i + 1" in py2, py2
+    assert "elif (s == 0):" in py2, py2
+    # boolean / string / void types and && || ! mapping
+    py3 = ts2py.translate(
+        "function g(ok: boolean, name: string): void {"
+        "  let r: boolean = ok && !false; }")
+    assert "def g(ok: bool, name: str):" in py3, py3
+    assert " and " in py3 and "not " in py3, py3
+    print("ts2py unit translation OK")
+
+
+def integration():
+    import www2json
+    with open(os.path.join(HERE, "ts.html")) as fh:
+        b = www2json.build_bundle("ts.html", fh.read())
+    assert "tsmod" in b["rpython"], "TS block not routed into the rpython map"
+    assert "def fib(n: int) -> int:" in b["rpython"]["tsmod"], \
+        b["rpython"]["tsmod"]
+    assert "function fib" not in b["scripts"], "TS leaked into the JS bucket"
+    print("www2json TS integration OK")
+
+
+def main(argv):
+    sys.path.insert(0, HERE)
+    unit()
+    integration()
+    print("ts_test: PASS")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

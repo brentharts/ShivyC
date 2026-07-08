@@ -1,0 +1,27 @@
+<html>
+<head>
+<script type="typescript" id="tsmod">
+function fib(n: number): number {
+    let a: number = 0;
+    let b: number = 1;
+    for (let i: number = 0; i < n; i++) {
+        let t: number = a + b;
+        a = b;
+        b = t;
+    }
+    return a;
+}
+</script>
+<script type="python">
+import ctypes
+dll = ctypes.CDLL('/tmp/jit.tsmod.so')
+def run():
+    console.log('typescript compiled to native, fib(10) =')
+    console.log(dll.fib(10))
+</script>
+</head>
+<body>
+<h1>typescript native</h1>
+<button onclick="run()">clickme</button>
+</body>
+</html>

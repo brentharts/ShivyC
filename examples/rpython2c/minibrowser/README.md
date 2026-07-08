@@ -367,6 +367,53 @@ cd build/gui && ./minibrowser_app --js-selftest   # JS greet() runs in the brows
 Needs `pip install pyjsparser` (optional, like Js2Py itself); without it the JS
 is simply left unrun.
 
+## TypeScript compiled to native (ts2py)
+
+Everybody compiles TypeScript to JavaScript. We do better: a `<script
+type="typescript">` block is translated to **typed rpython** and JIT-compiled to
+a native `.so` (the same path as `<script type="rpython">`), so a typed TS
+function becomes native machine code, not interpreted JavaScript. TypeScript's
+type annotations are exactly what py2c needs -- `number` -> `int`, `boolean` ->
+`bool`, `string` -> `str`, `void` -> `None`, `T[]` -> `list[t]`:
+
+```html
+<script type="typescript" id="tsmod">
+function fib(n: number): number {
+    let a: number = 0;
+    let b: number = 1;
+    for (let i: number = 0; i < n; i++) {
+        let t: number = a + b;
+        a = b;
+        b = t;
+    }
+    return a;
+}
+</script>
+<script type="python">
+import ctypes
+dll = ctypes.CDLL('/tmp/jit.tsmod.so')
+def run():
+    console.log(dll.fib(10))      # 55, computed by native code
+</script>
+```
+
+`www2json` routes the block into the page's rpython map; `ts2py` translates it
+(`def fib(n: int) -> int: ...`), and `jitc` compiles it to `jit.tsmod.so`, which
+the page's Python calls via ctypes like any native block.
+
+`ts2py.py` is a dependency-free, pure-Python TypeScript front end (no Node, no
+npm, no `typescript` compiler): its own tokenizer and a precedence-climbing
+expression parser cover typed function declarations, typed locals, the usual
+control flow, and the operator set (`===`->`==`, `&&`->`and`, `i++`->`i = i + 1`).
+It is a subset aimed at native page functions; a block it can't translate is
+skipped rather than mistranslated. Numeric work maps to `int` today (TS's single
+`number` type); floats and string returns are future.
+
+```
+python3 ts_test.py                                # translate + www2json routing
+cd build/gui && ./minibrowser_app --ts-selftest   # TS fib(10)=55, native, in-browser
+```
+
 ## Two-way input binding
 
 Typing into an `<input>` flows back into the DOM. Each rendered field is bound to
@@ -401,6 +448,9 @@ cd build/gui && ./minibrowser_app --twoway-selftest
 * **Wider JS coverage.** The js2py subset now handles DOM scripting, objects, and
   arrays; JS `+` string coercion, `this`/closures, and array iteration methods
   (`map`/`forEach`) are the next reach.
+* **Wider TypeScript coverage.** `ts2py` compiles typed numeric functions to
+  native code; `float`/`number` distinction, string returns across the FFI,
+  interfaces/type aliases, and arrow functions are the next reach.
 * **Real network fetch.** `www2json --url` exists; wiring it into `navigate()`
   (rather than local `*.html`) is a small step where the network is available.
 * **Images beyond a placeholder**, and a fuller keymap (other layouts, via
