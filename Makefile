@@ -751,6 +751,36 @@ minikraft: shim
 run-irq: baremetal-irq
 	qemu-system-x86_64 -kernel $(BUILD)/irq.elf -serial stdio
 
+# minibrowser on bare-metal VGA: parse HTML -> DOM -> render into a VGA graphics
+# framebuffer with a bitmap font, in a freestanding 64-bit long-mode kernel that
+# boots with a plain `qemu -kernel` (Multiboot AOUT kludge, no GRUB). Can also
+# fetch the page over virtio-net + ARP + UDP. See examples/rpython2c/mbos/.
+MBOS := $(RPY)/mbos
+mbos:
+	$(MAKE) -C $(MBOS)
+
+# Headless self-test: boot mbos, assert the rendered page text, save a shot.
+mbos-test:
+	$(MAKE) -C $(MBOS) test
+
+# Networked self-test: mbos fetches the page over virtio-net + ARP + UDP from
+# a host-side server (minikraft-network-stack concepts, compact polled driver).
+mbos-test-net:
+	$(MAKE) -C $(MBOS) test-net
+
+# 1920x1080 graphics via a 64 MiB VGA device.
+mbos-hires:
+	$(MAKE) -C $(MBOS) test-hires
+
+# rpython render path: dom/html/render generated from rpython by py2c and linked
+# into the kernel in place of the hand-written C (same dom.py as minibrowser).
+mbos-rpython:
+	$(MAKE) -C $(MBOS) rpython
+mbos-rpython-test:
+	$(MAKE) -C $(MBOS) rpython-test
+mbos-rpython-test-net:
+	$(MAKE) -C $(MBOS) rpython-test-net
+
 self:
 	cd tools && pypy3 py2c.py
 
@@ -760,7 +790,7 @@ self:
         selfhost_coverage_musl selfhost_link selfhost_build selfhost_compiler \
         bench_compile_speed \
         rpython benchmarks wayland rpyqt controls minibrowser \
-        baremetal-kernel baremetal-irq minikraft run-irq \
+        baremetal-kernel baremetal-irq minikraft run-irq mbos mbos-test mbos-test-net mbos-hires mbos-rpython mbos-rpython-test mbos-rpython-test-net \
         install_micropython clean_micropython test_micropython \
         test_micropython_core test_micropython_objects \
         test_micropython_modules test_micropython_emitters test_micropython_port \
