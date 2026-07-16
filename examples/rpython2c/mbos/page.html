@@ -1,0 +1,20 @@
+<html>
+<head><title>mbos</title></head>
+<body>
+<h1>mbos</h1>
+<p>This page was parsed into a DOM and rendered onto bare-metal VGA text
+by a freestanding kernel booted with qemu -kernel. No libc, no OS.</p>
+<h2>What works</h2>
+<p>Basic block layout with word wrap at the 80 column margin, headings,
+paragraphs, links, and lists. The same Node tree shape as minibrowser's
+dom.py, so the renderer can later be generated from rpython via py2c.</p>
+<h2>Links</h2>
+<p>Anchors keep their href: <a href="http://example.com">example.com</a>
+and the local <a href="/about.html">about page</a>.</p>
+<ul>
+<li>parse HTML to a DOM</li>
+<li>lay it out for the VGA text grid</li>
+<li>paint it, mirrored to serial for testing</li>
+</ul>
+</body>
+</html>

@@ -1,0 +1,18 @@
+<html>
+<head><title>mbos over the wire</title></head>
+<body>
+<h1>Fetched over the network</h1>
+<p>This HTML did not exist inside the kernel image. The bare-metal browser
+brought up virtio-net, resolved the host with ARP, requested this page over
+UDP, parsed it into a DOM, and rendered it -- all without an operating
+system.</p>
+<h2>The path it took</h2>
+<ul>
+<li>virtio-net legacy PCI, polled (net.c)</li>
+<li>ARP for 192.168.100.1, answered by QEMU slirp</li>
+<li>UDP request to the host page server (serve_page.py)</li>
+<li>html.c to dom.c to render.c, same as the embedded page</li>
+</ul>
+<p>Back to the <a href="/page.html">built-in page</a>.</p>
+</body>
+</html>
