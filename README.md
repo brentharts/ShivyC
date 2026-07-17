@@ -495,3 +495,6 @@ thus making the entire project self contained.
 Toward a Self-Hosting, Dependency-Free Python JIT* https://zenodo.org/records/21178004
     - *Beyond WebAssembly: Rethinking the Web Browser with
 Post-JavaScript, VM-Free Page Execution* https://ai.vixra.org/pdf/2607.0013v1.pdf
+
+## External Demos
+- https://github.com/OpenSourceJesus/ShivyCX-Game-Demos
